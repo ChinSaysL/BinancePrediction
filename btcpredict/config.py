@@ -53,10 +53,10 @@ class Settings(BaseSettings):
 
     # --- sizing ------------------------------------------------------------
     # Order size. With min_order == stake, fractional-Kelly values below the
-    # minimum fall back to this, so $3 means a flat $3 on every trade.
-    stake_usdt: float = 3.0
-    max_stake_usdt: float = 3.0
-    min_order_usdt: float = 3.0
+    # minimum fall back to this, so $6 means a flat $6 on every trade.
+    stake_usdt: float = 6.0
+    max_stake_usdt: float = 6.0
+    min_order_usdt: float = 6.0
     kelly_fraction: float = 0.25
     # Venue tolerance on price movement between quote and fill. 100 bps was
     # producing FOK failures ("Failed to execute the market order") when the
@@ -129,8 +129,9 @@ class Settings(BaseSettings):
     max_basis_usd: float = 60.0
 
     # --- risk --------------------------------------------------------------
-    # Daily cap scaled to the order size: 3 losing trades at $3 = $9.
-    daily_loss_cap_usdt: float = 9.0
+    # Daily cap: 3 losing trades at $6 = $18, a 4th would be -$24, so the
+    # -$20 cap halts after 3 full losers (plus part of a 4th).
+    daily_loss_cap_usdt: float = 20.0
     max_consecutive_losses: int = 5
     max_open_rounds: int = 1
 
