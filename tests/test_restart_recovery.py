@@ -1,0 +1,93 @@
+"""A restart must not orphan an open position."""
+import asyncio
+import tempfile
+from pathlib import Path
+
+import pytest
+
+from btcpredict.execution.paper import PaperBroker
+from btcpredict.main import Bot
+from btcpredict.store.db import Store
+
+
+def make_bot(store):
+    bot = Bot.__new__(Bot)                      # skip network setup
+    bot.mode = "paper"
+    bot.store = store
+    bot.open_fills = {}
+    from btcpredict.risk.guards import RiskGuard
+    bot.guard = RiskGuard(daily_loss_cap=10.0, max_consecutive_losses=5,
+                          max_open_rounds=1)
+    bot.broker = PaperBroker()
+    from btcpredict.calibration.report import PnLSummary
+    bot.pnl = PnLSummary()
+    return bot
+
+
+@pytest.fixture
+def store():
+    with tempfile.TemporaryDirectory() as d:
+        s = Store(Path(d) / "t.db")
+        yield s
+        s.close()
+
+
+def test_unsettled_fill_is_restored(store):
+    fid = store.insert("fills", {
+        "decision_id": 1, "slug": "btc-updown-5m-1", "ts_ms": 1000, "mode": "paper",
+        "side": "Up", "requested_px": 0.60, "filled_px": 0.62, "shares": 1.6129,
+        "stake": 1.0, "fee_paid": 0.02, "order_id": "paper-1", "raw": "",
+    })
+    bot = make_bot(store)
+    bot._restore_open_positions()
+
+    assert "btc-updown-5m-1" in bot.open_fills
+    restored_id, fill = bot.open_fills["btc-updown-5m-1"]
+    assert restored_id == fid
+    assert fill.side == "Up"
+    assert fill.shares == pytest.approx(1.6129)
+    assert fill.stake == pytest.approx(1.0)
+    # The guard must also know the round is occupied again.
+    assert not bot.guard.check("btc-updown-5m-1")[0]
+
+
+def test_already_settled_fill_is_not_restored(store):
+    fid = store.insert("fills", {
+        "decision_id": 1, "slug": "done", "ts_ms": 1000, "mode": "paper",
+        "side": "Up", "requested_px": 0.6, "filled_px": 0.62, "shares": 1.6,
+        "stake": 1.0, "fee_paid": 0.02, "order_id": "p1", "raw": "",
+    })
+    store.insert("settlements", {"fill_id": fid, "slug": "done", "ts_ms": 2000,
+                                 "won": 1, "payout": 1.6, "pnl": 0.58, "mode": "paper"})
+    bot = make_bot(store)
+    bot._restore_open_positions()
+    assert bot.open_fills == {}
+
+
+def test_other_modes_are_not_restored(store):
+    store.insert("fills", {
+        "decision_id": 1, "slug": "live-one", "ts_ms": 1000, "mode": "live",
+        "side": "Up", "requested_px": 0.6, "filled_px": 0.62, "shares": 1.6,
+        "stake": 1.0, "fee_paid": 0.02, "order_id": "L1", "raw": "",
+    })
+    bot = make_bot(store)          # paper broker
+    bot._restore_open_positions()
+    assert bot.open_fills == {}    # a live fill must not be settled by the paper broker
+
+
+def test_restored_position_then_settles(store):
+    store.insert("fills", {
+        "decision_id": 1, "slug": "r1", "ts_ms": 1000, "mode": "paper",
+        "side": "Up", "requested_px": 0.6, "filled_px": 0.62, "shares": 1.6129,
+        "stake": 1.0, "fee_paid": 0.02, "order_id": "p1", "raw": "",
+    })
+    store.upsert_round({"slug": "r1", "start_ms": 0, "end_ms": 1,
+                        "market_topic_id": 99, "winner": "Up"})
+    bot = make_bot(store)
+    bot._restore_open_positions()
+    asyncio.run(bot.settle_due())
+
+    assert bot.open_fills == {}
+    rows = store.query("SELECT * FROM settlements WHERE slug='r1'")
+    assert len(rows) == 1 and rows[0]["won"] == 1
+    assert bot.guard.check("r2")[0]      # the round slot is free again
