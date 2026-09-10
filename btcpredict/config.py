@@ -291,22 +291,36 @@ class Settings(BaseSettings):
     #
     # The percentage is the primary rule because a fixed dollar stop does not
     # mean the same thing at two account sizes. The old -$35 was ~46% of a $76
-    # account (a real brake, if a loose one) but only 3.5% of a $1,000 one,
-    # where it would trip on the second loser and sit the day out. 0.45 is
-    # chosen to reproduce that -$35 at today's $76 bankroll ($34.42), so this
-    # is a change of UNITS rather than of behaviour: today's risk is unchanged,
-    # but the stop keeps its meaning as the account scales.
+    # account but only 3.5% of a $1,000 one, where it would trip on the second
+    # loser and sit the day out.
     #
-    # Sized against the stake: at 4% per trade the stop is ~11 stakes wide, so
-    # the 5-consecutive-loss rule normally fires first and this catches the
-    # choppy days that never string five together. It is a catastrophe brake,
-    # not a profit optimiser -- tightening it was tested (tools/sizing_experiments)
-    # and bought no reduction in the tail, only fewer trades.
-    daily_loss_cap_pct: float = 0.45
+    # 0.20 -- five stakes at 4% -- is the knee of the swept curve
+    # (tools/project_balance.py --sweep-cap; 30 days, 44 trades/day, at four
+    # edge levels from +0.25/$1 down to zero):
+    #   * a daily stop CANNOT shrink a MONTHLY drawdown, at any level. medDD and
+    #     p95DD are flat across the whole 5%-to-disabled range at every edge
+    #     (central: 18.5-18.7% and 30.6-31.5%), because the cap resets each UTC
+    #     day while a monthly drawdown accumulates ACROSS days. The lever for
+    #     that is stake_fraction, not this.
+    #   * what it does buy is a bound on the worst DAY. p95 worst day at 45% was
+    #     16.1% / 23.4% / 33.4% (at +0.25 / +0.17 / +0.06 per $1); at 20% it is
+    #     19.6% / 20.7% / 22.6% -- bounded at ~20-23% whatever the edge turns
+    #     out to be.
+    #   * the premium rises as the edge falls: 45% -> 20% gives up 0.2% of profit
+    #     at +0.25/$1 and 0.8% at +0.17/$1, but 12% at +0.06/$1. Below ~15% the
+    #     cap fires 5-15 days a month and eats real EV for no monthly benefit;
+    #     above ~30% it stops buying any tail protection at all.
+    # The previous 0.45 was continuity with the old -$35 stop at $76.49, not a
+    # tuned number -- it let a single day take 45% of the account.
+    daily_loss_cap_pct: float = 0.20
     # Optional dollar CEILING on top of the percentage, for an account large
-    # enough that 45% is an unacceptable absolute loss. It participates in the
+    # enough that 20% is an unacceptable absolute loss. It takes part in the
     # same min(), and 0.0 = off, so at $76 the percentage alone binds.
     daily_loss_cap_usdt: float = 0.0
+    # Deliberately the same width as max_consecutive_losses: five losses at 4%
+    # compounding is ~18.5% of the bankroll, so the two rules now agree on what
+    # a bad day is. This cap catches the choppy days that never string five
+    # losses together; the streak rule catches the rest.
     max_consecutive_losses: int = 5
     max_open_rounds: int = 1
 
