@@ -117,6 +117,7 @@ def simulate(rets, tilts, *, bankroll, days, edge, tpd, paths,
     pool, _k = haircut(rets, edge)
     rng = random.Random(seed)
     snaps: dict[int, list[float]] = {d: [] for d in HORIZONS}
+    wr_snaps: dict[int, list[tuple[int, int]]] = {d: [] for d in HORIZONS}
     dds, halt_days, ruined = [], [], 0
     stopped_days, cap_days, worst_days = [], [], []
     frac = settings.stake_fraction
@@ -133,6 +134,7 @@ def simulate(rets, tilts, *, bankroll, days, edge, tpd, paths,
         losses, frozen, hit_halt = 0, False, False
         n_stopped = n_cap = 0
         worst_day = 0.0
+        wins = trades = 0
         for day in range(1, days + 1):
             if frozen and resume_after_halt:
                 frozen, losses = False, 0        # operator resumes the next day
@@ -155,6 +157,9 @@ def simulate(rets, tilts, *, bankroll, days, edge, tpd, paths,
                     pnl = rng.choice(pool) * stake
                     bank += pnl
                     day_pnl += pnl
+                    trades += 1
+                    if pnl > 0:
+                        wins += 1
                     losses = losses + 1 if pnl < 0 else 0
                     peak = max(peak, bank)
                     dd = min(dd, (bank - peak) / peak)
@@ -167,6 +172,7 @@ def simulate(rets, tilts, *, bankroll, days, edge, tpd, paths,
                 frozen = True
             if day in HORIZONS:
                 snaps[day].append(bank)
+                wr_snaps[day].append((wins, trades))
         dds.append(-dd * 100)
         stopped_days.append(n_stopped)
         cap_days.append(n_cap)
@@ -188,8 +194,11 @@ def simulate(rets, tilts, *, bankroll, days, edge, tpd, paths,
            "p95_worst_day": worst_days[int(0.95 * len(worst_days))]}
     for d in HORIZONS:
         xs = sorted(snaps[d])
+        w = sum(a for a, _ in wr_snaps[d])
+        t = sum(b for _, b in wr_snaps[d])
         out[d] = {"med": st.median(xs), "p10": xs[int(0.10 * len(xs))],
                   "p90": xs[int(0.90 * len(xs))],
+                  "wr": w / t if t else 0.0, "trades": t / len(snaps[d]),
                   "down": sum(1 for x in xs if x < bankroll) / len(xs)}
     return out
 
