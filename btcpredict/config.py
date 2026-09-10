@@ -75,10 +75,17 @@ class Settings(BaseSettings):
     sizing_metric: Literal["edge", "ev"] = "edge"
     min_stake_usdt: float = 5.0
     max_stake_usdt: float = 20.0
-    # sizing_mode="fraction" knobs. 5% of bankroll is about 1/9 of full Kelly
-    # (Kelly on the 70 replayed trades is mean/var = 45%), which is the right
-    # order of magnitude for an edge that is still only 70 trades old.
-    stake_fraction: float = 0.05
+    # sizing_mode="fraction" knobs. 4% of bankroll, chosen on DRAWDOWN rather
+    # than return: the old $5-10 band risked 9.0% of a $75 account per trade,
+    # and that fraction does not fall as the account shrinks. Simulated over the
+    # recorded trades (3000 paths, 19 trades/day), at 30 days:
+    #   band $5-10   median DD 29.7%   p95 DD 72.4%   p95 DD 100.2% at +0.15/$1
+    #   f=4%         median DD 23.5%   p95 DD 35.6%   p95 DD  49.1% at +0.15/$1
+    # and 4% also earns more in the central case ($1,818 vs $910), so it
+    # dominates the band on both axes there. The drawdown gain holds at BOTH
+    # edge assumptions because variance is far better estimated from 70 trades
+    # than the mean is; the profit gain does not.
+    stake_fraction: float = 0.04
     # Ceiling on the fractional stake, so compounding cannot run the stake up
     # to a size the venue's book cannot absorb in one FOK order. Also the
     # ceiling once a sizing tilt is on.
