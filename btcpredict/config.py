@@ -168,8 +168,16 @@ class Settings(BaseSettings):
     # Equal names disable the hybrid and keep the single-model gate.
     up_model: str = "digital"
     # Rising-regime gate for Up: skip Up when the 1h log return is above this
-    # (0 disables). Measured on the recording: Up WR 0.50 in rising hours vs
-    # 0.82 flat/down; the gate recovers ~+$3 and flattens the drawdown.
+    # (0 disables). Re-tested on the full recording once Up went back to the
+    # calibrated driftless model (tools/gate_sweep.py, 514 BTC + 444 ETH rounds):
+    # the lever is nearly inert. On BTC it removes 1 of 14 Up trades at 0.005
+    # (+$16.4 vs +$15.4 total per-$1, test slice identical), thresholds of 0.01
+    # and above are indistinguishable from OFF, and ETH has 7 trades total so it
+    # cannot speak. The original justification -- "Up WR 0.50 rising vs 0.82
+    # flat/down, recovers ~+$3" -- was measured on 25 rounds under the old Up
+    # model and does not reproduce.
+    # Kept at 0.005 because it is mildly positive on both assets and costs
+    # nothing measurable; treat it as untuned, not as a validated filter.
     up_regime_gate: float = 0.0
     # Fallback only: the fee comes from the measured curve
     # fee_bps = 180 * min(1, (1-px)/px) (see edge/signal.py). 180 bps is the
