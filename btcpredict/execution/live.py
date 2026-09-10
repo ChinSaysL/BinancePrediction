@@ -279,7 +279,11 @@ class LiveBroker:
         # order up in order/history, which reports the authoritative status.
         # History can lag a second or two, so retry briefly.
         order_id = resp.get("orderId") or resp.get("bundleId")
-        status = await self._order_status(order_id)
+        # Short budget here: this sits inside the order path, where every second
+        # spent waiting is a second of the quote's ~5s expireAt window and of
+        # the trade's tau window. Deeper verification belongs in settle(), which
+        # has minutes rather than seconds.
+        status = await self._order_status(order_id, tries=3, delay=0.4)
         if status is None:
             log.warning("order %s placed but history unavailable; "
                         "proceeding unverified", order_id)
@@ -313,20 +317,36 @@ class LiveBroker:
 
     async def settle(self, fill: Fill, winner: str) -> Settlement | None:
         if getattr(fill, "unverified", False):
-            # The venue returns 200 + orderId even when a FOK order fails, so
-            # a fill booked without a confirmed status may be phantom. By
-            # settlement time the order-history has caught up: FILLED proves
-            # the position, any terminal-failure proves there never was one.
+            # The venue returns 200 + orderId even when a FOK order fails, so a
+            # fill booked without a confirmed status may be phantom. By
+            # settlement time the order-history has caught up: FILLED proves the
+            # position, a terminal failure proves there never was one.
             status = await self._order_status(fill.order_id)
             if status is None:
                 fill.unverified_checks += 1
-                if fill.unverified_checks < 20:
-                    return None    # still unreadable; caller retries next tick
-                # Give up on history and ask the venue's position list: a
-                # claimable token for this position proves a real fill.
-                claimable = await self.claimable_token_ids()
-                if fill.token_id in claimable:
-                    status = "FILLED"
+                # "Cannot read" is NOT the same as "empty". Only positive
+                # evidence may void a fill: a failed read that was treated as
+                # absence would silently drop a real position -- and its
+                # winnings would never be redeemed either. So ask the venue what
+                # it actually holds, and keep asking while the answer is unknown.
+                held = await self._position_token_ids()
+                if held is not None:
+                    if fill.token_id in held:
+                        status = "FILLED"
+                    elif fill.unverified_checks >= 20:
+                        status = "FAILED"
+                        log.error("unverified order %s absent from the venue's "
+                                  "positions after %d checks; voiding fill for %s",
+                                  fill.order_id, fill.unverified_checks, fill.slug)
+                if status is None:
+                    # Unknown outcome: retry forever rather than guess. The
+                    # round slot stays closed (fail closed, never fail open).
+                    if fill.unverified_checks % 10 == 0:
+                        log.error("unverified order %s still unverifiable after "
+                                  "%d checks; holding %s un-settled (no PnL "
+                                  "booked, no new rounds) until the venue answers",
+                                  fill.order_id, fill.unverified_checks, fill.slug)
+                    return None
             if status != "FILLED":
                 log.warning("unverified order %s status=%s; voiding fill for %s",
                             fill.order_id, status, fill.slug)
@@ -337,6 +357,19 @@ class LiveBroker:
         payout = fill.shares if won else 0.0
         return Settlement(slug=fill.slug, won=won, payout=payout,
                           pnl=payout - fill.stake, ts_ms=int(time.time() * 1000))
+
+    async def _position_token_ids(self) -> set[str] | None:
+        """Token ids the wallet currently holds, or None when unreadable.
+
+        The None/empty distinction is load-bearing: callers must never read a
+        failed request as "the venue holds nothing".
+        """
+        resp = await self._request("GET", POSITION_LIST,
+                                   {"walletAddress": self.wallet_address})
+        if resp is None:
+            return None
+        return {p.get("tokenId") for p in (resp.get("positions") or [])
+                if p.get("tokenId")}
 
     async def claimable_token_ids(self) -> list[str]:
         resp = await self._request("GET", f"{P}/position/filter", {

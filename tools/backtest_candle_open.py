@@ -165,37 +165,35 @@ def replay(quotes, settled_by_slug, sigma_by_slug, hist, model,
         pred = model.predict(ctx)
         if not pred.emitted:
             continue
-        if model_up is not None:
-            pred_up = model_up.predict(ctx)
-            up_fair = (pred_up.p_up if pred_up.emitted
-                       and 0.0 < pred_up.p_up < 1.0 else pred.p_up)
-            sig = evaluate_hybrid(
-                pred.p_up, up_fair, q["up_ask"], q["down_ask"],
-                fee=fee, half_spread=0.0, safety_margin=params.safety_margin,
-                fee_model=FeeModel.NOTIONAL if params.fee_model == "notional"
-                else FeeModel.PROFIT,
-                max_quote=params.max_quote, min_quote=params.min_quote,
-                min_edge=params.min_edge, edge_haircut=params.edge_haircut)
-        else:
-            sig = evaluate(
-                pred.p_up, q["up_ask"], q["down_ask"],
-                fee=fee, half_spread=0.0, safety_margin=params.safety_margin,
-                fee_model=FeeModel.NOTIONAL if params.fee_model == "notional"
-                else FeeModel.PROFIT,
-                max_quote=params.max_quote, min_quote=params.min_quote,
-                min_edge=params.min_edge, edge_haircut=params.edge_haircut)
-
-        # Rising-regime gate for Up, mirrored from live (config.up_regime_gate).
-        if sig.act and sig.side == "Up" and params.up_regime_gate > 0:
+        # Rising-regime gate for Up, mirrored from live (config.up_regime_gate):
+        # decided BEFORE the side pick, so a blocked Up still falls back to a
+        # Down candidate that qualified on the same quote.
+        up_allowed, blocked_ret = True, None
+        if params.up_regime_gate > 0:
             c0 = bars[cursor - 1][1] if cursor > 0 else None
             past = [b for b in bars[:cursor] if b[0] <= ci - 60]
             if c0 and past and c0 > 0 and past[-1][1] > 0:
                 ret = math.log(c0 / past[-1][1])
                 if ret > params.up_regime_gate:
-                    sig = Signal(None, sig.fair, sig.quote, sig.edge, sig.hurdle,
-                                 sig.ev_per_dollar, False,
-                                 f"Up skipped: 1h ret {ret:+.4f} > "
-                                 f"{params.up_regime_gate:+.3f}")
+                    up_allowed, blocked_ret = False, ret
+        up_fair = pred.p_up
+        if model_up is not None:
+            pred_up = model_up.predict(ctx)
+            if pred_up.emitted and 0.0 < pred_up.p_up < 1.0:
+                up_fair = pred_up.p_up
+        sig = evaluate_hybrid(
+            pred.p_up, up_fair, q["up_ask"], q["down_ask"],
+            up_allowed=up_allowed,
+            fee=fee, half_spread=0.0, safety_margin=params.safety_margin,
+            fee_model=FeeModel.NOTIONAL if params.fee_model == "notional"
+            else FeeModel.PROFIT,
+            max_quote=params.max_quote, min_quote=params.min_quote,
+            min_edge=params.min_edge, edge_haircut=params.edge_haircut)
+        if blocked_ret is not None and not sig.act:
+            sig = Signal(None, sig.fair, sig.quote, sig.edge, sig.hurdle,
+                         sig.ev_per_dollar, False,
+                         f"Up skipped: 1h ret {blocked_ret:+.4f} > "
+                         f"{params.up_regime_gate:+.3f}")
 
         prev_side, prev_n = streak.get(slug, (None, 0))
         if sig.act and sig.side == prev_side:

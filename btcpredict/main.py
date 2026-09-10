@@ -26,7 +26,8 @@ import aiohttp
 from btcpredict.calibration.report import PnLSummary
 from btcpredict.config import MARKETS, settings
 from btcpredict.edge.signal import (FeeModel, Signal, evaluate,
-                                    evaluate_hybrid, kelly_stake)
+                                    evaluate_hybrid, kelly_stake,
+                                    stake_for_edge)
 from btcpredict.execution.base import Fill
 from btcpredict.execution.live import RETRYABLE_FAILURES, LiveBroker
 from btcpredict.execution.paper import PaperBroker
@@ -159,8 +160,12 @@ class Bot:
             bal = await self.broker.balance()
             log.info("LIVE mode. wallet %s balance $%.4f",
                      self.broker.wallet_address, bal)
-            if bal < settings.stake_usdt:
-                raise SystemExit(f"balance ${bal:.4f} below stake ${settings.stake_usdt}")
+            if bal > 0:
+                # Sizing must track real equity rather than a stale setting.
+                self.bankroll = bal
+            if bal < settings.min_order_usdt:
+                raise SystemExit(f"balance ${bal:.4f} below the venue minimum "
+                                 f"${settings.min_order_usdt:.2f}")
 
         if self.mode != "record":
             self._restore_open_positions()
@@ -282,7 +287,12 @@ class Bot:
         # Buy prices come from the real book (the ask), not the displayed
         # last-trade price, which was observed 2-3 cents away from the mid.
         up_bid = up_ask = down_bid = down_ask = None
-        if self.book and r.market_id:
+        if self.book and r.market_id and trade:
+            # Only the market we are allowed to trade: the untraded market's
+            # books were fetched every second purely for the recorder, tripling
+            # SAPI calls for data no replay uses (the tool is BTC-only). If the
+            # venue rate-limits, best_prices() returns None and the bot silently
+            # falls back to the displayed price plus an assumed spread.
             # Concurrently: sequential fetches let the price move between them,
             # which manufactured phantom complete-set arbitrages in recorded data
             # (one book drifted 0.21 between two calls).
@@ -322,6 +332,14 @@ class Bot:
             log.debug("model %s holds on %s: %s", self.model.name, r.slug, pred.reason)
             return
         fair_up = pred.p_up
+        # Per-side pricing: Up may be priced by a different model (the drift
+        # adjustment) than Down (the driftless digital).
+        up_fair = fair_up
+        if self.up_model is not None:
+            pred_up = self.up_model.predict(hist.ctx(
+                price=spot, strike=r.strike, tau_s=tau, sigma_1m=sigma))
+            if pred_up.emitted and 0.0 < pred_up.p_up < 1.0:
+                up_fair = pred_up.p_up
         sig_kw = dict(
             # fee=None -> per-quote fee from the measured curve
             # (fee_bps = 180 * min(1, (1-px)/px)); a flat fallback would
@@ -335,25 +353,23 @@ class Bot:
             min_edge=settings.min_edge,
             edge_haircut=settings.edge_haircut,
         )
-        if self.up_model is not None:
-            pred_up = self.up_model.predict(hist.ctx(
-                price=spot, strike=r.strike, tau_s=tau, sigma_1m=sigma))
-            up_fair = (pred_up.p_up if pred_up.emitted
-                       and 0.0 < pred_up.p_up < 1.0 else fair_up)
-            sig = evaluate_hybrid(fair_up, up_fair, buy_up, buy_down, **sig_kw)
-        else:
-            sig = evaluate(fair_up, buy_up, buy_down, **sig_kw)
-
-        # Rising-regime gate for Up (see config.up_regime_gate): when the last
-        # hour is already up, the venue has priced Up correctly and our Up edge
-        # is anti-informative (measured WR 0.50 rising vs 0.82 flat/down).
-        if sig.act and sig.side == "Up" and settings.up_regime_gate > 0:
+        # Rising-regime gate (see config.up_regime_gate): when the last hour is
+        # already up, the venue has priced Up correctly and our Up edge is
+        # anti-informative (measured WR 0.50 rising vs 0.82 flat/down). Decided
+        # BEFORE the side pick, so a blocked Up still falls back to a Down
+        # candidate that qualified on the same quote.
+        up_allowed, blocked_ret = True, None
+        if settings.up_regime_gate > 0:
             ret = hist.one_hour_return()
             if ret is not None and ret > settings.up_regime_gate:
-                sig = Signal(None, sig.fair, sig.quote, sig.edge, sig.hurdle,
-                             sig.ev_per_dollar, False,
-                             f"Up skipped: 1h ret {ret:+.4f} > "
-                             f"{settings.up_regime_gate:+.3f}")
+                up_allowed, blocked_ret = False, ret
+        sig = evaluate_hybrid(fair_up, up_fair, buy_up, buy_down,
+                              up_allowed=up_allowed, **sig_kw)
+        if blocked_ret is not None and not sig.act:
+            sig = Signal(None, sig.fair, sig.quote, sig.edge, sig.hurdle,
+                         sig.ev_per_dollar, False,
+                         f"Up skipped: 1h ret {blocked_ret:+.4f} > "
+                         f"{settings.up_regime_gate:+.3f}")
 
         # A signal must hold for several consecutive polls. A one-tick edge is
         # usually our own stale book or spot sample rather than a real
@@ -421,16 +437,12 @@ class Bot:
         acted = False
         stake = 0.0
         if sig.act and not gate_reason:
-            # Kelly is the sizing rule; the venue minimum is the floor. Below that
-            # minimum there is no way to express a smaller bet, so fall back to the
-            # configured stake rather than silently scaling a tiny Kelly bet up.
-            stake = kelly_stake(
-                sig.fair, sig.quote, bankroll=self.bankroll,
-                fraction=settings.kelly_fraction,
-                min_stake=settings.min_order_usdt, max_stake=settings.max_stake_usdt,
-            )
-            if stake <= 0:
-                stake = settings.stake_usdt
+            # Edge scaling: the weakest signal the gate accepts is staked at the
+            # venue floor, the strongest at the ceiling (see config.sizing_mode).
+            # Kelly is available but off by default -- at this bankroll a
+            # fractional-Kelly value sits below the venue minimum, and rounding
+            # that up to full size inverts the rule it came from.
+            stake = self._stake_for(sig)
             acted = stake >= settings.min_order_usdt
 
         did = self.store.insert("decisions", {
@@ -468,11 +480,39 @@ class Bot:
         })
         self.open_fills[r.slug] = (fid, fill)
         # implied_sigma inverts P(up), so it must always be fed the Up quote --
-        # passing the chosen side's quote breaks the inversion when that side is Down.
-        iv = implied_sigma(up.price, spot, r.strike, tau)
+        # passing the chosen side's quote breaks the inversion when that side is
+        # Down. A missing Up quote must not take down the tick after the fill
+        # has already been booked and stored.
+        try:
+            iv = implied_sigma(up.price, spot, r.strike, tau)
+        except (TypeError, ValueError):
+            iv = None
         log.info("OPEN %s %s stake=$%.2f @%.3f | %s | mkt_iv=%s realised=%.5f",
                  r.slug, fill.side, fill.stake, fill.filled_px, sig,
                  f"{iv:.5f}" if iv else "n/a", sigma)
+
+    def _stake_for(self, sig: Signal) -> float:
+        """Stake for an accepted signal (see config.sizing_mode/_metric)."""
+        if settings.sizing_mode == "kelly":
+            # Kelly returns 0 when the bet sits below the venue minimum; that
+            # means SKIP, never "bet the maximum instead".
+            return kelly_stake(sig.fair, sig.quote, bankroll=self.bankroll,
+                               fraction=settings.kelly_fraction,
+                               min_stake=settings.min_order_usdt,
+                               max_stake=settings.max_stake_usdt)
+        # What counts as "strongest": the claimed edge, or expected profit per
+        # dollar. The recording favours ev/$ -- large claims are the most
+        # inflated, so sizing up on them rewards the noisiest signals.
+        if settings.sizing_metric == "ev":
+            value = sig.ev_per_dollar
+            lo, hi = settings.stake_ev_lo, settings.stake_ev_hi
+        else:
+            value = sig.edge
+            lo, hi = settings.min_edge, settings.stake_edge_hi
+        return stake_for_edge(value, min_edge=lo,
+                              min_stake=settings.min_stake_usdt,
+                              max_stake=settings.max_stake_usdt,
+                              edge_at_max=hi)
 
     async def _place_order(self, r, sig, *, fair_up: float, token: str,
                            stake: float) -> Fill | None:
@@ -508,15 +548,22 @@ class Bot:
                     continue
                 real_px = float(quote.get("averagePrice") or sig.quote)
                 real_fee = float(quote.get("feeRateBps") or settings.fallback_fee_bps) / 10_000.0
+                # Re-check ONLY the chosen side, against its own hurdle. The old
+                # code re-picked "the best side" at the live price and refused
+                # the order when the OTHER side looked better -- discarding
+                # trades whose own edge was still intact. A None quote makes the
+                # other side untradeable, so evaluate() can only answer for this
+                # one.
                 recheck = evaluate(
-                    fair_up, real_px if sig.side == "Up" else 1.0 - real_px,
-                    1.0 - real_px if sig.side == "Up" else real_px,
+                    fair_up,
+                    real_px if sig.side == "Up" else None,
+                    None if sig.side == "Up" else 1.0 - real_px,
                     fee=real_fee, half_spread=0.0,
                     safety_margin=settings.safety_margin, fee_model=FeeModel.NOTIONAL,
                     max_quote=settings.max_quote, min_quote=settings.min_quote,
                     min_edge=settings.min_edge,
                     edge_haircut=settings.edge_haircut)
-                if not (recheck.act and recheck.side == sig.side):
+                if not recheck.act:
                     # The edge is gone at the live price. Retrying would only
                     # be chasing a trade the gate has already refused.
                     log.info("SKIP %s %s: real quote %.3f @ %d bps -> %s",

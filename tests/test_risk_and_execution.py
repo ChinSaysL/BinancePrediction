@@ -300,3 +300,70 @@ def test_live_broker_labels_a_terminal_venue_status_as_retryable():
     assert fill is None
     assert b.last_failure == "venue_failed"
     assert b.last_failure in live.RETRYABLE_FAILURES
+
+
+# --- unverified fills: a void is only allowed on positive evidence -----------
+
+def _unverified_broker(*, status, held):
+    """LiveBroker with the two verification calls stubbed out."""
+    from btcpredict.execution import live
+
+    b = live.LiveBroker(None, "k", "s", wallet_address="w", wallet_id="1")
+
+    async def _status(order_id, **kw):
+        return status
+
+    async def _positions():
+        return held                       # None models "could not ask"
+
+    b._order_status = _status
+    b._position_token_ids = _positions
+    return b
+
+
+def _unverified_fill():
+    from btcpredict.execution.base import Fill
+
+    return Fill(slug="r1", side="Up", requested_px=0.5, filled_px=0.5,
+                shares=20.0, stake=10.0, fee_paid=0.1, order_id="o1", ts_ms=1,
+                token_id="tok", unverified=True)
+
+
+def test_unverified_fill_voids_only_on_confirmed_absence():
+    b = _unverified_broker(status=None, held=set())     # readable, token absent
+    f = _unverified_fill()
+    f.unverified_checks = 19                            # one check short
+    s = asyncio.run(b.settle(f, "Down"))
+    assert s is not None and s.void and s.pnl == 0.0
+
+
+def test_unverified_fill_held_by_the_venue_settles_for_real():
+    b = _unverified_broker(status=None, held={"tok"})
+    s = asyncio.run(b.settle(_unverified_fill(), "Up"))
+    assert s is not None and not s.void and s.won
+    assert s.pnl == pytest.approx(10.0)
+
+
+def test_unverified_fill_never_voids_while_the_venue_is_unreadable():
+    # An unreadable position list is NOT evidence of absence: voiding here
+    # would silently drop a real position whose winnings are never redeemed.
+    b = _unverified_broker(status=None, held=None)
+    f = _unverified_fill()
+    f.unverified_checks = 100
+    for _ in range(3):
+        assert asyncio.run(b.settle(f, "Down")) is None
+    assert f.unverified_checks > 100
+
+
+def test_unverified_fill_with_terminal_status_is_voided():
+    b = _unverified_broker(status="FAILED", held=None)
+    s = asyncio.run(b.settle(_unverified_fill(), "Up"))
+    assert s is not None and s.void
+
+
+def test_verified_fill_skips_verification_entirely():
+    b = _unverified_broker(status="FAILED", held=set())
+    f = _unverified_fill()
+    f.unverified = False                                # status was confirmed
+    s = asyncio.run(b.settle(f, "Up"))
+    assert s is not None and not s.void and s.won

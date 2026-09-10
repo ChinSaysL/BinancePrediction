@@ -52,11 +52,34 @@ class Settings(BaseSettings):
     trading_mode: Literal["record", "paper", "live"] = "record"
 
     # --- sizing ------------------------------------------------------------
-    # Order size. With min_order == stake, fractional-Kelly values below the
-    # minimum fall back to this, so $10 means a flat $10 on every trade.
+    # "edge": the weakest accepted signal (edge == min_edge) is staked at
+    #   min_stake_usdt, the strongest (edge >= stake_edge_hi) at max_stake_usdt,
+    #   linear in between. "kelly": fractional Kelly, and a Kelly value below
+    #   the venue minimum SKIPS the trade instead of rounding up to full size.
+    sizing_mode: Literal["edge", "kelly"] = "edge"
+    # Which measure of "signal strength" drives the stake inside the band:
+    #   edge -> the gated, post-haircut edge   (min_edge .. stake_edge_hi)
+    #   ev   -> expected profit per $1 staked  (stake_ev_lo .. stake_ev_hi)
+    # Measured on the 61 recorded accepted trades, the edge metric is the
+    # weakest candidate: its top quartile realised WR 0.667 against 0.933 for
+    # the third quartile, i.e. the largest claims are the most inflated --
+    # exactly what edge_haircut documents. Sizing on ev/$, which prices the
+    # payoff asymmetry in, roughly doubles recorded PnL for ~35% more
+    # drawdown. Kept on "edge" until the live sample says otherwise.
+    sizing_metric: Literal["edge", "ev"] = "edge"
+    min_stake_usdt: float = 5.0
+    max_stake_usdt: float = 20.0
+    # Edge at which the maximum stake is reached. The gate accepts from
+    # min_edge up; recorded accepted edges ran 0.12 -> 0.22.
+    stake_edge_hi: float = 0.22
+    # The same anchors for the ev/$ metric: 5 cents of expected profit per
+    # dollar at the floor, 40 cents at the ceiling.
+    stake_ev_lo: float = 0.05
+    stake_ev_hi: float = 0.40
+    # Flat fallback, used only when sizing_mode is not "edge" and no stake can
+    # be computed.
     stake_usdt: float = 10.0
-    max_stake_usdt: float = 10.0
-    min_order_usdt: float = 10.0
+    min_order_usdt: float = 5.0
     kelly_fraction: float = 0.25
     # Venue tolerance on price movement between quote and fill. 100 bps was
     # producing FOK failures ("Failed to execute the market order") when the

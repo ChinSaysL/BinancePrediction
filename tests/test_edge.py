@@ -1,7 +1,8 @@
 import pytest
 
 from btcpredict.edge.signal import (FeeModel, breakeven_prob, evaluate,
-                                    evaluate_hybrid, expected_value, kelly_stake)
+                                    evaluate_hybrid, expected_value, kelly_stake,
+                                    stake_for_edge)
 
 FEE = 0.02
 
@@ -198,3 +199,43 @@ def test_hybrid_identical_probabilities_equals_evaluate():
     a = evaluate_hybrid(0.72, 0.72, quote_up=0.63, quote_down=0.37, **KW)
     b = evaluate(0.72, 0.63, 0.37, **KW)
     assert (a.side, a.edge, a.act) == (b.side, b.edge, b.act)
+
+
+def test_hybrid_up_not_allowed_still_takes_down():
+    # Both sides qualify inside one quote (q_up + q_down well below 1) and Up
+    # wins the EV pick, but Up is gated: the Down candidate must still be taken
+    # rather than thrown away with it.
+    both = evaluate_hybrid(0.55, 0.55, quote_up=0.25, quote_down=0.34, **KW)
+    assert both.act and both.side == "Up"
+    gated = evaluate_hybrid(0.55, 0.55, quote_up=0.25, quote_down=0.34,
+                            up_allowed=False, **KW)
+    assert gated.act and gated.side == "Down"
+
+
+def test_hybrid_up_not_allowed_blocks_up_entirely():
+    # Even a hugely underpriced Up must not be tradeable when it is gated.
+    sig = evaluate_hybrid(0.90, 0.90, quote_up=0.35, quote_down=0.65,
+                          up_allowed=False, **KW)
+    assert not sig.act
+
+
+def test_stake_for_edge_spans_the_configured_band():
+    kw = dict(min_edge=0.12, min_stake=5.0, max_stake=20.0, edge_at_max=0.22)
+    assert stake_for_edge(0.12, **kw) == pytest.approx(5.0)     # weakest signal
+    assert stake_for_edge(0.22, **kw) == pytest.approx(20.0)    # strongest
+    assert stake_for_edge(0.17, **kw) == pytest.approx(12.5)    # linear between
+    assert stake_for_edge(0.40, **kw) == pytest.approx(20.0)    # clamped high
+    assert stake_for_edge(0.01, **kw) == pytest.approx(5.0)     # clamped low
+
+
+def test_stake_for_edge_is_monotone():
+    kw = dict(min_edge=0.12, min_stake=5.0, max_stake=20.0, edge_at_max=0.22)
+    stakes = [stake_for_edge(e, **kw) for e in
+              (0.12, 0.14, 0.16, 0.18, 0.20, 0.22)]
+    assert stakes == sorted(stakes)
+    assert len(set(stakes)) == len(stakes)
+
+
+def test_stake_for_edge_flat_band_returns_floor():
+    assert stake_for_edge(0.20, min_edge=0.12, min_stake=10.0,
+                          max_stake=10.0, edge_at_max=0.22) == pytest.approx(10.0)

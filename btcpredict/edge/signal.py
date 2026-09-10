@@ -165,13 +165,22 @@ def evaluate(
 
 
 def evaluate_hybrid(fair_up_down_model: float, fair_up_up_model: float,
-                    quote_up: float, quote_down: float, **kwargs) -> Signal:
+                    quote_up: float, quote_down: float,
+                    *, up_allowed: bool = True, **kwargs) -> Signal:
     """Per-side gate: Down candidates priced by the down model, Up by the up model.
 
     evaluate() runs once per model probability; the down model's Up call and
     the up model's Down call are discarded, then the higher-EV acting signal
     wins. With identical probabilities this reduces to plain evaluate().
+
+    ``up_allowed=False`` removes the Up candidate BEFORE the pick, so a valid
+    Down candidate is still taken. Dropping Up after the pick would discard
+    whatever the opposite side had already qualified for. evaluate() treats a
+    None quote as "that side is not tradeable", which is how the gate is
+    expressed here.
     """
+    if not up_allowed:
+        quote_up = None
     if fair_up_down_model == fair_up_up_model:
         return evaluate(fair_up_down_model, quote_up, quote_down, **kwargs)
     down_sig = evaluate(fair_up_down_model, quote_up, quote_down, **kwargs)
@@ -187,6 +196,29 @@ def evaluate_hybrid(fair_up_down_model: float, fair_up_up_model: float,
         return Signal(None, best.fair, best.quote, best.edge, best.hurdle,
                       best.ev_per_dollar, False, best.reason)
     return max(cands, key=lambda s: s.ev_per_dollar)
+
+
+def stake_for_edge(edge: float, *, min_edge: float, min_stake: float,
+                   max_stake: float, edge_at_max: float) -> float:
+    """Scale the stake between min_stake and max_stake by signal strength.
+
+    The venue has a hard order minimum, so a smaller bet simply cannot be
+    expressed: the weakest signal the gate accepts (edge == min_edge) gets
+    min_stake, the strongest (edge >= edge_at_max) gets max_stake, linear in
+    between.
+
+    This replaces fractional Kelly as the live rule. On a $40 bankroll
+    0.25-Kelly is about $2.65 -- below the venue minimum -- so every order
+    previously fell through main's `if stake <= 0` path and was placed at FULL
+    size: the exact opposite of what Kelly had just said. A rule that cannot be
+    expressed at the current bankroll is worse than no rule, because it is
+    silent.
+    """
+    if max_stake <= min_stake:
+        return max(0.0, min_stake)
+    span = max(1e-9, edge_at_max - min_edge)
+    t = min(1.0, max(0.0, (edge - min_edge) / span))
+    return min_stake + (max_stake - min_stake) * t
 
 
 def kelly_stake(p: float, q: float, bankroll: float, fraction: float,
