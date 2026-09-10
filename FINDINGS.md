@@ -922,3 +922,49 @@ unseen 40% it is +$0.21 over 17 trades (t 0.04) against +$13.57 over 35 trades
 (t 1.89) on the train slice. Both sides show it (Down: +18.15 train, -0.94
 test). This is the walk-forward warning the repo already had a tool for, and it
 is the reason not to add any more tuned machinery on top.
+
+## The real fix cannot be shipped blind: it is being settled forward in paper (2026-09-10)
+
+Everything measured today agrees on one thing: our model's disagreement with
+the venue is worth nothing (b_disc = 0.10 +- 0.36 on Up, 0.06 +- 0.36 on Down),
+and the only mispricing we can actually see is the venue understating
+favourites by 1.24 on the log-odds (z ~ 8, on both sides independently). The
+obvious fix -- price honestly, i.e. anchor on the venue and stop spending the
+disagreement -- has one problem: it cannot be validated on the recording.
+
+  * at the live bar (min_edge 0.12) an honest probability trades NOTHING, on
+    either side. Shipping it is not a fix, it is a shutdown, and the fact that
+    the bar is only reachable via an overstated model is itself the finding;
+  * at a bar where honesty still trades (0.02) the edge is +1.1%/$1 over 610
+    rounds, positive on both slices -- and t = 0.45. A grid over the price floor
+    and the bar (12 cells) showed the sign flipping between slices, which is
+    what a search over noise looks like;
+  * the arithmetic of why it cannot be settled here: a binary bet's per-trade
+    return has sd ~1.2, so to resolve +1.1%/$1 at 2 sigma takes
+    (2 x 1.2 / 0.011)^2 ~ 48,000 trades. The recording has 610.
+
+So it is settled forward, on live quotes, without risking money:
+
+    btcpredict-paper.service   --mode paper
+      DB_PATH=data/paper2.db  PRICING_MODEL=calibrated_down
+      UP_MODEL=calibrated     MIN_EDGE=0.02   MIN_QUOTE=0.50
+
+A second instance, its own database, so it can never write into the live book.
+It prices both sides from the venue's own ask (amplified by the fitted 1.24),
+buys only sides quoted at 0.50+, and pays the measured fee curve. The live book
+is untouched: `up_model` and `pricing_model` stay `digital`.
+
+Read it with `python -m tools.ab_report`, which reports profit per $1 staked by
+side with a t-statistic -- the only column that says anything. Abort condition,
+stated before the data arrives: **if the honest book's EV/$1 is <= 0 after 2,000
+settled trades, the favourite-bias hypothesis is dead and the honest config is
+not the answer either.** At the replay's measured pace that is one to two weeks
+of running.
+
+Operational notes, because they cost time once already:
+  * the VPS deployment is rsync, NOT git -- `/root/BinancePrediction` has no
+    `.git`, so a `git pull && ...` chain fails silently and skips the rest;
+  * a stale `btcpredict-paper.service` from an earlier experiment existed on the
+    host (mode paper, UP_MODEL=drift_digital, writing into the LIVE db). It has
+    been stopped, disabled and kept at `/root/btcpredict-paper.service.old`.
+    It had added no rows.
