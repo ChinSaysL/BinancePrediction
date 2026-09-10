@@ -167,6 +167,11 @@ class Bot:
             self._seed_guard_state()
             if self.resume_guard:
                 self.guard.resume()
+                # Persist the reset: without a marker the next restart
+                # re-seeds today's old settlements and re-halts the bot, so
+                # the reset would only live until the next crash/restart.
+                self.store.set_meta("guard_reset_ms",
+                                    str(int(time.time() * 1000)))
 
     def _seed_guard_state(self) -> None:
         """Carry today's live PnL and loss streak into the fresh guard.
@@ -176,11 +181,19 @@ class Bot:
         """
         today = time.strftime("%Y-%m-%d", time.gmtime())
         mode = getattr(self.broker, "mode", "live")
+        reset_ms = 0
+        if mode == "live":
+            marker = self.store.get_meta("guard_reset_ms")
+            if marker:
+                try:
+                    reset_ms = int(marker)
+                except ValueError:
+                    reset_ms = 0
         rows = self.store.query(
             "SELECT s.pnl, s.ts_ms FROM settlements s "
             "JOIN fills f ON f.id = s.fill_id WHERE f.mode = ? "
-            "AND COALESCE(s.void, 0) = 0 "
-            "ORDER BY s.ts_ms DESC LIMIT 50", (mode,))
+            "AND COALESCE(s.void, 0) = 0 AND s.ts_ms >= ? "
+            "ORDER BY s.ts_ms DESC LIMIT 50", (mode, reset_ms))
         pnl = sum(r["pnl"] for r in rows
                   if time.strftime("%Y-%m-%d", time.gmtime(r["ts_ms"] / 1000)) == today)
         streak = 0

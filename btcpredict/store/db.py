@@ -109,6 +109,11 @@ CREATE TABLE IF NOT EXISTS settlements (
     void        INTEGER DEFAULT 0   -- 1: order never filled; no PnL is real
 );
 CREATE INDEX IF NOT EXISTS idx_settlements_slug ON settlements(slug);
+
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -135,6 +140,18 @@ class Store:
         shave = {r["name"] for r in self.conn.execute("PRAGMA table_info(settlements)")}
         if "void" not in shave:
             self.conn.execute("ALTER TABLE settlements ADD COLUMN void INTEGER DEFAULT 0")
+
+    def get_meta(self, key: str) -> str | None:
+        row = self.conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value))
+        self.conn.commit()
 
     # -- rounds -------------------------------------------------------------
     def upsert_round(self, r: dict[str, Any]) -> None:

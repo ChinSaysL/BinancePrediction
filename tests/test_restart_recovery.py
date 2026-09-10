@@ -1,7 +1,9 @@
 """A restart must not orphan an open position."""
 import asyncio
 import tempfile
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -91,3 +93,47 @@ def test_restored_position_then_settles(store):
     rows = store.query("SELECT * FROM settlements WHERE slug='r1'")
     assert len(rows) == 1 and rows[0]["won"] == 1
     assert bot.guard.check("r2")[0]      # the round slot is free again
+
+
+def test_guard_seeding_respects_persisted_reset(store):
+    # A --resume marker must survive restarts: settlements before the marker
+    # are ignored, so a reset day does not re-halt on the next boot.
+    now_ms = int(time.time() * 1000)
+    for slug, ts, pnl in (("old-loss", now_ms - 60_000, -50.0),
+                          ("fresh", now_ms, 10.0)):
+        fid = store.insert("fills", {
+            "decision_id": 1, "slug": slug, "ts_ms": ts, "mode": "live",
+            "side": "Up", "requested_px": 0.6, "filled_px": 0.62, "shares": 1.6,
+            "stake": 1.0, "fee_paid": 0.02, "order_id": slug, "raw": "",
+        })
+        store.insert("settlements", {"fill_id": fid, "slug": slug, "ts_ms": ts,
+                                     "won": 0, "payout": 0, "pnl": pnl,
+                                     "mode": "live"})
+    store.set_meta("guard_reset_ms", str(now_ms - 30_000))
+
+    bot = make_bot(store)
+    bot.mode = "live"
+    bot.broker = SimpleNamespace(mode="live")
+    bot._seed_guard_state()
+
+    assert bot.guard.state.daily_pnl == pytest.approx(10.0)
+
+
+def test_guard_seeding_without_reset_marker_counts_all(store):
+    # Without a marker the old loss is counted and the guard refuses to trade.
+    now_ms = int(time.time() * 1000)
+    fid = store.insert("fills", {
+        "decision_id": 1, "slug": "old-loss", "ts_ms": now_ms, "mode": "live",
+        "side": "Up", "requested_px": 0.6, "filled_px": 0.62, "shares": 1.6,
+        "stake": 1.0, "fee_paid": 0.02, "order_id": "old-loss", "raw": "",
+    })
+    store.insert("settlements", {"fill_id": fid, "slug": "old-loss",
+                                 "ts_ms": now_ms, "won": 0, "payout": 0,
+                                 "pnl": -50.0, "mode": "live"})
+    bot = make_bot(store)
+    bot.mode = "live"
+    bot.broker = SimpleNamespace(mode="live")
+    bot._seed_guard_state()
+
+    assert bot.guard.state.daily_pnl == pytest.approx(-50.0)
+    assert not bot.guard.check("some-round")[0]
