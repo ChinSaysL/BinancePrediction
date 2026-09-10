@@ -17,6 +17,10 @@ def make_bot(store):
     bot.mode = "paper"
     bot.store = store
     bot.open_fills = {}
+    # settle_due moves this ledger by the settlement P&L (see _reconcile_bankroll);
+    # Bot.__init__ always sets it, and these tests bypass __init__.
+    bot.bankroll = 100.0
+    bot._bankroll_drift = 0
     from btcpredict.risk.guards import RiskGuard
     bot.guard = RiskGuard(daily_loss_cap=10.0, max_consecutive_losses=5,
                           max_open_rounds=1)

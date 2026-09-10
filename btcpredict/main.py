@@ -43,6 +43,12 @@ from btcpredict.store.db import Store
 
 log = logging.getLogger("btcpredict")
 
+# How many consecutive venue reads must disagree with the bankroll ledger before
+# the venue's figure is believed over our own accounting. One or two is the
+# redemption lag (a stake leaves the wallet immediately, the payout lands later);
+# a run this long is a deposit, a withdrawal, or fees the ledger does not model.
+_BANKROLL_DRIFT_READS = 5
+
 
 def sec_into_candle(now_ms: int) -> int:
     """Seconds elapsed since the current 1-minute candle opened (0-59)."""
@@ -107,6 +113,10 @@ class Bot:
         self.book: LiveBroker | None = None
         self.open_fills: dict[str, tuple[int, Fill]] = {}   # slug -> (fill_id, Fill)
         self.bankroll = settings.bankroll_usdt
+        # Consecutive venue reads that have disagreed with the ledger. A single
+        # disagreement is the redemption lag; this counter is what tells the two
+        # apart (see _reconcile_bankroll).
+        self._bankroll_drift = 0
         self.pnl = PnLSummary()
         self._order_cooldown_until = 0.0
         # slug -> consecutive polls the same side has shown an edge
@@ -707,8 +717,9 @@ class Bot:
         Only ever called when a round of ours has just settled and nothing is
         open, because `walletBalance` excludes cash locked in an open position:
         reading it mid-round would UNDERSTATE equity and shrink the next stake.
-        Winnings are claimable positions rather than wallet cash until redeemed,
-        so the read also has to follow the redeem call for the same reason.
+
+        The read is a RECONCILIATION, not the answer -- see _reconcile_bankroll
+        for why the venue's number lags a settlement rather than tracking it.
         """
         if self.mode != "live" or getattr(self, "book", None) is None:
             return
@@ -719,11 +730,50 @@ class Bot:
         except Exception as e:          # never let a read failure stop trading
             log.warning("bankroll refresh failed: %s: %s", type(e).__name__, e)
             return
-        if bal <= 0 or abs(bal - self.bankroll) < 0.01:
-            return                      # unreadable, or fee-level noise
-        log.info("bankroll $%.4f -> $%.4f (equity moved; sizing follows)",
-                 self.bankroll, bal)
-        self.bankroll = bal
+        if bal <= 0:
+            return                      # unreadable
+        self._reconcile_bankroll(bal)
+
+    def _reconcile_bankroll(self, read: float) -> None:
+        """Adopt the venue's balance only when it is not a lag artefact.
+
+        The venue's walletBalance does NOT track equity in real time: a stake
+        leaves the wallet the instant the order fills, while the payout only
+        lands after the redemption settles on-chain. Measured on a win of
+        $0.4576 on a $1.53 stake, the balance read went $76.5027 -> $74.9727,
+        i.e. down by EXACTLY the stake, with the payout simply absent.
+
+        Sizing off that number shrinks the stake after every win -- the opposite
+        of compounding, and it would have quietly capped the account's growth.
+        So the bot keeps its own ledger (updated by settle_due) and only accepts
+        the venue's figure when it disagrees across several reads in a row, which
+        is what a deposit, a withdrawal or unmodelled fees look like. A lag
+        resolves within a read or two and never gets that far.
+        """
+        tol = max(0.50, 0.01 * abs(self.bankroll))
+        if abs(read - self.bankroll) <= tol:
+            self._bankroll_drift = 0
+            return
+        if read > self.bankroll:
+            # Money we did not account for: a deposit, or winnings the ledger
+            # never saw. Nothing is lost by taking it immediately.
+            log.info("bankroll $%.4f -> $%.4f (venue reports more than the "
+                     "ledger; adopting)", self.bankroll, read)
+            self.bankroll = read
+            self._bankroll_drift = 0
+            return
+        self._bankroll_drift += 1
+        if self._bankroll_drift < _BANKROLL_DRIFT_READS:
+            log.info("bankroll read $%.4f is below the ledger $%.4f "
+                     "(%d/%d reads; a redemption has not landed yet, keeping "
+                     "the ledger for sizing)", read, self.bankroll,
+                     self._bankroll_drift, _BANKROLL_DRIFT_READS)
+            return
+        log.warning("bankroll ledger $%.4f -> $%.4f (venue lower for %d reads "
+                    "in a row: withdrawal or unmodelled fees, not lag)",
+                    self.bankroll, read, self._bankroll_drift)
+        self.bankroll = read
+        self._bankroll_drift = 0
 
     async def settle_due(self) -> None:
         now_ms = int(time.time() * 1000)
@@ -758,6 +808,11 @@ class Bot:
                 continue
             self.guard.on_settle(slug, s.pnl)
             self.pnl.add(s.pnl, fill.stake, fill.fee_paid, s.won)
+            # The LEDGER, moved immediately and exactly: the stake has already
+            # left the wallet and the payout is on its way, so equity changes by
+            # exactly the settlement P&L. Waiting for the venue to agree is what
+            # made a win look like a loss (see _reconcile_bankroll).
+            self.bankroll += s.pnl
             del self.open_fills[slug]
             # Live winnings sit as a claimable position until redeemed; they do
             # not credit the wallet on their own.

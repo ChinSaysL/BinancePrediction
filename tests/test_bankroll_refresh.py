@@ -61,6 +61,7 @@ def make_bot(store, book, *, bankroll=76.0, open_fills=None):
     bot.book = book
     bot.broker = book
     bot.bankroll = bankroll
+    bot._bankroll_drift = 0
     bot.open_fills = dict(open_fills or {})
     bot.guard = RiskGuard(daily_loss_cap=0.0, max_consecutive_losses=5,
                           max_open_rounds=1, daily_loss_cap_pct=0.45,
@@ -135,3 +136,63 @@ def test_an_idle_tick_does_not_call_the_balance_endpoint(store):
     bot = make_bot(store, book)
     asyncio.run(bot.settle_due())
     assert book.balance_calls == 0
+
+
+# --- the venue's balance LAGS a settlement ----------------------------------
+#
+# A stake leaves the wallet the instant the order fills, but the payout only
+# lands after the redemption settles on-chain. Measured live on 2026-09-10
+# 20:55 on a WIN of $0.4576: the read went $76.5027 -> $74.9727, down by exactly
+# the $1.53 stake. Sizing off that read shrinks the stake after every win, which
+# is the opposite of compounding.
+
+def test_a_lower_read_from_the_redemption_lag_is_not_adopted(store):
+    bot = make_bot(store, FakeLiveBook(0.0), bankroll=76.5027)
+    bot._reconcile_bankroll(74.9727)            # stake out, payout not in yet
+    assert bot.bankroll == pytest.approx(76.5027)
+    assert bot._bankroll_drift == 1
+
+
+def test_a_higher_read_is_adopted_at_once(store):
+    """Money the ledger never saw (a deposit) costs nothing by taking it."""
+    bot = make_bot(store, FakeLiveBook(0.0), bankroll=76.5027)
+    bot._reconcile_bankroll(95.0)
+    assert bot.bankroll == pytest.approx(95.0)
+    assert bot._bankroll_drift == 0
+
+
+def test_a_persistently_lower_read_is_eventually_adopted(store):
+    """A withdrawal is not a lag: report it, then believe it."""
+    bot = make_bot(store, FakeLiveBook(0.0), bankroll=100.0)
+    for _ in range(4):
+        bot._reconcile_bankroll(80.0)
+        assert bot.bankroll == pytest.approx(100.0)
+    bot._reconcile_bankroll(80.0)               # fifth read in a row
+    assert bot.bankroll == pytest.approx(80.0)
+
+
+def test_the_drift_counter_resets_when_the_venue_catches_up(store):
+    bot = make_bot(store, FakeLiveBook(0.0), bankroll=100.0)
+    for _ in range(4):
+        bot._reconcile_bankroll(80.0)
+    bot._reconcile_bankroll(100.0)              # the payout landed
+    assert bot._bankroll_drift == 0
+    bot._reconcile_bankroll(80.0)
+    assert bot.bankroll == pytest.approx(100.0)  # back to counting from one
+
+
+def test_a_win_raises_the_ledger_even_when_the_read_lags(store):
+    """End to end: settle -> ledger up by the P&L -> lagging read ignored."""
+    book = FakeLiveBook(0.0)
+    bot = make_bot(store, book, bankroll=76.5027,
+                   open_fills={"r1": (7, make_fill(stake=1.53, shares=2.207))})
+    store.upsert_round({"slug": "r1", "start_ms": 0, "end_ms": 1,
+                        "market_topic_id": 99, "winner": "Up"})
+    book._balance = bot.bankroll - 1.53         # exactly what the venue showed
+
+    asyncio.run(bot.settle_due())
+
+    # pnl = payout 2.207 - stake 1.53 - fee 0.05
+    assert bot.bankroll == pytest.approx(76.5027 + 0.627)
+    assert book.balance_calls == 1              # the read still happened, and
+    assert bot._bankroll_drift == 1             # was recorded as a disagreement
