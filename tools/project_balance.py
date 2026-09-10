@@ -22,10 +22,10 @@ Method, and its three honest limits:
     pairs replays the fitted tilt edge (+$5.51/trade coupled vs +$2.24
     decoupled), which is the thing under test rather than something to assume.
 
-The 5-consecutive-loss halt is modelled faithfully because it is the rule most
-likely to end a month early: in the guard it is PERMANENT until a manual
-`--resume`, so a path that hits it stops trading and the balance freezes. Both
-behaviours are reported (`--no-resume` leaves the bot stopped).
+The 5-consecutive-loss halt is modelled faithfully. It is DAY-SCOPED: the
+streak halt and the daily stop both clear at the UTC day boundary, so a halt
+costs the rest of that day rather than the rest of the month. `--no-resume`
+shows the old permanent-halt behaviour for comparison.
 
 Usage:
     python -m tools.project_balance
@@ -190,7 +190,8 @@ def main() -> None:
     print(f"live rule: {settings.stake_fraction:.0%} of bankroll x tilt, "
           f"cap ${settings.stake_cap_usdt:.0f}, floor ${settings.min_order_usdt:.2f}, "
           f"daily stop {settings.daily_loss_cap_pct:.0%}, "
-          f"halt after {settings.max_consecutive_losses} straight losses")
+          f"halt after {settings.max_consecutive_losses} straight losses "
+          f"(day-scoped: trading resumes at the UTC day roll)")
     print(f"start ${b0:.2f}  |  {args.paths} paths"
           f"{'' if args.no_resume else ', resumed the day after a halt'}\n")
 

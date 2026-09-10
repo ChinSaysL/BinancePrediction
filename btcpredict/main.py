@@ -188,6 +188,11 @@ class Bot:
 
         Without this, a restart after the daily cap is breached lets the bot
         trade again on a day that already lost its budget.
+
+        Both quantities are DAY-SCOPED. The streak walk therefore stops at the
+        first settlement from an earlier date instead of reading the last N
+        settlements regardless of age: otherwise a restart on a fresh day would
+        inherit yesterday's losses and halt a day that should start clean.
         """
         today = time.strftime("%Y-%m-%d", time.gmtime())
         mode = getattr(self.broker, "mode", "live")
@@ -208,6 +213,8 @@ class Bot:
                   if time.strftime("%Y-%m-%d", time.gmtime(r["ts_ms"] / 1000)) == today)
         streak = 0
         for r in rows:                      # newest first
+            if time.strftime("%Y-%m-%d", time.gmtime(r["ts_ms"] / 1000)) != today:
+                break                       # the streak is day-scoped
             if r["pnl"] < 0:
                 streak += 1
             else:

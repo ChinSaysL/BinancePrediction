@@ -116,6 +116,54 @@ def test_daily_loss_cap_halt():
     assert not g.check("next")[0]
 
 
+def test_a_new_utc_day_clears_a_streak_halt():
+    """Regression: the streak halt used to be permanent. roll_day_if_needed
+    only cleared a halt whose reason started with "daily loss", and never reset
+    `consecutive_losses`, so check() kept re-deriving the halt from a counter
+    that could not fall -- 5 losses stopped the bot until a manual --resume,
+    even days later."""
+    g = guard(daily_loss_cap=999.0)          # isolate the streak rule
+    for i in range(3):                       # guard() halts at 3
+        g.on_open(f"r{i}"); g.on_settle(f"r{i}", -1.0)
+    assert not g.check("next")[0]
+    assert g.state.halt_kind == "streak"
+
+    g.state._day = "1999-01-01"              # force the UTC day boundary
+    assert g.check("next-day")[0]
+    assert g.state.consecutive_losses == 0
+    assert not g.state.halted and g.state.halt_kind == ""
+
+
+def test_a_new_utc_day_still_clears_the_daily_loss_halt():
+    g = guard(max_consecutive_losses=99)
+    g.on_settle("r", -3.5)
+    assert not g.check("next")[0]
+    g.state._day = "1999-01-01"
+    assert g.check("next-day")[0]
+
+
+def test_a_new_utc_day_does_not_clear_an_unknown_halt():
+    """Only the guard's own two halts expire. A halt raised from anywhere else
+    (empty halt_kind) stays put until someone resumes it deliberately."""
+    g = guard()
+    g.state.halted = True
+    g.state.halt_reason = "venue position mismatch"
+    g.state._day = "1999-01-01"
+    assert not g.check("next")[0]
+    assert g.state.halted
+
+
+def test_seed_daily_restores_a_live_streak_halt():
+    """A restart mid-streak must not launder it -- and must still expire it
+    with the day."""
+    g = guard()                              # cap 3.0, streak limit 3
+    g.seed_daily(-1.0, 3)                    # today's losses, cap not breached
+    assert not g.check("next")[0]
+    assert g.state.halt_kind == "streak"
+    g.state._day = "1999-01-01"
+    assert g.check("next-day")[0]
+
+
 def test_seed_daily_persists_halt_across_restart():
     # A fresh process must not forget that today's cap is already breached.
     g = guard()

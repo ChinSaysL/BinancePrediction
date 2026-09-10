@@ -137,3 +137,51 @@ def test_guard_seeding_without_reset_marker_counts_all(store):
 
     assert bot.guard.state.daily_pnl == pytest.approx(-50.0)
     assert not bot.guard.check("some-round")[0]
+
+
+def _add_live_loss(store, slug, ts_ms, pnl=-1.0):
+    fid = store.insert("fills", {
+        "decision_id": 1, "slug": slug, "ts_ms": ts_ms, "mode": "live",
+        "side": "Up", "requested_px": 0.6, "filled_px": 0.62, "shares": 1.6,
+        "stake": 1.0, "fee_paid": 0.02, "order_id": slug, "raw": "",
+    })
+    store.insert("settlements", {"fill_id": fid, "slug": slug, "ts_ms": ts_ms,
+                                 "won": 0, "payout": 0, "pnl": pnl,
+                                 "mode": "live"})
+
+
+def test_guard_seeding_counts_only_today_streak(store):
+    """Yesterday's losses must not halt a fresh day: the streak is day-scoped
+    exactly like the daily budget."""
+    now_ms = int(time.time() * 1000)
+    yesterday = now_ms - 26 * 3600 * 1000
+    for i in range(5):
+        _add_live_loss(store, f"yesterday-{i}", yesterday + i * 60_000)
+    _add_live_loss(store, "today", now_ms)
+
+    bot = make_bot(store)
+    bot.mode = "live"
+    bot.broker = SimpleNamespace(mode="live")
+    bot._seed_guard_state()
+
+    assert bot.guard.state.consecutive_losses == 1      # not 6
+    assert bot.guard.check("fresh")[0]                  # so trading continues
+
+
+def test_guard_seeding_halts_on_a_streak_still_running_today(store):
+    """The flip side: a restart mid-streak must not launder it."""
+    now_ms = int(time.time() * 1000)
+    for i in range(5):                                  # make_bot halts at 5
+        _add_live_loss(store, f"live-{i}", now_ms - (5 - i) * 60_000)
+
+    bot = make_bot(store)
+    bot.mode = "live"
+    bot.broker = SimpleNamespace(mode="live")
+    bot._seed_guard_state()
+
+    assert bot.guard.state.consecutive_losses == 5
+    allowed, why = bot.guard.check("fresh")
+    assert not allowed and "consecutive" in why
+    # ...and it expires with the day rather than needing a manual resume.
+    bot.guard.state._day = "1999-01-01"
+    assert bot.guard.check("tomorrow")[0]
