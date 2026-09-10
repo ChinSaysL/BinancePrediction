@@ -90,6 +90,10 @@ class Settings(BaseSettings):
     # `pricing_model`, Up candidates by `up_model` (prototype: drift_digital).
     # Equal names disable the hybrid and keep the single-model gate.
     up_model: str = "digital"
+    # Rising-regime gate for Up: skip Up when the 1h log return is above this
+    # (0 disables). Measured on the recording: Up WR 0.50 in rising hours vs
+    # 0.82 flat/down; the gate recovers ~+$3 and flattens the drawdown.
+    up_regime_gate: float = 0.0
     # Fallback only: the fee comes from the measured curve
     # fee_bps = 180 * min(1, (1-px)/px) (see edge/signal.py). 180 bps is the
     # curve's cap, so it is the conservative fallback when no fee is known.

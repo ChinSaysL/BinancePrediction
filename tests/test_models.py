@@ -215,3 +215,28 @@ def test_price_history_seed_drops_forming_bar():
     h = PriceHistory()
     h.seed([_kline(60_000, 100.0), _kline(120_000, 101.0)])
     assert len(h) == 1
+
+
+def test_one_hour_return_over_70_bars():
+    import math
+    h = PriceHistory()
+    h.seed([_kline(m * 60_000, 100.0 + m) for m in range(70)],
+           drop_forming=False)
+    # newest close = 169, close ~60 min back (minute 9) = 109
+    assert h.one_hour_return() == math.log(169.0 / 109.0)
+
+
+def test_one_hour_return_needs_a_full_hour():
+    h = PriceHistory()
+    h.seed([_kline(m * 60_000, 100.0 + m) for m in range(10)],
+           drop_forming=False)
+    assert h.one_hour_return() is None
+
+
+def test_one_hour_return_ignores_live_tick():
+    h = PriceHistory()
+    h.seed([_kline(m * 60_000, 100.0 + m) for m in range(70)],
+           drop_forming=False)
+    before = h.one_hour_return()
+    h.add_tick(500.0)
+    assert h.one_hour_return() == before

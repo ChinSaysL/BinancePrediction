@@ -20,6 +20,7 @@ the orchestrator reads as "no trade", preserving selective strategies (sniper).
 """
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -160,6 +161,24 @@ class PriceHistory:
     def add_tick(self, price: float | None) -> None:
         if price and price > 0:
             self._current = price
+
+    def one_hour_return(self) -> float | None:
+        """Log return over the last hour of completed 1m bars.
+
+        Feeds the rising-regime gate: in a market that has already moved up
+        over the past hour the venue prices Up correctly, so the model's Up
+        edge is anti-informative and Up trades are skipped.
+        """
+        if len(self._bars) < 2:
+            return None
+        newest_min = self._bars[-1][0] // 60_000
+        past = [b for b in self._bars if b[0] // 60_000 <= newest_min - 60]
+        if not past:
+            return None
+        c0, c1 = self._bars[-1][1], past[-1][1]
+        if c0 <= 0 or c1 <= 0:
+            return None
+        return math.log(c0 / c1)
 
     def ctx(self, *, price: float | None = None, strike: float | None = None,
             tau_s: float | None = None, sigma_1m: float | None = None) -> ModelContext:

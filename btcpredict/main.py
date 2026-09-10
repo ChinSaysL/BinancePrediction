@@ -25,7 +25,8 @@ import aiohttp
 
 from btcpredict.calibration.report import PnLSummary
 from btcpredict.config import MARKETS, settings
-from btcpredict.edge.signal import FeeModel, evaluate, evaluate_hybrid, kelly_stake
+from btcpredict.edge.signal import (FeeModel, Signal, evaluate,
+                                    evaluate_hybrid, kelly_stake)
 from btcpredict.execution.base import Fill
 from btcpredict.execution.live import RETRYABLE_FAILURES, LiveBroker
 from btcpredict.execution.paper import PaperBroker
@@ -342,6 +343,17 @@ class Bot:
             sig = evaluate_hybrid(fair_up, up_fair, buy_up, buy_down, **sig_kw)
         else:
             sig = evaluate(fair_up, buy_up, buy_down, **sig_kw)
+
+        # Rising-regime gate for Up (see config.up_regime_gate): when the last
+        # hour is already up, the venue has priced Up correctly and our Up edge
+        # is anti-informative (measured WR 0.50 rising vs 0.82 flat/down).
+        if sig.act and sig.side == "Up" and settings.up_regime_gate > 0:
+            ret = hist.one_hour_return()
+            if ret is not None and ret > settings.up_regime_gate:
+                sig = Signal(None, sig.fair, sig.quote, sig.edge, sig.hurdle,
+                             sig.ev_per_dollar, False,
+                             f"Up skipped: 1h ret {ret:+.4f} > "
+                             f"{settings.up_regime_gate:+.3f}")
 
         # A signal must hold for several consecutive polls. A one-tick edge is
         # usually our own stale book or spot sample rather than a real

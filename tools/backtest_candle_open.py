@@ -25,7 +25,8 @@ from dataclasses import dataclass, replace
 
 from btcpredict.calibration.report import PnLSummary, score
 from btcpredict.config import MARKETS, settings
-from btcpredict.edge.signal import FeeModel, evaluate, fee_rate_for_price
+from btcpredict.edge.signal import (FeeModel, Signal, evaluate,
+                                    evaluate_hybrid, fee_rate_for_price)
 from btcpredict.models import MODEL_NAMES, ModelContext, build_model
 from btcpredict.store.db import Store
 
@@ -49,6 +50,7 @@ class ReplayParams:
     max_tau_s: float = 240.0
     trade_candle_opens: tuple = (1, 2, 3, 4)
     side_filter: str = "both"   # both / Up / Down -- mirrors settings
+    up_regime_gate: float = 0.0  # skip Up when 1h log return exceeds this
     # Fee semantics are unconfirmed; NOTIONAL (on the stake) is the stricter
     # of the two, so it is the default. PROFIT is the looser guess.
     fee_model: str = "notional"
@@ -67,6 +69,7 @@ class ReplayParams:
             max_tau_s=settings.max_tau_s,
             trade_candle_opens=tuple(settings.trade_candle_opens),
             side_filter=settings.side_filter,
+            up_regime_gate=settings.up_regime_gate,
         )
 
 
@@ -98,11 +101,14 @@ def build_1m_history(quotes: list[dict]) -> list[tuple[int, float, float]]:
 
 
 def replay(quotes, settled_by_slug, sigma_by_slug, hist, model,
-           fee: float | None, candle_gate: bool, params: ReplayParams) -> dict:
+           fee: float | None, candle_gate: bool, params: ReplayParams,
+           model_up=None) -> dict:
     """Replay the decision path over recorded quotes (sorted by time).
 
     fee=None -> the measured per-price fee curve is used both in the gate and
     in PnL accounting; a float overrides with a flat rate for comparisons.
+    model_up (optional) mirrors the live per-side gate: Down candidates are
+    priced by `model`, Up candidates by `model_up`.
     """
     pnl = PnLSummary()
     trades: list[dict] = []
@@ -153,18 +159,43 @@ def replay(quotes, settled_by_slug, sigma_by_slug, hist, model,
             closes.append(bars[cursor][1])
             vols.append(bars[cursor][2])
             cursor += 1
-        pred = model.predict(ModelContext(
+        ctx = ModelContext(
             closes=closes + [spot], volumes=vols, price=spot,
-            strike=strike, tau_s=tau, sigma_1m=sigma_by_slug.get(slug, 0.0004)))
+            strike=strike, tau_s=tau, sigma_1m=sigma_by_slug.get(slug, 0.0004))
+        pred = model.predict(ctx)
         if not pred.emitted:
             continue
-        sig = evaluate(
-            pred.p_up, q["up_ask"], q["down_ask"],
-            fee=fee, half_spread=0.0, safety_margin=params.safety_margin,
-            fee_model=FeeModel.NOTIONAL if params.fee_model == "notional"
-            else FeeModel.PROFIT,
-            max_quote=params.max_quote, min_quote=params.min_quote,
-            min_edge=params.min_edge, edge_haircut=params.edge_haircut)
+        if model_up is not None:
+            pred_up = model_up.predict(ctx)
+            up_fair = (pred_up.p_up if pred_up.emitted
+                       and 0.0 < pred_up.p_up < 1.0 else pred.p_up)
+            sig = evaluate_hybrid(
+                pred.p_up, up_fair, q["up_ask"], q["down_ask"],
+                fee=fee, half_spread=0.0, safety_margin=params.safety_margin,
+                fee_model=FeeModel.NOTIONAL if params.fee_model == "notional"
+                else FeeModel.PROFIT,
+                max_quote=params.max_quote, min_quote=params.min_quote,
+                min_edge=params.min_edge, edge_haircut=params.edge_haircut)
+        else:
+            sig = evaluate(
+                pred.p_up, q["up_ask"], q["down_ask"],
+                fee=fee, half_spread=0.0, safety_margin=params.safety_margin,
+                fee_model=FeeModel.NOTIONAL if params.fee_model == "notional"
+                else FeeModel.PROFIT,
+                max_quote=params.max_quote, min_quote=params.min_quote,
+                min_edge=params.min_edge, edge_haircut=params.edge_haircut)
+
+        # Rising-regime gate for Up, mirrored from live (config.up_regime_gate).
+        if sig.act and sig.side == "Up" and params.up_regime_gate > 0:
+            c0 = bars[cursor - 1][1] if cursor > 0 else None
+            past = [b for b in bars[:cursor] if b[0] <= ci - 60]
+            if c0 and past and c0 > 0 and past[-1][1] > 0:
+                ret = math.log(c0 / past[-1][1])
+                if ret > params.up_regime_gate:
+                    sig = Signal(None, sig.fair, sig.quote, sig.edge, sig.hurdle,
+                                 sig.ev_per_dollar, False,
+                                 f"Up skipped: 1h ret {ret:+.4f} > "
+                                 f"{params.up_regime_gate:+.3f}")
 
         prev_side, prev_n = streak.get(slug, (None, 0))
         if sig.act and sig.side == prev_side:
@@ -445,13 +476,19 @@ def main() -> None:
 
     names = list(MODEL_NAMES) if args.model == "all" else [args.model]
     live_gate = settings.trade_on_candle_open
+    up_name = settings.up_model.strip().lower()
     for name in names:
         model = build_model(name)
-        print(f"{BAR}\nmodel: {name}")
+        model_up = (build_model(up_name)
+                    if up_name and up_name != name.strip().lower() else None)
+        print(f"{BAR}\nmodel: {name}"
+              + (f" + up-model: {up_name}" if model_up else ""))
         current = replay(quotes, settled_by_slug, sigma_by_slug, hist, model,
-                         args.fee, candle_gate=live_gate, params=base)
+                         args.fee, candle_gate=live_gate, params=base,
+                         model_up=model_up)
         other = replay(quotes, settled_by_slug, sigma_by_slug, hist, model,
-                       args.fee, candle_gate=not live_gate, params=base)
+                       args.fee, candle_gate=not live_gate, params=base,
+                       model_up=model_up)
         market_vs_model(quotes, settled_by_slug, sigma_by_slug, hist, model, base)
         print_trades("CURRENT LIVE CONFIG (" +
                      ("candle-open gate)" if live_gate else "ungated)"), current)
@@ -460,10 +497,12 @@ def main() -> None:
 
     print(f"\n{BAR}\ncost-model comparison (current live config, digital):")
     model = build_model("digital")
+    model_up = (build_model(up_name)
+                if up_name and up_name != "digital" else None)
     for label, f in (("flat 0.64% (old assumption)", 0.0064),
                      ("measured fee curve", None)):
         r = replay(quotes, settled_by_slug, sigma_by_slug, hist, model,
-                   f, candle_gate=live_gate, params=base)
+                   f, candle_gate=live_gate, params=base, model_up=model_up)
         print(f"  {label}: {r['pnl']}")
 
 
