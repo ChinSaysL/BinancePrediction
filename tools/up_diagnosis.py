@@ -240,7 +240,7 @@ def main() -> None:
 
     params = ReplayParams.from_settings()
     quotes, sbs, sigs, hist = load_inputs(args.market)
-    model = build_model("digital")
+    model = build_model(settings.pricing_model)
     ticks: list[dict] = []
     res = replay(quotes, sbs, sigs, hist, model, None, False, params=params,
                  model_up=build_model(settings.up_model),

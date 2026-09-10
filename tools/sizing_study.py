@@ -52,9 +52,16 @@ def load_inputs(market: str = "btc-updown-5m"):
 
 def load_trades(market: str = "btc-updown-5m"):
     quotes, sbs, sigs, hist = load_inputs(market)
-    digital, drift = build_model("digital"), build_model(settings.up_model)
-    res = replay(quotes, sbs, sigs, hist, digital, None, False,
-                 params=ReplayParams.from_settings(), model_up=drift)
+    # Must mirror live: whichever model prices Down (settings.pricing_model) and
+    # whichever prices Up. Hardcoding "digital" here made every tool that reads
+    # trades measure a strategy the bot had stopped running -- exactly the
+    # error this project has been trying to stop repeating.
+    main_model = build_model(settings.pricing_model)
+    up_model = build_model(settings.up_model)
+    per_side = (up_model if settings.up_model.strip().lower()
+                != settings.pricing_model.strip().lower() else None)
+    res = replay(quotes, sbs, sigs, hist, main_model, None, False,
+                 params=ReplayParams.from_settings(), model_up=per_side)
     trades = sorted(res["trades"], key=lambda t: t["ts_ms"])
     days = [dt.datetime.fromtimestamp(t["ts_ms"] / 1000, dt.timezone.utc).date()
             for t in trades]

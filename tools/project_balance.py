@@ -40,16 +40,21 @@ import random
 import statistics as st
 
 from btcpredict.config import settings
-from btcpredict.edge.signal import tilt_factor
+from btcpredict.edge.signal import stake_for_fraction, tilt_factor
 from tools.sizing_study import load_trades
 
 HORIZONS = (1, 2, 7, 14, 30)
 # Live runs BTC 5m only: main.tick() passes trade=(prefix == primary), so ETH 5m
-# is recorded and settled but deliberately never traded. Measured fill rate from
-# the live DB is 38 and 51 fills on the two complete UTC days, against 22/day
-# from the stricter replay (which needs recorded quotes AND signal persistence
-# for every candle open). The live number is what a projection should use.
-LIVE_TRADES_PER_DAY = 44.0
+# is recorded and settled but deliberately never traded.
+#
+# 249/day is the SHIPPED config's replay rate (614 trades over 678 rounds, the
+# honest pricing at a 0.01 bar, a position in ~90% of rounds). It replaces the
+# 44/day measured under the old digital/0.12 gate, which no longer describes
+# what runs. It is a FLOOR, not an estimate: live updates the persistence streak
+# before the tau-window check, so a signal that has been acting during tau > 210
+# counts toward the 2 polls and live fires on its first in-window tick, which
+# the replay never does. --trades-per-day 0 uses the recording's own rate.
+LIVE_TRADES_PER_DAY = 249.0
 # The levels matter more than anything else here, because the projection
 # compounds: at 4% per trade a 1%-per-trade difference is a 13x difference over
 # a month. Listed highest first.
@@ -111,6 +116,27 @@ def haircut(rets: list[float], edge: float | None) -> tuple[list[float], float]:
     return [r if r <= 0 else r * k for r in rets], k
 
 
+def _stake(bank: float, frac: float, tilts: list[float], floor: float,
+           cap: float) -> float:
+    """One trade's stake, exactly as main._base_stake_for + main._stake_for.
+
+    Fraction mode returns 0 (skip) when the base cannot reach the venue
+    minimum, and the tilt is then clamped UP to that minimum rather than
+    skipped -- which is why a 2% rule on a $66 bankroll pays $1.00 on most
+    trades instead of refusing them. A projection that models the skip but not
+    the clamp-up measures a strategy that never runs.
+    """
+    base = stake_for_fraction(bank, fraction=frac, min_stake=floor, cap=cap)
+    if base <= 0:
+        return 0.0
+    if settings.stake_tilt == "inv_z" and tilts:
+        t = tilt_factor(random.choice(tilts),
+                        reference=settings.tilt_reference_z,
+                        lo=settings.tilt_min, hi=settings.tilt_max)
+        base = min(max(base * t, floor), cap)
+    return base
+
+
 def simulate(rets, tilts, *, bankroll, days, edge, tpd, paths,
              resume_after_halt, cap_pct=None, seed=20260910):
     """One entry per path per horizon plus the risk statistics."""
@@ -151,9 +177,14 @@ def simulate(rets, tilts, *, bankroll, days, edge, tpd, paths,
                     if losses >= max_streak:
                         n_stopped += 1
                         break
-                    stake = min(bank * frac * rng.choice(tilts), cap)
-                    if stake < floor:
-                        break                    # cannot size: skip the trade
+                    stake = _stake(bank, frac, tilts, floor, cap)
+                    if stake <= 0:
+                        # The BASE cannot reach the venue minimum: live skips
+                        # this trade and keeps going, so this must be a
+                        # `continue`. It used to `break`, which ended the whole
+                        # day on one unlucky |z| draw and quietly reported a
+                        # trade rate near zero.
+                        continue
                     pnl = rng.choice(pool) * stake
                     bank += pnl
                     day_pnl += pnl

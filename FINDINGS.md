@@ -1035,3 +1035,57 @@ tau first and never counts those ticks. Live therefore trades somewhat MORE than
 the replay's numbers predict -- the replay's ~260 trades/day is a floor, not an
 estimate. It is a tools-vs-live mismatch, not a live bug, and it pushes the
 trade count (and so the variance) up, not down.
+
+## Final backtest of the shipped config (2026-09-10)
+
+Replay of exactly what runs live (`calibrated_down` for Down, `calibrated` for
+Up, haircut 1.0, bar 0.01, quote floor 0.50), 678 settled rounds, 614 trades
+(249/day), one position per round:
+
+| split | n | mean q | WR | P&L | EV/$1 | se | t |
+|---|---|---|---|---|---|---|---|
+| TRAIN (first 60%) | 366 | 0.699 | 71.6% | +6.25 | +0.017 | 0.035 | +0.49 |
+| TEST (last 40%) | 248 | 0.705 | 72.6% | +5.50 | +0.022 | 0.042 | +0.53 |
+| ALL | 614 | 0.701 | 72.0% | +11.74 | +0.019 | 0.027 | +0.71 |
+
+By side, ALL: Up 267 trades +0.002/$1, Down 347 trades +0.032/$1.
+By side, TEST: Up 111 trades +0.021/$1, Down 137 trades +0.023/$1.
+
+**The Up/Down asymmetry is gone.** Under the old gate the Up side was -0.072/$1
+against Down's +0.199 on live trades; under honest pricing the two sides are
+0.021 and 0.023 on the unseen slice, and both are positive. That is the check
+that the earlier "Up is broken" reading was a composition effect, not a defect:
+change the pricing, and the sides come back together.
+
+Projection from $66.06, 249 trades/day, 800 paths, daily stop 20%, 5-loss halt:
+
+| horizon | median | p10 | p90 | median P/L | return | chance down |
+|---|---|---|---|---|---|---|
+| 1 day | $70.02 | $55.00 | $83.62 | +$3.96 | +6.0% | 36.0% |
+| 2 days | $75.02 | $55.27 | $94.46 | +$8.96 | +13.6% | 28.5% |
+| 7 days | $94.68 | $49.72 | $136.49 | +$28.62 | +43.3% | 21.4% |
+| 14 days | $120.55 | $49.68 | $199.60 | +$54.49 | +82.5% | 21.2% |
+| 30 days | $211.70 | $49.66 | $470.23 | +$145.64 | +220.5% | 21.5% |
+
+Median drawdown 31%. With the edge forced to ZERO the same simulation gives a
+1-day median of -$0.66 and a 30-day median of $49.80 (-24.6%), chance down 76%.
+That is the honest shape of the bet: the two worlds differ by ~$195 of median
+terminal value and by 21% vs 76% chance of loss, and nothing measured yet says
+which one we are in.
+
+Two sizing mechanics show up in the numbers and are worth knowing:
+  * the $50 floor: 2% of bankroll falls under the venue's $1 minimum below $50
+    equity, and `stake_for_fraction` SKIPS rather than rounding up. Every path
+    converges on p10 ~ $49.7 -- the account stops trading instead of grinding
+    down. It is an accidental, and welcome, circuit breaker;
+  * `P(5-loss halt) 91%`: at 249 trades/day and a 28% loss rate a 5-loss run is
+    near-certain, so the day-scoped halt will pause trading most days. Part of
+    why the realised trade count will sit below 249/day.
+
+**A bug this run exposed, fixed here.** `tools/project_balance.simulate` ended
+the whole DAY when one draw of the |z| tilt pushed the stake under the venue
+minimum (`break` instead of `continue`), and it never modelled live's clamp-UP
+to the floor. Every projection in this repo before now was therefore measured
+against a strategy that stops trading after a handful of trades a day, which is
+why they reported 30-day median P/L of ~+$0.30. `_stake()` now mirrors
+`main._base_stake_for` + `main._stake_for` exactly.
