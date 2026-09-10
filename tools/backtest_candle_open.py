@@ -198,7 +198,7 @@ def replay(quotes, settled_by_slug, sigma_by_slug, hist, model,
             strike=strike, tau_s=tau, sigma_1m=sigma_by_slug.get(slug, 0.0004),
             # Live passes the executable Up ask; a market-anchored model must
             # see the same number here or the replay prices a different book.
-            quote_up=q["up_ask"])
+            quote_up=q["up_ask"], quote_down=q["down_ask"])
         pred = model.predict(ctx)
         if not pred.emitted:
             continue

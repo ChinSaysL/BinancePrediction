@@ -367,7 +367,7 @@ class Bot:
         hist.add_tick(spot)
         pred = self.model.predict(hist.ctx(
             price=spot, strike=r.strike, tau_s=tau, sigma_1m=sigma,
-            quote_up=buy_up))
+            quote_up=buy_up, quote_down=buy_down))
         if not pred.emitted or not (0.0 < pred.p_up < 1.0):
             log.debug("model %s holds on %s: %s", self.model.name, r.slug, pred.reason)
             return
@@ -378,7 +378,7 @@ class Bot:
         if self.up_model is not None:
             pred_up = self.up_model.predict(hist.ctx(
                 price=spot, strike=r.strike, tau_s=tau, sigma_1m=sigma,
-                quote_up=buy_up))
+                quote_up=buy_up, quote_down=buy_down))
             if pred_up.emitted and 0.0 < pred_up.p_up < 1.0:
                 up_fair = pred_up.p_up
         sig_kw = dict(

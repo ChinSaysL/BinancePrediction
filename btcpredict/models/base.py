@@ -48,6 +48,10 @@ class ModelContext:
     # needs to see it. None means "no usable quote": a market-anchored model
     # must fall back rather than trade on a guess.
     quote_up: float | None = None
+    # Same for Down. The gate has always priced Down as (1 - fair_up), so the
+    # Down side has never seen its own market price; a model that wants to
+    # anchor on it needs this.
+    quote_down: float | None = None
 
     def __post_init__(self) -> None:
         if self.volumes is None:
@@ -188,7 +192,8 @@ class PriceHistory:
 
     def ctx(self, *, price: float | None = None, strike: float | None = None,
             tau_s: float | None = None, sigma_1m: float | None = None,
-            quote_up: float | None = None) -> ModelContext:
+            quote_up: float | None = None,
+            quote_down: float | None = None) -> ModelContext:
         cur = price if price and price > 0 else self._current
         closes = [b[1] for b in self._bars]
         if cur is not None:
@@ -202,4 +207,5 @@ class PriceHistory:
             tau_s=tau_s,
             sigma_1m=sigma_1m,
             quote_up=quote_up,
+            quote_down=quote_down,
         )

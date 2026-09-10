@@ -97,7 +97,7 @@ def _sigmoid(x: float) -> float:
 
 
 def features(ctx: ModelContext) -> dict[str, float] | None:
-    """The feature vector, or None when the context cannot support one.
+    """The Up-side feature vector, or None when the context cannot support one.
 
     Exported so tools.train_up_model fits exactly the features predict() uses;
     a trainer that re-derives them would eventually fit something else.
@@ -115,14 +115,34 @@ def features_from_scalars(*, price, strike, tau_s, sigma_1m, quote_up,
             or quote_up is None or price <= 0 or strike <= 0 or sigma_1m <= 0
             or tau_s <= 0):
         return None
-    q = quote_up
-    if not 0.0 < q < 1.0:
+    return _feat(quote_up, clamp_p(fair_value(price, strike, tau_s,
+                                              sigma_1m)), imb)
+
+
+def features_down_from_scalars(*, price, strike, tau_s, sigma_1m, quote_down,
+                               imb: float) -> dict[str, float] | None:
+    """The Down-side features: same shape, the Down quote and Down closed form.
+
+    The gate derives the Down candidate from (1 - fair_up), so a model that
+    prices Down must use the down side's own disagreement, not the up side's.
+    """
+    if (price is None or strike is None or tau_s is None or sigma_1m is None
+            or quote_down is None or price <= 0 or strike <= 0 or sigma_1m <= 0
+            or tau_s <= 0):
         return None
-    p_dig = clamp_p(fair_value(price, strike, tau_s, sigma_1m))
-    lq, lp = _logit(q), _logit(p_dig)
+    p_up_dig = clamp_p(fair_value(price, strike, tau_s, sigma_1m))
+    return _feat(quote_down, 1.0 - p_up_dig, imb)
+
+
+def _feat(quote, p_side_digital: float, imb: float) -> dict[str, float] | None:
+    """market/disc/imb for one side, given that side's closed-form value."""
+    q = quote
+    if q is None or not 0.0 < q < 1.0 or p_side_digital is None:
+        return None
+    lq = _logit(q)
     return {
         "market": lq,
-        "disc": lp - lq,
+        "disc": _logit(p_side_digital) - lq,
         "imb": imb,
     }
 
@@ -147,6 +167,26 @@ DEFAULT_PARAMS: dict = {
     "b_disc": 0.103309,
     "b_imb": 0.396481,
 }
+
+# Fitted the same way on the DOWN side of the same 674 rounds (384 train / 250
+# test):
+#   b_market 1.2427 +- 0.1523 (z 8.16)
+#   b_disc   0.0570 +- 0.3642 (z 0.16)   the Down side's disagreement is also
+#                                        worth nothing
+#   b_imb   -0.3769 +- 0.7715 (z -0.49)
+# As a probability it is the best of the three (test Brier 0.1919 against the
+# venue's 0.1925 and digital's 0.1937). It is deliberately left UNFITTED here
+# because it failed the money test, which is the test that decides:
+#   * at the live min_edge of 0.12 it takes ZERO Down trades -- an honest
+#     probability never claims a 12-point edge on a 5-minute binary, so
+#     shipping it would simply stop the book (+$50.16 live, +$18.15 on the
+#     train slice);
+#   * with the bar lowered to 0.02 it trades 245 unseen rounds for +0.013/$1
+#     (t 0.32) and 363 train rounds for +0.008 (t 0.23) -- the right sign on
+#     both slices, but an edge of 1.3% per $1 staked that would need ~10x the
+#     trades to demonstrate (about a month of running).
+# See FINDINGS.md. Left empty so the model behaves exactly like digital.
+DOWN_PARAMS: dict = {}
 
 
 class CalibratedUpModel(StrategyModel):
@@ -181,3 +221,59 @@ class CalibratedUpModel(StrategyModel):
              + par.get("b_disc", 0.0) * f["disc"]
              + par.get("b_imb", 0.0) * f["imb"])
         return ModelPred(clamp_p(_sigmoid(x)), True, "calibrated")
+
+
+class CalibratedDownModel(StrategyModel):
+    """The symmetric recalibration, for the Down side.
+
+    The gate prices the Down candidate as (1 - fair_up), so this returns
+    `1 - p_down_calibrated`: the number the gate will use for Down is then
+    exactly the calibrated Down probability. Its own Up call is discarded by
+    evaluate_hybrid (the Down model's Up side has never been used), which is
+    the same contract DigitalModel already lives under.
+
+    This exists because the Down side is where the money is and it has never
+    seen its own market price: every live Down trade so far was priced by an
+    implied complement, not by the venue's ask for Down.
+    """
+
+    name = "calibrated_down"
+    DEFAULT_PARAMS = DOWN_PARAMS
+
+    def analyze(self, ctx: ModelContext) -> StrategySignal:
+        p = self.predict(ctx)
+        if not p.emitted:
+            return StrategySignal(0, 0, p.reason)
+        side = 1 if p.p_up > 0.5 else (-1 if p.p_up < 0.5 else 0)
+        return StrategySignal(side, min(0.95, abs(p.p_up - 0.5) * 2.0),
+                              p.reason)
+
+    def predict(self, ctx: ModelContext) -> ModelPred:
+        p_up_dig = None
+        if (ctx.price is not None and ctx.strike is not None
+                and ctx.tau_s is not None and ctx.sigma_1m is not None):
+            p_up_dig = (1.0 if ctx.price > ctx.strike else 0.0) \
+                if ctx.tau_s <= 0 else fair_value(ctx.price, ctx.strike,
+                                                  ctx.tau_s, ctx.sigma_1m)
+            p_up_dig = clamp_p(p_up_dig)
+        if p_up_dig is None:
+            return ModelPred(0.5, False, "calibrated_down: missing inputs")
+        f = features_down_from_scalars(
+            price=ctx.price, strike=ctx.strike, tau_s=ctx.tau_s,
+            sigma_1m=ctx.sigma_1m, quote_down=ctx.quote_down,
+            imb=taker_imbalance(ctx.taker_buys, ctx.volumes))
+        if f is None:
+            # No Down quote, no anchor: fall back to the closed form, which is
+            # exactly what p_up = 1 - p_up_digital implies for the Down side.
+            return ModelPred(clamp_p(1.0 - p_up_dig), True,
+                             "calibrated_down: no quote, closed form")
+        par = self.params
+        if not par:
+            # Not fitted: behave exactly like the digital model. Returning a
+            # constant here would price Down at 0.5 and kill every Down trade.
+            return ModelPred(clamp_p(1.0 - p_up_dig), True,
+                             "calibrated_down: unfitted, closed form")
+        x = (par.get("b_market", 0.0) * f["market"]
+             + par.get("b_disc", 0.0) * f["disc"]
+             + par.get("b_imb", 0.0) * f["imb"])
+        return ModelPred(clamp_p(1.0 - _sigmoid(x)), True, "calibrated_down")

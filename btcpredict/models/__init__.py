@@ -25,7 +25,8 @@ from __future__ import annotations
 
 from btcpredict.models.base import (ModelContext, ModelPred, PriceHistory,
                                     StrategyModel, StrategySignal)
-from btcpredict.models.calibrated import CalibratedUpModel
+from btcpredict.models.calibrated import (CalibratedDownModel,
+                                          CalibratedUpModel)
 from btcpredict.models.digital import DigitalModel
 from btcpredict.models.drift_digital import DriftDigitalModel
 from btcpredict.models.hybrid import HybridModel
@@ -39,6 +40,7 @@ from btcpredict.models.sniper import SniperModel
 _REGISTRY: dict[str, type[StrategyModel]] = {
     "digital": DigitalModel,
     "calibrated": CalibratedUpModel,
+    "calibrated_down": CalibratedDownModel,
     "drift_digital": DriftDigitalModel,
     "momentum": MomentumModel,
     "mean_rev": MeanRevModel,
@@ -64,6 +66,6 @@ __all__ = [
     "ModelContext", "ModelPred", "PriceHistory", "StrategyModel", "StrategySignal",
     "MODEL_NAMES", "build_model",
     "DigitalModel", "MomentumModel", "MeanRevModel", "SentimentModel",
-    "DriftDigitalModel", "CalibratedUpModel",
+    "DriftDigitalModel", "CalibratedUpModel", "CalibratedDownModel",
     "HybridModel", "PhantomModel", "SniperModel", "BtcMakerModel",
 ]

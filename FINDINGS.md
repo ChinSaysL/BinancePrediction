@@ -873,3 +873,52 @@ been earning from all along (Down live: mean q 0.555, WR 69.4%).
 Open question, unmeasured: the Down side has never been shown the down quote --
 the gate prices Down as 1 - fair_up. A symmetric recalibration of the Down side
 is the obvious next test, and it is where the money is.
+
+## The same treatment for Down, and the decision not to ship either (2026-09-10)
+
+Both sides now have a fitted, market-anchored recalibration (`calibrated` for
+Up, `calibrated_down` for Down), and both were scored on the same split: fitted
+on the first 60% of rounds, scored on the last 40%. The Down quote is new --
+until now the gate priced Down as (1 - fair_up), so the side that earns the
+money had never been shown its own market price.
+
+| fit | b_market | b_disc | test Brier (venue / model / digital) |
+|---|---|---|---|
+| Up | +1.2368 ± 0.1529 (z 8.09) | +0.1033 ± 0.3565 (z 0.29) | 0.1927 / 0.1921 / 0.1940 |
+| Down | +1.2427 ± 0.1523 (z 8.16) | +0.0570 ± 0.3642 (z 0.16) | 0.1925 / 0.1919 / 0.1937 |
+
+Both are better probabilities than the model we run, both are level with the
+venue (paired t of -0.34 and -0.31), and **both say our disagreement with the
+venue is worth nothing** (b_disc inside one standard error of zero, on two
+independent fits). The two sides agree to three decimal places on b_market,
+which is the strongest single number produced today: the venue's price is real
+and amplified (~1.24x), and our own contribution to it is not measurable.
+
+Then the money test, which is the one that decides:
+
+| config | bar | train | test |
+|---|---|---|---|
+| live (digital both sides) | 0.12 | 35 trades, +0.388/$1, t 1.89 | 17 trades, +0.012/$1, t 0.04 |
+| recalibrated, both sides | 0.12 | 0 trades | 0 trades |
+| recalibrated, both sides | 0.05 | 66 trades, +0.052/$1, t 0.80 | 38 trades, -0.032/$1, t -0.33 |
+| recalibrated, both sides | 0.03 | 335 trades, +0.008/$1, t 0.25 | 232 trades, +0.002/$1, t 0.06 |
+| recalibrated, both sides | 0.02 | 363 trades, +0.008/$1, t 0.23 | 245 trades, +0.013/$1, t 0.32 |
+
+**Decision: neither recalibration is shipped, and `up_model` / `pricing_model`
+stay `digital`.**
+
+  * as a swap they are harmful, not neutral: with an honest probability nothing
+    clears min_edge = 0.12 -- zero Up trades AND zero Down trades, i.e. the gate
+    would stop the book. That is worth knowing in itself: **the 0.12 bar is
+    only reachable because the digital model overstates edges.** An honest
+    probability refuses to trade this book at all;
+  * with the bar lowered to where the honest model does trade, the edge is
+    1.3%/$1 with t = 0.32 on 245 unseen trades -- the right sign on both
+    slices, and about 10x too small a sample to bank.
+
+The other thing this exposed, which matters more than either fit: **the live
+config's profit lives entirely in the slice that chose its thresholds.** On the
+unseen 40% it is +$0.21 over 17 trades (t 0.04) against +$13.57 over 35 trades
+(t 1.89) on the train slice. Both sides show it (Down: +18.15 train, -0.94
+test). This is the walk-forward warning the repo already had a tool for, and it
+is the reason not to add any more tuned machinery on top.

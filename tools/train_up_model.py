@@ -41,7 +41,8 @@ import statistics as st
 from btcpredict.config import settings
 from btcpredict.models import build_model
 from btcpredict.models.base import clamp_p
-from btcpredict.models.calibrated import features_from_scalars
+from btcpredict.models.calibrated import (features_down_from_scalars,
+                                          features_from_scalars)
 from btcpredict.pricing.digital import fair_value
 from tools.backtest_candle_open import ReplayParams, replay
 from tools.sizing_study import load_inputs
@@ -129,7 +130,36 @@ def logloss(pairs: list[tuple[float, int]]) -> float:
                     for p, y in pairs]) if pairs else float("nan")
 
 
-def build_sample(ticks: list[dict], sbs: dict, cut: int):
+def side_quote(t: dict, side: str):
+    return t["up_ask"] if side == "up" else t["down_ask"]
+
+
+def side_digital(t: dict, side: str) -> float:
+    """The closed form's probability for that side, as the gate sees it.
+
+    Down is the complement: the gate has never had a separate Down model, it
+    prices Down as (1 - fair_up).
+    """
+    p_up = clamp_p(fair_value(t["spot"], t["strike"], t["tau"], t["sigma"]))
+    return p_up if side == "up" else 1.0 - p_up
+
+
+def side_features(t: dict, side: str):
+    if side == "up":
+        return features_from_scalars(
+            price=t["spot"], strike=t["strike"], tau_s=t["tau"],
+            sigma_1m=t["sigma"], quote_up=t["up_ask"], imb=t["imb"])
+    return features_down_from_scalars(
+        price=t["spot"], strike=t["strike"], tau_s=t["tau"],
+        sigma_1m=t["sigma"], quote_down=t["down_ask"], imb=t["imb"])
+
+
+def side_label(t: dict, side: str) -> int:
+    won = t["outcome_up"] if side == "up" else not t["outcome_up"]
+    return 1 if won else 0
+
+
+def build_sample(ticks: list[dict], sbs: dict, cut: int, side: str):
     """One row per round: the first tick the gate evaluates, with its outcome."""
     seen: set[str] = set()
     train, test, skipped = [], [], 0
@@ -138,20 +168,17 @@ def build_sample(ticks: list[dict], sbs: dict, cut: int):
         if slug in seen:
             continue
         seen.add(slug)
-        f = features_from_scalars(
-            price=t["spot"], strike=t["strike"], tau_s=t["tau"],
-            sigma_1m=t["sigma"], quote_up=t["up_ask"], imb=t["imb"])
+        f = side_features(t, side)
         if f is None:
             skipped += 1
             continue
-        # The feature builder must reproduce the digital probability the gate
-        # actually saw, or the fit is not of the live model.
-        dig = clamp_p(fair_value(t["spot"], t["strike"], t["tau"],
-                                 t["sigma"]))
-        if abs(_logit(dig) - (_logit(t["up_ask"]) + f["disc"])) > 1e-6:
+        # The feature builder must reproduce the probability the gate actually
+        # saw, or the fit is not of the live model.
+        q = side_quote(t, side)
+        if abs(_logit(side_digital(t, side)) - (_logit(q) + f["disc"])) > 1e-6:
             raise SystemExit("feature/digital mismatch: refusing to fit")
         x = [f[c] for c in COLS]
-        y = 1 if t["outcome_up"] else 0
+        y = side_label(t, side)
         (train if sbs[slug]["start_ms"] < cut else test).append((x, y, f, t))
     return train, test, skipped
 
@@ -159,6 +186,8 @@ def build_sample(ticks: list[dict], sbs: dict, cut: int):
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--market", default="btc-updown-5m")
+    ap.add_argument("--side", choices=("up", "down"), default="up",
+                    help="which side's probability to recalibrate")
     ap.add_argument("--train-frac", type=float, default=0.60)
     ap.add_argument("--l2", type=float, default=0.0,
                     help="ridge on the information matrix (0 = plain MLE)")
@@ -174,10 +203,10 @@ def main() -> None:
 
     starts = sorted({r["start_ms"] for r in sbs.values()})
     cut = starts[int(len(starts) * args.train_frac)]
-    train, test, skipped = build_sample(ticks, sbs, cut)
-    print(f"{args.market}: {len(sbs)} settled rounds, {len(ticks)} evaluated "
-          f"ticks, {len(train)} train rows / {len(test)} test rows "
-          f"({skipped} rounds unusable)")
+    train, test, skipped = build_sample(ticks, sbs, cut, args.side)
+    print(f"{args.market} / {args.side} side: {len(sbs)} settled rounds, "
+          f"{len(ticks)} evaluated ticks, {len(train)} train rows / "
+          f"{len(test)} test rows ({skipped} rounds unusable)")
     print(f"split at round {int(len(starts) * args.train_frac)} of {len(starts)} "
           f"(ms {cut})\n")
 
@@ -216,9 +245,8 @@ def main() -> None:
     print("\n=== probability quality, TRAIN / TEST (one tick per round) ===")
     print(f"  {'model':<14}{'brier tr':>10}{'brier te':>10}"
           f"{'logloss te':>12}{'mean|p-q| te':>14}")
-    for label, fn in (("digital", lambda t: clamp_p(fair_value(
-                          t["spot"], t["strike"], t["tau"], t["sigma"]))),
-                      ("venue ask", lambda t: t["up_ask"]),
+    for label, fn in (("digital", lambda t: side_digital(t, args.side)),
+                      ("venue ask", lambda t: side_quote(t, args.side)),
                       ("calibrated", None)):
         tr_p, te_p = [], []
         for x, y, _f, t in train:
@@ -229,8 +257,9 @@ def main() -> None:
             p = (_sigmoid(sum(b * v for b, v in zip(beta, x)))
                  if fn is None else fn(t))
             te_p.append((p, y))
-        gap = st.mean([abs(p - t["up_ask"]) for (_x, _y, _f, t), (p, _y2)
-                       in zip(test, te_p)]) if te_p else float("nan")
+        gap = st.mean([abs(p - side_quote(t, args.side))
+                       for (_x, _y, _f, t), (p, _y2) in zip(test, te_p)]) \
+            if te_p else float("nan")
         print(f"  {label:<14}{brier(tr_p):>10.4f}{brier(te_p):>10.4f}"
               f"{logloss(te_p):>12.4f}{gap:>14.4f}")
 
@@ -239,7 +268,7 @@ def main() -> None:
     diffs = []
     for x, y, _f, t in test:
         p = _sigmoid(sum(b * v for b, v in zip(beta, x)))
-        diffs.append((p - y) ** 2 - (t["up_ask"] - y) ** 2)
+        diffs.append((p - y) ** 2 - (side_quote(t, args.side) - y) ** 2)
     if len(diffs) > 2:
         mu = st.mean(diffs)
         sd = st.pstdev(diffs)
@@ -251,14 +280,15 @@ def main() -> None:
 
     fitted = {f"b_{c}": b for c, b in zip(COLS, beta)}
     print("\n=== paste into btcpredict/models/calibrated.py ===")
-    print("DEFAULT_PARAMS: dict = {")
+    print("DOWN_PARAMS: dict = {" if args.side == "down"
+          else "DEFAULT_PARAMS: dict = {")
     for k in tuple(f"b_{c}" for c in COLS):
         print(f'    "{k}": {fitted[k]:.6f},')
     print("}")
     if args.no_replay:
         return
 
-    print("\n=== money: the gate with Up priced by the recalibration ===")
+    print(f"\n=== money: the gate with the {args.side} side recalibrated ===")
     print(f"  {'':<26}{'n':>6}{'mean q':>8}{'WR%':>9}{'P&L':>10}"
           f"{'EV/$1':>9}{'se':>8}{'t':>7}")
 
@@ -275,14 +305,26 @@ def main() -> None:
               f"{sum(rs):>+10.2f}{ev:>+9.3f}{sem:>8.3f}"
               f"{ev / sem if sem else 0:>+7.2f}")
 
-    for label, name, par in (("live (digital for Up)", settings.up_model, None),
-                             ("recalibrated for Up", "calibrated", fitted)):
-        res = replay(quotes, sbs, sigs, hist, build_model("digital"), None,
-                     False, params=params, model_up=build_model(name, par))
+    if args.side == "up":
+        variants = (("live", settings.pricing_model, None,
+                     settings.up_model, None),
+                    ("recal", settings.pricing_model, None,
+                     "calibrated", fitted))
+    else:
+        variants = (("live", settings.pricing_model, None,
+                     settings.up_model, None),
+                    ("recal", "calibrated_down", fitted,
+                     settings.up_model, None))
+    for label, dn, dn_par, up, up_par in variants:
+        res = replay(quotes, sbs, sigs, hist, build_model(dn, dn_par), None,
+                     False, params=params,
+                     model_up=(build_model(up, up_par) if up != dn else None))
         tr = [t for t in res["trades"] if sbs[t["slug"]]["start_ms"] < cut]
         te = [t for t in res["trades"] if sbs[t["slug"]]["start_ms"] >= cut]
         for who, sel in (("Up  train", [t for t in tr if t["side"] == "Up"]),
                          ("Up  test", [t for t in te if t["side"] == "Up"]),
+                         ("Dn  train", [t for t in tr if t["side"] == "Down"]),
+                         ("Dn  test", [t for t in te if t["side"] == "Down"]),
                          ("all train", tr), ("all test", te)):
             line(f"{label[:14]:<14} {who}", sel)
     print(f"\n  (baseline gate without the recalibration: "
