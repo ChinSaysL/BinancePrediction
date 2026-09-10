@@ -686,8 +686,41 @@ class Bot:
                          fresh.slug, fresh.winner_name, fresh.end_price)
         return done
 
+    async def _refresh_bankroll(self) -> None:
+        """Re-read wallet equity so percentage sizing compounds intraday.
+
+        `setup` reads the balance once, and without this the stake stays frozen
+        at whatever the account held when the process started: after a winning
+        run the bot would keep betting 4% of the ORIGINAL account, and after
+        losses it would keep betting the same dollars against a smaller one --
+        at a $76 start, a slide to $40 would have made the "4%" stake 7.6% of
+        what was left, which is the exact failure mode fraction sizing exists
+        to prevent.
+
+        Only ever called when a round of ours has just settled and nothing is
+        open, because `walletBalance` excludes cash locked in an open position:
+        reading it mid-round would UNDERSTATE equity and shrink the next stake.
+        Winnings are claimable positions rather than wallet cash until redeemed,
+        so the read also has to follow the redeem call for the same reason.
+        """
+        if self.mode != "live" or getattr(self, "book", None) is None:
+            return
+        if self.open_fills:
+            return                      # still invested; equity is not readable
+        try:
+            bal = await self.book.balance()
+        except Exception as e:          # never let a read failure stop trading
+            log.warning("bankroll refresh failed: %s: %s", type(e).__name__, e)
+            return
+        if bal <= 0 or abs(bal - self.bankroll) < 0.01:
+            return                      # unreadable, or fee-level noise
+        log.info("bankroll $%.4f -> $%.4f (equity moved; sizing follows)",
+                 self.bankroll, bal)
+        self.bankroll = bal
+
     async def settle_due(self) -> None:
         now_ms = int(time.time() * 1000)
+        settled = False
         for slug, (fid, fill) in list(self.open_fills.items()):
             row = self.store.get_round(slug)
             if not row or row["end_ms"] > now_ms - 5_000:
@@ -708,6 +741,7 @@ class Bot:
                 "won": int(s.won), "payout": s.payout, "pnl": s.pnl,
                 "mode": self.broker.mode, "void": int(s.void),
             })
+            settled = True
             if s.void:
                 # The venue never filled the order: no stake was deployed, so
                 # there is no PnL, no guard update, and nothing to redeem.
@@ -725,6 +759,10 @@ class Bot:
                 log.info("redeem -> %s", str(claimed)[:200])
             log.info("SETTLE %s %s winner=%s pnl=%+.4f | running: %s",
                      slug, "WON" if s.won else "LOST", winner, s.pnl, self.pnl)
+        if settled:
+            # A position closed, so the wallet balance is readable as equity
+            # and the next stake should track it (see _refresh_bankroll).
+            await self._refresh_bankroll()
 
     # -- run ----------------------------------------------------------------
     async def run(self) -> None:

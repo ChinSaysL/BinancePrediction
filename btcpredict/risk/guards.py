@@ -51,13 +51,20 @@ class RiskGuard:
         tightens as the account shrinks -- deliberately the conservative
         direction, and the reason a percentage cap needs to be several stakes
         wide to be usable rather than hair-trigger.
+
+        A cap of 0 means OFF for either knob, and a guard with both off has no
+        daily limit at all (the loss-streak rule still applies). That is why
+        this cannot simply `min` the two: a disabled dollar cap would otherwise
+        read as a zero-dollar budget and halt on the first loser.
         """
-        if self.daily_loss_cap_pct <= 0 or self.bankroll is None:
-            return self.daily_loss_cap
-        b = self.bankroll()
-        if not b or b <= 0:
-            return self.daily_loss_cap
-        return min(self.daily_loss_cap, self.daily_loss_cap_pct * b)
+        caps: list[float] = []
+        if self.daily_loss_cap > 0:
+            caps.append(self.daily_loss_cap)
+        if self.daily_loss_cap_pct > 0 and self.bankroll is not None:
+            b = self.bankroll()
+            if b and b > 0:
+                caps.append(self.daily_loss_cap_pct * b)
+        return min(caps) if caps else float("inf")
 
     def check(self, slug: str) -> tuple[bool, str]:
         """May we open a position on `slug`? Returns (allowed, reason)."""

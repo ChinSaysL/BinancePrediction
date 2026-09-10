@@ -52,6 +52,26 @@ def test_percentage_daily_cap_ignores_a_missing_or_broken_bankroll():
                  bankroll=lambda: 0.0).effective_daily_cap() == pytest.approx(3.0)
 
 
+def test_daily_cap_can_be_switched_off_entirely():
+    """0 means off for BOTH knobs. A disabled dollar cap must never be read as
+    a zero-dollar budget, which would halt on the first loser."""
+    g = guard(daily_loss_cap=0.0)
+    assert g.effective_daily_cap() == float("inf")
+    g.on_settle("r1", -5.0)
+    assert not g.state.halted
+    assert g.check("r2")[0]
+
+
+def test_percentage_daily_cap_keeps_its_meaning_as_the_account_grows():
+    """The point of the switch: one rule that means the same at every size."""
+    b = {"v": 76.0}
+    g = guard(daily_loss_cap=0.0, daily_loss_cap_pct=0.45,
+              bankroll=lambda: b["v"])
+    assert g.effective_daily_cap() == pytest.approx(34.2)    # ~ the old $35
+    b["v"] = 1000.0
+    assert g.effective_daily_cap() == pytest.approx(450.0)   # same 45%
+
+
 def test_percentage_daily_cap_is_honoured_when_seeding_after_a_restart():
     g = guard(daily_loss_cap_pct=0.05, bankroll=lambda: 40.0)   # cap $2.00
     g.seed_daily(-2.50)

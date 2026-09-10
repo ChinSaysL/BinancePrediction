@@ -284,16 +284,29 @@ class Settings(BaseSettings):
     max_basis_usd: float = 60.0
 
     # --- risk --------------------------------------------------------------
-    # Daily cap: 3 losing trades at $10 = $30, a 4th would be -$40, so the
-    # -$35 cap halts during the 4th consecutive loser.
-    daily_loss_cap_usdt: float = 35.0
-    # Percentage-of-bankroll alternative: the day halts at the FIRST of the
-    # absolute cap and pct * bankroll (measured against the CURRENT bankroll,
-    # so it tightens as the account shrinks). 0.0 = off.
-    # Mind the interaction with the stake size: at a 5% stake a 5% cap halts
-    # after a single full loss, so a useful value is several stakes wide
-    # (15-20%), otherwise the loss-streak halt is the binding rule anyway.
-    daily_loss_cap_pct: float = 0.0
+    # Daily stop as a FRACTION of the bankroll: the day halts once cumulative
+    # PnL reaches -pct * bankroll, measured against the CURRENT bankroll, so it
+    # tightens as the account shrinks and -- with the intraday equity refresh
+    # in main.Bot._refresh_bankroll -- also grows with the account.
+    #
+    # The percentage is the primary rule because a fixed dollar stop does not
+    # mean the same thing at two account sizes. The old -$35 was ~46% of a $76
+    # account (a real brake, if a loose one) but only 3.5% of a $1,000 one,
+    # where it would trip on the second loser and sit the day out. 0.45 is
+    # chosen to reproduce that -$35 at today's $76 bankroll ($34.42), so this
+    # is a change of UNITS rather than of behaviour: today's risk is unchanged,
+    # but the stop keeps its meaning as the account scales.
+    #
+    # Sized against the stake: at 4% per trade the stop is ~11 stakes wide, so
+    # the 5-consecutive-loss rule normally fires first and this catches the
+    # choppy days that never string five together. It is a catastrophe brake,
+    # not a profit optimiser -- tightening it was tested (tools/sizing_experiments)
+    # and bought no reduction in the tail, only fewer trades.
+    daily_loss_cap_pct: float = 0.45
+    # Optional dollar CEILING on top of the percentage, for an account large
+    # enough that 45% is an unacceptable absolute loss. It participates in the
+    # same min(), and 0.0 = off, so at $76 the percentage alone binds.
+    daily_loss_cap_usdt: float = 0.0
     max_consecutive_losses: int = 5
     max_open_rounds: int = 1
 
