@@ -770,17 +770,35 @@ was redone on the whole evaluated population instead of the trades
   live drift (scale 0.5)  -0.068 (2.9 s)   -0.009        -0.085 at 0.75-0.95
   drift (scale 1.5)       -0.111 (4.6 s)   -0.022        -0.135 at 0.75-0.95
 
-514 BTC rounds / ~24k ticks, replicated on 444 ETH rounds / ~19k ticks. The shape
-matters: it is not "P(Up) too high" but OVER-CONFIDENCE — a fan that under-claims
-low probabilities (+0.056 at 0.05-0.25) and over-claims high ones — and it grows
-with the drift the model is told to trust (-0.068 at scale 0.5, -0.111 at 1.5).
-The prototype built to fix Up was the cause, not the cure; the driftless model is
-calibrated to within 1 sigma in every band on both assets. `.env` had overridden
-the config default of `digital`, so the fix was to stop overriding it.
+514 BTC rounds / ~24k ticks, replicated on 444 ETH rounds / ~19k ticks. Re-run
+later the same evening on the fuller recording (666 BTC rounds / ~44k ticks) and
+the verdict sharpens rather than moves:
+
+  model                   band 0.5-0.95    all ticks    by band
+  driftless (digital)     -0.040 (2.0 s)   -0.002 (0.1s) +0.010/-0.006/-0.020
+  live drift (scale 0.5)  -0.072 (3.5 s)   -0.007       -0.080 at 0.75-0.95
+  drift (scale 1.5)       -0.115 (5.4 s)   -0.018       -0.135 at 0.75-0.95
+
+The shape matters: it is not "P(Up) too high" but OVER-CONFIDENCE — a fan that
+under-claims low probabilities (+0.049 at 0.05-0.25) and over-claims high ones —
+and it grows with the drift the model is told to trust (-0.072 at scale 0.5,
+-0.115 at 1.5). The prototype built to fix Up was the cause, not the cure; the
+driftless model is calibrated to within 1 sigma in every band. `.env` had
+overridden the config default of `digital`, so the fix was to stop overriding it.
+
+**Cross-checked independently against klines** (`tools/backtest_calibration
+--days 10`: 2,879 synthetic rounds, out-of-sample rolling sigma, no venue quotes
+and no selection): reliability 0.0011 at every decision mark, skill +11.5% at
+t=1m rising to +38.6% at t=3m. It agrees, with one mild exception worth naming:
+the top of the range over-claims (0.8-0.9 claimed 0.844 vs 0.739 actual, 0.9-1.0
+claimed 0.947 vs 0.843 at t=1m) and the bottom under-claims. That is ordinary
+normal-tail optimism, and it is exactly why `max_quote=0.90` exists -- the cap
+is validated by this, not contradicted by it.
 
 Do not read this as "Up now makes money": the replay's SELECTED Up trades are
 still negative (14 trades, -$4.0) and live Up is 52 trades WR 0.56, -$3.18.
-Calibration was necessary, not sufficient.
+Calibration was necessary, not sufficient. The tradeable-band slice of the
+driftless model sits at -0.040 (2.0 sigma) -- borderline, watched, not acted on.
 
 **`up_regime_gate` re-tested** (`tools/gate_sweep.py`), now that Up is priced by
 the calibrated model: it moves 0-1 trade out of 14 and 0.01+ is identical to OFF.
