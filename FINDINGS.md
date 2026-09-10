@@ -968,3 +968,54 @@ Operational notes, because they cost time once already:
     host (mode paper, UP_MODEL=drift_digital, writing into the LIVE db). It has
     been stopped, disabled and kept at `/root/btcpredict-paper.service.old`.
     It had added no rows.
+
+## Shipped: honest pricing is now the live config (2026-09-10)
+
+The best version the historical data supports is now live. It is the honest
+pricing from the previous section, with one knob fixed that I had got wrong.
+
+**The haircut was being applied twice.** `edge_haircut` (0.85) shrinks the
+model's disagreement toward the quote before the gate believes any of it. But
+`calibrated`/`calibrated_down` ARE that shrink, fitted: their b_disc terms are
+the measured share of the disagreement that is real (0.10 and 0.06). Running
+them under a 0.85 haircut shrank an already-shrunk edge, and the gate then
+demanded 0.02 of what was left. With `edge_haircut = 1.0` the same signals come
+through at twice the realised value:
+
+| config | train | test |
+|---|---|---|
+| incumbent (digital both sides, bar 0.12) | 35 trades, +0.388/$1, t 1.89 | 18 trades, **-0.045/$1, t -0.17** |
+| honest, haircut 0.85, bar 0.02 (paper run) | 365 trades, +0.009/$1, t 0.26 | 246 trades, +0.011/$1, t 0.26 |
+| **honest, haircut 1.00, bar 0.01 (SHIPPED)** | 366 trades, +0.017/$1, t 0.49 | 247 trades, **+0.026/$1, t 0.63** |
+
+The incumbent is the best config on the first 60% of rounds and negative on the
+last 40%; the honest config is positive on both and *better* out of sample than
+in it. That is the whole reason for the switch, and it is also the honest limit
+of the claim: +0.026/$1 at t 0.63 is not a demonstrated edge, it is the best
+estimate available.
+
+Live `.env` now:
+
+    pricing_model=calibrated_down     up_model=calibrated
+    edge_haircut=1.0                  min_edge=0.01
+    min_quote=0.50                    stake_fraction=0.02
+
+Revert is `cp .env.bak-2026-09-10 .env && systemctl restart btcpredict`.
+Abort condition: if EV/$1 by side or in total is <= 0 after ~1,000 settled
+trades, the honest pricing is wrong too and the revert goes in.
+
+**The risk is not small and the account size is what sets it.** The honest
+config takes a position in ~90% of rounds: ~260 trades/day against the previous
+~44. Sizing is a fraction of bankroll, and `stake_for_fraction` SKIPS rather
+than rounds up when the fraction cannot reach the venue minimum -- so the
+venue's $1 order minimum is a hard floor of 1.5% of a $66 account, and the
+smallest defensible bet is the smallest bet available. At 2% stakes the
+expectation is roughly +0.026 x 260 x 0.02 ~ +13%/day if the edge is real, with
+a daily standard deviation of about 0.02 x 1.2 x sqrt(260) ~ 39%. If the edge is
+zero that is a 260-trade-a-day coin flip, bounded only by the 20% daily stop and
+the 5-loss halt (which will now fire every few days: 260 x 0.28^5 x 0.72 ~ 0.3
+expected runs a day). Everything about this is a bet on a t 0.63 estimate.
+
+The paper instance (`btcpredict-paper.service`) has been stopped: with live
+running the same pricing there is nothing left to compare it against, and two
+instances polling the same book only risks rate limits.
