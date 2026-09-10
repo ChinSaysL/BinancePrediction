@@ -258,7 +258,6 @@ class Bot:
         if time.time() - self._last_vol_refresh < 60.0:
             return
         try:
-            import math
             for sym, v in self.vols.items():
                 klines = await fetch_klines(self.session, "1m", 5, symbol=sym)
                 for k in klines[:-1]:      # skip the still-forming bar
