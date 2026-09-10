@@ -95,19 +95,35 @@ def evaluate(
     max_quote: float = 0.90,
     min_quote: float = 0.0,
     min_edge: float = 0.0,
+    edge_haircut: float = 1.0,
 ) -> Signal:
     """Pick the better side, if either clears its hurdle.
 
     Both sides are evaluated independently rather than assuming they are
     complementary: quotes are quantized to 0.01 and need not sum to exactly 1.
+
+    `edge_haircut` scales the model's disagreement with the venue before any
+    of it is believed: p_used = q + haircut * (p_model - q). Measured on 31h of
+    recorded btc-5m quotes, only part of the claimed edge is ever realised, and
+    the shortfall GROWS with the claim -- at a claimed edge of 0.03-0.06 the
+    realised edge was +0.005, at 0.09-0.12 it was +0.064 against a claim of
+    ~0.10. A flat `safety_margin` cannot express that, because the error is
+    proportional to the claim rather than constant. The haircut feeds the EV
+    and therefore Kelly as well as the gate: sizing off an inflated probability
+    overbets, which is the expensive half of the mistake.
+
+    1.0 disables it. See config.edge_haircut for why the default is not fitted.
     """
     fair_down = 1.0 - fair_up
     candidates = []
-    for side, p, q in (("Up", fair_up, quote_up), ("Down", fair_down, quote_down)):
+    for side, p_model, q in (("Up", fair_up, quote_up),
+                             ("Down", fair_down, quote_down)):
         # A missing quote (one side of the book empty) is not tradeable, and must
         # not raise -- callers pass straight through from feed data.
         if q is None or not 0.0 < q < 1.0:
             continue
+        # Believe only `edge_haircut` of the disagreement with the venue.
+        p = q + edge_haircut * (p_model - q)
         # Crossing the spread means paying above the displayed price.
         q_eff = min(0.999, q + half_spread)
         # The venue's fee depends on the price paid, so it is derived per

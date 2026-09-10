@@ -23,6 +23,12 @@ class Fill:
     order_id: str
     ts_ms: int
     raw: str = ""
+    token_id: str = ""
+    # The order was placed (HTTP 200 + orderId) but order-history could not
+    # confirm its status. The venue returns 200 even for FOK orders that fail,
+    # so such a fill is provisional: settle() re-verifies and may void it.
+    unverified: bool = False
+    unverified_checks: int = 0
 
     @property
     def max_payout(self) -> float:
@@ -37,6 +43,9 @@ class Settlement:
     payout: float
     pnl: float
     ts_ms: int
+    # True when the fill turned out to be phantom: the venue never filled the
+    # order, so nothing was staked and the recorded pnl is zero by design.
+    void: bool = False
 
 
 @runtime_checkable

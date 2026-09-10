@@ -27,7 +27,7 @@ from btcpredict.calibration.report import PnLSummary
 from btcpredict.config import MARKETS, settings
 from btcpredict.edge.signal import FeeModel, evaluate, kelly_stake
 from btcpredict.execution.base import Fill
-from btcpredict.execution.live import LiveBroker
+from btcpredict.execution.live import RETRYABLE_FAILURES, LiveBroker
 from btcpredict.execution.paper import PaperBroker
 from btcpredict.feeds.binance_spot import SpotFeed, fetch_klines
 from btcpredict.feeds.market_feed import MarketFeed, Round
@@ -169,6 +169,7 @@ class Bot:
         rows = self.store.query(
             "SELECT s.pnl, s.ts_ms FROM settlements s "
             "JOIN fills f ON f.id = s.fill_id WHERE f.mode = 'live' "
+            "AND COALESCE(s.void, 0) = 0 "
             "ORDER BY s.ts_ms DESC LIMIT 50")
         pnl = sum(r["pnl"] for r in rows
                   if time.strftime("%Y-%m-%d", time.gmtime(r["ts_ms"] / 1000)) == today)
@@ -309,6 +310,7 @@ class Bot:
             max_quote=settings.max_quote,
             min_quote=settings.min_quote,
             min_edge=settings.min_edge,
+            edge_haircut=settings.edge_haircut,
         )
 
         # A signal must hold for several consecutive polls. A one-tick edge is
@@ -337,6 +339,10 @@ class Bot:
                        if settings.trade_on_candle_open else settings.min_tau_s)
         if sig.act and streak < settings.signal_persistence:
             gate_reason = f"signal held {streak}/{settings.signal_persistence} polls"
+        elif (settings.side_filter != "both"
+              and sig.act and sig.side != settings.side_filter):
+            gate_reason = (f"side {sig.side} filtered "
+                           f"(trading {settings.side_filter} only)")
         elif (settings.trade_on_candle_open
               and sec_into_candle(now_ms) >= settings.candle_open_window_s):
             gate_reason = (f"mid-candle ({sec_into_candle(now_ms)}s past open; "
@@ -402,56 +408,9 @@ class Bot:
 
         token = up.token_id if sig.side == "Up" else down.token_id
 
-        # Re-check against a live quote before committing. The venue's fee is
-        # dynamic and its executable price can differ from the book, so the
-        # decision above used estimates. get-quote does not execute, so this
-        # costs nothing but a round trip -- and the quote is REUSED for the
-        # order itself so placing it costs no extra latency (quote TTL is ~5s).
-        quote = None
-        if self.broker.mode == "live":
-            quote = await self.broker.get_quote(token, stake)
-            if not quote:
-                self._order_cooldown_until = time.time() + 30.0
-                log.warning("no pre-trade quote for %s; skipping", r.slug)
-                return
-            real_px = float(quote.get("averagePrice") or sig.quote)
-            real_fee = float(quote.get("feeRateBps") or settings.fallback_fee_bps) / 10_000.0
-            recheck = evaluate(
-                fair_up, real_px if sig.side == "Up" else 1.0 - real_px,
-                1.0 - real_px if sig.side == "Up" else real_px,
-                fee=real_fee, half_spread=0.0,
-                safety_margin=settings.safety_margin, fee_model=FeeModel.NOTIONAL,
-                max_quote=settings.max_quote, min_quote=settings.min_quote,
-                min_edge=settings.min_edge)
-            if not (recheck.act and recheck.side == sig.side):
-                log.info("SKIP %s %s: real quote %.3f @ %d bps -> %s",
-                         r.slug, sig.side, real_px, int(real_fee * 10_000),
-                         recheck.reason)
-                return
-            log.info("pre-trade check ok: px=%.3f fee=%dbps ev/$=%+.4f",
-                     real_px, int(real_fee * 10_000), recheck.ev_per_dollar)
-
-        # Re-gate at execution time. The decision fired inside the open window,
-        # but the live quote recheck above costs a second or two of round trip;
-        # never let a fill land after the window has closed. Trades happen at
-        # the candle open or not at all.
-        if (self.broker.mode == "live" and settings.trade_on_candle_open):
-            sec = sec_into_candle(int(time.time() * 1000))
-            if sec >= settings.candle_open_window_s:
-                log.info("SKIP %s %s: slipped past candle open (%ds); order withheld",
-                         r.slug, sig.side, sec)
-                return
-
-        kw = {"quote": quote} if self.broker.mode == "live" else {}
-        fill = await self.broker.buy(slug=r.slug, side=sig.side, token_id=token,
-                                     price=sig.quote, stake=stake, **kw)
+        fill = await self._place_order(r, sig, fair_up=fair_up, token=token,
+                                       stake=stake)
         if not fill:
-            # Back off rather than re-firing every tick: a rejected order is
-            # almost always a persistent condition, and retrying at 1 Hz just
-            # hammers the venue for the rest of the round.
-            self._order_cooldown_until = time.time() + 30.0
-            log.warning("order failed for %s %s; pausing orders for 30s",
-                        r.slug, sig.side)
             return
         self.guard.on_open(r.slug)
         self.store.conn.execute("UPDATE decisions SET acted=1 WHERE id=?", (did,))
@@ -470,6 +429,99 @@ class Bot:
         log.info("OPEN %s %s stake=$%.2f @%.3f | %s | mkt_iv=%s realised=%.5f",
                  r.slug, fill.side, fill.stake, fill.filled_px, sig,
                  f"{iv:.5f}" if iv else "n/a", sigma)
+
+    async def _place_order(self, r, sig, *, fair_up: float, token: str,
+                           stake: float) -> Fill | None:
+        """Place one order, retrying a confirmed rejection a bounded number of times.
+
+        Returns the fill, or None when the order could not be placed -- having
+        set the order cooldown if the failure was an actual rejection rather
+        than a gate refusing to trade.
+        """
+        # A FOK order fails whenever the book moves between the quote and the
+        # execution, and that is a transient miss rather than a reason to give
+        # up the round -- so make a bounded number of attempts. Each one redoes
+        # the whole pre-trade path: a spent quoteId cannot be re-sent, and both
+        # the edge and the candle-open window can evaporate in the second or
+        # two a failed attempt costs.
+        attempts = max(1, settings.order_max_attempts)
+        fill = None
+        for attempt in range(attempts):
+            if attempt:
+                await asyncio.sleep(settings.order_retry_delay_s)
+
+            # Re-check against a live quote before committing. The venue's fee is
+            # dynamic and its executable price can differ from the book, so the
+            # decision above used estimates. get-quote does not execute, so this
+            # costs nothing but a round trip -- and the quote is REUSED for the
+            # order itself so placing it costs no extra latency (quote TTL is ~5s).
+            quote = None
+            if self.broker.mode == "live":
+                quote = await self.broker.get_quote(token, stake)
+                if not quote:
+                    log.warning("no pre-trade quote for %s (attempt %d/%d)",
+                                r.slug, attempt + 1, attempts)
+                    continue
+                real_px = float(quote.get("averagePrice") or sig.quote)
+                real_fee = float(quote.get("feeRateBps") or settings.fallback_fee_bps) / 10_000.0
+                recheck = evaluate(
+                    fair_up, real_px if sig.side == "Up" else 1.0 - real_px,
+                    1.0 - real_px if sig.side == "Up" else real_px,
+                    fee=real_fee, half_spread=0.0,
+                    safety_margin=settings.safety_margin, fee_model=FeeModel.NOTIONAL,
+                    max_quote=settings.max_quote, min_quote=settings.min_quote,
+                    min_edge=settings.min_edge,
+                    edge_haircut=settings.edge_haircut)
+                if not (recheck.act and recheck.side == sig.side):
+                    # The edge is gone at the live price. Retrying would only
+                    # be chasing a trade the gate has already refused.
+                    log.info("SKIP %s %s: real quote %.3f @ %d bps -> %s",
+                             r.slug, sig.side, real_px, int(real_fee * 10_000),
+                             recheck.reason)
+                    return
+                log.info("pre-trade check ok: px=%.3f fee=%dbps ev/$=%+.4f",
+                         real_px, int(real_fee * 10_000), recheck.ev_per_dollar)
+
+            # Re-gate at execution time. The decision fired inside the open window,
+            # but the live quote recheck above costs a second or two of round trip
+            # -- and so does every retry; never let a fill land after the window
+            # has closed. Trades happen at the candle open or not at all.
+            if (self.broker.mode == "live" and settings.trade_on_candle_open):
+                sec = sec_into_candle(int(time.time() * 1000))
+                if sec >= settings.candle_open_window_s:
+                    log.info("SKIP %s %s: slipped past candle open (%ds); order withheld",
+                             r.slug, sig.side, sec)
+                    return
+
+            kw = {"quote": quote} if self.broker.mode == "live" else {}
+            fill = await self.broker.buy(slug=r.slug, side=sig.side, token_id=token,
+                                         price=sig.quote, stake=stake, **kw)
+            if fill:
+                break
+
+            # Only retry a failure the venue confirmed. Anything else -- a
+            # timeout or a 5xx on place-order, a status we could not read --
+            # may have left a live order behind, and placing a second one
+            # would double the exposure. Brokers that report no reason (paper,
+            # whose rejections are deterministic anyway) stop here too.
+            reason = getattr(self.broker, "last_failure", None)
+            if reason not in RETRYABLE_FAILURES:
+                log.error("order failed for %s %s (%s); not retrying",
+                          r.slug, sig.side, reason or "outcome unknown")
+                break
+            log.warning("order attempt %d/%d failed for %s %s (%s)",
+                        attempt + 1, attempts, r.slug, sig.side, reason)
+
+        if not fill:
+            # Back off rather than re-firing every tick: a rejection that
+            # survives every attempt is almost always a persistent condition,
+            # and retrying at 1 Hz just hammers the venue for the rest of the
+            # round.
+            self._order_cooldown_until = time.time() + settings.order_cooldown_s
+            log.warning("order failed for %s %s after %d attempt(s); "
+                        "pausing orders for %.0fs",
+                        r.slug, sig.side, attempt + 1, settings.order_cooldown_s)
+        return fill
 
     # -- settlement ---------------------------------------------------------
     async def backfill_settlements(self, limit: int = 5) -> int:
@@ -511,11 +563,20 @@ class Bot:
             if not winner:
                 continue      # not resolved yet; try again next tick
             s = await self.broker.settle(fill, winner)
+            if s is None:
+                continue      # unverified and still unreadable; retry next tick
             self.store.insert("settlements", {
                 "fill_id": fid, "slug": slug, "ts_ms": s.ts_ms,
                 "won": int(s.won), "payout": s.payout, "pnl": s.pnl,
-                "mode": self.broker.mode,
+                "mode": self.broker.mode, "void": int(s.void),
             })
+            if s.void:
+                # The venue never filled the order: no stake was deployed, so
+                # there is no PnL, no guard update, and nothing to redeem.
+                log.warning("SETTLE %s VOID: order never filled at the venue "
+                            "(phantom fill dropped)", slug)
+                del self.open_fills[slug]
+                continue
             self.guard.on_settle(slug, s.pnl)
             self.pnl.add(s.pnl, fill.stake, fill.fee_paid, s.won)
             del self.open_fills[slug]

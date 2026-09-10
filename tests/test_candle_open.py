@@ -30,8 +30,9 @@ def test_gate_window_setting_shape():
     # Candle indexes are minutes remaining at the open: 1..4.
     assert settings.trade_candle_opens
     assert set(settings.trade_candle_opens) <= {1, 2, 3, 4}
-    # Replay-tested edge floor for the price-catcher: 0.08 is the winner.
-    assert 0.05 < settings.min_edge < 0.12
+    # Replay-tested edge floor for the price-catcher. Live (2026-09-10):
+    # Down-only + h=0.85 + 0.12 -> +$19.34, mdd -$1.35, CI entirely > 0.
+    assert 0.05 < settings.min_edge <= 0.15
     # Replay-tested quote floor: cheap longshots carry the highest observed
     # fees (180 bps below px 0.50) and the <0.25 band lost money on the recording.
     assert 0.20 <= settings.min_quote <= 0.30

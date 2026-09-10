@@ -105,7 +105,8 @@ CREATE TABLE IF NOT EXISTS settlements (
     won         INTEGER,
     payout      REAL,
     pnl         REAL,
-    mode        TEXT
+    mode        TEXT,
+    void        INTEGER DEFAULT 0   -- 1: order never filled; no PnL is real
 );
 CREATE INDEX IF NOT EXISTS idx_settlements_slug ON settlements(slug);
 """
@@ -131,6 +132,9 @@ class Store:
                          ("fee_rate_bps", "INTEGER")):
             if col not in have:
                 self.conn.execute(f"ALTER TABLE quotes ADD COLUMN {col} {typ}")
+        shave = {r["name"] for r in self.conn.execute("PRAGMA table_info(settlements)")}
+        if "void" not in shave:
+            self.conn.execute("ALTER TABLE settlements ADD COLUMN void INTEGER DEFAULT 0")
 
     # -- rounds -------------------------------------------------------------
     def upsert_round(self, r: dict[str, Any]) -> None:

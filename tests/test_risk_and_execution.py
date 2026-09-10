@@ -164,3 +164,139 @@ def test_live_order_uses_the_verified_parameter_values():
     src = inspect.getsource(live.LiveBroker.buy)
     assert '"timeInForce": "FOK"' in src
     assert live.LiveBroker(None, "k", "s").account_type == "SPOT"
+
+
+# -- order retries ---------------------------------------------------------
+class _StubBroker:
+    """Live-shaped broker whose buy() replays a scripted list of outcomes."""
+
+    mode = "live"
+
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.last_failure = None
+        self.buys = 0
+        self.quotes = 0
+
+    async def get_quote(self, token_id, stake, side="BUY"):
+        self.quotes += 1
+        return {"quoteId": f"q{self.quotes}", "averagePrice": 0.57,
+                "feeRateBps": 60, "expireAt": 0}
+
+    async def buy(self, *, slug, side, token_id, price, stake, quote=None):
+        self.buys += 1
+        outcome = self.outcomes.pop(0)
+        if outcome == "fill":
+            self.last_failure = None
+            from btcpredict.execution.base import Fill
+            return Fill(slug=slug, side=side, requested_px=price, filled_px=0.57,
+                        shares=stake / 0.57, stake=stake, fee_paid=0.06,
+                        order_id=f"o{self.buys}", ts_ms=0)
+        self.last_failure = outcome
+        return None
+
+
+class _Sig:
+    """The signal from the live log: Down at 0.570 with the model at P(up)=0.28."""
+
+    act, side, quote, fair, edge = True, "Down", 0.57, 0.72, 0.10
+
+
+class _Round:
+    slug = "btc-updown-5m-1788968400"
+
+
+def _bot(broker):
+    from btcpredict.main import Bot
+    bot = Bot.__new__(Bot)
+    bot.broker = broker
+    bot._order_cooldown_until = 0.0
+    return bot
+
+
+def _place(broker):
+    bot = _bot(broker)
+    fill = asyncio.run(bot._place_order(_Round(), _Sig(), fair_up=0.28,
+                                        token="tok", stake=10.0))
+    return bot, fill
+
+
+def test_a_venue_rejection_is_retried_until_it_fills(monkeypatch):
+    """A FOK failure is the book moving mid-flight, not a reason to skip the round.
+
+    This is the bug from the live log: order FAILED on the venue and the bot
+    went straight to a 30s pause instead of re-quoting.
+    """
+    from btcpredict.config import settings
+    monkeypatch.setattr(settings, "order_retry_delay_s", 0.0)
+    monkeypatch.setattr(settings, "order_max_attempts", 3)
+    # These exercise the retry path, not the edge gate: keep the stub's signal
+    # qualifying regardless of what the live haircut is set to.
+    monkeypatch.setattr(settings, "edge_haircut", 1.0)
+
+    b = _StubBroker(["venue_failed", "fill"])
+    bot, fill = _place(b)
+
+    assert fill is not None
+    assert b.buys == 2
+    # A fresh quote per attempt: the first quoteId is spent and cannot be re-sent.
+    assert b.quotes == 2
+    assert bot._order_cooldown_until == 0.0      # it filled; no backoff
+
+
+def test_retries_are_bounded_and_then_cool_down(monkeypatch):
+    from btcpredict.config import settings
+    monkeypatch.setattr(settings, "order_retry_delay_s", 0.0)
+    monkeypatch.setattr(settings, "order_max_attempts", 3)
+    # These exercise the retry path, not the edge gate: keep the stub's signal
+    # qualifying regardless of what the live haircut is set to.
+    monkeypatch.setattr(settings, "edge_haircut", 1.0)
+
+    b = _StubBroker(["venue_failed"] * 3)
+    bot, fill = _place(b)
+
+    assert fill is None
+    assert b.buys == 3
+    assert bot._order_cooldown_until > 0.0
+
+
+def test_an_unknown_outcome_is_never_retried(monkeypatch):
+    """The order may be live on the venue; a second one would double the stake."""
+    from btcpredict.config import settings
+    monkeypatch.setattr(settings, "order_retry_delay_s", 0.0)
+    monkeypatch.setattr(settings, "order_max_attempts", 3)
+    # These exercise the retry path, not the edge gate: keep the stub's signal
+    # qualifying regardless of what the live haircut is set to.
+    monkeypatch.setattr(settings, "edge_haircut", 1.0)
+
+    b = _StubBroker(["unknown", "fill"])
+    bot, fill = _place(b)
+
+    assert fill is None
+    assert b.buys == 1
+    assert bot._order_cooldown_until > 0.0
+
+
+def test_live_broker_labels_a_terminal_venue_status_as_retryable():
+    from btcpredict.execution import live
+
+    b = live.LiveBroker(None, "k", "s", wallet_address="w", wallet_id="1")
+
+    async def quote(*a, **kw):
+        return {"quoteId": "q1", "amountOut": to_wei(17.5),
+                "feeAmount": to_wei(0.1), "averagePrice": 0.57, "expireAt": 0}
+
+    async def request(method, path, params):
+        return {"orderId": "26090900001873335541"}
+
+    async def status(order_id, **kw):
+        return "FAILED"
+
+    b.get_quote = quote
+    b._request = request
+    b._order_status = status
+    fill = asyncio.run(b.buy(slug="s", side="Down", token_id="t",
+                             price=0.57, stake=10.0))
+    assert fill is None
+    assert b.last_failure == "venue_failed"
+    assert b.last_failure in live.RETRYABLE_FAILURES

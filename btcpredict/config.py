@@ -53,16 +53,30 @@ class Settings(BaseSettings):
 
     # --- sizing ------------------------------------------------------------
     # Order size. With min_order == stake, fractional-Kelly values below the
-    # minimum fall back to this, so $6 means a flat $6 on every trade.
-    stake_usdt: float = 6.0
-    max_stake_usdt: float = 6.0
-    min_order_usdt: float = 6.0
+    # minimum fall back to this, so $10 means a flat $10 on every trade.
+    stake_usdt: float = 10.0
+    max_stake_usdt: float = 10.0
+    min_order_usdt: float = 10.0
     kelly_fraction: float = 0.25
     # Venue tolerance on price movement between quote and fill. 100 bps was
     # producing FOK failures ("Failed to execute the market order") when the
     # book moved mid-flight; 300 bps cuts those while the 0.08 edge floor
     # still leaves room for a 3% slip on a winning trade.
     slippage_bps: int = 300
+    # A FOK order that fails is usually just the book moving between the quote
+    # and the execution -- transient, and worth one more shot with a FRESH
+    # quote rather than sitting out the round. Total attempts per decision,
+    # including the first; 1 disables retrying. Each attempt costs a quote plus
+    # an order round trip (~2s), so 3 is what fits inside a 10s candle-open
+    # window. Retries only ever follow a failure the venue confirmed, never an
+    # order whose outcome is unknown (see execution/live.RETRYABLE_FAILURES).
+    order_max_attempts: int = 3
+    # Small pause between attempts: re-quoting into the same instant that just
+    # failed tends to fail the same way.
+    order_retry_delay_s: float = 0.75
+    # Backoff after all attempts are spent, so a persistent rejection cannot
+    # re-fire on every 1 Hz tick for the rest of the round.
+    order_cooldown_s: float = 30.0
     # Kelly sizes against this. Kept explicit rather than derived from the stake,
     # so raising the bankroll is one edit and sizing scales as intended.
     bankroll_usdt: float = 40.0
@@ -89,23 +103,61 @@ class Settings(BaseSettings):
     # +$7.66 at 0.15, +$5.90 at 0.35 on the 94-round recording).
     min_quote: float = 0.25
     # Replay evidence under the measured fee curve (backtest_candle_open,
-    # 100-round recording): the winning variant is the ungated price-catcher --
-    # no candle-open requirement, a BIG edge floor instead. 0.08: +$14.52 on 31
-    # trades, WR 0.71, bootstrap 95% CI [+1.64, +27.85] (excludes zero).
-    # 0.05 gated: +$10.74, CI spans zero. Small edges are noise; big edges are
-    # the quote lag, and they can appear at any second.
-    min_edge: float = 0.08
+    # BTC-only): the winning variant is the ungated price-catcher -- no
+    # candle-open requirement, a BIG edge floor instead. Small edges are
+    # noise; big edges are the quote lag, and they can appear at any second.
+    # BTC-only joint re-tune (471 rounds, 2026-09-10): live runs min_edge 0.12
+    # with edge_haircut 0.85 and side_filter Down (set in .env): +$19.34,
+    # mdd -$1.35, WR 0.80, halves +8.42/+10.91, bootstrap CI [+7.35,+31.50].
+    min_edge: float = 0.09
+    # Fraction of the model's disagreement with the venue that is treated as
+    # real: p_used = quote + edge_haircut * (fair - quote).
+    #
+    # NOT a fitted constant, on purpose. Measured on 31h of btc-5m recordings
+    # the realised edge is roughly half the claimed edge (claimed 0.096 ->
+    # realised 0.061 in the first half of the window, +0.007 in the second),
+    # but every band's 95% CI spans zero once errors are clustered by round,
+    # and the two halves are not statistically distinguishable. So 0.5 is a
+    # deliberate safety haircut, not an estimate: the sign of the bias is
+    # solid (every band, both halves, the model claims more than it delivers),
+    # the magnitude is not. min_edge is set against the HAIRCUT edge, so
+    # changing this knob alone changes which trades qualify.
+    #
+    # DEFAULT IS 0.5 (a deliberate safety haircut, not a fitted constant).
+    # Measured on 31h of live btc-5m recordings the realised edge is roughly
+    # half the claimed edge, so believing half of the disagreement is the
+    # conservative choice. min_edge is compared against the HAIRCUT edge: with
+    # min_edge 0.09, a haircut of 0.5 demands a raw edge of 0.18 and cuts the
+    # replayed trade count from ~155 to ~13 (WR 0.77, mdd -$1.07, both halves
+    # positive). 0.7 is the more-active compromise (56 trades, mdd -$5.09).
+    # Always change the pair together: 0.5 with min_edge 0.045 reproduces the
+    # haircut-off selection exactly.
+    edge_haircut: float = 1.0
+    # Which sides to trade. "both" is the neutral default; the live choice is
+    # "Down" (set in .env). Evidence (BTC-only, measured fee curve): across
+    # every configuration and BOTH chronological halves, Up trades are where
+    # the money is lost -- old 0.08/4/240: Up -11.07 vs Down +13.54; 0.09/2/210:
+    # first half Up +0.73 vs Down +25.52, second half Up -6.62 vs Down +2.13.
+    # The venue's Up side is persistently rich relative to the model (the crowd
+    # is long-biased), so the model's Up edge is an illusion more often than
+    # not. Down-only keeps the first half's PnL and turns the losing second
+    # half positive: n=95, WR 0.60, +$26.46, mdd -$9.05, halves +23.38 / +3.08,
+    # bootstrap 95% CI [+2.41, +50.97] -- the first CI here to exclude zero.
+    side_filter: Literal["both", "Up", "Down"] = "both"
     # The market beats us in 88% of rounds inside the final minute (p<0.0001).
     # Trading there is a measured loss, so the window starts at 60s.
     min_tau_s: float = 60.0
-    max_tau_s: float = 240.0
+    # BTC-only joint re-tune (366 rounds): with persistence=2 the tau-210 cut
+    # beats 240 (+$29.18 vs +$18.69 at 0.08 edge) -- the newest candle's first
+    # 30s (candle 4 at tau 240-210) is the only losing slice on clean data.
+    max_tau_s: float = 210.0
     # An edge must survive this many consecutive polls before we act: a
     # single-tick edge is usually our own stale data, not a real dislocation.
-    # Re-tune on 296 rounds (2026-09-09): 4 -> +$16.84 (WR 0.72, mdd -3.3) vs
-    # 2 -> +$11.75 (WR 0.61, mdd -11.9). The overnight losses were exactly the
-    # marginal trades persistence 2 admits and 4 skips. Both split halves
-    # positive, bootstrap CI [+0.9, +32.5].
-    signal_persistence: int = 4
+    # BTC-only re-tune (366 rounds, 2026-09-09): 2 beats 4 on clean data
+    # (the old persistence-4 tune was run with ETH mixed into the replay,
+    # inflating it). 0.09/2/210: +$25.31, mdd -$5.58, both halves positive
+    # (+$17.32 / +$7.99); 0.09/3/210's newest half is already negative.
+    signal_persistence: int = 2
 
     # --- execution timing ---------------------------------------------------
     # OFF: the candle-open gate lost to the price-catcher on every robustness
@@ -129,9 +181,9 @@ class Settings(BaseSettings):
     max_basis_usd: float = 60.0
 
     # --- risk --------------------------------------------------------------
-    # Daily cap: 3 losing trades at $6 = $18, a 4th would be -$24, so the
-    # -$20 cap halts after 3 full losers (plus part of a 4th).
-    daily_loss_cap_usdt: float = 20.0
+    # Daily cap: 3 losing trades at $10 = $30, a 4th would be -$40, so the
+    # -$35 cap halts during the 4th consecutive loser.
+    daily_loss_cap_usdt: float = 35.0
     max_consecutive_losses: int = 5
     max_open_rounds: int = 1
 

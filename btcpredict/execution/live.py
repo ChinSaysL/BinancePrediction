@@ -71,6 +71,14 @@ class LiveBrokerError(RuntimeError):
     pass
 
 
+# `buy()` failure reasons for which the venue is KNOWN to hold no order, so
+# placing again cannot double the exposure. Anything else -- a timeout, a 5xx,
+# a status we could not read -- may have left a live order behind and must
+# never be re-placed. See `LiveBroker.last_failure`.
+RETRYABLE_FAILURES = frozenset({"no_quote", "quote_expired", "rejected",
+                                "venue_failed"})
+
+
 class LiveBroker:
     mode = "live"
 
@@ -86,6 +94,13 @@ class LiveBroker:
         self.account_type = account_type
         self.slippage_bps = slippage_bps
         self.recv_window = recv_window
+        # Why the most recent `buy()` returned None, so the caller can tell a
+        # safe-to-retry rejection from an unknown outcome (see
+        # RETRYABLE_FAILURES). Only one order is ever in flight at a time
+        # (max_open_rounds == 1), so a single field per broker is enough.
+        self.last_failure: str | None = None
+        self._transport_error = False
+        self._last_status = 0
 
     @property
     def enabled(self) -> bool:
@@ -108,17 +123,23 @@ class LiveBroker:
 
     async def _request(self, method: str, path: str, params: dict) -> dict | None:
         url = f"{BASE}{path}?{self._sign(params)}"
+        self._transport_error = False
+        self._last_status = 0
         try:
             async with self.session.request(
                 method, url, headers={"X-MBX-APIKEY": self.api_key},
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as r:
                 body = await r.json(content_type=None)
+                self._last_status = r.status
                 if r.status != 200:
                     log.error("live %s %s -> HTTP %s: %s", method, path, r.status, body)
                     return None
                 return body
         except Exception as e:
+            # The request may still have reached the venue. For an order that
+            # means the outcome is UNKNOWN, never "it did not happen".
+            self._transport_error = True
             log.error("live %s %s failed: %s: %s", method, path, type(e).__name__, e)
             return None
 
@@ -210,6 +231,7 @@ class LiveBroker:
                   quote: dict | None = None) -> Fill | None:
         if not self.enabled:
             raise LiveBrokerError("wallet not configured; call discover_wallet() first")
+        self.last_failure = None
 
         # A quote may be supplied by the caller (the pre-trade recheck already
         # fetched one). Using it avoids a second round trip that eats into the
@@ -217,6 +239,7 @@ class LiveBroker:
         if quote is None:
             quote = await self.get_quote(token_id, stake)
         if not quote or not quote.get("quoteId"):
+            self.last_failure = "no_quote"
             log.error("no quote for %s %s stake=%.2f", slug, side, stake)
             return None
 
@@ -225,6 +248,7 @@ class LiveBroker:
         avg_px = float(quote.get("averagePrice") or price)
         expire_at = int(quote.get("expireAt") or 0)
         if expire_at and expire_at <= time.time() * 1000:
+            self.last_failure = "quote_expired"
             log.warning("quote %s already expired; skipping", quote["quoteId"])
             return None
 
@@ -241,6 +265,13 @@ class LiveBroker:
             "slippageBps": self.slippage_bps,
         })
         if not resp:
+            # A 4xx carries a venue error code (-1102, -3026, ...): the order
+            # was refused outright and nothing is live. A transport failure or
+            # a 5xx is different -- the order may have been accepted and we
+            # simply never saw the reply, so its outcome is unknown.
+            refused = (not self._transport_error
+                       and 400 <= self._last_status < 500)
+            self.last_failure = "rejected" if refused else "unknown"
             return None
 
         # The venue returns HTTP 200 + {orderId} even when the order FAILS to
@@ -253,6 +284,11 @@ class LiveBroker:
             log.warning("order %s placed but history unavailable; "
                         "proceeding unverified", order_id)
         elif status != "FILLED":
+            # A terminal non-FILLED status is authoritative: the venue took no
+            # position, so the caller may safely place a fresh order. FOK
+            # market orders land here whenever the book moves between the
+            # quote and the execution, which is transient.
+            self.last_failure = "venue_failed"
             log.error("order %s status=%s on venue; treating as failed (%s)",
                       order_id, status, slug)
             return None
@@ -268,9 +304,35 @@ class LiveBroker:
             order_id=str(resp.get("orderId") or resp.get("bundleId")
                          or quote["quoteId"]),
             ts_ms=int(time.time() * 1000), raw=str(resp)[:2000],
+            token_id=token_id,
+            # Status unreadable: the venue may or may not hold an order. The
+            # fill is provisional and settle() will re-verify and void it if
+            # the venue never actually filled anything.
+            unverified=(status is None),
         )
 
-    async def settle(self, fill: Fill, winner: str) -> Settlement:
+    async def settle(self, fill: Fill, winner: str) -> Settlement | None:
+        if getattr(fill, "unverified", False):
+            # The venue returns 200 + orderId even when a FOK order fails, so
+            # a fill booked without a confirmed status may be phantom. By
+            # settlement time the order-history has caught up: FILLED proves
+            # the position, any terminal-failure proves there never was one.
+            status = await self._order_status(fill.order_id)
+            if status is None:
+                fill.unverified_checks += 1
+                if fill.unverified_checks < 20:
+                    return None    # still unreadable; caller retries next tick
+                # Give up on history and ask the venue's position list: a
+                # claimable token for this position proves a real fill.
+                claimable = await self.claimable_token_ids()
+                if fill.token_id in claimable:
+                    status = "FILLED"
+            if status != "FILLED":
+                log.warning("unverified order %s status=%s; voiding fill for %s",
+                            fill.order_id, status, fill.slug)
+                return Settlement(slug=fill.slug, won=False, payout=0.0,
+                                  pnl=0.0, ts_ms=int(time.time() * 1000),
+                                  void=True)
         won = fill.side.lower() == (winner or "").lower()
         payout = fill.shares if won else 0.0
         return Settlement(slug=fill.slug, won=won, payout=payout,

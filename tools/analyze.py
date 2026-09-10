@@ -21,25 +21,68 @@ import math
 import statistics as st
 
 from btcpredict.calibration.report import (PnLSummary, reliability_table, score)
-from btcpredict.config import settings
+from btcpredict.config import MARKETS, settings
 from btcpredict.edge.signal import FeeModel, evaluate
 from btcpredict.pricing.digital import fair_value
 from btcpredict.store.db import Store
 
 BAR = "=" * 78
 
+# The recorder stores every market in MARKETS, but only the primary one is ever
+# traded. Mixing them silently corrupts every report here: the oracle chain
+# check paired an ETH round against the next BTC round and called it a data
+# fault, and the go/no-go priced ETH quotes with BTC's volatility. Reports are
+# therefore scoped to one market at a time.
+PRIMARY = MARKETS[0][0]
+
 
 def section(t: str) -> None:
     print(f"\n{BAR}\n{t}\n{BAR}")
 
 
-def basis_report(store: Store) -> None:
-    section("1. ORACLE vs SPOT BASIS")
+def market_prefixes(store: Store) -> list[str]:
+    """Every market prefix actually present in the recording."""
+    seen = {r["slug"].rsplit("-", 1)[0] for r in store.query("SELECT slug FROM rounds")}
+    return sorted(seen)
+
+
+def median_sigma(store: Store, market: str) -> float:
+    """1-minute sigma for `market`, as close to what the model saw as possible.
+
+    The primary market has `decisions.sigma_1m` written by the live estimator.
+    Other markets are recorded but never traded, so they have no decisions rows
+    and their sigma is estimated from their own spot series instead. Reusing the
+    primary's sigma for another market -- what this report used to do --
+    misprices every quote in it.
+    """
+    if market == PRIMARY:
+        vals = [r["sigma_1m"] for r in store.query(
+            "SELECT sigma_1m FROM decisions WHERE sigma_1m IS NOT NULL")]
+        if vals:
+            return st.median(vals)
+    seq: dict[str, list] = {}
+    for r in store.query("SELECT slug, ts_ms, spot FROM quotes "
+                         "WHERE spot IS NOT NULL AND slug LIKE ? ORDER BY ts_ms",
+                         (market + "%",)):
+        seq.setdefault(r["slug"], []).append((r["ts_ms"], r["spot"]))
+    rets = []
+    for s_ in seq.values():
+        for (t0, p0), (t1, p1) in zip(s_, s_[1:]):
+            dt_min = (t1 - t0) / 60_000
+            if 0 < dt_min < 0.5 and p0:
+                rets.append((p1 / p0 - 1) / math.sqrt(dt_min))
+    return st.pstdev(rets) if len(rets) > 100 else 0.00037
+
+
+def basis_report(store: Store, market: str) -> None:
+    section(f"1. ORACLE vs SPOT BASIS  [{market}]")
     rounds = store.query(
         "SELECT slug, strike, end_price, start_ms, end_ms FROM rounds "
-        "WHERE winner IS NOT NULL AND end_price IS NOT NULL ORDER BY start_ms")
+        "WHERE winner IS NOT NULL AND end_price IS NOT NULL AND slug LIKE ? "
+        "ORDER BY start_ms", (market + "%",))
     quotes = store.query(
-        "SELECT slug, ts_ms, spot FROM quotes WHERE spot IS NOT NULL ORDER BY ts_ms")
+        "SELECT slug, ts_ms, spot FROM quotes WHERE spot IS NOT NULL "
+        "AND slug LIKE ? ORDER BY ts_ms", (market + "%",))
     by_slug: dict[str, list] = {}
     for q in quotes:
         by_slug.setdefault(q["slug"], []).append(q)
@@ -68,29 +111,36 @@ def basis_report(store: Store) -> None:
 
 def chain_report(store: Store) -> None:
     section("2. ORACLE CHAIN INTEGRITY")
-    rows = store.query("""SELECT slug, start_ms, strike, end_price FROM rounds
-                          WHERE strike IS NOT NULL ORDER BY start_ms""")
-    bad = 0
-    checked = 0
-    for a, b in zip(rows, rows[1:]):
-        if b["start_ms"] - a["start_ms"] != 300_000 or a["end_price"] is None:
+    # Per market. Chaining across markets compares an ETH close to a BTC strike
+    # and reports every such pair as a fault -- which is what produced a 58%
+    # "mismatch" rate the moment a second market started recording.
+    for market in market_prefixes(store):
+        rows = store.query("""SELECT slug, start_ms, strike, end_price FROM rounds
+                              WHERE strike IS NOT NULL AND slug LIKE ?
+                              ORDER BY start_ms""", (market + "%",))
+        bad = checked = 0
+        for a, b in zip(rows, rows[1:]):
+            if b["start_ms"] - a["start_ms"] != 300_000 or a["end_price"] is None:
+                continue
+            checked += 1
+            if abs(a["end_price"] - b["strike"]) > 1e-6:
+                bad += 1
+        if not checked:
             continue
-        checked += 1
-        if abs(a["end_price"] - b["strike"]) > 1e-6:
-            bad += 1
-    print(f"  consecutive pairs checked: {checked}   mismatches: {bad}")
-    if checked and not bad:
-        print("  chain is exact: end_price[N] == strike[N+1] (settlement series is reliable)")
+        verdict = ("chain is exact (settlement series is reliable)" if not bad
+                   else f"{bad / checked:.1%} of pairs disagree -- investigate")
+        print(f"  {market:18s} pairs={checked:4d} mismatches={bad:4d}  {verdict}")
 
 
-def calibration_report(store: Store) -> None:
-    section("3. MODEL vs MARKET  (the go/no-go)")
+def calibration_report(store: Store, market: str) -> None:
+    section(f"3. MODEL vs MARKET  (the go/no-go)  [{market}]")
     rows = store.query("""
         SELECT q.*, r.winner, r.strike AS rstrike
           FROM quotes q JOIN rounds r ON r.slug = q.slug
          WHERE r.winner IS NOT NULL AND q.spot IS NOT NULL
                AND q.tau_s > 0 AND r.strike IS NOT NULL AND q.up_ask IS NOT NULL
-    """)
+               AND q.slug LIKE ?
+    """, (market + "%",))
     n_rounds = len({r["slug"] for r in rows})
     if n_rounds < 20:
         print(f"  only {n_rounds} settled rounds ({len(rows)} quotes). Need >=20 distinct")
@@ -98,11 +148,13 @@ def calibration_report(store: Store) -> None:
         print("  share a single outcome, so a big quote count proves nothing. Keep recording.")
         return
 
-    sigma = st.median([r["sigma_1m"] for r in store.query(
-        "SELECT sigma_1m FROM decisions WHERE sigma_1m IS NOT NULL")] or [0.00037])
+    sigma = median_sigma(store, market)
+    print(f"  sigma_1m used: {sigma:.5f}")
 
+    # 150-300s is split at the live max_tau_s so the report says directly
+    # whether the tail of the trading window is a band we actually price better.
     for lo, hi, label in ((0, 60, "0-60s left"), (60, 150, "60-150s left"),
-                          (150, 300, "150-300s left")):
+                          (150, 240, "150-240s left"), (240, 300, "240-300s left")):
         band = [r for r in rows if lo < r["tau_s"] <= hi]
         if len({r["slug"] for r in band}) < 20:
             continue
@@ -130,10 +182,11 @@ def calibration_report(store: Store) -> None:
         print(reliability_table(model, outs, min_n=15))
 
 
-def lag_report(store: Store) -> None:
-    section("4. QUOTE LAG BEHIND SPOT")
+def lag_report(store: Store, market: str) -> None:
+    section(f"4. QUOTE LAG BEHIND SPOT  [{market}]")
     rows = store.query("""SELECT slug, ts_ms, up_price, spot FROM quotes
-                          WHERE spot IS NOT NULL ORDER BY slug, ts_ms""")
+                          WHERE spot IS NOT NULL AND slug LIKE ?
+                          ORDER BY slug, ts_ms""", (market + "%",))
     by_round: dict[str, list] = {}
     for r in rows:
         by_round.setdefault(r["slug"], []).append(r)
@@ -160,19 +213,19 @@ def lag_report(store: Store) -> None:
         print("  a peak at lag>0 means the quote follows spot -- that delay is the edge")
 
 
-def cost_sensitivity(store: Store) -> None:
-    section("5. COST SENSITIVITY  (would the rule have made money?)")
+def cost_sensitivity(store: Store, market: str) -> None:
+    section(f"5. COST SENSITIVITY  (would the rule have made money?)  [{market}]")
     rows = store.query("""
         SELECT q.*, r.winner, r.strike AS rstrike, r.fee_rate_bps
           FROM quotes q JOIN rounds r ON r.slug = q.slug
          WHERE r.winner IS NOT NULL AND q.spot IS NOT NULL
-               AND q.tau_s > 0 AND r.strike IS NOT NULL
+               AND q.tau_s > 0 AND r.strike IS NOT NULL AND q.slug LIKE ?
       ORDER BY q.ts_ms
-    """)
+    """, (market + "%",))
     if len(rows) < 100:
         print(f"  only {len(rows)} scored quotes -- need more. Keep recording.")
         return
-    sigma = 0.00037
+    sigma = median_sigma(store, market)
     print(f"  {'half_spread':>12} {'trades':>7} {'win_rate':>9} {'pnl':>9} {'roi':>9}")
     for hs in (0.00, 0.01, 0.02, 0.03, 0.05):
         pnl = PnLSummary()
@@ -203,7 +256,8 @@ def cost_sensitivity(store: Store) -> None:
 def realised_pnl(store: Store) -> None:
     section("6. RECORDED PAPER/LIVE RESULTS")
     rows = store.query("""SELECT s.*, f.stake, f.fee_paid FROM settlements s
-                          JOIN fills f ON f.id = s.fill_id""")
+                          JOIN fills f ON f.id = s.fill_id
+                          WHERE COALESCE(s.void, 0) = 0""")
     if not rows:
         print("  no settled trades recorded yet")
         return
@@ -217,17 +271,21 @@ def realised_pnl(store: Store) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default=str(settings.db_path))
+    ap.add_argument("--market", default=PRIMARY,
+                    help=f"market prefix to analyse (default {PRIMARY}, the only "
+                         "one that trades). Section 2 always covers all markets.")
     args = ap.parse_args()
     store = Store(args.db)
     c = store.counts()
     print(f"DB: {args.db}")
     print(f"rounds={c['rounds']} quotes={c['quotes']} decisions={c['decisions']} "
           f"fills={c['fills']} settlements={c['settlements']}")
-    basis_report(store)
+    print(f"market: {args.market}  (recorded: {', '.join(market_prefixes(store))})")
+    basis_report(store, args.market)
     chain_report(store)
-    calibration_report(store)
-    lag_report(store)
-    cost_sensitivity(store)
+    calibration_report(store, args.market)
+    lag_report(store, args.market)
+    cost_sensitivity(store, args.market)
     realised_pnl(store)
     store.close()
 

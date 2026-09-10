@@ -126,3 +126,39 @@ def test_fee_curve_matches_the_venue():
                          (0.83, 37), (0.90, 21)):
         assert abs(fee_bps_for_price(px) - observed) <= 1.5, px
     assert fee_bps_for_price(0.50) == pytest.approx(180.0)
+
+
+def test_edge_haircut_shrinks_the_claim_toward_the_venue_price():
+    """Only part of the model's disagreement with the venue is real edge.
+
+    Measured on recorded btc-5m quotes, the shortfall grows WITH the claim, so
+    the correction has to be proportional (a haircut), not a constant
+    subtraction like safety_margin.
+    """
+    from btcpredict.edge.signal import FeeModel, evaluate
+
+    kw = dict(fee=0.0, half_spread=0.0, safety_margin=0.0,
+              fee_model=FeeModel.NOTIONAL, min_quote=0.0, max_quote=1.0)
+    # model says Up is 0.80 against a 0.60 ask: a claimed edge of 0.20.
+    full = evaluate(0.80, 0.60, 0.40, **kw)
+    half = evaluate(0.80, 0.60, 0.40, edge_haircut=0.5, **kw)
+    assert full.side == half.side == "Up"
+    assert full.edge == pytest.approx(0.20)
+    assert half.edge == pytest.approx(0.10)          # 0.60 + 0.5*(0.80-0.60)
+    # the haircut must reach EV too -- Kelly sizes off it, and sizing on an
+    # inflated probability overbets.
+    assert half.ev_per_dollar < full.ev_per_dollar
+    # and it gates: a claim that only clears min_edge before the haircut fails after.
+    assert evaluate(0.80, 0.60, 0.40, min_edge=0.15, **kw).act
+    assert not evaluate(0.80, 0.60, 0.40, min_edge=0.15, edge_haircut=0.5, **kw).act
+
+
+def test_edge_haircut_of_one_is_a_no_op():
+    """The default must not change behaviour for callers that do not pass it."""
+    from btcpredict.edge.signal import FeeModel, evaluate
+
+    kw = dict(fee=0.01, half_spread=0.0, safety_margin=0.01,
+              fee_model=FeeModel.NOTIONAL, min_quote=0.25, max_quote=0.90)
+    a = evaluate(0.72, 0.63, 0.37, **kw)
+    b = evaluate(0.72, 0.63, 0.37, edge_haircut=1.0, **kw)
+    assert (a.side, a.edge, a.ev_per_dollar, a.act) == (b.side, b.edge, b.ev_per_dollar, b.act)

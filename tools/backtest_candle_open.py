@@ -24,7 +24,7 @@ from collections import defaultdict
 from dataclasses import dataclass, replace
 
 from btcpredict.calibration.report import PnLSummary, score
-from btcpredict.config import settings
+from btcpredict.config import MARKETS, settings
 from btcpredict.edge.signal import FeeModel, evaluate, fee_rate_for_price
 from btcpredict.models import MODEL_NAMES, ModelContext, build_model
 from btcpredict.store.db import Store
@@ -37,6 +37,9 @@ class ReplayParams:
     """Every gate knob the replay honours, seeded from live settings."""
 
     min_edge: float = 0.05
+    # Must track live: a replay that believes the raw model edge measures a
+    # different strategy from the one that trades.
+    edge_haircut: float = 1.0
     max_quote: float = 0.90
     min_quote: float = 0.15
     signal_persistence: int = 3
@@ -45,6 +48,7 @@ class ReplayParams:
     min_tau_s: float = 60.0
     max_tau_s: float = 240.0
     trade_candle_opens: tuple = (1, 2, 3, 4)
+    side_filter: str = "both"   # both / Up / Down -- mirrors settings
     # Fee semantics are unconfirmed; NOTIONAL (on the stake) is the stricter
     # of the two, so it is the default. PROFIT is the looser guess.
     fee_model: str = "notional"
@@ -53,6 +57,7 @@ class ReplayParams:
     def from_settings(cls) -> "ReplayParams":
         return cls(
             min_edge=settings.min_edge,
+            edge_haircut=settings.edge_haircut,
             max_quote=settings.max_quote,
             min_quote=settings.min_quote,
             signal_persistence=settings.signal_persistence,
@@ -61,6 +66,7 @@ class ReplayParams:
             min_tau_s=settings.min_tau_s,
             max_tau_s=settings.max_tau_s,
             trade_candle_opens=tuple(settings.trade_candle_opens),
+            side_filter=settings.side_filter,
         )
 
 
@@ -158,7 +164,7 @@ def replay(quotes, settled_by_slug, sigma_by_slug, hist, model,
             fee_model=FeeModel.NOTIONAL if params.fee_model == "notional"
             else FeeModel.PROFIT,
             max_quote=params.max_quote, min_quote=params.min_quote,
-            min_edge=params.min_edge)
+            min_edge=params.min_edge, edge_haircut=params.edge_haircut)
 
         prev_side, prev_n = streak.get(slug, (None, 0))
         if sig.act and sig.side == prev_side:
@@ -170,6 +176,10 @@ def replay(quotes, settled_by_slug, sigma_by_slug, hist, model,
         n = streak.get(slug, (None, 0))[1]
 
         if sig.act and n >= params.signal_persistence:
+            if (params.side_filter != "both"
+                    and sig.side != params.side_filter):
+                streak.pop(slug, None)      # skip this signal; round stays open
+                continue
             fill = q["up_ask"] if sig.side == "Up" else q["down_ask"]
             won = sig.side == r["winner"]
             f = fee if fee is not None else fee_rate_for_price(fill)
@@ -252,12 +262,17 @@ def market_vs_model(quotes, settled_by_slug, sigma_by_slug, hist, model,
 def sweep(quotes, settled_by_slug, sigma_by_slug, hist, model, fee, base) -> None:
     """One-dimensional parameter sweeps around `base` (candle-open gate)."""
     axes = {
-        "min_edge": [0.03, 0.04, 0.05, 0.06, 0.08],
+        # The grid must bracket the live value on BOTH sides: a sweep that
+        # stops at the current setting reports it as the optimum by
+        # construction, which is how 0.08 came to look monotone-best.
+        "min_edge": [0.03, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.12],
         "max_quote": [0.80, 0.85, 0.90, 0.95],
         # Cheap contracts pay the fee cap (180 bps) regardless of price, so
         # the interesting cut-offs sit higher than they did under flat fees.
         "min_quote": [0.15, 0.25, 0.35, 0.50],
-        "signal_persistence": [2, 3, 4, 5],
+        "signal_persistence": [2, 3, 4, 5, 6],
+        "edge_haircut": [0.3, 0.4, 0.5, 0.7, 1.0],
+        "max_tau_s": [120.0, 150.0, 180.0, 210.0, 240.0],
         "candle_open_window_s": [3.0, 5.0, 8.0, 10.0],
         "safety_margin": [0.005, 0.010, 0.015, 0.020],
     }
@@ -321,7 +336,8 @@ def bias_report(quotes, settled_by_slug, sigma_by_slug, hist, model, fee, base) 
     # The forward test: live settlements, which no sweep has seen.
     live = Store(path=settings.db_path).query("""
         SELECT s.pnl, s.won FROM settlements s
-        JOIN fills f ON f.id = s.fill_id WHERE f.mode = 'live'
+        JOIN fills f ON f.id = s.fill_id
+        WHERE f.mode = 'live' AND COALESCE(s.void, 0) = 0
         ORDER BY s.ts_ms""")
     if live:
         l = cohort([{"pnl": r["pnl"], "won": r["won"]} for r in live])
@@ -369,6 +385,8 @@ def bias_report(quotes, settled_by_slug, sigma_by_slug, hist, model, fee, base) 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--market", default=MARKETS[0][0],
+                    help="market prefix to replay (default: the traded one)")
     ap.add_argument("--model", default="digital",
                     help="model name or 'all'")
     ap.add_argument("--fee", type=float, default=None,
@@ -383,15 +401,20 @@ def main() -> None:
     args = ap.parse_args()
 
     store = Store(path=settings.db_path)
+    # One market only. The recorder covers every market in MARKETS, but the bot
+    # trades just the primary one, so replaying them together measures a
+    # strategy nobody runs -- and the untraded market's PnL moves every sweep
+    # result it is mixed into.
+    like = args.market + "%"
     settled = store.query(
         "SELECT slug, strike, end_price, winner, start_ms FROM rounds "
         "WHERE winner IS NOT NULL AND strike IS NOT NULL AND end_price IS NOT NULL "
-        "ORDER BY start_ms")
+        "AND slug LIKE ? ORDER BY start_ms", (like,))
     quotes = store.query("""
         SELECT q.* FROM quotes q
         JOIN rounds r ON r.slug = q.slug
-        WHERE r.winner IS NOT NULL
-        ORDER BY q.ts_ms""")
+        WHERE r.winner IS NOT NULL AND q.slug LIKE ?
+        ORDER BY q.ts_ms""", (like,))
 
     settled_by_slug = {r["slug"]: r for r in settled}
     sigma_by_slug = {r["slug"]: rolling_sigma(settled, i)
@@ -404,20 +427,20 @@ def main() -> None:
             else "measured fee curve")
 
     if args.sweep:
-        print(f"{len(settled)} settled rounds, {len(quotes)} quotes "
-              f"({cost})\n")
+        print(f"{args.market}: {len(settled)} settled rounds, "
+              f"{len(quotes)} quotes ({cost})\n")
         sweep(quotes, settled_by_slug, sigma_by_slug, hist,
               build_model("digital"), args.fee, base)
         return
 
     if args.bias:
-        print(f"{len(settled)} settled rounds, {len(quotes)} quotes "
-              f"({cost})\n")
+        print(f"{args.market}: {len(settled)} settled rounds, "
+              f"{len(quotes)} quotes ({cost})\n")
         bias_report(quotes, settled_by_slug, sigma_by_slug, hist,
                     build_model("digital"), args.fee, base)
         return
 
-    print(f"{len(settled)} settled rounds, {len(quotes)} quotes, "
+    print(f"{args.market}: {len(settled)} settled rounds, {len(quotes)} quotes, "
           f"{len(hist)} reconstructed 1m bars ({cost})\n")
 
     names = list(MODEL_NAMES) if args.model == "all" else [args.model]

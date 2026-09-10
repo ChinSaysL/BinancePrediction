@@ -310,6 +310,137 @@ confirms a fill.
 **Failed orders retried at 1 Hz** for a whole round. There is now a 30 s cooldown
 after any rejection.
 
+**The cooldown then went too far the other way.** A FOK order fails whenever the
+book moves between the quote and the execution (`status=FAILED` in
+`order/history`), which is transient — but a single failure sat the bot out for
+30 s, i.e. the rest of the round. Orders now make up to `order_max_attempts` (3)
+attempts, each with a **fresh quote** (a spent `quoteId` cannot be re-sent) and
+a full re-run of the edge recheck and the candle-open re-gate; the cooldown only
+starts once they are all spent.
+
+**A retry is only safe against a failure the venue confirmed.** `LiveBroker`
+now records *why* `buy()` returned None (`last_failure`). A terminal
+`FAILED`/`CANCELLED`/`REJECTED` status, an expired quote or a 4xx reject mean no
+order exists, so re-placing is safe. A timeout or a 5xx on `place-order` does
+not: the order may have been accepted and only the reply lost. Those are never
+retried — re-placing one would double the exposure.
+
+---
+
+# The analysis tools were mixing markets (found 09-09)
+
+The recorder covers every market in `MARKETS`, but the bot trades only the
+primary one. Two tools pooled them, and both of their headline numbers were
+wrong as soon as ETH recording started:
+
+- **`analyze.py` oracle chain** paired consecutive rounds by `start_ms` with no
+  market grouping, so it compared an ETH close against the next BTC strike and
+  called it a settlement fault: **209 of 361 pairs "mismatched"**. Per market
+  the chain is exact (btc 0/362, eth 0/294). The settlement series was never
+  broken.
+- **`analyze.py` go/no-go** priced every market with `median(decisions.sigma_1m)`
+  -- and decisions rows only exist for the traded market, so ETH quotes were
+  scored with BTC's volatility.
+- **`backtest_candle_open.py`** replayed all markets together, measuring a
+  strategy nobody runs. ETH alone lost money over the window, so every `--sweep`
+  row was a blend of the traded market and an untraded one.
+
+Both are now scoped by `--market`, defaulting to `MARKETS[0]`. Section 2 still
+covers every market, one line each, because it is a recorder health check.
+
+What changed once scoped to btc-5m alone:
+
+| | pooled (wrong) | btc-5m only |
+|---|---|---|
+| replay, live config | n=136, +12.65, ROI +9.3% | n=106, +5.52, ROI +5.2% |
+| split halves | +15.84 / **-3.19** | +0.82 / **+4.70** |
+| profit concentration | top-3 = 61% | top-3 = **154%** |
+| 60-150s Brier gap | +0.0012 | **+0.0018** |
+| quote-lag peak corr | +0.2427 | **+0.3171** |
+
+The pooled numbers were wrong in both directions: they invented a decay story
+(the "second half is losing" was ETH) and they hid how few trades carry the
+profit (without its best 3 trades the rule loses money).
+
+**A sweep grid must bracket the live value on both sides.** `min_edge` stopped
+at 0.08, which was the live setting, so it reported a monotone ramp to "the
+best" value by construction. Extended past it, 0.08 is an unremarkable cell on
+a surface that is flat and mostly inside the noise.
+
+**Average quote accuracy does not imply trade-level profit.** The go/no-go says
+the model only beats the venue in the 60-150s band. Cutting `max_tau_s` to 150
+to match made things *worse* (-2.01 per $1 staked, P(profitable) 39%, the worst
+of every cut-off tried; 180-240s are all positive). The rule does not trade the
+average quote, it trades its high-conviction disagreements -- those are a
+different population. The window stays at 240s.
+
+---
+
+# The model's error grows with its own confidence (found 09-10)
+
+Live trades kept losing more often than the model said they would. Bucketing
+every live fill by the model's claimed probability shows it is optimistic
+everywhere:
+
+| model says | actually won | n |
+|---|---|---|
+| 48.0% | 45.8% | 24 |
+| 67.3% | **56.2%** | 16 |
+| 80.0% | 76.5% | 17 |
+| 91.5% | 85.2% | 27 |
+
+The recorded quotes (40,489 scored btc-5m polls) show *why*, and it is not a
+constant bias. Bucketing by **claimed edge** -- how far the model is from the
+venue -- the shortfall grows with the claim:
+
+| claimed edge | n (quotes) | model says | actually won | gap |
+|---|---|---|---|---|
+| 0.00-0.03 | 16647 | 60.0% | 58.2% | -1.7% |
+| 0.03-0.06 | 10231 | 57.0% | 52.2% | -4.8% |
+| 0.06-0.09 | 5064 | 57.0% | 52.7% | -4.3% |
+| 0.09-0.12 | 2575 | 58.9% | 53.4% | -5.5% |
+| 0.12-0.20 | 2169 | 53.3% | **39.6%** | -13.6% |
+| 0.20+ | 369 | 52.3% | **25.7%** | -26.6% |
+
+**The bigger the disagreement with the venue, the more likely the venue is
+right.** A large "edge" is usually our own stale spot or a bad sigma, not a
+mispricing. This matters directly, because `min_edge` *selects for* exactly
+these trades -- raising it pushes the bot toward its worst-calibrated signals.
+
+Expressed as realised edge over the price paid, inside the trading window:
+
+| claimed edge | rounds | realised edge | 95% CI (clustered by round) |
+|---|---|---|---|
+| 0.06-0.09 | 339 | +0.030 | [-0.027, +0.081] |
+| 0.09-0.12 | 216 | +0.064 | [-0.005, +0.128] |
+| 0.12+ | 114 | +0.036 | [-0.070, +0.136] |
+
+Roughly half the claimed edge is real -- but **every CI spans zero**, and the
+two halves of the window give k=0.63 and k=0.07 with overlapping intervals. The
+*sign* of the bias is solid (every band, both halves, the model claims more than
+it delivers); the *magnitude* is not estimable from 31 hours.
+
+## What was built
+
+`evaluate(edge_haircut=...)` shrinks the claim toward the venue price:
+`p_used = quote + haircut * (fair - quote)`, feeding the gate, the EV and
+therefore Kelly. A proportional haircut is the right shape because the error is
+proportional to the claim; `safety_margin` subtracts a constant and cannot
+express this.
+
+**It defaults to 1.0 (off).** `min_edge` is compared against the haircut edge,
+so setting the haircut alone silently doubles the real threshold -- with
+min_edge 0.09 a haircut of 0.5 demands a raw 0.18 and cuts the replayed trade
+count from 153 to 13. The pair `haircut 0.5 / min_edge 0.045` reproduces the
+current selection exactly (n=153, +23.79, identical).
+
+**Honest limit:** while Kelly is clamped (`stake == min_order == max_stake`),
+the haircut is close to a re-parameterisation of `min_edge` -- it only bites
+differently through the EV test and the hurdle comparison. Its real value is a
+correct EV in the logs, correct sizing if Kelly is ever unclamped, and one knob
+that means "how much of the model do I believe" instead of a threshold tuned by
+hand.
+
 ---
 
 # Backtest on historical fills (`tools/backtest_orders.py`)
@@ -555,3 +686,49 @@ test that no sweep has seen. If live trades keep resembling the losing half,
 that settles the question before the CI does. Live is currently 4 settlements,
 −$1.69 — tracking the losing half; the $3 daily cap bounds the cost of the
 experiment.
+
+## Re-tune @ 366 BTC-only settled rounds (2026-09-09, live config)
+
+**First, a data bug was fixed in the tools themselves:** the replay and the
+analytics were mixing every market in `MARKETS` (BTC + ETH), but the bot only
+ever trades BTC — so every sweep result before this section mixed in an
+untraded market's PnL and reported optima nobody would actually have traded.
+`tools/backtest_candle_open.py` and `tools/analyze.py` are now scoped to one
+market (default: the traded one). All numbers below are BTC-only.
+
+Live config is: ungated, `min_edge=0.08`, `persistence=4`, `min_quote=0.25`,
+measured fee curve. On the clean sample:
+
+| Axis | Result |
+|---|---|
+| `min_edge` | 0.08 → +$3.48 (WR 0.56, mdd −$8.40); 0.06 → +$12.85; 0.09 → +$4.93; 0.10 → −$3.56 |
+| `signal_persistence` | 2 → +$19.71 (mdd −$11.62); 4 → +$3.48; 5/6 ≈ 0 |
+| `min_quote` | 0.15 → +$8.80 (mdd −$18.76); 0.25 → +$3.48 |
+| `max_tau_s` | 210s best (+$6.90); 150s worst (−$4.05) |
+| joint cells | 0.09/pers3 → +$12.33, mdd −$6.88; 0.08/pers2 → +$19.71, mdd −$11.62 |
+
+The honest reading changed: the current config is **not** the grid optimum on
+clean data (0.09/pers3 and 0.08/pers2 beat it), but every configuration's
+round-bootstrap CI spans zero — current: median +$3.10, 95% CI [−$18.73,
++$26.40], P(profitable) 61%, top-3 trades = 244% of profit. In-sample the
+strategy is *unproven*, not optimal. The live forward test remains the only
+positive signal: **75 settlements, WR 0.653, +$36.52**.
+
+**Adopted (19:43, same day): `min_edge=0.09`, `persistence=2`, `max_tau=210`.**
+Joint grid on the clean sample: +$23.67 vs +$4.44 for the old config, 125
+trades, WR 0.57. The defensible part of the choice is **persistence=2 alone**:
+all top-8 cells in the 54-cell grid use it, i.e. one dial is consistently
+better across the whole grid. The rest is noise-level: `0.08/2/180` (+$25.44)
+and `0.08/2/210` (+$24.49) sit within each other's error bars of the adopted
+cell, and a both-halves-positive filter does not discriminate (25 of 54 cells
+pass it, including pers-3 and pers-4 cells). Treat +$23.67 as a ceiling, not
+a forecast. A guard simulation shows no downside: both old and adopted halt
+once per ~31h on the $35 cap (adopted halts later, 4 signals blocked vs 42).
+Do not re-tune on the same 31 hours again — that is fitting the noise twice.
+The live forward test remains the judge.
+
+Also in this pass: `LiveBroker` now classifies order failures — only failures
+the venue *confirmed* (4xx rejection, terminal FAILED status, missing/expired
+quote) are retried (`order_max_attempts=3`), and unknown outcomes (timeouts,
+5xx, unreadable status) are never re-placed, closing a potential
+double-exposure path. 100 tests pass.
