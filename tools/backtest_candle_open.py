@@ -224,10 +224,13 @@ def replay(quotes, settled_by_slug, sigma_by_slug, hist, model,
         # Signal-strength floor. |z| is how decided the round already is, in
         # units of the remaining move -- it is independent of where the venue
         # prices the side, so it catches the trades the edge gate wrongly
-        # accepts (cheap because unlikely, not because mispriced).
+        # accepts (cheap because unlikely, not because mispriced). Recorded on
+        # every trade so sizing studies can use it.
+        sigma_used = sigma_by_slug.get(slug, 0.0004)
+        mz = (abs(math.log(spot / strike))
+              / (sigma_used * math.sqrt(tau / 60.0))
+              if spot > 0 and strike > 0 and tau > 0 else 0.0)
         if sig.act and params.min_moneyness_sd > 0:
-            mz = abs(math.log(spot / strike)) / (
-                sigma_by_slug.get(slug, 0.0004) * math.sqrt(tau / 60.0))
             if mz < params.min_moneyness_sd:
                 sig = Signal(None, sig.fair, sig.quote, sig.edge, sig.hurdle,
                              sig.ev_per_dollar, False,
@@ -256,7 +259,7 @@ def replay(quotes, settled_by_slug, sigma_by_slug, hist, model,
             trades.append({
                 "slug": slug, "side": sig.side, "tau": tau,
                 "q": fill, "p": sig.fair, "edge": sig.edge,
-                "won": won, "pnl": trade_pnl,
+                "won": won, "pnl": trade_pnl, "mz": mz,
                 "ts_ms": q["ts_ms"], "round_start": r["start_ms"],
             })
             open_rounds.add(slug)

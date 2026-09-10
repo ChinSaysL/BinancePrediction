@@ -228,6 +228,23 @@ def stake_for_edge(edge: float, *, min_edge: float, min_stake: float,
     return min_stake + (max_stake - min_stake) * t
 
 
+def tilt_factor(moneyness_sd: float, *, reference: float, lo: float,
+                hi: float) -> float:
+    """Multiplier that concentrates stake where the recording says the edge is.
+
+    Our edge is the venue's quote lagging spot, and that lag is largest while
+    the round is still undecided: measured per-$1 return falls with |z|
+    (+1.03, +0.49, +0.06, +0.17 by quartile), the mirror of Polymarket whose
+    CLOB prices small moves correctly. So small |z| earns a bigger stake,
+    bounded so a single trade cannot dominate the book.
+
+    Returns 1.0 (no tilt) when the inputs carry no information.
+    """
+    if reference <= 0 or moneyness_sd <= 0 or hi <= 0:
+        return 1.0
+    return max(lo, min(hi, reference / moneyness_sd))
+
+
 def stake_for_fraction(bankroll: float, *, fraction: float, min_stake: float,
                        cap: float) -> float:
     """Fixed percentage of the bankroll.

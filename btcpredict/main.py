@@ -27,7 +27,8 @@ from btcpredict.calibration.report import PnLSummary
 from btcpredict.config import MARKETS, settings
 from btcpredict.edge.signal import (FeeModel, Signal, evaluate,
                                     evaluate_hybrid, kelly_stake,
-                                    stake_for_edge, stake_for_fraction)
+                                    stake_for_edge, stake_for_fraction,
+                                    tilt_factor)
 from btcpredict.execution.base import Fill
 from btcpredict.execution.live import RETRYABLE_FAILURES, LiveBroker
 from btcpredict.execution.paper import PaperBroker
@@ -460,7 +461,13 @@ class Bot:
             # Kelly is available but off by default -- at this bankroll a
             # fractional-Kelly value sits below the venue minimum, and rounding
             # that up to full size inverts the rule it came from.
-            stake = self._stake_for(sig)
+            # |z| -- how decided the round already is, in units of the remaining
+            # move. Used by the sizing tilt; 0.0 means "no information".
+            mz = (abs(math.log(spot / r.strike))
+                  / (sigma * math.sqrt(tau / 60.0))
+                  if spot and r.strike and spot > 0 and r.strike > 0
+                  and tau > 0 and sigma > 0 else 0.0)
+            stake = self._stake_for(sig, mz)
             acted = stake >= settings.min_order_usdt
 
         did = self.store.insert("decisions", {
@@ -509,8 +516,22 @@ class Bot:
                  r.slug, fill.side, fill.stake, fill.filled_px, sig,
                  f"{iv:.5f}" if iv else "n/a", sigma)
 
-    def _stake_for(self, sig: Signal) -> float:
-        """Stake for an accepted signal (see config.sizing_mode/_metric)."""
+    def _stake_for(self, sig: Signal, moneyness_sd: float = 0.0) -> float:
+        """Stake for an accepted signal (see config.sizing_mode/_metric).
+
+        Applies the optional sizing tilt on top of whichever base rule is
+        active: the tilt redistributes the stake, it does not change the total.
+        """
+        base = self._base_stake_for(sig)
+        if base > 0 and settings.stake_tilt == "inv_z":
+            t = tilt_factor(moneyness_sd, reference=settings.tilt_reference_z,
+                            lo=settings.tilt_min, hi=settings.tilt_max)
+            base = min(max(base * t, settings.min_order_usdt),
+                       settings.stake_cap_usdt)
+        return base
+
+    def _base_stake_for(self, sig: Signal) -> float:
+        """The active sizing rule, before any tilt."""
         if settings.sizing_mode == "kelly":
             # Kelly returns 0 when the bet sits below the venue minimum; that
             # means SKIP, never "bet the maximum instead".

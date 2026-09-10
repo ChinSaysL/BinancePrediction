@@ -2,7 +2,8 @@ import pytest
 
 from btcpredict.edge.signal import (FeeModel, breakeven_prob, evaluate,
                                     evaluate_hybrid, expected_value, kelly_stake,
-                                    stake_for_edge, stake_for_fraction)
+                                    stake_for_edge, stake_for_fraction,
+                                    tilt_factor)
 
 FEE = 0.02
 
@@ -262,6 +263,35 @@ def test_stake_for_fraction_respects_min_and_cap():
 def test_stake_for_fraction_never_exceeds_the_bankroll():
     assert stake_for_fraction(30.0, fraction=0.9, min_stake=1.0,
                               cap=0.0) == pytest.approx(27.0)
+
+
+def test_tilt_factor_rewards_undecided_rounds():
+    """Small |z| means the round is still open, which is where the recording
+    says our edge is (+1.03 per $1 in the lowest quartile vs +0.06 in the third)."""
+    kw = dict(reference=0.65, lo=0.5, hi=2.0)
+    assert tilt_factor(0.65, **kw) == pytest.approx(1.0)     # at the reference
+    assert tilt_factor(0.325, **kw) == pytest.approx(2.0)    # half the reference
+    assert tilt_factor(1.3, **kw) == pytest.approx(0.5)      # twice the reference
+    assert tilt_factor(0.01, **kw) == pytest.approx(2.0)     # clamped high
+    assert tilt_factor(99.0, **kw) == pytest.approx(0.5)     # clamped low
+    # monotone: more decided -> smaller stake
+    assert (tilt_factor(0.2, **kw) > tilt_factor(0.5, **kw)
+            > tilt_factor(1.0, **kw))
+
+
+def test_tilt_factor_is_inert_without_information():
+    kw = dict(reference=0.65, lo=0.5, hi=2.0)
+    assert tilt_factor(0.0, **kw) == 1.0        # no |z| -> no tilt
+    assert tilt_factor(-1.0, **kw) == 1.0
+    assert tilt_factor(0.5, reference=0.0, lo=0.5, hi=2.0) == 1.0
+    assert tilt_factor(0.5, reference=0.65, lo=0.5, hi=0.0) == 1.0
+
+
+def test_tilt_redistributes_rather_than_raises():
+    """At the reference |z| the tilt must be exactly neutral, so turning it on
+    does not raise the average stake by itself."""
+    kw = dict(reference=0.65, lo=0.5, hi=2.0)
+    assert tilt_factor(0.65, **kw) * 5.0 == pytest.approx(5.0)
 
 
 def test_stake_for_edge_is_monotone():

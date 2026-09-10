@@ -80,8 +80,27 @@ class Settings(BaseSettings):
     # order of magnitude for an edge that is still only 70 trades old.
     stake_fraction: float = 0.05
     # Ceiling on the fractional stake, so compounding cannot run the stake up
-    # to a size the venue's book cannot absorb in one FOK order.
+    # to a size the venue's book cannot absorb in one FOK order. Also the
+    # ceiling once a sizing tilt is on.
     stake_cap_usdt: float = 25.0
+    # Sizing tilt: multiply the stake by a factor that depends on how undecided
+    # the round still is, then re-clamp. Available in every sizing mode, so it
+    # redistributes the stake without having to change the base rule.
+    #   none  - no tilt
+    #   inv_z - stake UP when |z| is small. Justified on the recording: per-$1
+    #           return FALLS with |z| (+1.03, +0.49, +0.06, +0.17 by quartile)
+    #           -- the mirror of Polymarket, whose CLOB prices small moves
+    #           correctly. Out of sample, at matched average exposure, every
+    #           tilt exponent from 0.5 to 1.5 beat flat on BOTH slices (test
+    #           $134 -> $157..$314) with the gain monotone in the exponent, so
+    #           this is a plateau and not a fitted peak. It costs drawdown:
+    #           -9.8% flat vs -10.8% to -22% tilted.
+    # Turning it on widens the effective stake range beyond [min_stake_usdt,
+    # max_stake_usdt] up to [min_order_usdt, stake_cap_usdt].
+    stake_tilt: Literal["none", "inv_z"] = "none"
+    tilt_reference_z: float = 0.65   # |z| at which the multiplier is exactly 1
+    tilt_min: float = 0.5            # bounds, so one trade cannot dominate
+    tilt_max: float = 2.0
     # Edge at which the maximum stake is reached. The gate accepts from
     # min_edge up; recorded accepted edges ran 0.12 -> 0.22.
     stake_edge_hi: float = 0.22
