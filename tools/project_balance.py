@@ -112,30 +112,42 @@ def haircut(rets: list[float], edge: float | None) -> tuple[list[float], float]:
 
 
 def simulate(rets, tilts, *, bankroll, days, edge, tpd, paths,
-             resume_after_halt, seed=20260910):
+             resume_after_halt, cap_pct=None, seed=20260910):
     """One entry per path per horizon plus the risk statistics."""
     pool, _k = haircut(rets, edge)
     rng = random.Random(seed)
     snaps: dict[int, list[float]] = {d: [] for d in HORIZONS}
     dds, halt_days, ruined = [], [], 0
+    stopped_days, cap_days, worst_days = [], [], []
     frac = settings.stake_fraction
     cap = settings.stake_cap_usdt
     floor = settings.min_order_usdt
-    cap_pct = settings.daily_loss_cap_pct
+    cap_pct = settings.daily_loss_cap_pct if cap_pct is None else cap_pct
+    # 0 = OFF, not a zero-dollar budget: `day_pnl <= -0 * bank` is true the
+    # instant a day is flat, which would stop trading on the first tick.
+    cap_on = cap_pct > 0
     max_streak = settings.max_consecutive_losses
 
     for _ in range(paths):
         bank, peak, dd = bankroll, bankroll, 0.0
         losses, frozen, hit_halt = 0, False, False
+        n_stopped = n_cap = 0
+        worst_day = 0.0
         for day in range(1, days + 1):
             if frozen and resume_after_halt:
                 frozen, losses = False, 0        # operator resumes the next day
+            day_start = bank
             day_pnl = 0.0
             if not frozen:
                 for _ in range(int(tpd)):
                     # the guard recomputes the cap against the CURRENT bankroll,
                     # so it tightens as the day goes badly
-                    if day_pnl <= -cap_pct * bank or losses >= max_streak:
+                    if cap_on and day_pnl <= -cap_pct * bank:
+                        n_stopped += 1
+                        n_cap += 1
+                        break
+                    if losses >= max_streak:
+                        n_stopped += 1
                         break
                     stake = min(bank * frac * rng.choice(tilts), cap)
                     if stake < floor:
@@ -146,6 +158,8 @@ def simulate(rets, tilts, *, bankroll, days, edge, tpd, paths,
                     losses = losses + 1 if pnl < 0 else 0
                     peak = max(peak, bank)
                     dd = min(dd, (bank - peak) / peak)
+            if day_start > 0:
+                worst_day = min(worst_day, (bank - day_start) / day_start)
             if losses >= max_streak:
                 if not hit_halt:                 # count PATHS, not episodes
                     hit_halt = True
@@ -154,22 +168,69 @@ def simulate(rets, tilts, *, bankroll, days, edge, tpd, paths,
             if day in HORIZONS:
                 snaps[day].append(bank)
         dds.append(-dd * 100)
+        stopped_days.append(n_stopped)
+        cap_days.append(n_cap)
+        worst_days.append(-worst_day * 100)
         if bank < 2 * floor:
             ruined += 1
 
     dds.sort()
+    worst_days.sort()
     out = {"dds": dds,
            "p95_dd": dds[int(0.95 * len(dds))] if dds else 0.0,
            "med_dd": st.median(dds) if dds else 0.0,
            "halt_p": len(halt_days) / paths,
            "halt_day": st.median(halt_days) if halt_days else None,
-           "ruin_p": ruined / paths}
+           "ruin_p": ruined / paths,
+           "stopped_days": st.mean(stopped_days),
+           "cap_days": st.mean(cap_days),
+           "med_worst_day": st.median(worst_days),
+           "p95_worst_day": worst_days[int(0.95 * len(worst_days))]}
     for d in HORIZONS:
         xs = sorted(snaps[d])
         out[d] = {"med": st.median(xs), "p10": xs[int(0.10 * len(xs))],
                   "p90": xs[int(0.90 * len(xs))],
                   "down": sum(1 for x in xs if x < bankroll) / len(xs)}
     return out
+
+
+def cap_curve(rets, tilts, *, bankroll, days, tpd, paths,
+              edges=(("central", 0.25), ("other venue", 0.17),
+                     ("small edge", 0.06), ("no edge", 0.0)),
+              caps=(0.05, 0.10, 0.15, 0.20, 0.30, 0.45, 0.0)) -> None:
+    """How the daily stop trades profit for tail protection.
+
+    0.0 = no daily stop at all, which is the baseline the others are judged
+    against. The cap is also expressed in STAKES (cap / stake_fraction), because
+    that is the unit the decision is actually made in: 45% is eleven losing
+    trades at 4% each.
+
+    Run at several edge levels on purpose. How much a daily stop is worth
+    depends almost entirely on whether the edge is real: at +0.25/$1 the
+    average day GAINS ~44% of the bankroll, so a losing day is rare and the cap
+    has almost nothing to do. At zero edge the same cap is a working brake.
+    """
+    for label, edge in edges:
+        print(f"\ndaily stop curve  |  {days}-day horizon, {label} edge "
+              f"{edge:+.2f}/$1, {tpd:.0f} trades/day, {paths} paths")
+        print(f"  {'cap':>6}{'stakes':>7}{'med profit':>12}{'p10 profit':>12}"
+              f"{'medDD':>8}{'p95DD':>8}{'days stopped':>14}{'p95 worst day':>15}")
+        for c in caps:
+            r = simulate(rets, tilts, bankroll=bankroll, days=days, edge=edge,
+                         tpd=tpd, paths=paths, resume_after_halt=True,
+                         cap_pct=c)
+            label_c = "off" if c == 0.0 else f"{c:.0%}"
+            stakes = "-" if c == 0.0 else f"{c / settings.stake_fraction:.0f}"
+            print(f"  {label_c:>6}{stakes:>7}${r[days]['med'] - bankroll:>+11.0f}"
+                  f"${r[days]['p10']:>11.0f}{r['med_dd']:>7.1f}%"
+                  f"{r['p95_dd']:>7.1f}%{r['stopped_days']:>9.1f}/{days:<3}"
+                  f"{r['p95_worst_day']:>14.1f}%")
+    print("\n  A daily stop cannot shrink a MONTHLY drawdown much: the cap resets\n"
+          "  every UTC day, while a monthly drawdown accumulates ACROSS days, so\n"
+          "  the only days it removes are the ones that would have started the\n"
+          "  spiral. What it does buy is a bound on a single day -- worth having\n"
+          "  as a circuit breaker against a runaway bug, not as a way to improve\n"
+          "  the monthly distribution.")
 
 
 def main() -> None:
@@ -183,12 +244,23 @@ def main() -> None:
                     help="0 = use the rate measured in the recording instead")
     ap.add_argument("--no-resume", action="store_true",
                     help="leave the bot stopped after a 5-loss halt")
+    ap.add_argument("--sweep-cap", action="store_true",
+                    help="curve of the daily loss stop instead of the table")
+    ap.add_argument("--edge", type=float, default=None,
+                    help="single edge to use instead of the default set")
     args = ap.parse_args()
 
     rets, tilts, replay_tpd = build_pools(args.market)
     tpd = args.trades_per_day or replay_tpd
     b0 = args.bankroll
     losses = sum(1 for r in rets if r <= 0)
+
+    if args.sweep_cap:
+        edges = ([(f"{args.edge:+.2f}/$1", args.edge)] if args.edge is not None
+                 else None)
+        cap_curve(rets, tilts, bankroll=b0, days=args.days, tpd=tpd,
+                  paths=args.paths, **({"edges": edges} if edges else {}))
+        return
 
     print(f"replayed {len(rets)} recorded BTC trades  |  mean {st.mean(rets):+.4f}/$1  "
           f"sd {st.pstdev(rets):.3f}  |  loss rate {losses / len(rets):.0%}")
