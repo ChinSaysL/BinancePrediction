@@ -216,10 +216,17 @@ def replay(quotes, settled_by_slug, sigma_by_slug, hist, model,
                 up_fair = pred_up.p_up
         if collected is not None:
             # Before the gate: this is the model's opinion, not the gate's.
+            # The quotes travel with it so a consumer can re-run the gate under
+            # different knobs (per-side bars, price caps) on the SAME ticks the
+            # live bot actually saw, instead of guessing what it was shown.
             collected.append({
                 "slug": slug, "ts_ms": q["ts_ms"], "tau": tau,
                 "p_up_down_model": pred.p_up, "p_up": up_fair,
                 "outcome_up": r["winner"] == "Up",
+                "up_ask": q["up_ask"], "down_ask": q["down_ask"],
+                "spot": spot, "strike": strike,
+                "sigma": sigma_by_slug.get(slug, 0.0004),
+                "up_allowed": up_allowed, "blocked_ret": blocked_ret,
             })
         sig = evaluate_hybrid(
             pred.p_up, up_fair, q["up_ask"], q["down_ask"],

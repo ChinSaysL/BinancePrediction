@@ -29,7 +29,12 @@ from tools.backtest_candle_open import (ReplayParams, build_1m_history, replay,
                                         rolling_sigma)
 
 
-def load_trades(market: str = "btc-updown-5m"):
+def load_inputs(market: str = "btc-updown-5m"):
+    """Quotes/settlements/sigma/history for one market, ready for `replay`.
+
+    Split out of load_trades so tools that need the raw replay inputs (rather
+    than the trades it produced) do not re-query the DB and drift apart.
+    """
     store = Store(path=settings.db_path)
     like = market + "%"
     settled = store.query(
@@ -42,6 +47,11 @@ def load_trades(market: str = "btc-updown-5m"):
     sbs = {r["slug"]: r for r in settled}
     sigs = {r["slug"]: rolling_sigma(settled, i) for i, r in enumerate(settled)}
     hist = build_1m_history(quotes, store=store, symbol="BTCUSDT")
+    return quotes, sbs, sigs, hist
+
+
+def load_trades(market: str = "btc-updown-5m"):
+    quotes, sbs, sigs, hist = load_inputs(market)
     digital, drift = build_model("digital"), build_model(settings.up_model)
     res = replay(quotes, sbs, sigs, hist, digital, None, False,
                  params=ReplayParams.from_settings(), model_up=drift)
