@@ -480,3 +480,85 @@ def test_verified_fill_skips_verification_entirely():
     f.unverified = False                                # status was confirmed
     s = asyncio.run(b.settle(f, "Up"))
     assert s is not None and not s.void and s.won
+
+
+# --- placement: an unreadable status must not become a booked fill ----------
+#
+# History lags place-order by a second or two, so "status unreadable" is the
+# COMMON case, not the rare one: every one of the four orders on 2026-09-10
+# 19:26-20:23 logged "proceeding unverified". Booking on assumption is how the
+# trade record and the venue drift apart.
+
+def _buy_broker(*, status=None, held=None, positions_readable=True):
+    """LiveBroker whose place-order succeeds but whose status read fails."""
+    from btcpredict.execution import live
+
+    b = live.LiveBroker(None, "k", "s", wallet_address="w", wallet_id="1")
+
+    async def quote(*a, **kw):
+        return {"quoteId": "q1", "amountOut": to_wei(17.5),
+                "feeAmount": to_wei(0.1), "averagePrice": 0.57, "expireAt": 0}
+
+    async def request(method, path, params=None):
+        return {"orderId": "o1"}
+
+    async def _status(order_id, **kw):
+        return status
+
+    async def _positions():
+        return held
+
+    b.get_quote = quote
+    b._request = request
+    b._order_status = _status
+    b._position_token_ids = _positions
+    return b
+
+
+def _buy(b, token="tok"):
+    return asyncio.run(b.buy(slug="s", side="Up", token_id=token,
+                             price=0.57, stake=10.0))
+
+
+def test_unreadable_status_with_no_position_is_not_booked():
+    """The phantom: the venue refused the order, the status read failed, and
+    the bot used to book a trade that never happened."""
+    b = _buy_broker(status=None, held=set())            # readable, token absent
+    assert _buy(b) is None
+    assert b.last_failure == "unconfirmed"
+    # And it must NOT be retryable: absence from a lagging position list is
+    # weak evidence, so a second order could double the exposure.
+    from btcpredict.execution import live
+    assert b.last_failure not in live.RETRYABLE_FAILURES
+
+
+def test_unreadable_status_with_a_position_is_booked_as_verified():
+    """The effect proves the cause: a position can only exist if it filled."""
+    b = _buy_broker(status=None, held={"tok"})
+    fill = _buy(b)
+    assert fill is not None
+    assert not fill.unverified
+    assert fill.order_id == "o1"
+
+
+def test_unreadable_status_and_unreadable_positions_books_provisionally():
+    """Neither endpoint answered: hold the fill as provisional rather than
+    dropping it, because dropping a real position strands its winnings. settle()
+    gets minutes to resolve it instead of the order path's second."""
+    b = _buy_broker(status=None, held=None)
+    fill = _buy(b)
+    assert fill is not None and fill.unverified
+
+
+def test_a_confirmed_status_needs_no_position_lookup():
+    b = _buy_broker(status="FILLED", held=set())
+    calls = []
+    b._position_token_ids = lambda: calls.append(1)     # must not be reached
+    fill = _buy(b)
+    assert fill is not None and not fill.unverified
+    assert calls == []
+
+
+def test_a_position_in_another_token_does_not_confirm_this_order():
+    b = _buy_broker(status=None, held={"someone-elses-token"})
+    assert _buy(b) is None

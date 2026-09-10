@@ -73,7 +73,8 @@ class LiveBrokerError(RuntimeError):
 
 # `buy()` failure reasons for which the venue is KNOWN to hold no order, so
 # placing again cannot double the exposure. Anything else -- a timeout, a 5xx,
-# a status we could not read -- may have left a live order behind and must
+# a status we could not read, or an absence from a position list that has not
+# yet caught up (`unconfirmed`) -- may have left a live order behind and must
 # never be re-placed. See `LiveBroker.last_failure`.
 RETRYABLE_FAILURES = frozenset({"no_quote", "quote_expired", "rejected",
                                 "venue_failed"})
@@ -283,10 +284,40 @@ class LiveBroker:
         # spent waiting is a second of the quote's ~5s expireAt window and of
         # the trade's tau window. Deeper verification belongs in settle(), which
         # has minutes rather than seconds.
-        status = await self._order_status(order_id, tries=3, delay=0.4)
+        status = await self._order_status(order_id, tries=4, delay=0.5)
         if status is None:
-            log.warning("order %s placed but history unavailable; "
-                        "proceeding unverified", order_id)
+            # The history endpoint did not answer in time. It lags the
+            # place-order call by a second or two, so this is the COMMON case
+            # rather than the rare one -- and it used to mean the fill was
+            # booked on assumption. Never do that: a phantom fill corrupts the
+            # P&L, the risk guard's exposure and the trade record, and nothing
+            # downstream can tell it apart from a real trade.
+            # The position list is the EFFECT of a fill, so ask it instead: a
+            # position in this token can only exist if the order went through.
+            held = await self._confirm_by_position(token_id)
+            if held is False:
+                # Absent from a readable position list. That is evidence the
+                # order did not land -- but NOT proof, since the list lags a
+                # fill. So this is deliberately NOT retryable: re-placing on
+                # weak evidence would double the exposure if the first order
+                # did fill. Nothing is booked and the round is abandoned; if
+                # the position does appear, the round gate sees it and blocks
+                # re-entry anyway, and redeem() claims ALL claimable tokens
+                # rather than only the ones this bot booked, so winnings are
+                # not stranded.
+                self.last_failure = "unconfirmed"
+                log.error("order %s unverifiable and the venue holds no "
+                          "position in %s; NOT booking and NOT retrying",
+                          order_id, slug)
+                return None
+            if held is True:
+                log.info("order %s confirmed by the venue's position list (%s)",
+                         order_id, slug)
+                status = "FILLED"
+            else:
+                log.warning("order %s UNCONFIRMED: order history and position "
+                            "list both unreadable; booking provisionally and "
+                            "letting settle() decide (%s)", order_id, slug)
         elif status != "FILLED":
             # A terminal non-FILLED status is authoritative: the venue took no
             # position, so the caller may safely place a fresh order. FOK
@@ -314,6 +345,27 @@ class LiveBroker:
             # the venue never actually filled anything.
             unverified=(status is None),
         )
+
+    async def _confirm_by_position(self, token_id: str, tries: int = 3,
+                                   delay: float = 0.5) -> bool | None:
+        """Does the venue hold `token_id`? True / False / None (unreadable).
+
+        The tie-breaker for an order whose status could not be read. Polled
+        briefly, because a position takes a moment to appear after a FOK fill.
+
+        False is only returned when the list was actually read and did not
+        contain the token -- a list we could never read proves nothing, so it
+        returns None rather than an absence (the None/empty distinction in
+        _position_token_ids is load-bearing).
+        """
+        held: set[str] | None = None
+        for i in range(tries):
+            held = await self._position_token_ids()
+            if held is not None and token_id in held:
+                return True
+            if i < tries - 1:
+                await asyncio.sleep(delay)
+        return False if held is not None else None
 
     async def settle(self, fill: Fill, winner: str) -> Settlement | None:
         if getattr(fill, "unverified", False):
