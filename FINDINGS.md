@@ -1019,3 +1019,19 @@ expected runs a day). Everything about this is a bet on a t 0.63 estimate.
 The paper instance (`btcpredict-paper.service`) has been stopped: with live
 running the same pricing there is nothing left to compare it against, and two
 instances polling the same book only risks rate limits.
+
+First live order under the new config, for the record: `btc-updown-5m-1789082100`,
+Up, requested 0.75, filled 0.7602, stake $1.00 (the 2% fraction came out below
+the venue floor and the sizing code clamps up to $1 rather than skipping),
+fee $0.0067. It is buying the favourite, which is what the honest pricing is
+supposed to do: at q = 0.76 the amplified venue price is 0.806, an edge of
++0.046 against a 0.01 bar.
+
+One fidelity gap between live and the replay, found while watching this:
+live updates the persistence STREAK before the tau-window check, so a signal
+that has been acting during tau > 210 counts toward the 2 polls and the trade
+can fire on the first in-window tick. `backtest_candle_open.replay` filters on
+tau first and never counts those ticks. Live therefore trades somewhat MORE than
+the replay's numbers predict -- the replay's ~260 trades/day is a floor, not an
+estimate. It is a tools-vs-live mismatch, not a live bug, and it pushes the
+trade count (and so the variance) up, not down.
