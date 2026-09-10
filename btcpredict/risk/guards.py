@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 log = logging.getLogger(__name__)
@@ -34,11 +35,29 @@ class RiskState:
 
 class RiskGuard:
     def __init__(self, *, daily_loss_cap: float, max_consecutive_losses: int,
-                 max_open_rounds: int):
+                 max_open_rounds: int, daily_loss_cap_pct: float = 0.0,
+                 bankroll: Callable[[], float] | None = None):
         self.daily_loss_cap = abs(daily_loss_cap)
+        self.daily_loss_cap_pct = abs(daily_loss_cap_pct)
+        self.bankroll = bankroll
         self.max_consecutive_losses = max_consecutive_losses
         self.max_open_rounds = max_open_rounds
         self.state = RiskState()
+
+    def effective_daily_cap(self) -> float:
+        """Loss limit for the day: whichever of the two caps is reached first.
+
+        The percentage is taken against the CURRENT bankroll, so the limit
+        tightens as the account shrinks -- deliberately the conservative
+        direction, and the reason a percentage cap needs to be several stakes
+        wide to be usable rather than hair-trigger.
+        """
+        if self.daily_loss_cap_pct <= 0 or self.bankroll is None:
+            return self.daily_loss_cap
+        b = self.bankroll()
+        if not b or b <= 0:
+            return self.daily_loss_cap
+        return min(self.daily_loss_cap, self.daily_loss_cap_pct * b)
 
     def check(self, slug: str) -> tuple[bool, str]:
         """May we open a position on `slug`? Returns (allowed, reason)."""
@@ -46,9 +65,10 @@ class RiskGuard:
         s = self.state
         if s.halted:
             return False, f"halted: {s.halt_reason}"
-        if s.daily_pnl <= -self.daily_loss_cap:
+        cap = self.effective_daily_cap()
+        if s.daily_pnl <= -cap:
             s.halted = True
-            s.halt_reason = f"daily loss cap {self.daily_loss_cap:.2f} hit"
+            s.halt_reason = f"daily loss cap {cap:.2f} hit"
             return False, s.halt_reason
         if s.consecutive_losses >= self.max_consecutive_losses:
             s.halted = True
@@ -70,9 +90,10 @@ class RiskGuard:
             self.state.consecutive_losses += 1
         else:
             self.state.consecutive_losses = 0
-        if self.state.daily_pnl <= -self.daily_loss_cap:
+        cap = self.effective_daily_cap()
+        if self.state.daily_pnl <= -cap:
             self.state.halted = True
-            self.state.halt_reason = f"daily loss cap {self.daily_loss_cap:.2f} hit"
+            self.state.halt_reason = f"daily loss cap {cap:.2f} hit"
             log.error("RISK HALT: %s", self.state.halt_reason)
         elif self.state.consecutive_losses >= self.max_consecutive_losses:
             self.state.halted = True
@@ -106,7 +127,8 @@ class RiskGuard:
         """
         self.state.daily_pnl = pnl_today
         self.state.consecutive_losses = consecutive_losses
-        if pnl_today <= -self.daily_loss_cap:
+        cap = self.effective_daily_cap()
+        if pnl_today <= -cap:
             self.state.halted = True
-            self.state.halt_reason = f"daily loss cap {self.daily_loss_cap:.2f} hit"
+            self.state.halt_reason = f"daily loss cap {cap:.2f} hit"
             log.error("RISK HALT: %s (persisted across restart)", self.state.halt_reason)

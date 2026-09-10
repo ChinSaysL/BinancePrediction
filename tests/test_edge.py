@@ -2,7 +2,7 @@ import pytest
 
 from btcpredict.edge.signal import (FeeModel, breakeven_prob, evaluate,
                                     evaluate_hybrid, expected_value, kelly_stake,
-                                    stake_for_edge)
+                                    stake_for_edge, stake_for_fraction)
 
 FEE = 0.02
 
@@ -226,6 +226,42 @@ def test_stake_for_edge_spans_the_configured_band():
     assert stake_for_edge(0.17, **kw) == pytest.approx(12.5)    # linear between
     assert stake_for_edge(0.40, **kw) == pytest.approx(20.0)    # clamped high
     assert stake_for_edge(0.01, **kw) == pytest.approx(5.0)     # clamped low
+
+
+def test_stake_for_fraction_tracks_the_bankroll():
+    kw = dict(fraction=0.05, min_stake=1.0, cap=25.0)
+    assert stake_for_fraction(68.0, **kw) == pytest.approx(3.40)
+    assert stake_for_fraction(200.0, **kw) == pytest.approx(10.0)
+    # a bigger bankroll stakes more -- that is the whole point of the mode
+    assert stake_for_fraction(400.0, **kw) > stake_for_fraction(200.0, **kw)
+
+
+def test_stake_for_fraction_shrinks_after_losses():
+    """The behaviour that separates this from a dollar band: the same
+    percentage of a smaller bankroll is a smaller stake."""
+    kw = dict(fraction=0.05, min_stake=1.0, cap=25.0)
+    before = stake_for_fraction(68.0, **kw)
+    after = stake_for_fraction(68.0 - 12 * before, **kw)
+    assert after < before
+
+
+def test_stake_for_fraction_respects_min_and_cap():
+    kw = dict(fraction=0.05, min_stake=1.0, cap=25.0)
+    assert stake_for_fraction(1000.0, **kw) == pytest.approx(25.0)   # capped
+    # 5% of $20 is exactly the $1 venue floor -- still expressible
+    assert stake_for_fraction(20.0, **kw) == pytest.approx(1.0)
+    # below the venue minimum the fraction is NOT rounded up: rounding up
+    # silently raises the real risk fraction, the one thing this mode controls
+    assert stake_for_fraction(19.0, **kw) == 0.0
+    assert stake_for_fraction(10.0, **kw) == 0.0
+    assert stake_for_fraction(0.0, **kw) == 0.0
+    assert stake_for_fraction(-5.0, **kw) == 0.0
+    assert stake_for_fraction(100.0, fraction=0.0, min_stake=1.0, cap=25.0) == 0.0
+
+
+def test_stake_for_fraction_never_exceeds_the_bankroll():
+    assert stake_for_fraction(30.0, fraction=0.9, min_stake=1.0,
+                              cap=0.0) == pytest.approx(27.0)
 
 
 def test_stake_for_edge_is_monotone():

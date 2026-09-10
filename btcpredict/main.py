@@ -27,7 +27,7 @@ from btcpredict.calibration.report import PnLSummary
 from btcpredict.config import MARKETS, settings
 from btcpredict.edge.signal import (FeeModel, Signal, evaluate,
                                     evaluate_hybrid, kelly_stake,
-                                    stake_for_edge)
+                                    stake_for_edge, stake_for_fraction)
 from btcpredict.execution.base import Fill
 from btcpredict.execution.live import RETRYABLE_FAILURES, LiveBroker
 from btcpredict.execution.paper import PaperBroker
@@ -94,6 +94,8 @@ class Bot:
             daily_loss_cap=settings.daily_loss_cap_usdt,
             max_consecutive_losses=settings.max_consecutive_losses,
             max_open_rounds=settings.max_open_rounds,
+            daily_loss_cap_pct=settings.daily_loss_cap_pct,
+            bankroll=lambda: self.bankroll,
         )
         # --resume deliberately clears a persisted halt (fresh daily budget).
         self.resume_guard = False
@@ -516,6 +518,14 @@ class Bot:
                                fraction=settings.kelly_fraction,
                                min_stake=settings.min_order_usdt,
                                max_stake=settings.max_stake_usdt)
+        if settings.sizing_mode == "fraction":
+            # Percentage of the live bankroll. Returns 0 (skip) when the
+            # fraction cannot reach the venue minimum -- see
+            # stake_for_fraction for why it must not round up.
+            return stake_for_fraction(self.bankroll,
+                                      fraction=settings.stake_fraction,
+                                      min_stake=settings.min_order_usdt,
+                                      cap=settings.stake_cap_usdt)
         # What counts as "strongest": the claimed edge, or expected profit per
         # dollar. The recording favours ev/$ -- large claims are the most
         # inflated, so sizing up on them rewards the noisiest signals.

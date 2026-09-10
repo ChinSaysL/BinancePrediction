@@ -14,6 +14,51 @@ def guard(**kw):
                         "max_open_rounds": 1, **kw})
 
 
+def test_daily_cap_stays_absolute_when_pct_is_off():
+    # no bankroll wired up, and pct 0 -> the old absolute behaviour, unchanged
+    assert guard().effective_daily_cap() == pytest.approx(3.0)
+    assert guard(bankroll=lambda: 40.0).effective_daily_cap() == pytest.approx(3.0)
+
+
+def test_percentage_daily_cap_binds_before_the_absolute_one():
+    # 5% of $40 is $2.00, i.e. tighter than the $3.00 absolute cap
+    g = guard(daily_loss_cap_pct=0.05, bankroll=lambda: 40.0)
+    assert g.effective_daily_cap() == pytest.approx(2.0)
+    g.on_settle("r1", -2.0)
+    assert g.state.halted
+    assert "2.00" in g.state.halt_reason
+
+
+def test_percentage_daily_cap_never_exceeds_the_absolute_cap():
+    # 5% of $1000 is $50, but the absolute cap still governs
+    g = guard(daily_loss_cap_pct=0.05, bankroll=lambda: 1000.0)
+    assert g.effective_daily_cap() == pytest.approx(3.0)
+
+
+def test_percentage_daily_cap_follows_the_bankroll_down():
+    """A percentage cap must tighten as the account shrinks -- that is the
+    behaviour fixed dollars cannot provide."""
+    b = {"v": 100.0}
+    g = guard(daily_loss_cap=100.0, daily_loss_cap_pct=0.10,
+              bankroll=lambda: b["v"])
+    assert g.effective_daily_cap() == pytest.approx(10.0)
+    b["v"] = 50.0
+    assert g.effective_daily_cap() == pytest.approx(5.0)
+
+
+def test_percentage_daily_cap_ignores_a_missing_or_broken_bankroll():
+    assert guard(daily_loss_cap_pct=0.05).effective_daily_cap() == pytest.approx(3.0)
+    assert guard(daily_loss_cap_pct=0.05,
+                 bankroll=lambda: 0.0).effective_daily_cap() == pytest.approx(3.0)
+
+
+def test_percentage_daily_cap_is_honoured_when_seeding_after_a_restart():
+    g = guard(daily_loss_cap_pct=0.05, bankroll=lambda: 40.0)   # cap $2.00
+    g.seed_daily(-2.50)
+    assert g.state.halted
+    assert "2.00" in g.state.halt_reason
+
+
 def test_one_position_per_round():
     g = guard()
     assert g.check("r1")[0]

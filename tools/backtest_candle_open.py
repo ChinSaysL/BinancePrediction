@@ -43,6 +43,12 @@ class ReplayParams:
     edge_haircut: float = 1.0
     max_quote: float = 0.90
     min_quote: float = 0.15
+    # Signal-strength floor: |ln(spot/strike)| / (sigma*sqrt(tau/60)). Measured
+    # on an independent venue (Polymarket 5m crypto, 1,292 trades) the per-trade
+    # return rises monotonically with this quantity, and weak-signal trades
+    # LOSE money even though the edge gate accepts them. On OUR recording it is
+    # the reverse at every floor -- see settings.min_moneyness_sd. 0.0 = off.
+    min_moneyness_sd: float = 0.0
     signal_persistence: int = 3
     candle_open_window_s: float = 5.0
     safety_margin: float = 0.01
@@ -62,6 +68,7 @@ class ReplayParams:
             edge_haircut=settings.edge_haircut,
             max_quote=settings.max_quote,
             min_quote=settings.min_quote,
+            min_moneyness_sd=settings.min_moneyness_sd,
             signal_persistence=settings.signal_persistence,
             candle_open_window_s=settings.candle_open_window_s,
             safety_margin=settings.safety_margin,
@@ -213,6 +220,19 @@ def replay(quotes, settled_by_slug, sigma_by_slug, hist, model,
                          sig.ev_per_dollar, False,
                          f"Up skipped: 1h ret {blocked_ret:+.4f} > "
                          f"{params.up_regime_gate:+.3f}")
+
+        # Signal-strength floor. |z| is how decided the round already is, in
+        # units of the remaining move -- it is independent of where the venue
+        # prices the side, so it catches the trades the edge gate wrongly
+        # accepts (cheap because unlikely, not because mispriced).
+        if sig.act and params.min_moneyness_sd > 0:
+            mz = abs(math.log(spot / strike)) / (
+                sigma_by_slug.get(slug, 0.0004) * math.sqrt(tau / 60.0))
+            if mz < params.min_moneyness_sd:
+                sig = Signal(None, sig.fair, sig.quote, sig.edge, sig.hurdle,
+                             sig.ev_per_dollar, False,
+                             f"weak signal: |z| {mz:.2f} < "
+                             f"{params.min_moneyness_sd:.2f}")
 
         prev_side, prev_n = streak.get(slug, (None, 0))
         if sig.act and sig.side == prev_side:

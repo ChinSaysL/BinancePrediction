@@ -228,6 +228,35 @@ def stake_for_edge(edge: float, *, min_edge: float, min_stake: float,
     return min_stake + (max_stake - min_stake) * t
 
 
+def stake_for_fraction(bankroll: float, *, fraction: float, min_stake: float,
+                       cap: float) -> float:
+    """Fixed percentage of the bankroll.
+
+    The alternative to a dollar band. A band bet $5-10 regardless of size, so
+    on a $68 bankroll it risked 7-15% per trade -- and after losses the SAME
+    dollar stake is a larger fraction, so the risk fraction rises exactly when
+    the account is shrinking. Measured on the replayed sequence, twelve
+    consecutive losses finish a $68 bankroll at fixed dollars, while 5% of
+    bankroll leaves $37 and recovers.
+
+    Returns 0.0 (== SKIP) when the fraction cannot reach the venue minimum.
+    Rounding up would silently raise the real fraction, which is the one thing
+    this mode exists to control; below about a $20 bankroll the account is too
+    small to subdivide further and sitting out is the honest answer.
+    """
+    if bankroll <= 0 or fraction <= 0:
+        return 0.0
+    if bankroll < min_stake:
+        return 0.0
+    stake = bankroll * fraction
+    if cap > 0:
+        stake = min(stake, cap)
+    stake = min(stake, bankroll)
+    if stake < min_stake:
+        return 0.0
+    return stake
+
+
 def kelly_stake(p: float, q: float, bankroll: float, fraction: float,
                 min_stake: float, max_stake: float) -> float:
     """Fractional Kelly for a binary payout, clamped to the allowed range.

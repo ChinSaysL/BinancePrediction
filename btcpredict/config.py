@@ -56,7 +56,13 @@ class Settings(BaseSettings):
     #   min_stake_usdt, the strongest (edge >= stake_edge_hi) at max_stake_usdt,
     #   linear in between. "kelly": fractional Kelly, and a Kelly value below
     #   the venue minimum SKIPS the trade instead of rounding up to full size.
-    sizing_mode: Literal["edge", "kelly"] = "edge"
+    #   "fraction": a fixed PERCENTAGE of the live bankroll (stake_fraction),
+    #   floored at the venue minimum and capped by stake_cap_usdt. Unlike the
+    #   band, the stake shrinks as the bankroll shrinks, which is the whole
+    #   point: with fixed dollars the risk FRACTION rises exactly when losing.
+    #   A fraction that cannot reach the venue minimum SKIPS the trade rather
+    #   than rounding up, because rounding up silently raises the real fraction.
+    sizing_mode: Literal["edge", "kelly", "fraction"] = "edge"
     # Which measure of "signal strength" drives the stake inside the band:
     #   edge -> the gated, post-haircut edge   (min_edge .. stake_edge_hi)
     #   ev   -> expected profit per $1 staked  (stake_ev_lo .. stake_ev_hi)
@@ -69,6 +75,13 @@ class Settings(BaseSettings):
     sizing_metric: Literal["edge", "ev"] = "edge"
     min_stake_usdt: float = 5.0
     max_stake_usdt: float = 20.0
+    # sizing_mode="fraction" knobs. 5% of bankroll is about 1/9 of full Kelly
+    # (Kelly on the 70 replayed trades is mean/var = 45%), which is the right
+    # order of magnitude for an edge that is still only 70 trades old.
+    stake_fraction: float = 0.05
+    # Ceiling on the fractional stake, so compounding cannot run the stake up
+    # to a size the venue's book cannot absorb in one FOK order.
+    stake_cap_usdt: float = 25.0
     # Edge at which the maximum stake is reached. The gate accepts from
     # min_edge up; recorded accepted edges ran 0.12 -> 0.22.
     stake_edge_hi: float = 0.22
@@ -79,7 +92,11 @@ class Settings(BaseSettings):
     # Flat fallback, used only when sizing_mode is not "edge" and no stake can
     # be computed.
     stake_usdt: float = 10.0
-    min_order_usdt: float = 5.0
+    # Venue minimum order size. Measured, not assumed: 54 live orders of exactly
+    # $1.00 filled with real order ids (1.04-3.86 shares), so the floor is $1.
+    # The old $5 was self-inflicted and leaked into the balance gate and the
+    # Kelly minimum, silently blocking stakes the venue would have accepted.
+    min_order_usdt: float = 1.0
     kelly_fraction: float = 0.25
     # Venue tolerance on price movement between quote and fill. 100 bps was
     # producing FOK failures ("Failed to execute the market order") when the
@@ -132,6 +149,19 @@ class Settings(BaseSettings):
     # below px 0.50. Cheap longshots pay the cap; favourites are cheap. This
     # floor and the re-sweep under the true curve agree on 0.25 (+$8.98 vs
     # +$7.66 at 0.15, +$5.90 at 0.35 on the 94-round recording).
+    # Signal-strength floor, in units of the remaining move:
+    # |ln(spot/strike)| / (sigma*sqrt(tau/60)). 0.0 = off.
+    # Motivated by an independent venue (Polymarket 5m crypto, 1,292 trades,
+    # 2026-03-06..12) where per-trade return rises monotonically with |z| and
+    # the weak-signal trades actually LOSE money. It does NOT reproduce here:
+    # in tools/walk_forward --sweep moneyness every floor from 0.25 to 1.50
+    # scores worse than 0.0 on both train and test (train +0.303/trade at 0.0
+    # vs +0.027 at 0.5; total PnL +15.47 -> +0.96). Our edge comes from the
+    # venue's quote lagging spot, which is largest exactly when the move is
+    # SMALL; Polymarket's CLOB prices those rounds correctly (realised WR 0.374
+    # against its own price of 0.359). Kept at 0.0, do not re-tune without a
+    # bigger recording.
+    min_moneyness_sd: float = 0.0
     min_quote: float = 0.25
     # Walk-forward check (tools/walk_forward.py, 60/40 time split): widening
     # this to 0.20 looks better on the pooled window (+35.8 vs +30.3 per $1)
@@ -220,6 +250,13 @@ class Settings(BaseSettings):
     # Daily cap: 3 losing trades at $10 = $30, a 4th would be -$40, so the
     # -$35 cap halts during the 4th consecutive loser.
     daily_loss_cap_usdt: float = 35.0
+    # Percentage-of-bankroll alternative: the day halts at the FIRST of the
+    # absolute cap and pct * bankroll (measured against the CURRENT bankroll,
+    # so it tightens as the account shrinks). 0.0 = off.
+    # Mind the interaction with the stake size: at a 5% stake a 5% cap halts
+    # after a single full loss, so a useful value is several stakes wide
+    # (15-20%), otherwise the loss-streak halt is the binding rule anyway.
+    daily_loss_cap_pct: float = 0.0
     max_consecutive_losses: int = 5
     max_open_rounds: int = 1
 
