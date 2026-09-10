@@ -98,7 +98,18 @@ class Settings(BaseSettings):
     # Turning it on widens the effective stake range beyond [min_stake_usdt,
     # max_stake_usdt] up to [min_order_usdt, stake_cap_usdt].
     stake_tilt: Literal["none", "inv_z"] = "none"
-    tilt_reference_z: float = 0.65   # |z| at which the multiplier is exactly 1
+    # The multiplier is clamp(reference/|z|, tilt_min, tilt_max). NOTE the clip
+    # makes its MEAN exceed reference/median|z| -- with the recording's |z|
+    # distribution, reference 0.65 leaves the mean multiplier at 1.30, i.e. a
+    # silent 30% stake increase. 0.30 is the value that makes the mean
+    # multiplier 1.0 on the 70 replayed trades, so turning the tilt on changes
+    # only the SHAPE of the bets, which is the part that was tested at matched
+    # exposure: same mean stake ($6.76 vs $6.83), PnL +$385.57 vs +$252.39
+    # (+53%), drawdown -$22.81 vs -$20.14, PnL/DD 16.9 vs 12.5.
+    # Caveat: |z| = |ln(S/K)|/(sigma*sqrt(tau/60)) shrinks when volatility
+    # rises, so a fixed reference drifts exposure with the regime. Re-derive it
+    # if the realised |z| distribution moves.
+    tilt_reference_z: float = 0.30
     tilt_min: float = 0.5            # bounds, so one trade cannot dominate
     tilt_max: float = 2.0
     # Edge at which the maximum stake is reached. The gate accepts from
