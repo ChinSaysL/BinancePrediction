@@ -185,8 +185,14 @@ DEFAULT_PARAMS: dict = {
 #     (t 0.32) and 363 train rounds for +0.008 (t 0.23) -- the right sign on
 #     both slices, but an edge of 1.3% per $1 staked that would need ~10x the
 #     trades to demonstrate (about a month of running).
-# See FINDINGS.md. Left empty so the model behaves exactly like digital.
-DOWN_PARAMS: dict = {}
+# See FINDINGS.md. Live does not select this model; it exists so the honest
+# pricing can be run forward in paper (see tools/ab_report.py for the readout)
+# against the live book, instead of being argued about on 674 rounds.
+DOWN_PARAMS: dict = {
+    "b_market": 1.242673,
+    "b_disc": 0.056951,
+    "b_imb": -0.376878,
+}
 
 
 class CalibratedUpModel(StrategyModel):
