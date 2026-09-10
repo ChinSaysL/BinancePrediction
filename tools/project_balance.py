@@ -50,23 +50,30 @@ HORIZONS = (1, 2, 7, 14, 30)
 # from the stricter replay (which needs recorded quotes AND signal persistence
 # for every candle open). The live number is what a projection should use.
 LIVE_TRADES_PER_DAY = 44.0
-# The four levels matter more than anything else here, because the projection
+# The levels matter more than anything else here, because the projection
 # compounds: at 4% per trade a 1%-per-trade difference is a 13x difference over
 # a month. Listed highest first.
+#   as realised, current era  +0.540/$1 -- the 5 live trades since the era cut
+#                  (today 11:00 UTC). NOT USABLE as a forecast: se 0.367, so the
+#                  95% interval is [-0.18, +1.26], and all 5 predate the tilt
+#                  and the fraction switch.
 #   as recorded    +0.43/$1 -- the 70-trade BTC replay. IN-SAMPLE: the same
 #                  rounds chose the gate thresholds, and fills are assumed at
 #                  the displayed ask.
 #   central        +0.25/$1 -- the haircut this project has been using.
 #   other venue    +0.17/$1 -- the independent Polymarket replication net of
 #                  that venue's fees (1,292 trades, t=+5.65). The only number
-#                  here that was produced outside this repo.
-#   as realised    +0.06/$1 -- what live actually paid: +$30.54 over ~$520
-#                  staked across 105 fills (stakes averaged ~$5), i.e. mostly
-#                  with the OLD broken configuration.
-EDGES = [("as recorded, in-sample (+0.43/$1)", None),
+#                  here produced outside this repo.
+#   old build      +0.031/$1 -- the 99 live trades BEFORE the era cut, on
+#                  superseded sizing ($1-$10.50 stakes, the broken configs).
+#                  Pooling this with the current era is what produced the +0.06
+#                  that was quoted before: 99 trades of +0.031 plus 5 of +0.540
+#                  averages to +0.071, which describes no build that ever ran.
+EDGES = [("as realised, current era (+0.540/$1)", 0.540),
+         ("as recorded, in-sample (+0.43/$1)", None),
          ("central (+0.25/$1)", 0.25),
          ("other venue (+0.17/$1)", 0.17),
-         ("as realised live (+0.06/$1)", 0.06),
+         ("old build only (+0.031/$1)", 0.031),
          ("NULL: no edge at all (0.00/$1)", 0.0)]
 
 
