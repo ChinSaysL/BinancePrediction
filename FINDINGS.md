@@ -1089,3 +1089,46 @@ to the floor. Every projection in this repo before now was therefore measured
 against a strategy that stops trading after a handful of trades a day, which is
 why they reported 30-day median P/L of ~+$0.30. `_stake()` now mirrors
 `main._base_stake_for` + `main._stake_for` exactly.
+
+## Daily stop: tested at OFF / 10 / 15 / 20 / 30% -- it does not matter (2026-09-10)
+
+Asked whether the daily loss stop should be disabled, so it was tested properly
+on the shipped config (618-trade pool at +0.0219/$1, 249 trades/day, $66.06,
+300 paths, 30 days):
+
+| daily stop | median | profit | med DD | p95 DD | P(DD>30%) | P(DD>50%) | ruin | halt |
+|---|---|---|---|---|---|---|---|---|
+| OFF | $245.88 | +$179.82 | 31.3% | 46.4% | 56.0% | 3.0% | 0% | 92% |
+| 10% | $223.15 | +$157.09 | 30.0% | 45.0% | 50.0% | 2.3% | 0% | 92% |
+| 15% | $248.52 | +$182.46 | 30.6% | 45.8% | 52.7% | 1.7% | 0% | 93% |
+| 20% (live) | $236.27 | +$170.21 | 30.5% | 45.4% | 52.0% | 1.7% | 0% | 95% |
+| 30% | $243.07 | +$177.01 | 31.1% | 46.4% | 55.3% | 2.3% | 0% | 92% |
+
+Non-monotonic and within +-6% across every setting: this is noise, not a
+signal. The reason is that the stop almost never binds -- the day-scoped
+5-loss HALT fires on 92-95% of paths and truncates the day first (median worst
+day is 10-17%, short of a 20% stop). Verdict: **leave it at 20%.** Disabling it
+buys nothing measurable and removes a control that costs nothing.
+
+## Why an old sizing table promised +$1,818 in 30 days (2026-09-10)
+
+An earlier session's table (`tools/sizing_study`, 3000 paths x 200 TRADES)
+reported median profit +$1,347 for f=3% and +$1,818 for f=4%. Re-running the
+same tool, same horizon, on the shipped config now reports +$6 (3%) and +$7
+(5%) -- a 200x difference from an unchanged calculation. Three reasons:
+
+  * the horizon is 200 TRADES, not 30 days, and it bootstraps trades with no
+    daily stop and no 5-loss halt;
+  * back then the tool's pool was the in-sample 70-trade replay at +0.43/$1.
+    The shipped pool is +0.0219/$1, a 20x smaller edge, and compounding a 20x
+    edge over 200 trades is what produced four-figure medians;
+  * the tool's own footer says it: "treat the growth columns as an upper bound".
+
+**The honest 30-day answer** (`tools.project_balance`, which models days, the
+daily stop, the day-scoped halt, the tilt, the venue floor and the cap): median
+$211.70 from $66.06 (+$145.64, 800 paths), p10 $49.66, p90 $470.23. Run with the
+edge forced to zero the same simulation gives a median of $49.80. So the range
+is +$146 if the edge is real to -$16 if it is not, and a 300-path run of the
+same thing gives $236 rather than $212 -- at these path counts +-10% is Monte
+Carlo noise, which is itself worth remembering before reading any of these
+tables too closely.
