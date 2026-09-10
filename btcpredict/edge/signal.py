@@ -56,6 +56,7 @@ class Signal:
     ev_per_dollar: float      # expected profit per $1 staked
     act: bool
     reason: str
+    fair_up_model: float | None = None  # raw P(Up) that produced it (rechecks)
 
     def __str__(self) -> str:
         if not self.act:
@@ -134,7 +135,8 @@ def evaluate(
         candidates.append((ev, side, p, q, hurdle))
 
     if not candidates:
-        return Signal(None, fair_up, quote_up, 0.0, 0.0, -1.0, False, "no valid quote")
+        return Signal(None, fair_up, quote_up, 0.0, 0.0, -1.0, False,
+                      "no valid quote", fair_up_model=fair_up)
 
     # Refuse deep favourites. At q=0.98 a $1 bet wins $0.02 and needs ~98.6%
     # accuracy to break even, but measured reliability in the top bucket was
@@ -147,7 +149,8 @@ def evaluate(
         q = min(c[3] for c in priced_out)
         side = "above max_quote" if q > max_quote else "below min_quote"
         return Signal(None, fair_up, quote_up, 0.0, 0.0, -1.0, False,
-                      f"quote {q:.2f} {side} [{min_quote:.2f},{max_quote:.2f}]")
+                      f"quote {q:.2f} {side} [{min_quote:.2f},{max_quote:.2f}]",
+                      fair_up_model=fair_up)
 
     ev, side, p, q, hurdle = max(candidates, key=lambda c: c[0])
     edge = p - q
@@ -157,7 +160,33 @@ def evaluate(
         else f"edge {edge:+.3f} < min_edge {min_edge:.3f}" if edge < min_edge
         else f"edge {edge:+.3f} <= hurdle {hurdle:.3f}"
     )
-    return Signal(side, p, q, edge, hurdle, ev, act, reason)
+    return Signal(side, p, q, edge, hurdle, ev, act, reason,
+                  fair_up_model=fair_up)
+
+
+def evaluate_hybrid(fair_up_down_model: float, fair_up_up_model: float,
+                    quote_up: float, quote_down: float, **kwargs) -> Signal:
+    """Per-side gate: Down candidates priced by the down model, Up by the up model.
+
+    evaluate() runs once per model probability; the down model's Up call and
+    the up model's Down call are discarded, then the higher-EV acting signal
+    wins. With identical probabilities this reduces to plain evaluate().
+    """
+    if fair_up_down_model == fair_up_up_model:
+        return evaluate(fair_up_down_model, quote_up, quote_down, **kwargs)
+    down_sig = evaluate(fair_up_down_model, quote_up, quote_down, **kwargs)
+    up_sig = evaluate(fair_up_up_model, quote_up, quote_down, **kwargs)
+    cands = []
+    if down_sig.act and down_sig.side == "Down":
+        cands.append(down_sig)
+    if up_sig.act and up_sig.side == "Up":
+        cands.append(up_sig)
+    if not cands:
+        best = (down_sig if down_sig.ev_per_dollar >= up_sig.ev_per_dollar
+                else up_sig)
+        return Signal(None, best.fair, best.quote, best.edge, best.hurdle,
+                      best.ev_per_dollar, False, best.reason)
+    return max(cands, key=lambda s: s.ev_per_dollar)
 
 
 def kelly_stake(p: float, q: float, bankroll: float, fraction: float,

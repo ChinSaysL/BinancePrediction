@@ -86,6 +86,10 @@ class Settings(BaseSettings):
     # model; the rest are the arena bots ported from polymarket-bot-arena
     # (see btcpredict/models/__init__.py for the full list).
     pricing_model: str = "digital"
+    # Opt-in per-side hybrid gate: Down candidates are priced by
+    # `pricing_model`, Up candidates by `up_model` (prototype: drift_digital).
+    # Equal names disable the hybrid and keep the single-model gate.
+    up_model: str = "digital"
     # Fallback only: the fee comes from the measured curve
     # fee_bps = 180 * min(1, (1-px)/px) (see edge/signal.py). 180 bps is the
     # curve's cap, so it is the conservative fallback when no fee is known.
@@ -211,9 +215,10 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _validate_pricing_model(self) -> "Settings":
         from btcpredict.models import MODEL_NAMES
-        if self.pricing_model.strip().lower() not in MODEL_NAMES:
-            raise ValueError(
-                f"unknown pricing_model '{self.pricing_model}'; choose from {MODEL_NAMES}")
+        for name in (self.pricing_model, self.up_model):
+            if name.strip().lower() not in MODEL_NAMES:
+                raise ValueError(
+                    f"unknown model '{name}'; choose from {MODEL_NAMES}")
         return self
 
     @property

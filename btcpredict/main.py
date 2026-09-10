@@ -25,7 +25,7 @@ import aiohttp
 
 from btcpredict.calibration.report import PnLSummary
 from btcpredict.config import MARKETS, settings
-from btcpredict.edge.signal import FeeModel, evaluate, kelly_stake
+from btcpredict.edge.signal import FeeModel, evaluate, evaluate_hybrid, kelly_stake
 from btcpredict.execution.base import Fill
 from btcpredict.execution.live import RETRYABLE_FAILURES, LiveBroker
 from btcpredict.execution.paper import PaperBroker
@@ -76,6 +76,12 @@ class Bot:
         # Rolling 1m-bar history per symbol, feeding the strategy models.
         self.histories: dict[str, PriceHistory] = {}
         self.model = build_model(settings.pricing_model)
+        # Opt-in per-side gate: Up is priced by `up_model` when it differs
+        # from the default model (prototype: drift-adjusted digital for Up).
+        self.up_model = (build_model(settings.up_model)
+                         if settings.up_model.strip().lower()
+                         != settings.pricing_model.strip().lower()
+                         else None)
         self.spot = self.spots["BTCUSDT"]
         self.vol = VolEstimator(
             lam=settings.vol_ewma_lambda,
@@ -120,6 +126,9 @@ class Bot:
         self.vol = self.vols["BTCUSDT"]
         self._last_vol_refresh = time.time()
         log.info("pricing model: %s", self.model.name)
+        if self.up_model is not None:
+            log.info("per-side gate: Down=%s Up=%s",
+                     self.model.name, self.up_model.name)
 
         if settings.has_credentials:
             book = LiveBroker(self.session, settings.binance_api_key,
@@ -166,11 +175,12 @@ class Bot:
         trade again on a day that already lost its budget.
         """
         today = time.strftime("%Y-%m-%d", time.gmtime())
+        mode = getattr(self.broker, "mode", "live")
         rows = self.store.query(
             "SELECT s.pnl, s.ts_ms FROM settlements s "
-            "JOIN fills f ON f.id = s.fill_id WHERE f.mode = 'live' "
+            "JOIN fills f ON f.id = s.fill_id WHERE f.mode = ? "
             "AND COALESCE(s.void, 0) = 0 "
-            "ORDER BY s.ts_ms DESC LIMIT 50")
+            "ORDER BY s.ts_ms DESC LIMIT 50", (mode,))
         pnl = sum(r["pnl"] for r in rows
                   if time.strftime("%Y-%m-%d", time.gmtime(r["ts_ms"] / 1000)) == today)
         streak = 0
@@ -298,8 +308,7 @@ class Bot:
             log.debug("model %s holds on %s: %s", self.model.name, r.slug, pred.reason)
             return
         fair_up = pred.p_up
-        sig = evaluate(
-            fair_up, buy_up, buy_down,
+        sig_kw = dict(
             # fee=None -> per-quote fee from the measured curve
             # (fee_bps = 180 * min(1, (1-px)/px)); a flat fallback would
             # misprice every side except px~0.50.
@@ -312,6 +321,14 @@ class Bot:
             min_edge=settings.min_edge,
             edge_haircut=settings.edge_haircut,
         )
+        if self.up_model is not None:
+            pred_up = self.up_model.predict(hist.ctx(
+                price=spot, strike=r.strike, tau_s=tau, sigma_1m=sigma))
+            up_fair = (pred_up.p_up if pred_up.emitted
+                       and 0.0 < pred_up.p_up < 1.0 else fair_up)
+            sig = evaluate_hybrid(fair_up, up_fair, buy_up, buy_down, **sig_kw)
+        else:
+            sig = evaluate(fair_up, buy_up, buy_down, **sig_kw)
 
         # A signal must hold for several consecutive polls. A one-tick edge is
         # usually our own stale book or spot sample rather than a real
@@ -408,8 +425,10 @@ class Bot:
 
         token = up.token_id if sig.side == "Up" else down.token_id
 
-        fill = await self._place_order(r, sig, fair_up=fair_up, token=token,
-                                       stake=stake)
+        fill = await self._place_order(
+            r, sig,
+            fair_up=sig.fair_up_model if sig.fair_up_model is not None else fair_up,
+            token=token, stake=stake)
         if not fill:
             return
         self.guard.on_open(r.slug)

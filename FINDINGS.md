@@ -732,3 +732,25 @@ the venue *confirmed* (4xx rejection, terminal FAILED status, missing/expired
 quote) are retried (`order_max_attempts=3`), and unknown outcomes (timeouts,
 5xx, unreadable status) are never re-placed, closing a potential
 double-exposure path. 100 tests pass.
+
+## Drift-adjusted digital prototype (2026-09-10)
+
+Question: can Up be fixed with a momentum-aware model instead of Down-only?
+
+- New model `drift_digital` (btcpredict/models/drift_digital.py): adds an
+  estimated short-term drift to the digital formula,
+  P(Up) = Phi((ln(S/K) + scale*mu_1m*tau_min) / (sigma_1m*sqrt(tau_min))),
+  mu blending recent-bar log returns with the round's realized move.
+- Result on the recording (513 rounds, ~43h): driftless Up was 14 trades
+  WR 0.429 -$3.98; drift Up is 55 trades WR 0.745 +$8.23. Raising the
+  driftless edge floor never fixed Up (losses per trade grew with claimed
+  edge) -- the venue prices Up momentum that the driftless model cannot see.
+- Per-side hybrid (driftless Down + drift Up, opt-in via `up_model` setting):
+  79 trades WR 0.759 +$27.09 mdd -$3.33. All 12 sweep cells positive
+  (+15.18..+29.62), split halves +12.06/+17.56, round bootstrap 95% CI
+  [+13.09, +46.37] P>0 100%. Defaults (scale 0.5, blend 0.5) kept, not the
+  argmax, to avoid cell-picking.
+- Live config untouched (digital Down-only, +$19.34, mdd -$1.35). A paper
+  instance (`btcpredict-paper` systemd unit) runs the hybrid with
+  SIDE_FILTER=both, UP_MODEL=drift_digital on the VPS for an out-of-sample
+  trial; guard seeding is mode-scoped so paper never inherits live PnL.

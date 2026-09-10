@@ -1,7 +1,7 @@
 import pytest
 
 from btcpredict.edge.signal import (FeeModel, breakeven_prob, evaluate,
-                                    expected_value, kelly_stake)
+                                    evaluate_hybrid, expected_value, kelly_stake)
 
 FEE = 0.02
 
@@ -162,3 +162,39 @@ def test_edge_haircut_of_one_is_a_no_op():
     a = evaluate(0.72, 0.63, 0.37, **kw)
     b = evaluate(0.72, 0.63, 0.37, edge_haircut=1.0, **kw)
     assert (a.side, a.edge, a.ev_per_dollar, a.act) == (b.side, b.edge, b.ev_per_dollar, b.act)
+
+
+KW = dict(fee=0.0, half_spread=0.0, safety_margin=0.0,
+          fee_model=FeeModel.NOTIONAL, min_quote=0.0, max_quote=0.90,
+          min_edge=0.10)
+
+
+def test_hybrid_down_candidate_comes_from_down_model():
+    # Down model sees a big Down edge; up model sees none.
+    sig = evaluate_hybrid(0.30, 0.62, quote_up=0.60, quote_down=0.40, **KW)
+    assert sig.act and sig.side == "Down"
+    assert sig.fair_up_model == 0.30
+
+
+def test_hybrid_up_candidate_comes_from_up_model():
+    # Up model sees a big Up edge; down model sees none.
+    sig = evaluate_hybrid(0.63, 0.71, quote_up=0.60, quote_down=0.40, **KW)
+    assert sig.act and sig.side == "Up"
+    assert sig.fair_up_model == 0.71
+
+
+def test_hybrid_discards_wrong_side_from_each_model():
+    # Down model's Up call and up model's Down call must be ignored, so the
+    # side always matches the model that priced it.
+    sig = evaluate_hybrid(0.30, 0.70, quote_up=0.60, quote_down=0.40, **KW)
+    assert sig.act and sig.side in ("Up", "Down")
+    if sig.side == "Up":
+        assert sig.fair_up_model == 0.70
+    else:
+        assert sig.fair_up_model == 0.30
+
+
+def test_hybrid_identical_probabilities_equals_evaluate():
+    a = evaluate_hybrid(0.72, 0.72, quote_up=0.63, quote_down=0.37, **KW)
+    b = evaluate(0.72, 0.63, 0.37, **KW)
+    assert (a.side, a.edge, a.act) == (b.side, b.edge, b.act)
