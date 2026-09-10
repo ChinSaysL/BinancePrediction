@@ -126,13 +126,20 @@ def build_1m_history(quotes: list[dict], store=None, symbol: str | None = None
 
 def replay(quotes, settled_by_slug, sigma_by_slug, hist, model,
            fee: float | None, candle_gate: bool, params: ReplayParams,
-           model_up=None) -> dict:
+           model_up=None, collected: list | None = None) -> dict:
     """Replay the decision path over recorded quotes (sorted by time).
 
     fee=None -> the measured per-price fee curve is used both in the gate and
     in PnL accounting; a float overrides with a flat rate for comparisons.
     model_up (optional) mirrors the live per-side gate: Down candidates are
     priced by `model`, Up candidates by `model_up`.
+
+    collected (optional): if a list is passed, EVERY evaluated tick is appended
+    to it as {slug, tau, p_up, outcome_up, ...}. Calibration questions need the
+    full population, not the handful of ticks the gate happened to trade -- the
+    acted sample is ~70 trades, while the evaluated population is thousands of
+    ticks across every settled round. Ticks inside a round are correlated, so
+    consumers must cluster by slug before computing errors.
     """
     pnl = PnLSummary()
     trades: list[dict] = []
@@ -207,6 +214,13 @@ def replay(quotes, settled_by_slug, sigma_by_slug, hist, model,
             pred_up = model_up.predict(ctx)
             if pred_up.emitted and 0.0 < pred_up.p_up < 1.0:
                 up_fair = pred_up.p_up
+        if collected is not None:
+            # Before the gate: this is the model's opinion, not the gate's.
+            collected.append({
+                "slug": slug, "ts_ms": q["ts_ms"], "tau": tau,
+                "p_up_down_model": pred.p_up, "p_up": up_fair,
+                "outcome_up": r["winner"] == "Up",
+            })
         sig = evaluate_hybrid(
             pred.p_up, up_fair, q["up_ask"], q["down_ask"],
             up_allowed=up_allowed,
