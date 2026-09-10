@@ -133,6 +133,11 @@ class Settings(BaseSettings):
     # floor and the re-sweep under the true curve agree on 0.25 (+$8.98 vs
     # +$7.66 at 0.15, +$5.90 at 0.35 on the 94-round recording).
     min_quote: float = 0.25
+    # Walk-forward check (tools/walk_forward.py, 60/40 time split): widening
+    # this to 0.20 looks better on the pooled window (+35.8 vs +30.3 per $1)
+    # but NOT out of sample -- test-slice per-trade is +0.47 at 0.20 against
+    # +0.69 at 0.25, with a deeper drawdown (-2.04 vs -1.02). So 0.25 stays.
+    # The code comment about sub-0.25 "losing money" predates edge_haircut.
     # Replay evidence under the measured fee curve (backtest_candle_open,
     # BTC-only): the winning variant is the ungated price-catcher -- no
     # candle-open requirement, a BIG edge floor instead. Small edges are
