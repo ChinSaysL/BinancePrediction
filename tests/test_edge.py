@@ -239,3 +239,14 @@ def test_stake_for_edge_is_monotone():
 def test_stake_for_edge_flat_band_returns_floor():
     assert stake_for_edge(0.20, min_edge=0.12, min_stake=10.0,
                           max_stake=10.0, edge_at_max=0.22) == pytest.approx(10.0)
+
+
+def test_hybrid_discard_reason_names_the_discarded_side():
+    # The discard path must not reuse the discarded candidate's own "ok" reason:
+    # that made non-trades indistinguishable from trades in the decision log.
+    # Here the down model acts on Up and the up model acts on Down, so nothing
+    # survives the per-side rule.
+    sig = evaluate_hybrid(0.80, 0.35, quote_up=0.50, quote_down=0.50, **KW)
+    assert not sig.act and sig.side is None
+    assert sig.reason != "ok"
+    assert "discarded" in sig.reason and "Up" in sig.reason

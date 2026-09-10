@@ -193,8 +193,15 @@ def evaluate_hybrid(fair_up_down_model: float, fair_up_up_model: float,
     if not cands:
         best = (down_sig if down_sig.ev_per_dollar >= up_sig.ev_per_dollar
                 else up_sig)
+        # `best` may have acted, but on the side its own model does not price
+        # here (the down model's Up call, the up model's Down call), so the
+        # per-side rule discards it. Say that explicitly: reusing the discarded
+        # signal's own "ok" reason made 204 of 205 gate-clearing polls look
+        # like trades that some *other* gate had refused.
+        reason = (f"discarded {best.side} candidate priced by the other model"
+                  if best.act else best.reason)
         return Signal(None, best.fair, best.quote, best.edge, best.hurdle,
-                      best.ev_per_dollar, False, best.reason)
+                      best.ev_per_dollar, False, reason)
     return max(cands, key=lambda s: s.ev_per_dollar)
 
 
