@@ -97,8 +97,7 @@ def show(label, ticks, bands=False):
 
 
 def main() -> None:
-    for market, symbol in (("btc-updown-5m", "BTCUSDT"),
-                           ("eth-updown-5m", "ETHUSDT")):
+    for market, symbol in (("btc-updown-5m", "BTCUSDT"),):
         quotes, sbs, sigs, hist = load(market)
         print(f"\n=== {market}: {len(sbs)} settled rounds ===")
         if not sbs:

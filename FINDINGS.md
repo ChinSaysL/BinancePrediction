@@ -754,3 +754,44 @@ Question: can Up be fixed with a momentum-aware model instead of Down-only?
   instance (`btcpredict-paper` systemd unit) runs the hybrid with
   SIDE_FILTER=both, UP_MODEL=drift_digital on the VPS for an out-of-sample
   trial; guard seeding is mode-scoped so paper never inherits live PnL.
+
+## The drift prototype is over-confident — reverted, and ETH removed (2026-09-10)
+
+**Supersedes the section above: `up_model` is back to `digital` and Up stays on.**
+
+Live Up was claiming ~0.76 and delivering ~0.56. The first measurement of that
+used 46 acted Up trades, whose standard error is ~0.12 — big enough to "show" a
+bias that small samples cannot see, and to hide one they can. So the measurement
+was redone on the whole evaluated population instead of the trades
+(`tools/calib_quotes.py`, which scores every tick and clusters errors BY ROUND):
+
+  model                   band 0.5-0.95    all ticks     by band
+  driftless (digital)     -0.039 (1.7 s)   -0.007 (0.4s) flat, every band within 1 s
+  live drift (scale 0.5)  -0.068 (2.9 s)   -0.009        -0.085 at 0.75-0.95
+  drift (scale 1.5)       -0.111 (4.6 s)   -0.022        -0.135 at 0.75-0.95
+
+514 BTC rounds / ~24k ticks, replicated on 444 ETH rounds / ~19k ticks. The shape
+matters: it is not "P(Up) too high" but OVER-CONFIDENCE — a fan that under-claims
+low probabilities (+0.056 at 0.05-0.25) and over-claims high ones — and it grows
+with the drift the model is told to trust (-0.068 at scale 0.5, -0.111 at 1.5).
+The prototype built to fix Up was the cause, not the cure; the driftless model is
+calibrated to within 1 sigma in every band on both assets. `.env` had overridden
+the config default of `digital`, so the fix was to stop overriding it.
+
+Do not read this as "Up now makes money": the replay's SELECTED Up trades are
+still negative (14 trades, -$4.0) and live Up is 52 trades WR 0.56, -$3.18.
+Calibration was necessary, not sufficient.
+
+**`up_regime_gate` re-tested** (`tools/gate_sweep.py`), now that Up is priced by
+the calibrated model: it moves 0-1 trade out of 14 and 0.01+ is identical to OFF.
+Its original justification (Up WR 0.50 rising vs 0.82 flat/down, worth ~+$3) came
+from 25 rounds under the old model and does not reproduce. Left at 0.005 as
+untuned-but-free, and the config comment now says so.
+
+**ETH removed from `MARKETS`.** The bot never traded it — `main.tick` passes
+`trade=(prefix == primary)` and every live fill in the record is `btc` — so all
+it produced was recorded data behind a second spot feed, a second volatility
+estimator and a second discovery call per tick. The recorded history stays in the
+database; re-adding it is one line in `MARKETS` plus the symbol in the tools.
+Worth knowing what is lost: the ETH replication was the strongest single piece of
+evidence for the calibration finding above, and that is now a manual re-add.

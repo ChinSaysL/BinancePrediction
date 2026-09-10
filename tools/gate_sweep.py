@@ -57,8 +57,7 @@ def main() -> None:
           f"up_regime_gate={settings.up_regime_gate} "
           f"min_edge={settings.min_edge} edge_haircut={settings.edge_haircut}\n")
 
-    for market, symbol in (("btc-updown-5m", "BTCUSDT"),
-                           ("eth-updown-5m", "ETHUSDT")):
+    for market, symbol in (("btc-updown-5m", "BTCUSDT"),):
         quotes, sbs, sigs, hist = load(market, symbol)
         if not sbs:
             continue

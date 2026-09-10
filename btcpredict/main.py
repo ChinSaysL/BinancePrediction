@@ -76,9 +76,9 @@ class Bot:
         self.store = store
         self.session = session
         self.market = MarketFeed(session)
-        # One spot feed and volatility estimator per underlying: the 15m ETH/BNB
-        # markets carry 30-450x less volume than BTC 5m, which is where looser
-        # pricing is more likely, but they need their own price and sigma.
+        # One spot feed and volatility estimator per market in MARKETS. There is
+        # only one now (BTC 5m); the dicts stay keyed by symbol because the
+        # feeds, the histories and the models are all per-underlying.
         self.symbols = sorted({sym for _, sym, _ in MARKETS})
         self.spots: dict[str, SpotFeed] = {
             sym: SpotFeed(session, symbol=sym) for sym in self.symbols}
@@ -298,8 +298,11 @@ class Bot:
     async def tick(self) -> None:
         await self.refresh_vol_if_stale()
         found = await self.market.rounds_by_prefixes([p for p, _, _ in MARKETS])
-        # Record every market; only the primary one may trade, so that a
-        # low-liquidity market cannot be traded before it has been evaluated.
+        # MARKETS holds one market (BTC 5m), so this loop runs once and the
+        # trade flag is always true. Both the loop and the flag are kept: they
+        # are what stops a newly added market from being traded before it has
+        # been evaluated, and removing that guard is how the daily loss cap was
+        # once bypassed.
         primary = MARKETS[0][0]
         for prefix, sym, _ in MARKETS:
             r = found.get(prefix)

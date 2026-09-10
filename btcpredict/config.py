@@ -21,15 +21,16 @@ SPOT_WS = "wss://stream.binance.com:9443/ws"
 EVENT_SLUG = "btc-up-or-down-5m"
 ROUND_SECONDS = 300
 
-# Markets to record, as (slug prefix, Binance symbol, round seconds).
-# BTC 5m is the flagship and is efficiently priced; the 15m markets carry
-# 30-450x less volume, which is where looser pricing is more likely.
-# 5-minute markets only. BTC 5m is the flagship and was shown to be efficiently
-# priced (the market beats our model near expiry, p=0.008). ETH 5m runs on the
-# same cadence with far less volume, so it is the remaining untested candidate.
+# Markets to record and trade, as (slug prefix, Binance symbol, round seconds).
+# BTC 5m only. ETH 5m ran on the same cadence with far less volume and was
+# removed on 2026-09-10: the bot never traded it (main.tick passes
+# trade=(prefix == primary), and every live fill in the record is btc), so the
+# only thing it produced was recorded data behind a second spot feed, a second
+# volatility estimator and a second market-discovery call per tick. Its history
+# is still in the database if it is ever revisited -- re-adding it here plus the
+# symbol below is the whole change.
 MARKETS = [
     ("btc-updown-5m", "BTCUSDT", 300),
-    ("eth-updown-5m", "ETHUSDT", 300),
 ]
 
 

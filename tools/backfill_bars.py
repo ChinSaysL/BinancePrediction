@@ -6,7 +6,7 @@ so any window can be filled after the fact instead of waiting days to collect it
 
 Usage:
     python -m tools.backfill_bars                 # cover the recorded window
-    python -m tools.backfill_bars --symbol ETHUSDT --hours 48
+    python -m tools.backfill_bars --symbol BTCUSDT --hours 48
 """
 from __future__ import annotations
 
