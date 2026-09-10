@@ -125,6 +125,7 @@ class Bot:
             hist = PriceHistory()
             hist.seed(klines)
             self.histories[sym] = hist
+            self._store_bars(sym, klines[:-1])   # seed the bars table too
         self.vol = self.vols["BTCUSDT"]
         self._last_vol_refresh = time.time()
         log.info("pricing model: %s", self.model.name)
@@ -254,9 +255,24 @@ class Bot:
                     if o > 0 and c > 0:
                         v.add(math.log(c / o))
                 self.histories[sym].merge(klines)
+                # Persist the bars incl. taker-buy volume (kline field 9): the
+                # quotes table cannot reconstruct order flow, so without this
+                # the order-flow models can never be replayed or tuned.
+                self._store_bars(sym, klines[:-1])
             self._last_vol_refresh = time.time()
         except Exception as e:
             log.warning("vol refresh failed: %s: %s", type(e).__name__, e)
+
+    def _store_bars(self, symbol: str, klines: list[list]) -> None:
+        """Store (open_ms, close, volume, taker_buy) for completed bars."""
+        rows = []
+        for k in klines:
+            try:
+                rows.append((int(k[0]), float(k[4]), float(k[5]), float(k[9])))
+            except (TypeError, ValueError, IndexError):
+                continue
+        if rows:
+            self.store.upsert_bars(symbol, rows)
 
     # -- main tick ----------------------------------------------------------
     async def tick(self) -> None:

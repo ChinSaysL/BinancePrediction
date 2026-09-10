@@ -240,3 +240,29 @@ def test_one_hour_return_ignores_live_tick():
     before = h.one_hour_return()
     h.add_tick(500.0)
     assert h.one_hour_return() == before
+
+
+def test_build_1m_history_without_store_has_no_taker_data():
+    from tools.backtest_candle_open import build_1m_history
+
+    quotes = [{"ts_ms": 60_000, "spot": 100.0}, {"ts_ms": 90_000, "spot": 101.0},
+              {"ts_ms": 120_000, "spot": 102.0}]
+    hist = build_1m_history(quotes)
+    assert hist == [(1, 101.0, 2.0, 0.0), (2, 102.0, 1.0, 0.0)]
+
+
+def test_build_1m_history_uses_stored_bars_for_volume_and_taker():
+    import tempfile
+    from pathlib import Path
+    from tools.backtest_candle_open import build_1m_history
+    from btcpredict.store.db import Store
+
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / "t.db")
+        store.upsert_bars("BTCUSDT", [(60_000, 100.0, 12.5, 7.5)])
+        quotes = [{"ts_ms": 60_000, "spot": 100.0}, {"ts_ms": 90_000, "spot": 101.0},
+                  {"ts_ms": 120_000, "spot": 102.0}]
+        hist = build_1m_history(quotes, store=store, symbol="BTCUSDT")
+        # minute 1 takes Binance's volume/taker; minute 2 falls back to the
+        # poll count with no order-flow data
+        assert hist == [(1, 101.0, 12.5, 7.5), (2, 102.0, 1.0, 0.0)]

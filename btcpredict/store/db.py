@@ -110,6 +110,19 @@ CREATE TABLE IF NOT EXISTS settlements (
 );
 CREATE INDEX IF NOT EXISTS idx_settlements_slug ON settlements(slug);
 
+-- Reconstructed/authoritative 1m bars, including Binance kline field 9 (taker
+-- buy base volume). The quotes table can only ever reconstruct close+volume,
+-- so the order-flow models (sentiment, hybrid) cannot be replayed from it.
+-- Binance serves this history, so the table is backfillable for any window.
+CREATE TABLE IF NOT EXISTS bars (
+    symbol    TEXT NOT NULL,
+    open_ms   INTEGER NOT NULL,
+    close     REAL,
+    volume    REAL,
+    taker_buy REAL,
+    PRIMARY KEY (symbol, open_ms)
+);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -152,6 +165,33 @@ class Store:
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value))
         self.conn.commit()
+
+    # -- 1m bars ------------------------------------------------------------
+    def upsert_bars(self, symbol: str, bars: Iterable[tuple[int, float, float, float]]
+                    ) -> int:
+        """Store (open_ms, close, volume, taker_buy) bars, newest value wins.
+
+        Keeps the order-flow models replayable: the venue-side quotes table has
+        no taker data at all, and only Binance can supply it (live or backfilled).
+        """
+        rows = [(symbol, int(o), float(c), float(v), float(t))
+                for o, c, v, t in bars]
+        if not rows:
+            return 0
+        self.conn.executemany(
+            "INSERT INTO bars (symbol, open_ms, close, volume, taker_buy) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(symbol, open_ms) DO UPDATE SET "
+            "close = excluded.close, volume = excluded.volume, "
+            "taker_buy = excluded.taker_buy", rows)
+        self.conn.commit()
+        return len(rows)
+
+    def bars_since(self, symbol: str, start_ms: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT open_ms, close, volume, taker_buy FROM bars "
+            "WHERE symbol = ? AND open_ms >= ? ORDER BY open_ms",
+            (symbol, start_ms)).fetchall()
 
     # -- rounds -------------------------------------------------------------
     def upsert_round(self, r: dict[str, Any]) -> None:

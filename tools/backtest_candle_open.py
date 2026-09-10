@@ -86,18 +86,35 @@ def rolling_sigma(settled: list[dict], idx: int, window: int = 48) -> float:
     return max(0.00015, st.pstdev(rets))
 
 
-def build_1m_history(quotes: list[dict]) -> list[tuple[int, float, float]]:
-    """1m (minute, close, volume) bars reconstructed from recorded spot.
+def build_1m_history(quotes: list[dict], store=None, symbol: str | None = None
+                     ) -> list[tuple[int, float, float, float]]:
+    """1m (minute, close, volume, taker_buy) bars.
 
-    close = last spot polled in that minute, volume = poll count (a liquidity
-    proxy -- enough for the volume-confirmation signals). Sorted by minute.
+    close = last spot polled in that minute (the venue's own series, and the
+    only price the strategy actually saw). volume/taker_buy come from the stored
+    Binance bars when available, because the quotes table cannot reconstruct
+    order flow at all -- without it the order-flow models (sentiment, hybrid)
+    can never be replayed. Missing taker data is written as 0.0, which makes
+    those models hold rather than invent a signal. Sorted by minute.
     Quotes must be sorted by ts_ms.
     """
     minutes: dict[int, list[float]] = defaultdict(list)
     for q in quotes:
         if q["spot"] and q["spot"] > 0:
             minutes[q["ts_ms"] // 60_000].append(q["spot"])
-    return sorted((m, spots[-1], float(len(spots))) for m, spots in minutes.items())
+
+    stored: dict[int, tuple[float, float]] = {}
+    if store is not None and symbol and minutes:
+        first = min(minutes)
+        for row in store.bars_since(symbol, first * 60_000):
+            stored[row["open_ms"] // 60_000] = (row["volume"] or 0.0,
+                                                row["taker_buy"] or 0.0)
+
+    out = []
+    for m, spots in sorted(minutes.items()):
+        vol, taker = stored.get(m, (float(len(spots)), 0.0))
+        out.append((m, spots[-1], vol, taker))
+    return out
 
 
 def replay(quotes, settled_by_slug, sigma_by_slug, hist, model,
@@ -122,6 +139,7 @@ def replay(quotes, settled_by_slug, sigma_by_slug, hist, model,
     cursor = 0
     closes: list[float] = []
     vols: list[float] = []
+    takers: list[float] = []
     # With candle gating the final candle opens at tau ~= 59.9s, just under
     # min_tau_s=60; the allowance lets the decision stand for its open time.
     min_tau = (params.min_tau_s - params.candle_open_window_s
@@ -158,9 +176,10 @@ def replay(quotes, settled_by_slug, sigma_by_slug, hist, model,
         while cursor < len(bars) and bars[cursor][0] < ci:
             closes.append(bars[cursor][1])
             vols.append(bars[cursor][2])
+            takers.append(bars[cursor][3])
             cursor += 1
         ctx = ModelContext(
-            closes=closes + [spot], volumes=vols, price=spot,
+            closes + [spot], vols, takers, price=spot,
             strike=strike, tau_s=tau, sigma_1m=sigma_by_slug.get(slug, 0.0004))
         pred = model.predict(ctx)
         if not pred.emitted:
@@ -255,7 +274,7 @@ def market_vs_model(quotes, settled_by_slug, sigma_by_slug, hist, model,
     """Brier of model vs market ask on every candle-open poll (the go/no-go)."""
     preds_m, preds_q, outs = [], [], []
     cursor = 0
-    closes, vols = [], []
+    closes, vols, takers = [], [], []
     for q in quotes:
         slug = q["slug"]
         r = settled_by_slug.get(slug)
@@ -269,9 +288,10 @@ def market_vs_model(quotes, settled_by_slug, sigma_by_slug, hist, model,
         while cursor < len(hist) and hist[cursor][0] < m:
             closes.append(hist[cursor][1])
             vols.append(hist[cursor][2])
+            takers.append(hist[cursor][3])
             cursor += 1
         pred = model.predict(ModelContext(
-            closes=closes + [q["spot"]], volumes=vols,
+            closes + [q["spot"]], vols, takers,
             price=q["spot"], strike=r["strike"], tau_s=q["tau_s"],
             sigma_1m=sigma_by_slug.get(slug, 0.0004)))
         if not pred.emitted:
@@ -416,6 +436,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--market", default=MARKETS[0][0],
                     help="market prefix to replay (default: the traded one)")
+    ap.add_argument("--symbol", default=None,
+                    help="spot symbol whose stored bars supply volume/taker "
+                         "data (default: the market's own symbol)")
     ap.add_argument("--model", default="digital",
                     help="model name or 'all'")
     ap.add_argument("--fee", type=float, default=None,
@@ -428,6 +451,9 @@ def main() -> None:
                     choices=("notional", "profit"),
                     help="fee semantics assumed by the gate (notional is stricter)")
     args = ap.parse_args()
+    if args.symbol is None:
+        args.symbol = next((sym for prefix, sym, _ in MARKETS
+                            if prefix == args.market), "BTCUSDT")
 
     store = Store(path=settings.db_path)
     # One market only. The recorder covers every market in MARKETS, but the bot
@@ -448,7 +474,7 @@ def main() -> None:
     settled_by_slug = {r["slug"]: r for r in settled}
     sigma_by_slug = {r["slug"]: rolling_sigma(settled, i)
                      for i, r in enumerate(settled)}
-    hist = build_1m_history(quotes)
+    hist = build_1m_history(quotes, store=store, symbol=args.symbol)
     base = ReplayParams.from_settings()
     if args.fee_model != "notional":
         base = replace(base, fee_model=args.fee_model)
