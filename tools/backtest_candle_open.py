@@ -28,6 +28,7 @@ from btcpredict.config import MARKETS, settings
 from btcpredict.edge.signal import (FeeModel, Signal, evaluate,
                                     evaluate_hybrid, fee_rate_for_price)
 from btcpredict.models import MODEL_NAMES, ModelContext, build_model
+from btcpredict.models.calibrated import taker_imbalance
 from btcpredict.store.db import Store
 
 BAR = "=" * 78
@@ -194,7 +195,10 @@ def replay(quotes, settled_by_slug, sigma_by_slug, hist, model,
             cursor += 1
         ctx = ModelContext(
             closes + [spot], vols, takers, price=spot,
-            strike=strike, tau_s=tau, sigma_1m=sigma_by_slug.get(slug, 0.0004))
+            strike=strike, tau_s=tau, sigma_1m=sigma_by_slug.get(slug, 0.0004),
+            # Live passes the executable Up ask; a market-anchored model must
+            # see the same number here or the replay prices a different book.
+            quote_up=q["up_ask"])
         pred = model.predict(ctx)
         if not pred.emitted:
             continue
@@ -227,6 +231,7 @@ def replay(quotes, settled_by_slug, sigma_by_slug, hist, model,
                 "spot": spot, "strike": strike,
                 "sigma": sigma_by_slug.get(slug, 0.0004),
                 "up_allowed": up_allowed, "blocked_ret": blocked_ret,
+                "imb": taker_imbalance(takers, vols),
             })
         sig = evaluate_hybrid(
             pred.p_up, up_fair, q["up_ask"], q["down_ask"],

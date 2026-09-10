@@ -42,6 +42,12 @@ class ModelContext:
     strike: float | None = None
     tau_s: float | None = None              # seconds to settlement
     sigma_1m: float | None = None           # per-minute log-return stdev (digital only)
+    # The venue's own ask for Up. A model is not required to use it -- the
+    # closed-form digital ignores it -- but the venue price is the strongest
+    # single Up probability on this book, so a model that CORRECTS the market
+    # needs to see it. None means "no usable quote": a market-anchored model
+    # must fall back rather than trade on a guess.
+    quote_up: float | None = None
 
     def __post_init__(self) -> None:
         if self.volumes is None:
@@ -181,7 +187,8 @@ class PriceHistory:
         return math.log(c0 / c1)
 
     def ctx(self, *, price: float | None = None, strike: float | None = None,
-            tau_s: float | None = None, sigma_1m: float | None = None) -> ModelContext:
+            tau_s: float | None = None, sigma_1m: float | None = None,
+            quote_up: float | None = None) -> ModelContext:
         cur = price if price and price > 0 else self._current
         closes = [b[1] for b in self._bars]
         if cur is not None:
@@ -194,4 +201,5 @@ class PriceHistory:
             strike=strike,
             tau_s=tau_s,
             sigma_1m=sigma_1m,
+            quote_up=quote_up,
         )

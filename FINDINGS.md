@@ -813,3 +813,63 @@ estimator and a second discovery call per tick. The recorded history stays in th
 database; re-adding it is one line in `MARKETS` plus the symbol in the tools.
 Worth knowing what is lost: the ETH replication was the strongest single piece of
 evidence for the calibration finding above, and that is now a manual re-add.
+
+## The Up side: a purpose-built model says there is no Up edge to find (2026-09-10)
+
+The Up side is where this book loses (live: 52 trades, WR 55.8%, -$3.18; replay:
+18 trades, WR 44.4%, -$3.43) while Down pays. Every *threshold* tested for it
+(per-side edge bar, price cap, price floor, probability shift) helped on one
+dataset and hurt on the other, which is the signature of fitting noise. So
+instead of a threshold, the probability itself was rebuilt:
+`btcpredict/models/calibrated.py`, fitted by `tools.train_up_model.py`.
+
+Method: one tick per round (the first the gate evaluates, so rows are
+independent), fitted on the first 60% of rounds and scored on the last 40% it
+never saw. The design was checked before the coefficients were believed --
+pairwise column correlations are printed, and two earlier specifications were
+discarded because they were unidentified:
+
+  * with moneyness in sd as a column, the fit returned b_market = -1.32
+    (se 3.54) and b0 se = 11.6: logit(p_digital), z and the disagreement are
+    one column three ways, since the digital probability IS a function of z;
+  * with a free intercept plus sqrt(tau/60), the pair is only identified
+    jointly and put the model 2.5 points BELOW the venue at q = 0.5, inventing
+    a permanent Down bias from noise. Dropped both; at q = 0.5 with no
+    disagreement the model now returns exactly 0.5.
+
+Final fit (384 rows, 3 parameter), scores on the unseen 250 rows:
+
+| term | coef | se | z | reading |
+|---|---|---|---|---|
+| `b_market` | +1.2368 | 0.1529 | +8.09 | the venue's level, amplified |
+| `b_disc` | +0.1033 | 0.3565 | +0.29 | our disagreement is worth ~0 |
+| `b_imb` | +0.3965 | 0.7709 | +0.51 | order flow adds nothing |
+
+**`b_disc` is the whole Up story: when we disagree with the venue, ~10% ± 36%
+of that disagreement is real, i.e. statistically nothing.** Fitted b = 1 exactly
+is inside the interval. Up stops being mispriced when the model stops claiming
+an edge, and this is the measurement of how much was being claimed.
+
+Probability quality on the unseen slice (Brier): venue ask 0.1927, calibrated
+0.1921, digital 0.1940. The recalibration beats what we run and ties the market
+(paired vs the venue: -0.00064 ± 0.00188, t = -0.34) -- it is not a discovery,
+it is a repair.
+
+Consequence, and why this is not simply "turn Up off": used as `up_model`, the
+recalibration takes **zero Up trades** on both slices, because it never honestly
+finds the 0.12 edge the gate demands. The Up side does not need a filter or a
+ban; the venue's own price is already the best available Up probability.
+
+Separate finding, same fit: **the venue's price is too tame.** Fitting
+logit(outcome) = b * logit(ask) on BOTH sides over 768 train rows gives
+b = 1.2538 ± 0.1055 (z = +2.41 against b = 1), and the amplified price beats the
+raw price on Brier on both slices (train 0.1905 vs 0.1916, test 0.1922 vs
+0.1928). Buying the amplified favourite (either side) at a 0.01 probability
+threshold returns +0.027/$1 on 254 unseen trades, and +0.017-0.044 on the train
+slice -- positive everywhere, but t < 1, so the bias is real while the money
+from it is not yet demonstrated. Note this is the same force the Down side has
+been earning from all along (Down live: mean q 0.555, WR 69.4%).
+
+Open question, unmeasured: the Down side has never been shown the down quote --
+the gate prices Down as 1 - fair_up. A symmetric recalibration of the Down side
+is the obvious next test, and it is where the money is.

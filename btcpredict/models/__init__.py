@@ -4,6 +4,7 @@ The repository's original model is the closed-form digital option. This package
 adds the strategy bots ported from polymarket-bot-arena (adapted to Binance):
 
     digital    original driftless digital option (baseline)
+    calibrated market-anchored recalibration of P(Up) (see models/calibrated.py)
     momentum   short-term candle momentum + volume confirmation
     mean_rev   z-score + RSI reversion
     sentiment  taker order-flow ratio + its momentum (Binance analogue of X data)
@@ -24,6 +25,7 @@ from __future__ import annotations
 
 from btcpredict.models.base import (ModelContext, ModelPred, PriceHistory,
                                     StrategyModel, StrategySignal)
+from btcpredict.models.calibrated import CalibratedUpModel
 from btcpredict.models.digital import DigitalModel
 from btcpredict.models.drift_digital import DriftDigitalModel
 from btcpredict.models.hybrid import HybridModel
@@ -36,6 +38,7 @@ from btcpredict.models.sniper import SniperModel
 
 _REGISTRY: dict[str, type[StrategyModel]] = {
     "digital": DigitalModel,
+    "calibrated": CalibratedUpModel,
     "drift_digital": DriftDigitalModel,
     "momentum": MomentumModel,
     "mean_rev": MeanRevModel,
@@ -61,6 +64,6 @@ __all__ = [
     "ModelContext", "ModelPred", "PriceHistory", "StrategyModel", "StrategySignal",
     "MODEL_NAMES", "build_model",
     "DigitalModel", "MomentumModel", "MeanRevModel", "SentimentModel",
-    "DriftDigitalModel",
+    "DriftDigitalModel", "CalibratedUpModel",
     "HybridModel", "PhantomModel", "SniperModel", "BtcMakerModel",
 ]
