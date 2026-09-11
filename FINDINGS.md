@@ -1132,3 +1132,27 @@ is +$146 if the edge is real to -$16 if it is not, and a 300-path run of the
 same thing gives $236 rather than $212 -- at these path counts +-10% is Monte
 Carlo noise, which is itself worth remembering before reading any of these
 tables too closely.
+
+## ab_report now cuts at the config change (2026-09-11)
+
+The report the pre-committed decision runs on was pooling eras: it read all
+168 live settlements, which mixes the 114 trades of the retired digital/0.12
+gate with the 55 under the shipped honest pricing. Pooled it says EV/$1 +0.119
+(t 1.81) -- a number that describes no configuration that ever ran, the same
+era-pooling error this project was already burned by once.
+
+It now cuts at 2026-09-10T23:14:45Z by default (`--since all` to include older
+eras), and the two reads are not close:
+
+| era | n | WR | EV/$1 | t | P&L |
+|---|---|---|---|---|---|
+| pooled (wrong) | 168 | 69.6% | +0.119 | +1.81 | +$46.07 |
+| **shipped config only** | **55** | **83.6%** | **+0.209** | **+2.74** | **+$26.18** |
+
+Equity is $92.38, up from $66.06. Trade 55 of the ~1,000 the scaling rule
+waits for.
+
+Note for whoever reads this next: t = 2.74 at 55 trades already clears the
+t > 2 bar, but 54 of those 55 trades were the SAME side (Up, 98%) inside one
+directional regime, so the effective evidence is far narrower than n = 55
+suggests. The bar is not being moved for a good number.

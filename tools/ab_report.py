@@ -27,12 +27,28 @@ Reading it:
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import math
 import sqlite3
 import statistics as st
 from pathlib import Path
 
 ABORT_TRADES = 2000
+# The shipped honest-pricing config went live at this moment. Trades before it
+# ran a different configuration and must never be pooled with trades after it:
+# a report that averages the two describes a strategy that never ran, which is
+# exactly the era-pooling error this project has already been burned by once.
+CONFIG_CHANGE = "2026-09-10T23:14:45Z"
+
+
+def parse_when(s: str) -> int:
+    s = s.strip().replace("Z", "+00:00")
+    if s.replace(".", "", 1).isdigit():
+        return int(float(s))
+    d = dt.datetime.fromisoformat(s)
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=dt.timezone.utc)
+    return int(d.timestamp() * 1000)
 
 
 def load(db: Path) -> list[sqlite3.Row]:
@@ -80,20 +96,31 @@ def main() -> None:
                     help="databases to read (default: live + paper2)")
     ap.add_argument("--min-n", type=int, default=0,
                     help="flag groups with too few trades to read")
+    ap.add_argument("--since", default=CONFIG_CHANGE,
+                    help=f"only settled trades after this ISO time or epoch ms "
+                         f"(default {CONFIG_CHANGE}, when the honest pricing "
+                         f"went live). Pass 'all' to include earlier eras, "
+                         f"which describes no configuration that ever ran.")
     args = ap.parse_args()
 
     root = Path(__file__).resolve().parent.parent
     dbs = [Path(p) for p in args.db] if args.db else [
         root / "data" / "btcpredict.db", root / "data" / "paper2.db"]
+    cut = 0 if str(args.since).lower() == "all" else parse_when(args.since)
+    if cut:
+        print(f"counting settled trades after "
+              f"{dt.datetime.fromtimestamp(cut/1000, dt.timezone.utc):%Y-%m-%d %H:%M} UTC "
+              f"(the shipped config's start; --since all to include older eras)")
 
     for db in dbs:
-        rows = load(db)
+        rows = [r for r in load(db) if r["ts_ms"] > cut]
         for mode in ("live", "paper"):
             sel = [r for r in rows if r["mode"] == mode]
             if sel:
                 report(f"{db.name} [{mode}]", sel, args.min_n)
 
-    paper = [r for r in load(dbs[-1]) if r["mode"] == "paper"]
+    paper = [r for r in load(dbs[-1])
+             if r["mode"] == "paper" and r["ts_ms"] > cut]
     if paper:
         n = len(paper)
         rets = [r["pnl"] / r["stake"] for r in paper if r["stake"]]
