@@ -319,14 +319,42 @@ class LiveBroker:
                             "list both unreadable; booking provisionally and "
                             "letting settle() decide (%s)", order_id, slug)
         elif status != "FILLED":
-            # A terminal non-FILLED status is authoritative: the venue took no
-            # position, so the caller may safely place a fresh order. FOK
-            # market orders land here whenever the book moves between the
-            # quote and the execution, which is transient.
-            self.last_failure = "venue_failed"
-            log.error("order %s status=%s on venue; treating as failed (%s)",
-                      order_id, status, slug)
-            return None
+            # A non-FILLED status is NOT evidence that the venue holds no
+            # order, and treating it as such bought the same round twice: this
+            # is the SAME order-history endpoint that lags the fill by a second
+            # or two in the branch above, so a stale FAILED for an order that
+            # had actually filled sent the caller into the retry loop, which
+            # placed a second order for a round it was already long. Double
+            # exposure, real money.
+            # So confirm against the position list -- the EFFECT of a fill --
+            # before believing the status. `venue_failed` (and therefore the
+            # retry) is only returned when a readable list omits the token.
+            held = await self._confirm_by_position(token_id)
+            if held is True:
+                log.error("order %s reported %s but the venue HOLDS a position "
+                          "in %s; booking it and NOT retrying",
+                          order_id, status, slug)
+                status = "FILLED"
+            elif held is False:
+                # Confirmed empty: no position, so the caller may safely place
+                # a fresh order. FOK market orders land here whenever the book
+                # moves between the quote and the execution, which is
+                # transient.
+                self.last_failure = "venue_failed"
+                log.error("order %s status=%s with no position held; treating "
+                          "as failed (%s)", order_id, status, slug)
+                return None
+            else:
+                # Unreadable position list: the status says no fill and the
+                # venue may disagree, and re-placing on that doubt is exactly
+                # the double buy. Abandon the round instead. redeem() claims
+                # ALL claimable tokens rather than only the ones this bot
+                # booked, so a position we never booked is not stranded.
+                self.last_failure = "unconfirmed"
+                log.error("order %s status=%s but the position list is "
+                          "unreadable; NOT booking and NOT retrying (%s)",
+                          order_id, status, slug)
+                return None
 
         shares = shares_gross - fee_shares
         # The fee is quoted in outcome-token units; express it in USDT so PnL

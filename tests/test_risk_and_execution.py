@@ -308,6 +308,13 @@ class _StubBroker:
         self.last_failure = outcome
         return None
 
+    async def positions(self):
+        # Empty, and READABLE: the retry loop refuses to re-place unless it can
+        # confirm the venue holds no position for the round (an unreadable list
+        # is indistinguishable from "we might already be long"). A live broker
+        # without a position list is no longer a valid model of one.
+        return []
+
 
 class _Sig:
     """The signal from the live log: Down at 0.570 with the model at P(up)=0.28."""
@@ -332,6 +339,37 @@ def _place(broker):
     fill = asyncio.run(bot._place_order(_Round(), _Sig(), fair_up=0.28,
                                         token="tok", stake=10.0))
     return bot, fill
+
+
+def test_a_down_order_is_rechecked_against_its_own_price(monkeypatch):
+    """The pre-trade quote prices the TOKEN being bought, so it is THAT side's.
+
+    The stub signal is Down at 0.57, and `_StubBroker.get_quote` returns 0.57
+    for the token -- the Down price. The recheck used to pass `1.0 - 0.57` as
+    the Down quote, scoring a 0.57 favourite as if it cost 0.43, so any Down
+    order above 0.50 was refused by min_quote = 0.50. That is every Down
+    favourite the honest pricing exists to buy: the live book ran 54 Up / 1 Down
+    while the replay (no recheck) took 347 Down / 267 Up, and 62 distinct live
+    rounds were refused with "real quote 0.670 -> quote 0.33 below min_quote".
+    """
+    from btcpredict.config import settings
+    monkeypatch.setattr(settings, "order_retry_delay_s", 0.0)
+    monkeypatch.setattr(settings, "order_max_attempts", 1)
+    monkeypatch.setattr(settings, "edge_haircut", 1.0)
+    monkeypatch.setattr(settings, "min_quote", 0.50)
+
+    b = _StubBroker(["fill"])
+    _bot_, fill = _place(b)
+    assert fill is not None, "a 0.57 Down favourite must pass a 0.50 floor"
+    assert b.buys == 1
+
+    # ...and the floor still bites on the price actually paid, not on its
+    # complement: at a 0.60 floor the same 0.57 order is refused.
+    monkeypatch.setattr(settings, "min_quote", 0.60)
+    b2 = _StubBroker(["fill"])
+    _bot2, fill2 = _place(b2)
+    assert fill2 is None
+    assert b2.buys == 0
 
 
 def test_a_venue_rejection_is_retried_until_it_fills(monkeypatch):
@@ -391,6 +429,14 @@ def test_an_unknown_outcome_is_never_retried(monkeypatch):
 
 
 def test_live_broker_labels_a_terminal_venue_status_as_retryable():
+    """A FAILED status is retryable ONLY once the venue is confirmed empty.
+
+    This test used to assert `venue_failed` on the strength of the status
+    alone -- which is the bug: the order-history endpoint lags a fill, so a
+    stale FAILED for an order that had filled sent the caller into the retry
+    loop for a round it was already long. Retryability now requires positive
+    evidence of absence from the position list.
+    """
     from btcpredict.execution import live
 
     b = live.LiveBroker(None, "k", "s", wallet_address="w", wallet_id="1")
@@ -405,14 +451,89 @@ def test_live_broker_labels_a_terminal_venue_status_as_retryable():
     async def status(order_id, **kw):
         return "FAILED"
 
+    async def positions():
+        return []                     # read, and it holds nothing
+
     b.get_quote = quote
     b._request = request
     b._order_status = status
+    b._position_token_ids = positions
     fill = asyncio.run(b.buy(slug="s", side="Down", token_id="t",
                              price=0.57, stake=10.0))
     assert fill is None
     assert b.last_failure == "venue_failed"
     assert b.last_failure in live.RETRYABLE_FAILURES
+
+
+def test_a_stale_failed_status_never_causes_a_second_buy():
+    """Order history says FAILED, the position list says we are long.
+
+    The list is the EFFECT of a fill and cannot be wrong in this direction, so
+    the fill is booked and the failure is NOT retryable. Before the fix this
+    returned venue_failed, the retry loop placed a second order, and the bot
+    held twice the intended position in one round.
+    """
+    from btcpredict.execution import live
+
+    b = live.LiveBroker(None, "k", "s", wallet_address="w", wallet_id="1")
+
+    async def quote(*a, **kw):
+        return {"quoteId": "q1", "amountOut": to_wei(17.5),
+                "feeAmount": to_wei(0.1), "averagePrice": 0.57, "expireAt": 0}
+
+    async def request(method, path, params):
+        return {"orderId": "26091100001877448929"}
+
+    async def status(order_id, **kw):
+        return "FAILED"
+
+    async def positions():
+        return {"t"}                   # the token-id set the venue reports
+
+    b.get_quote = quote
+    b._request = request
+    b._order_status = status
+    b._position_token_ids = positions
+    fill = asyncio.run(b.buy(slug="s", side="Up", token_id="t",
+                             price=0.57, stake=10.0))
+    assert fill is not None, "a held position must be booked, not discarded"
+    assert fill.token_id == "t"
+    assert fill.unverified is False
+    assert b.last_failure is None
+
+
+def test_a_failed_status_with_unreadable_positions_is_not_retryable():
+    """Neither source can be trusted, so the round is abandoned.
+
+    A retry here is a coin flip between "nothing was placed" and "we are
+    already long", and the losing side of that coin is a doubled position.
+    """
+    from btcpredict.execution import live
+
+    b = live.LiveBroker(None, "k", "s", wallet_address="w", wallet_id="1")
+
+    async def quote(*a, **kw):
+        return {"quoteId": "q1", "amountOut": to_wei(17.5),
+                "feeAmount": to_wei(0.1), "averagePrice": 0.57, "expireAt": 0}
+
+    async def request(method, path, params):
+        return {"orderId": "26091100001877449048"}
+
+    async def status(order_id, **kw):
+        return "FAILED"
+
+    async def positions():
+        return None                   # could not ask
+
+    b.get_quote = quote
+    b._request = request
+    b._order_status = status
+    b._position_token_ids = positions
+    fill = asyncio.run(b.buy(slug="s", side="Up", token_id="t",
+                             price=0.57, stake=10.0))
+    assert fill is None
+    assert b.last_failure == "unconfirmed"
+    assert b.last_failure not in live.RETRYABLE_FAILURES
 
 
 # --- unverified fills: a void is only allowed on positive evidence -----------

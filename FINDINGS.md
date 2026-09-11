@@ -1156,3 +1156,61 @@ Note for whoever reads this next: t = 2.74 at 55 trades already clears the
 t > 2 bar, but 54 of those 55 trades were the SAME side (Up, 98%) inside one
 directional regime, so the effective evidence is far narrower than n = 55
 suggests. The bar is not being moved for a good number.
+
+## Two live bugs found and fixed on 2026-09-11
+
+### 1. A failed order could be re-placed and buy the same round twice
+
+`venue_failed` is in RETRYABLE_FAILURES, and it was returned on the strength of
+the order-history status alone. Order history is the SAME endpoint that lags a
+fill by a second or two -- the code already refuses to trust it in the adjacent
+branch -- so a stale FAILED for an order that had actually filled sent the
+caller into the retry loop for a round it was already long. The live record
+contains two such doubles (Sep 8, $1.00 of extra exposure each); at ~250 orders
+/day instead of 44, it would have got much worse.
+
+Fixed in two places:
+  * `LiveBroker.buy` -- a non-FILLED status now confirms against the position
+    LIST (the effect of a fill) before reporting `venue_failed`. Held -> book it
+    and do not retry. Confirmed absent -> retryable. Unreadable -> `unconfirmed`,
+    no book, no retry;
+  * `Bot._place_order` -- before every retry, ask the venue whether it already
+    holds the token, and refuse to re-place if it does or if the list cannot be
+    read. Belt and braces, because the cost of the doubt is a doubled position
+    and a retry costs one API call.
+
+### 2. Every Down FAVOURITE was being refused by a complement bug (the big one)
+
+`get_quote` quotes the token being bought (`tokenId`), so `averagePrice` is THAT
+side's price -- verified against the record: a Down order's `real quote 0.600`
+matched the venue's `down_ask = 0.6`. The pre-trade recheck passed `1 - real_px`
+as the Down quote anyway, scoring a 0.60 favourite as if it cost 0.40. With
+`min_quote = 0.50` that refuses **every Down order above 0.50**, i.e. every Down
+favourite -- the exact side the honest pricing exists to buy.
+
+Measured cost: **63 distinct rounds refused since the config switch**, and zero
+such refusals on the Up side (Up was unaffected: its recheck passed the price
+uncomplemented). The live book therefore ran **54 Up / 1 Down** while the replay
+-- which has no pre-trade recheck -- took **267 Up / 347 Down**.
+
+**This corrects the explanation given earlier for the overnight result.** I said
+the 98%-Up profile was "by design, the tape was up all night". It was not: it
+was this bug. The tape contributed, but the mechanism that produced a
+one-sided book was a live-only code path, not the market.
+
+It also invalidates the live sample as evidence about the shipped strategy: 55
+trades of an Up-only book are not a sample of what the replay measured, so the
+scaling rule's ~1,000-trade clock restarts at the fix (09:41:59Z, recorded in
+`tools/ab_report.CONFIG_CHANGE`). First order after the restart was a Down
+favourite at 0.73, which the bug would have refused.
+
+## Tests that depend on .env are worse than no tests (2026-09-11)
+
+Three retry tests and one config-shape test failed on the VPS while passing
+locally, with byte-identical code and test files. The cause was the `.env`:
+`test_gate_window_setting_shape` asserted `0.05 < settings.min_edge <= 0.15` and
+`0.20 <= min_quote <= 0.30` -- one era's TUNED VALUES, which the shipped config
+deliberately changed to 0.01 / 0.50. The retry tests assumed a Down price that
+`min_quote = 0.50` legitimately refuses. A suite whose result depends on which
+machine runs it is not a suite. The shape assertions are now invariants and the
+retry tests pin the thresholds their stubs assume.

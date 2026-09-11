@@ -34,11 +34,19 @@ import statistics as st
 from pathlib import Path
 
 ABORT_TRADES = 2000
-# The shipped honest-pricing config went live at this moment. Trades before it
-# ran a different configuration and must never be pooled with trades after it:
-# a report that averages the two describes a strategy that never ran, which is
-# exactly the era-pooling error this project has already been burned by once.
-CONFIG_CHANGE = "2026-09-10T23:14:45Z"
+# Trades before this moment are NOT a sample of the strategy that is running.
+# Hand-maintained, and it has already moved twice in one session, so it only
+# holds while the config is frozen -- which is the current plan:
+#
+#   .. 2026-09-10 23:14  the retired digital/0.12 gate, flat $1-$10 band
+#   23:14 .. 2026-09-11 09:41  honest pricing, but every Down FAVOURITE was
+#       refused by a complement bug in the pre-trade recheck (63 rounds refused,
+#       54 of 55 trades Up) -- an Up-only sample of a different live path
+#   from 09:41 onward  what the replay actually measured (267 Up / 347 Down)
+#
+# The scaling rule's ~1,000-trade clock starts at the cut, not at the config
+# switch: those 55 trades cannot be pooled with these.
+CONFIG_CHANGE = "2026-09-11T09:41:59Z"
 
 
 def parse_when(s: str) -> int:

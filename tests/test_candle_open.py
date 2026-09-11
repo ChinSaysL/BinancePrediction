@@ -30,9 +30,13 @@ def test_gate_window_setting_shape():
     # Candle indexes are minutes remaining at the open: 1..4.
     assert settings.trade_candle_opens
     assert set(settings.trade_candle_opens) <= {1, 2, 3, 4}
-    # Replay-tested edge floor for the price-catcher. Live (2026-09-10):
-    # Down-only + h=0.85 + 0.12 -> +$19.34, mdd -$1.35, CI entirely > 0.
-    assert 0.05 < settings.min_edge <= 0.15
-    # Replay-tested quote floor: cheap longshots carry the highest observed
-    # fees (180 bps below px 0.50) and the <0.25 band lost money on the recording.
-    assert 0.20 <= settings.min_quote <= 0.30
+    # The edge floor and the quote floor are TUNED VALUES, not invariants, and
+    # asserting one era's numbers made this suite fail on whichever machine had
+    # a different .env -- the VPS ran 0.01/0.50 against a test that demanded
+    # 0.05-0.15 / 0.20-0.30. Assert the shape instead; the history lives in
+    # FINDINGS.md. (Successive eras: 0.12 with min_quote 0.25, then the honest
+    # pricing at 0.01 with min_quote 0.50, haircut 1.0.)
+    assert 0.0 < settings.min_edge < 1.0
+    assert 0.0 <= settings.min_quote < settings.max_quote <= 1.0
+    assert 0.0 < settings.max_tau_s <= 300.0
+    assert settings.stake_fraction > 0.0 or settings.sizing_mode != "fraction"

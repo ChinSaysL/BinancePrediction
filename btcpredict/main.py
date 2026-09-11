@@ -602,6 +602,26 @@ class Bot:
         for attempt in range(attempts):
             if attempt:
                 await asyncio.sleep(settings.order_retry_delay_s)
+                # Last line of defence against double exposure. Whatever the
+                # previous attempt reported -- including a status the venue
+                # called FAILED -- ask the venue what it actually holds before
+                # re-placing: an earlier attempt that filled shows up here, and
+                # buying again would put on a second position in a round we are
+                # already long. The broker confirms this for its own failures
+                # (see LiveBroker.buy), so this only ever catches the residual
+                # cases -- and it is cheap next to a doubled position.
+                if self.broker.mode == "live":
+                    held = await self._venue_position_tokens()
+                    if held is None:
+                        log.error("cannot read the venue's positions; not "
+                                  "re-placing %s %s after a failure",
+                                  r.slug, sig.side)
+                        break
+                    if token in held:
+                        log.error("venue already holds %s for %s; an earlier "
+                                  "attempt DID fill -- not re-placing",
+                                  token, r.slug)
+                        break
 
             # Re-check against a live quote before committing. The venue's fee is
             # dynamic and its executable price can differ from the book, so the
@@ -623,10 +643,20 @@ class Bot:
                 # trades whose own edge was still intact. A None quote makes the
                 # other side untradeable, so evaluate() can only answer for this
                 # one.
+                # That quote is for the TOKEN being bought (get_quote sends its
+                # tokenId), so its averagePrice IS that side's price. This used
+                # to pass `1.0 - real_px` for a Down order -- complementing a
+                # price that needed no complementing, so the Down candidate was
+                # scored against 0.40 when the market asked 0.60. Measured on the
+                # live record: down_ask 0.600 came back as "quote 0.40", and with
+                # min_quote at 0.50 that refused every Down FAVOURITE -- the side
+                # the honest pricing exists to buy. The live book ran 54 Up to 1
+                # Down, against the replay's 267 Up / 347 Down, and the replay has
+                # no recheck: it is the live path only.
                 recheck = evaluate(
                     fair_up,
                     real_px if sig.side == "Up" else None,
-                    None if sig.side == "Up" else 1.0 - real_px,
+                    real_px if sig.side == "Down" else None,
                     fee=real_fee, half_spread=0.0,
                     safety_margin=settings.safety_margin, fee_model=FeeModel.NOTIONAL,
                     max_quote=settings.max_quote, min_quote=settings.min_quote,
