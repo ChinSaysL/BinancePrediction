@@ -81,11 +81,27 @@ EDGES = [("as realised, current era (+0.540/$1)", 0.540),
          ("old build only (+0.031/$1)", 0.031),
          ("NULL: no edge at all (0.00/$1)", 0.0)]
 
+# What the fill costs, measured rather than assumed. On 51 live fills
+# (2026-09-11) the EV per $1 measured at the quote the gate saw averaged
+# +0.0431, and at the price actually paid +0.0300 -- the fill costs 0.0132/$1
+# and was worse than the quote on 78% of fills. Every payoff in this file is
+# built from QUOTES, so a projection that does not subtract this is about 30%
+# optimistic about the edge it is sizing. Override with --slip 0 for the old
+# gross numbers.
+MEASURED_SLIP_PER_DOLLAR = 0.0132
 
-def build_pools(market: str) -> tuple[list[float], list[float], float]:
-    """Per-$1 returns and tilt multipliers, plus the measured trade rate."""
+
+def build_pools(market: str, slip: float = MEASURED_SLIP_PER_DOLLAR
+                ) -> tuple[list[float], list[float], float]:
+    """Per-$1 returns NET of entry cost, tilt multipliers, and the trade rate.
+
+    The pool's payoffs are computed from the quote the gate saw; live pays the
+    fill, 1-2s later, and pays UP on 78% of them. `slip` is that difference,
+    charged to every trade because it is paid on entry whatever the outcome.
+    Set it to 0 to see the gross pool, which is what earlier projections used.
+    """
     trades, _ = load_trades(market)
-    rets = [t["pnl"] for t in trades]
+    rets = [t["pnl"] - slip for t in trades]
     tilts = [tilt_factor(t["mz"], reference=settings.tilt_reference_z,
                          lo=settings.tilt_min, hi=settings.tilt_max)
              for t in trades]
@@ -116,17 +132,47 @@ def haircut(rets: list[float], edge: float | None) -> tuple[list[float], float]:
     return [r if r <= 0 else r * k for r in rets], k
 
 
+def _base_stake(bank: float, frac: float, floor: float, cap: float) -> float:
+    """main.Bot._base_stake_for, for the modes whose inputs this pool has.
+
+    The mode has to be READ from settings rather than assumed. This tool kept
+    modelling fraction mode after live moved to a flat edge band, i.e. it
+    reported the numbers of a rule nobody was trading -- the same class of
+    fidelity bug that made `break` stand in for `continue`. A mode whose inputs
+    are not in the pool raises instead of quietly substituting another one.
+    """
+    if settings.sizing_mode == "fraction":
+        # Returns 0 (skip) when the base cannot reach the venue minimum,
+        # unless the floor is switched on -- in which case it returns the
+        # minimum. Reading the setting matters: a tool that assumed SKIP would
+        # project an idle bot while a floored one is trading every round.
+        return stake_for_fraction(bank, fraction=frac, min_stake=floor, cap=cap,
+                                  floor_to_minimum=(
+                                      settings.stake_floor_to_minimum))
+    if settings.sizing_mode == "edge":
+        if settings.min_stake_usdt == settings.max_stake_usdt:
+            # A flat band needs no per-trade edge: every accepted signal is
+            # staked the same, at every bankroll -- including one too small for
+            # the stake, which is precisely how a fixed stake ruins an account.
+            return settings.min_stake_usdt
+        raise NotImplementedError(
+            "edge mode with a band needs a per-trade edge; this pool holds "
+            "per-$1 returns only -- use a flat band (min == max) instead")
+    raise NotImplementedError(
+        f"sizing_mode={settings.sizing_mode!r} needs per-trade fair/quote, "
+        "which this projection does not carry")
+
+
 def _stake(bank: float, frac: float, tilts: list[float], floor: float,
            cap: float) -> float:
     """One trade's stake, exactly as main._base_stake_for + main._stake_for.
 
-    Fraction mode returns 0 (skip) when the base cannot reach the venue
-    minimum, and the tilt is then clamped UP to that minimum rather than
-    skipped -- which is why a 2% rule on a $66 bankroll pays $1.00 on most
-    trades instead of refusing them. A projection that models the skip but not
-    the clamp-up measures a strategy that never runs.
+    The venue floor is enforced in the tilt's clamp-UP: a base that cannot
+    reach the minimum is a skip (0.0) and never a smaller bet, while a tilted
+    stake that falls below it is raised to it. A projection that models the
+    skip but not the clamp-up measures a strategy that never runs.
     """
-    base = stake_for_fraction(bank, fraction=frac, min_stake=floor, cap=cap)
+    base = _base_stake(bank, frac, floor, cap)
     if base <= 0:
         return 0.0
     if settings.stake_tilt == "inv_z" and tilts:
@@ -154,6 +200,9 @@ def simulate(rets, tilts, *, bankroll, days, edge, tpd, paths,
     # instant a day is flat, which would stop trading on the first tick.
     cap_on = cap_pct > 0
     max_streak = settings.max_consecutive_losses
+    # 0 = off here too, or the very first check (`losses >= 0`) freezes every
+    # path on day 1 and the tool reports a bot that never trades.
+    streak_on = max_streak > 0
 
     for _ in range(paths):
         bank, peak, dd = bankroll, bankroll, 0.0
@@ -174,7 +223,7 @@ def simulate(rets, tilts, *, bankroll, days, edge, tpd, paths,
                         n_stopped += 1
                         n_cap += 1
                         break
-                    if losses >= max_streak:
+                    if streak_on and losses >= max_streak:
                         n_stopped += 1
                         break
                     stake = _stake(bank, frac, tilts, floor, cap)
@@ -196,7 +245,7 @@ def simulate(rets, tilts, *, bankroll, days, edge, tpd, paths,
                     dd = min(dd, (bank - peak) / peak)
             if day_start > 0:
                 worst_day = min(worst_day, (bank - day_start) / day_start)
-            if losses >= max_streak:
+            if streak_on and losses >= max_streak:
                 if not hit_halt:                 # count PATHS, not episodes
                     hit_halt = True
                     halt_days.append(day)
@@ -260,7 +309,9 @@ def cap_curve(rets, tilts, *, bankroll, days, tpd, paths,
                          tpd=tpd, paths=paths, resume_after_halt=True,
                          cap_pct=c)
             label_c = "off" if c == 0.0 else f"{c:.0%}"
-            stakes = "-" if c == 0.0 else f"{c / settings.stake_fraction:.0f}"
+            stakes = ("-" if c == 0.0 or settings.sizing_mode != "fraction"
+                      or settings.stake_fraction <= 0
+                      else f"{c / settings.stake_fraction:.0f}")
             print(f"  {label_c:>6}{stakes:>7}${r[days]['med'] - bankroll:>+11.0f}"
                   f"${r[days]['p10']:>11.0f}{r['med_dd']:>7.1f}%"
                   f"{r['p95_dd']:>7.1f}%{r['stopped_days']:>9.1f}/{days:<3}"
@@ -288,9 +339,12 @@ def main() -> None:
                     help="curve of the daily loss stop instead of the table")
     ap.add_argument("--edge", type=float, default=None,
                     help="single edge to use instead of the default set")
+    ap.add_argument("--slip", type=float, default=MEASURED_SLIP_PER_DOLLAR,
+                    help="entry cost per $1 staked, subtracted from every trade "
+                         "(measured 0.0132 on 51 live fills; 0 = the gross pool)")
     args = ap.parse_args()
 
-    rets, tilts, replay_tpd = build_pools(args.market)
+    rets, tilts, replay_tpd = build_pools(args.market, slip=args.slip)
     tpd = args.trades_per_day or replay_tpd
     b0 = args.bankroll
     losses = sum(1 for r in rets if r <= 0)
@@ -302,14 +356,26 @@ def main() -> None:
                   paths=args.paths, **({"edges": edges} if edges else {}))
         return
 
-    print(f"replayed {len(rets)} recorded BTC trades  |  mean {st.mean(rets):+.4f}/$1  "
-          f"sd {st.pstdev(rets):.3f}  |  loss rate {losses / len(rets):.0%}")
+    print(f"replayed {len(rets)} recorded BTC trades  |  mean {st.mean(rets):+.4f}/$1 "
+          f"net of a {args.slip * 100:.2f}c/$1 entry slip "
+          f"({st.mean(rets) + args.slip:+.4f}/$1 gross)  "
+          f"|  sd {st.pstdev(rets):.3f}  |  loss rate {losses / len(rets):.0%}")
     print(f"trade rate: {tpd:.0f}/day live measurement (replay alone gives "
           f"{replay_tpd:.0f}/day); live trades BTC 5m only")
-    print(f"live rule: {settings.stake_fraction:.0%} of bankroll x tilt, "
-          f"cap ${settings.stake_cap_usdt:.0f}, floor ${settings.min_order_usdt:.2f}, "
-          f"daily stop {settings.daily_loss_cap_pct:.0%}, "
-          f"halt after {settings.max_consecutive_losses} straight losses "
+    if settings.sizing_mode == "fraction":
+        sizing = (f"{settings.stake_fraction:.0%} of bankroll x tilt, "
+                  f"cap ${settings.stake_cap_usdt:.0f}")
+    elif settings.sizing_mode == "edge":
+        sizing = (f"edge band ${settings.min_stake_usdt:.0f}"
+                  f"-${settings.max_stake_usdt:.0f}")
+    else:
+        sizing = settings.sizing_mode
+    stop = ("OFF" if settings.daily_loss_cap_pct <= 0
+            else f"{settings.daily_loss_cap_pct:.0%}")
+    halt = ("off" if settings.max_consecutive_losses <= 0
+            else f"after {settings.max_consecutive_losses} straight losses")
+    print(f"live rule: {sizing}, floor ${settings.min_order_usdt:.2f}, "
+          f"daily stop {stop}, halt {halt} "
           f"(day-scoped: trading resumes at the UTC day roll)")
     print(f"start ${b0:.2f}  |  {args.paths} paths"
           f"{'' if args.no_resume else ', resumed the day after a halt'}\n")

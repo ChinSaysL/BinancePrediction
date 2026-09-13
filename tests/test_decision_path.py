@@ -176,6 +176,206 @@ def test_a_gated_signal_is_recorded_but_not_ordered(store, monkeypatch,
     assert rows[0]["acted"] == 0
 
 
+def test_impulse_mode_poll_never_falls_through_to_the_model(store, monkeypatch,
+                                                            no_gates):
+    """Regression, 2026-09-12: impulse entries moved to the feed's clock, and
+    the poll's own trigger was made conditional on `impulse_on_tick` -- which
+    left the poll falling through to the MODEL block below it, so the live bot
+    would have traded the model once a second and the impulse never.
+
+    The `return` in that branch is what keeps impulse mode impulse-only, so
+    this asserts the poll records and decides NOTHING when the trigger belongs
+    to the fast path: no model call, no order, no decision row.
+    """
+    monkeypatch.setattr("btcpredict.config.settings.entry_mode", "impulse")
+    monkeypatch.setattr("btcpredict.config.settings.impulse_on_tick", True)
+    bot = make_bot(store)
+    actionable(monkeypatch)                     # actionable, IF it were consulted
+
+    def must_not_be_asked(ctx):
+        raise AssertionError("impulse mode must never consult the model")
+
+    bot.model = SimpleNamespace(name="stub", predict=must_not_be_asked)
+
+    async def boom(*a, **k):
+        raise AssertionError("impulse mode must never order from the poll")
+
+    bot._place_order = boom
+    asyncio.run(bot._record(make_round(), "BTCUSDT", trade=True))
+
+    assert bot.store.counts()["quotes"] == 1, "the poll still records the tick"
+    assert bot.store.counts()["decisions"] == 0
+
+
+def test_both_mode_falls_through_to_the_model_when_the_impulse_is_quiet(
+        store, monkeypatch, no_gates):
+    """entry_mode="both" is the union arm: the impulse owns a round when it
+    fires (on the websocket clock, before this poll), and otherwise the model
+    decides exactly as in "model" mode.
+
+    The whole change is that the `return` guarding the impulse branch became
+    conditional. This pins the half that is new -- a quiet impulse must reach
+    the model -- while the test above still pins that PURE impulse mode does
+    not. Measured 2026-09-12: the two gates want the same round only 52 times
+    in 830, which is why falling through does not starve the impulse.
+    """
+    monkeypatch.setattr("btcpredict.config.settings.entry_mode", "both")
+    monkeypatch.setattr("btcpredict.config.settings.impulse_on_tick", True)
+    bot = make_bot(store)
+    actionable(monkeypatch)
+
+    asked = []
+    real = bot.model.predict
+    bot.model = SimpleNamespace(
+        name="stub", predict=lambda ctx: (asked.append(1), real(ctx))[1])
+
+    placed = []
+
+    async def capture(*a, **k):
+        placed.append(k)
+        return None
+
+    bot._place_order = capture
+    asyncio.run(bot._record(make_round(), "BTCUSDT", trade=True))
+
+    assert asked, "both mode must consult the model when the impulse is quiet"
+    assert bot.store.counts()["decisions"] == 1
+    assert placed, "the model's entry must still reach the order path"
+    assert placed[0].get("impulse_order") is not True, (
+        "a model entry in both mode must NOT be tagged as an impulse order: "
+        "that tag skips the model re-check and applies the impulse price cap")
+
+
+def test_both_mode_still_lets_the_impulse_own_the_round(store, monkeypatch,
+                                                        no_gates):
+    """CHANGED 2026-09-13: the refusal is no longer what this pins.
+
+    This used to assert that a round the impulse claimed was never re-entered
+    by the model, via the shared one-position-per-round rule. Arms are
+    independent now and each has its own budget, so the impulse claiming a
+    round no longer spends the model's slot -- `guard.on_open(slug)` below
+    fills the MAIN pool, which is what still refuses the model's own second
+    entry. That invariant (an arm cannot double ITSELF) is the one worth
+    keeping here.
+    """
+    monkeypatch.setattr("btcpredict.config.settings.entry_mode", "both")
+    monkeypatch.setattr("btcpredict.config.settings.impulse_on_tick", True)
+    bot = make_bot(store)
+    actionable(monkeypatch)
+    r = make_round()
+    bot.guard.on_open(r.slug)                   # the MODEL arm holds it
+
+    async def boom(*a, **k):
+        raise AssertionError("the model re-entered a round it already holds")
+
+    bot._place_order = boom
+    asyncio.run(bot._record(r, "BTCUSDT", trade=True))
+
+    assert bot.store.counts()["decisions"] == 1, "the refusal is still recorded"
+
+
+def _stale(monkeypatch, **over):
+    """Turn the stale-display maker on with the shipped thresholds."""
+    monkeypatch.setattr("btcpredict.config.settings.stale_maker_enabled", True)
+    for k, v in dict(stale_maker_min_gap=0.05, stale_maker_min_edge=0.20,
+                     stale_maker_offset=0.01, stale_maker_wait_s=5.0).items():
+        monkeypatch.setattr(f"btcpredict.config.settings.{k}", over.get(k, v))
+
+
+def test_a_stale_display_rests_below_the_book_instead_of_crossing(
+        store, monkeypatch, no_gates):
+    """The whole point: the display lags the book by ~2s, and the measured edge
+    is only there if we buy BELOW the book (+0.3449/$1 at the mid, t 5.88, vs
+    +0.0175 at the ask, t 0.47). So the order must rest, never cross.
+
+    The round's displayed Up price is 0.40 while the gate's quote (the book ask)
+    is 0.70 -- a 0.30 stale gap.
+    """
+    _stale(monkeypatch)
+    bot = make_bot(store)
+    actionable(monkeypatch, fair=0.90, quote=0.70)
+    posted = {}
+
+    async def buy_limit(**kw):
+        posted.update(kw)
+        return None                             # rested, nobody crossed to us
+
+    bot.broker = SimpleNamespace(mode="paper", buy_limit=buy_limit)
+
+    async def boom(*a, **k):
+        raise AssertionError("a stale display must NOT be crossed with a taker")
+
+    bot._place_order = boom
+    asyncio.run(bot._record(make_round(), "BTCUSDT", trade=True))
+
+    assert posted, "it must post a resting bid"
+    assert posted["limit_px"] == 0.41, "post at the stale display plus the offset"
+    assert posted["limit_px"] < 0.70, "and strictly below the book, or it crosses"
+
+
+def test_an_unfilled_rest_leaves_the_attempt_recorded(store, monkeypatch,
+                                                      no_gates):
+    """Fill rate is the one number the backtest cannot supply, so an unfilled
+    attempt has to stay on the record: fills / attempts is only recoverable if
+    the attempt keeps its decision row at acted=0."""
+    _stale(monkeypatch)
+    bot = make_bot(store)
+    actionable(monkeypatch, fair=0.90, quote=0.70)
+
+    async def buy_limit(**kw):
+        return None
+
+    bot.broker = SimpleNamespace(mode="paper", buy_limit=buy_limit)
+    asyncio.run(bot._record(make_round(), "BTCUSDT", trade=True))
+
+    rows = bot.store.query("SELECT acted FROM decisions")
+    assert len(rows) == 1, "the attempt is recorded"
+    assert rows[0]["acted"] == 0, "and stays unpromoted until it actually fills"
+
+
+def test_a_fresh_display_still_takes_the_normal_taker_path(store, monkeypatch,
+                                                          no_gates):
+    """No lag, no maker. With the book at 0.42 against a 0.40 display the gap is
+    0.02, under stale_maker_min_gap -- there is nothing stale to rest on."""
+    _stale(monkeypatch)
+    bot = make_bot(store)
+    actionable(monkeypatch, fair=0.90, quote=0.42)
+    took = []
+
+    async def buy_limit(**kw):
+        raise AssertionError("a fresh display must not go to the maker path")
+
+    async def taker(*a, **k):
+        took.append(1)
+        return None
+
+    bot.broker = SimpleNamespace(mode="paper", buy_limit=buy_limit)
+    bot._place_order = taker
+    asyncio.run(bot._record(make_round(), "BTCUSDT", trade=True))
+    assert took, "it must fall back to the taker order"
+
+
+def test_the_arm_is_inert_while_the_flag_is_off(store, monkeypatch, no_gates):
+    """It ships OFF because the fill rate is unmeasured; the flag is the only
+    thing standing between a backtest and real money."""
+    monkeypatch.setattr("btcpredict.config.settings.stale_maker_enabled", False)
+    bot = make_bot(store)
+    actionable(monkeypatch, fair=0.90, quote=0.70)
+    took = []
+
+    async def buy_limit(**kw):
+        raise AssertionError("the flag is off; nothing may rest")
+
+    async def taker(*a, **k):
+        took.append(1)
+        return None
+
+    bot.broker = SimpleNamespace(mode="paper", buy_limit=buy_limit)
+    bot._place_order = taker
+    asyncio.run(bot._record(make_round(), "BTCUSDT", trade=True))
+    assert took, "with the flag off the taker path is unchanged"
+
+
 def test_the_tilt_moves_the_stake_the_right_way(store, monkeypatch, no_gates):
     """Small |z| means the round is still undecided, which the recording says
     is where the edge is: it must stake MORE, not less."""

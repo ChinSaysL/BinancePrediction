@@ -153,6 +153,20 @@ class Store:
         shave = {r["name"] for r in self.conn.execute("PRAGMA table_info(settlements)")}
         if "void" not in shave:
             self.conn.execute("ALTER TABLE settlements ADD COLUMN void INTEGER DEFAULT 0")
+        hfill = {r["name"] for r in self.conn.execute("PRAGMA table_info(fills)")}
+        if "ev_at_fill" not in hfill:
+            # Per-fill EV at the price actually paid, next to the gate's EV at
+            # the quote. Added 2026-09-11, when the difference turned out to be
+            # worth about a third of the claimed edge.
+            self.conn.execute("ALTER TABLE fills ADD COLUMN ev_at_fill REAL")
+        if "token_id" not in hfill:
+            # Which outcome token the fill actually bought. Without it, a fill
+            # restored after a restart carries token_id None, and settle()'s
+            # verification -- "is this token in the venue's position list?" --
+            # asks about nothing, concludes the venue holds none, and VOIDS a
+            # real position after 20 checks: the stake is spent, the PnL reads
+            # zero, and the round's result is missing from the record.
+            self.conn.execute("ALTER TABLE fills ADD COLUMN token_id TEXT")
 
     def get_meta(self, key: str) -> str | None:
         row = self.conn.execute(

@@ -190,7 +190,11 @@ class MarketFeed:
         the large sports and politics books.
         """
         found: dict[str, Round] = {}
-        for offset in range(0, 600, 50):
+        # 600 topics was enough for a single family. The venue lists ~1,600 and
+        # the crypto up/down families sit deep in the tail (eth-updown-15m was
+        # found past offset 900), so sweep deeper -- the loop still exits as soon
+        # as every requested prefix is found, so extra pages cost nothing warm.
+        for offset in range(0, 2000, 50):
             data = await self._post(MARKET_LIST_URL, {"limit": 50, "offset": offset})
             if not data:
                 break

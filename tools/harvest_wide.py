@@ -36,7 +36,19 @@ async def main():
     ap.add_argument("--span", type=int, default=4000, help="topic ids to sweep")
     ap.add_argument("--concurrency", type=int, default=10)
     ap.add_argument("--chunk", type=int, default=200)
+    # WIDENED 2026-09-13. The sweep visits every topic id in the range anyway --
+    # other markets interleave with ours, which is exactly why the id spacing is
+    # irregular -- so the scan already SEES eth/bnb/sol/15m/1h rounds and used to
+    # throw them away. Keeping them costs nothing and is the only way to test
+    # whether the cross arm's mechanic transfers to other markets: that needs a
+    # strike, and the strike is a Chainlink oracle price the venue only serves
+    # through market/detail. There is no historical order-book endpoint, so the
+    # books must come from elsewhere, but the strikes can all come from here.
+    ap.add_argument("--prefix", default="btc-updown-5m",
+                    help="comma-separated slug prefixes to keep, or 'all'")
     args = ap.parse_args()
+    prefixes = ([] if args.prefix.strip().lower() == "all"
+                else [p.strip() for p in args.prefix.split(",") if p.strip()])
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
     store = Store(settings.db_path)
@@ -48,8 +60,8 @@ async def main():
         seen = {r["market_topic_id"] for r in store.query(
             "SELECT market_topic_id FROM rounds WHERE market_topic_id IS NOT NULL")}
         start = min(seen) if seen else top
-        log.info("sweeping %d ids down from %d (have %d rounds)",
-                 args.span, start, len(seen))
+        log.info("sweeping %d ids down from %d (have %d rounds) | keeping %s",
+                 args.span, start, len(seen), args.prefix)
 
         t0, hits = time.time(), 0
         for lo in range(start - 1, start - 1 - args.span, -args.chunk):
@@ -59,7 +71,8 @@ async def main():
                 continue
             for tid, r in await asyncio.gather(*(probe(feed, i, sem) for i in ids)):
                 seen.add(tid)
-                if r and r.slug.startswith("btc-updown-5m"):
+                if r and (not prefixes
+                          or any(r.slug.startswith(p) for p in prefixes)):
                     store_round(store, r)
                     hits += 1
             n = store.query("SELECT COUNT(*) c FROM rounds WHERE winner IS NOT NULL "

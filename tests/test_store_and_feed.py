@@ -8,6 +8,22 @@ from btcpredict.feeds.market_feed import parse_round
 from btcpredict.pricing.digital import fair_value
 from btcpredict.store.db import Store
 
+
+def test_fills_gains_the_ev_at_fill_column_on_an_old_database(tmp_path):
+    """The live DB predates the column. A migration that silently does nothing
+    turns every later insert into either a crash or a lost measurement."""
+    path = tmp_path / "old.db"
+    s = Store(path)
+    s.conn.execute("DROP TABLE fills")
+    s.conn.execute("CREATE TABLE fills (id INTEGER PRIMARY KEY, slug TEXT)")
+    s.conn.commit()
+    s.conn.close()
+    again = Store(path)                                   # reopen = migrate
+    cols = {r["name"] for r in again.conn.execute("PRAGMA table_info(fills)")}
+    assert "ev_at_fill" in cols
+    assert Store(path).conn.execute(
+        "PRAGMA table_info(fills)").fetchall()             # idempotent
+
 # A real payload shape captured from the live endpoint, trimmed to what we read.
 SAMPLE = {
     "marketTopicId": 5436179,

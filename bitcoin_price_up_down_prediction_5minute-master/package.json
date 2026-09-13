@@ -1,0 +1,22 @@
+{
+  "name": "btc-5m-direction",
+  "version": "1.0.0",
+  "description": "5-minute BTCUSDT direction model — microstructure features, regime, decision engine",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/runner.js",
+    "dev": "ts-node src/runner.ts",
+    "watch": "tsc --watch"
+  },
+  "keywords": ["btc", "perpetual", "microstructure", "order-flow", "direction"],
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.9.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0"
+  }
+}

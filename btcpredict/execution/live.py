@@ -30,6 +30,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import http.client
+import json
 import logging
 import time
 from decimal import Decimal
@@ -55,6 +57,23 @@ POSITION_LIST = f"{P}/position/list"
 PAYMENT_OPTIONS = f"{P}/balance/payment-options"
 BATCH_REDEEM = f"{P}/batch-redeem"
 ORDER_HISTORY = f"{P}/order/history"
+ACTIVE_ORDERS = f"{P}/order/list"
+BATCH_CANCEL = f"{P}/trade/batch-cancel"
+
+
+def amount_usdt(x: str | int | float | None) -> float:
+    """An order-record amount as USDT.
+
+    Order/quotes disagree on units in the venue's own docs: quotes carry wei
+    ("1000000000000000000"), order records carry decimals ("1.00"). Reading
+    one as the other is a 1e18 error, so treat anything implausibly large as
+    wei rather than trusting either convention.
+    """
+    try:
+        v = float(x or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return float(from_wei(int(v))) if v >= 1e6 else v
 
 
 def to_wei(usdt: float) -> str:
@@ -100,6 +119,16 @@ class LiveBroker:
         # RETRYABLE_FAILURES). Only one order is ever in flight at a time
         # (max_open_rounds == 1), so a single field per broker is enough.
         self.last_failure: str | None = None
+        # The venue's own explanation for the most recent failure, verbatim.
+        # It lives ONLY in the order-history record (`errorMessage`), which
+        # `_order_status` reads and used to throw away -- so every rejection
+        # before 2026-09-12 was logged as a bare status with no cause. The one
+        # value seen so far is "Failed to execute the market order", which
+        # means the bundle's reference price was stale by more than
+        # `slippageBps` when it executed (measured: a quote taken while the
+        # displayed price was still 0.15 against a book that had already
+        # repriced to 0.60).
+        self.last_order_error: str | None = None
         self._transport_error = False
         self._last_status = 0
 
@@ -116,9 +145,10 @@ class LiveBroker:
         # The venue verifies the signature over RAW commas in comma-separated
         # list parameters (observed on batch-redeem after a contract change:
         # %2C-encoded queries started returning -1022). Replacing %2C with
-        # ',' keeps the signed string identical to what is sent. No other
-        # parameter uses reserved characters.
-        qs = qs.replace("%2C", ",")
+        # ',' keeps the signed string identical to what is sent. The same
+        # applies to batch-cancel's indexed brackets (documented as a known
+        # issue: %5B/%5D break the signature), and for the same reason.
+        qs = qs.replace("%2C", ",").replace("%5B", "[").replace("%5D", "]")
         sig = hmac.new(self.api_secret, qs.encode(), hashlib.sha256).hexdigest()
         return f"{qs}&signature={sig}"
 
@@ -206,9 +236,19 @@ class LiveBroker:
             })
             if resp:
                 for o in (resp.get("orders") or []):
-                    if o.get("orderId") == order_id:
+                    if str(o.get("orderId")) == str(order_id):
                         status = o.get("status") or ""
+                        # The venue explains a refusal here and nowhere else.
+                        # Read it before the status check: a FAILED record with
+                        # an empty `errorMessage` is a different problem from
+                        # one the venue explained.
+                        err = o.get("errorMessage")
+                        if err:
+                            self.last_order_error = str(err)
                         if status == "FILLED" or status in terminal_fail:
+                            if status in terminal_fail:
+                                log.error("order %s %s: %s", order_id, status,
+                                          err or "(venue gave no reason)")
                             return status
                         # SUBMITTED etc.: still in flight, retry below.
                         break
@@ -217,15 +257,261 @@ class LiveBroker:
         return None
 
     # -- trading ------------------------------------------------------------
-    async def get_quote(self, token_id: str, stake: float, side: str = "BUY") -> dict | None:
-        return await self._request("POST", GET_QUOTE, {
+    async def get_quote(self, token_id: str, stake: float, side: str = "BUY",
+                        *, order_type: str = "MARKET",
+                        price_limit: float | None = None) -> dict | None:
+        params = {
             "walletAddress": self.wallet_address,
             "tokenId": token_id,
             "side": side,
             "amountIn": to_wei(stake),
-            "orderType": "MARKET",
+            "orderType": order_type,
+            "slippageBps": self.slippage_bps,
+        }
+        # LIMIT quotes REQUIRE priceLimit (verified: omitting it is refused
+        # with a generic -3026 that names no field).
+        if order_type == "LIMIT" and price_limit is not None:
+            params["priceLimit"] = f"{price_limit:.2f}"
+        return await self._request("POST", GET_QUOTE, params)
+
+    async def order_record(self, order_id: str, tries: int = 3,
+                           delay: float = 0.4) -> dict | None:
+        """The full order-history record for one order, or None if unknown.
+
+        `_order_status` answers "did it work?"; this answers "how much of it
+        filled, at what price" -- which is what a resting order needs.
+        """
+        for i in range(tries):
+            resp = await self._request("GET", ORDER_HISTORY, {
+                "walletAddress": self.wallet_address,
+                "pageSize": 50, "pageNo": 1,
+            })
+            for o in ((resp or {}).get("orders") or []):
+                if str(o.get("orderId")) == str(order_id):
+                    return o
+            if i < tries - 1:
+                await asyncio.sleep(delay)
+        return None
+
+    async def active_orders(self) -> list[dict]:
+        """Orders still working (OPENING, partly filled) for this wallet."""
+        resp = await self._request("GET", ACTIVE_ORDERS, {
+            "walletAddress": self.wallet_address, "limit": 50,
+        })
+        return (resp or {}).get("orders") or []
+
+    async def cancel_orders(self, order_ids: list[str]) -> list[str]:
+        """Cancel working orders; returns the ids the venue confirms cancelled.
+
+        Built by hand over http.client rather than the normal client. The
+        parameters are indexed brackets (cancelInfoList[0].orderId) and the
+        venue signs the RAW string, so any HTTP layer that percent-encodes
+        [ ] -> %5B/%5D yields -1022 -- measured live on 2026-09-11 with
+        aiohttp, which does exactly that. http.client sends the bytes as
+        given, and `_sign` already restores the brackets it encodes.
+        """
+        if not order_ids:
+            return []
+        done = await asyncio.to_thread(self._cancel_blocking, list(order_ids))
+        settled = {str(d) for d in done}
+        left = [o for o in order_ids if str(o) not in settled]
+        if not left:
+            return done
+        # The venue answers -9000 SYSTEM_ERROR to cancels it will not take:
+        # measured 15 of 15 on 2026-09-12 while the orders had already filled
+        # 98-99%, and 104 times in the log since 09-11 (batch-redeem too).
+        #
+        # A refused cancel is NOT evidence the order is still working. The
+        # remainder is usually a 1-2% remnant that already filled or expired
+        # with its round. Assuming "still working" would cry wolf on every
+        # single order; assuming "cancelled" would leave a genuine orphan
+        # unmanaged on the ~5% of rounds where one exists. So ask the venue's
+        # own working-order list, which is the only authority, and treat an
+        # unanswerable question as unanswered rather than as an answer.
+        resp = await self._request("GET", ACTIVE_ORDERS, {
+            "walletAddress": self.wallet_address, "limit": 50,
+        })
+        if resp is None:
+            log.warning("cancel of %s was refused and the working-order list "
+                        "could not be read, so their state is UNKNOWN -- not "
+                        "retrying blind", left)
+            return done
+        working = {str(o.get("orderId")) for o in (resp.get("orders") or [])}
+        stuck = [o for o in left if str(o) in working]
+        if not stuck:
+            # The expected resolution of the -9000 above, and equally
+            # routine: DEBUG so the pair does not dominate the log. The two
+            # branches that DO matter -- an unreadable working list, and an
+            # order the venue still lists -- stay at WARNING below.
+            log.debug("cancel of %s was refused but the venue shows nothing "
+                      "working; treating as done", left)
+            return done
+        log.warning("cancel refused and the venue still lists %s as working; "
+                    "retrying once", stuck)
+        done += await asyncio.to_thread(self._cancel_blocking, stuck)
+        settled = {str(d) for d in done}
+        after = await self._request("GET", ACTIVE_ORDERS, {
+            "walletAddress": self.wallet_address, "limit": 50,
+        })
+        if after is None:
+            log.warning("retried cancel of %s; state now unknown", stuck)
+            return done
+        still = {str(o.get("orderId")) for o in (after.get("orders") or [])}
+        for o in stuck:
+            if str(o) in still:
+                log.error("order %s is STILL working after two cancels -- "
+                          "unmanaged exposure, check the venue", o)
+        return done
+
+    def _cancel_blocking(self, order_ids: list[str]) -> list[str]:
+        params: dict[str, object] = {"walletAddress": self.wallet_address,
+                                     "walletId": self.wallet_id}
+        for i, oid in enumerate(order_ids):
+            params[f"cancelInfoList[{i}].orderId"] = oid
+        host = BASE.split("//", 1)[1]
+        conn = http.client.HTTPSConnection(host, timeout=10)
+        try:
+            conn.request("POST", f"{BATCH_CANCEL}?{self._sign(params)}",
+                         headers={"X-MBX-APIKEY": self.api_key})
+            r = conn.getresponse()
+            raw = r.read()
+            body = json.loads(raw or b"{}")
+            if r.status != 200:
+                # -9000 is the venue's answer to cancelling an order that is
+                # already terminal, and it is the NORMAL case here: a limit
+                # that books at fill_break leaves a 1-2% tail which never
+                # fills and expires with the round, so there is nothing left
+                # to cancel by the time we ask.
+                #
+                # Measured 2026-09-13 over the full log: 199 of these, and
+                # `cancel_orders` -- which reconciles against the venue's own
+                # working-order list -- found a genuinely stuck order ZERO
+                # times and failed to read that list ZERO times. Booked stakes
+                # and shares also match the venue's record exactly, and an
+                # order that read 98% at fill time still reads 98% hours
+                # later, so the tail is dead rather than unbooked.
+                #
+                # It was a WARNING on the reasoning that cancel_orders would
+                # escalate a real orphan. That reasoning still holds and those
+                # escalations are untouched -- but 199 warnings for a condition
+                # that has never once mattered trains you to ignore the log,
+                # which costs more than it saves. Any OTHER code stays loud.
+                code = body.get("code") if isinstance(body, dict) else None
+                (log.debug if code == -9000 else log.warning)(
+                    "live POST %s -> HTTP %s: %s", BATCH_CANCEL, r.status, body)
+                return []
+            return [str(x) for x in (body.get("canceled") or [])]
+        except Exception as e:                      # noqa: BLE001 - never raise
+            log.error("cancel failed: %s: %s", type(e).__name__, e)
+            return []
+        finally:
+            conn.close()
+
+    async def buy_limit(self, *, slug: str, side: str, token_id: str,
+                        limit_px: float, stake: float, wait_s: float,
+                        poll_s: float = 0.75,
+                        fill_break: float = 0.999) -> Fill | None:
+        """Post a resting LIMIT, wait `wait_s`, and cancel whatever is left.
+
+        A limit that does not fill is a MISSED ROUND, not a quiet success, so
+        the caller gets None and the round is over. Crossing afterwards would
+        pay exactly the spread the limit exists to avoid, so it is deliberately
+        not done here -- the A/B has to measure posting, not posting-then-
+        paying-anyway.
+
+        The fill price comes from the venue's own record, never from what we
+        asked: a resting order can fill BETTER than its limit, and booking the
+        requested price would invent a P&L.
+        """
+        if not self.enabled:
+            raise LiveBrokerError("wallet not configured; call discover_wallet() first")
+        self.last_failure = None
+        self.last_order_error = None
+        quote = await self.get_quote(token_id, stake, order_type="LIMIT",
+                                     price_limit=limit_px)
+        if not quote or not quote.get("quoteId"):
+            self.last_failure = "no_quote"
+            log.error("no LIMIT quote for %s %s at %.2f", slug, side, limit_px)
+            return None
+        resp = await self._request("POST", PLACE_ORDER, {
+            "walletAddress": self.wallet_address,
+            "walletId": self.wallet_id,
+            "quoteId": quote["quoteId"],
+            # LIMIT must be GTC; FOK belongs to MARKET (schema, verified live).
+            "timeInForce": "GTC",
+            "accountType": self.account_type,
+            "orderType": "LIMIT",
+            "priceLimit": f"{limit_px:.2f}",
             "slippageBps": self.slippage_bps,
         })
+        if not resp:
+            refused = (not self._transport_error
+                       and 400 <= self._last_status < 500)
+            self.last_failure = "rejected" if refused else "unknown"
+            return None
+        order_id = str(resp.get("orderId") or resp.get("bundleId") or "")
+        if not order_id:
+            self.last_failure = "no_order_id"
+            return None
+
+        deadline = time.time() + max(0.0, wait_s)
+        rec: dict | None = None
+        terminal = {"CLOSED", "CANCELLED", "CANCELED", "EXPIRED", "FAILED"}
+        while True:
+            rec = await self.order_record(order_id, tries=1)
+            filled = float((rec or {}).get("fillPercentage") or 0.0)
+            # Done at `fill_break`, not at 1.0. Waiting out the clock for the
+            # last 1-2% of an already-filled order cost a median 16s on half of
+            # 238 measured orders, and at tau < wait_s that delay is the
+            # difference between a booked fill and a cancellation at the bell.
+            # The remainder is cancelled below, and the fill is booked from the
+            # venue's own filled amounts.
+            if filled >= fill_break:
+                break
+            if filled <= 0.0 and str((rec or {}).get("status") or "") in terminal:
+                break
+            if time.time() >= deadline:
+                break
+            await asyncio.sleep(poll_s)
+
+        filled = float((rec or {}).get("fillPercentage") or 0.0)
+        if filled <= 0.0:
+            cancelled = await self.cancel_orders([order_id])
+            self.last_failure = "limit_unfilled"
+            log.info("limit %s %s @%.2f unfilled after %.0fs -> %s (%s)",
+                     slug, side, limit_px, wait_s,
+                     "cancelled" if cancelled else "CANCEL NOT CONFIRMED",
+                     order_id)
+            return None
+
+        usdt = amount_usdt(rec.get("filledUsdtAmount")) or stake * filled
+        shares = amount_usdt(rec.get("filledShareQty"))
+        px = (usdt / shares) if shares > 0 else limit_px
+        # `marketProviderFee` is denominated in SHARES, not USDT, exactly as the
+        # quote's feeAmount is (see buy()). Verified on a real crossing limit on
+        # 2026-09-12: 0.111 shares on a $0.83 fill at 0.1526, i.e. 2.0% of the
+        # stake -- the 200bps the venue advertises. Read as dollars it books
+        # 13.4% of the stake, so every limit fill over-reported its fee by 1/px,
+        # and at the cheap end (px 0.02-0.05) by 20-50x.
+        fee = amount_usdt(rec.get("marketProviderFee")) * px
+        if filled < 0.999:                    # partial: cancel the remainder
+            await self.cancel_orders([order_id])
+        log.info("limit %s %s FILLED %.0f%% @%.4f ($%.2f -> %.4f shares, fee $%.4f)",
+                 slug, side, filled * 100, px, usdt, shares, fee)
+        return Fill(ts_ms=int(time.time() * 1000), side=side, slug=slug,
+                    requested_px=limit_px, filled_px=px, shares=shares,
+                    stake=usdt, fee_paid=fee, order_id=order_id,
+                    # Which token was bought. bind() needs it to persist the fill
+                    # and settle() needs it to VERIFY one: an unverified fill is
+                    # checked with "is this token in the venue's positions?", and
+                    # with token_id None that question is unanswerable -- the
+                    # check concludes the venue holds nothing and voids a real
+                    # position. The market path always set it; this one did not.
+                    token_id=token_id,
+                    # JSON, not the dict itself: `fills.raw` is TEXT, and a dict
+                    # fails to bind AFTER the order has already filled -- which
+                    # is how a real fill went unbooked on 2026-09-11.
+                    raw=json.dumps(rec, default=str))
 
     async def buy(self, *, slug: str, side: str, token_id: str,
                   price: float, stake: float,
@@ -233,6 +519,7 @@ class LiveBroker:
         if not self.enabled:
             raise LiveBrokerError("wallet not configured; call discover_wallet() first")
         self.last_failure = None
+        self.last_order_error = None
 
         # A quote may be supplied by the caller (the pre-trade recheck already
         # fetched one). Using it avoids a second round trip that eats into the
@@ -280,11 +567,15 @@ class LiveBroker:
         # order up in order/history, which reports the authoritative status.
         # History can lag a second or two, so retry briefly.
         order_id = resp.get("orderId") or resp.get("bundleId")
-        # Short budget here: this sits inside the order path, where every second
-        # spent waiting is a second of the quote's ~5s expireAt window and of
-        # the trade's tau window. Deeper verification belongs in settle(), which
-        # has minutes rather than seconds.
-        status = await self._order_status(order_id, tries=4, delay=0.5)
+        # This sits inside the order path, where every second spent waiting is a
+        # second of the quote's ~5s expireAt window and of the trade's tau
+        # window -- so the budget is bounded, but it has to be long enough to
+        # mean something. Measured on 2026-09-12: order ...702147 was FILLED by
+        # the venue at +0.75s yet order/history did not show it within 2s (4 x
+        # 0.5s), so the old budget reported "unreadable" for an order that had
+        # already executed, and the position list was still empty 3.5s later.
+        # ~3.6s here plus the position patience below covers that latency.
+        status = await self._order_status(order_id, tries=6, delay=0.6)
         if status is None:
             # The history endpoint did not answer in time. It lags the
             # place-order call by a second or two, so this is the COMMON case
@@ -307,8 +598,10 @@ class LiveBroker:
                 # not stranded.
                 self.last_failure = "unconfirmed"
                 log.error("order %s unverifiable and the venue holds no "
-                          "position in %s; NOT booking and NOT retrying",
-                          order_id, slug)
+                          "position in %s; NOT booking and NOT retrying%s",
+                          order_id, slug,
+                          f" (venue said: {self.last_order_error})"
+                          if self.last_order_error else "")
                 return None
             if held is True:
                 log.info("order %s confirmed by the venue's position list (%s)",
@@ -342,7 +635,8 @@ class LiveBroker:
                 # transient.
                 self.last_failure = "venue_failed"
                 log.error("order %s status=%s with no position held; treating "
-                          "as failed (%s)", order_id, status, slug)
+                          "as failed (%s): %s", order_id, status, slug,
+                          self.last_order_error or "no reason given")
                 return None
             else:
                 # Unreadable position list: the status says no fill and the
@@ -374,12 +668,15 @@ class LiveBroker:
             unverified=(status is None),
         )
 
-    async def _confirm_by_position(self, token_id: str, tries: int = 3,
-                                   delay: float = 0.5) -> bool | None:
+    async def _confirm_by_position(self, token_id: str, tries: int = 6,
+                                   delay: float = 0.8) -> bool | None:
         """Does the venue hold `token_id`? True / False / None (unreadable).
 
         The tie-breaker for an order whose status could not be read. Polled
-        briefly, because a position takes a moment to appear after a FOK fill.
+        briefly, because a position takes a moment to appear after a FOK fill --
+        and on 2026-09-12 it took longer than the 1.5s this used to allow, so a
+        real fill was declared absent and thrown away. Absence is only believed
+        after ~4s of asking, which still fits inside an impulse round's tau.
 
         False is only returned when the list was actually read and did not
         contain the token -- a list we could never read proves nothing, so it

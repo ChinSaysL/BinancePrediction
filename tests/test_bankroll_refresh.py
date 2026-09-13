@@ -80,7 +80,7 @@ def test_refresh_is_skipped_while_a_position_is_open(store):
     """walletBalance excludes locked cash, so reading it while invested would
     understate equity and shrink the next stake below the intended fraction."""
     book = FakeLiveBook(20.0)                   # free cash only, rest is invested
-    bot = make_bot(store, book, open_fills={"r1": (1, make_fill())})
+    bot = make_bot(store, book, open_fills={1: ("r1", make_fill())})
     asyncio.run(bot._refresh_bankroll())
     assert bot.bankroll == pytest.approx(76.0)
     assert book.balance_calls == 0
@@ -118,7 +118,7 @@ def test_refresh_tolerates_a_bot_without_a_book(store):
 def test_settlement_refreshes_the_bankroll_after_a_win(store):
     """End to end: settle -> redeem the winnings -> re-read equity."""
     book = FakeLiveBook(83.4)
-    bot = make_bot(store, book, open_fills={"r1": (7, make_fill())})
+    bot = make_bot(store, book, open_fills={7: ("r1", make_fill())})
     store.upsert_round({"slug": "r1", "start_ms": 0, "end_ms": 1,
                         "market_topic_id": 99, "winner": "Up"})
     asyncio.run(bot.settle_due())
@@ -185,7 +185,7 @@ def test_a_win_raises_the_ledger_even_when_the_read_lags(store):
     """End to end: settle -> ledger up by the P&L -> lagging read ignored."""
     book = FakeLiveBook(0.0)
     bot = make_bot(store, book, bankroll=76.5027,
-                   open_fills={"r1": (7, make_fill(stake=1.53, shares=2.207))})
+                   open_fills={7: ("r1", make_fill(stake=1.53, shares=2.207))})
     store.upsert_round({"slug": "r1", "start_ms": 0, "end_ms": 1,
                         "market_topic_id": 99, "winner": "Up"})
     book._balance = bot.bankroll - 1.53         # exactly what the venue showed

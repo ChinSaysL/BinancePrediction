@@ -42,11 +42,54 @@ ABORT_TRADES = 2000
 #   23:14 .. 2026-09-11 09:41  honest pricing, but every Down FAVOURITE was
 #       refused by a complement bug in the pre-trade recheck (63 rounds refused,
 #       54 of 55 trades Up) -- an Up-only sample of a different live path
-#   from 09:41 onward  what the replay actually measured (267 Up / 347 Down)
+#   09:41 .. 2026-09-11 12:59  what the replay actually measured (267 Up / 347
+#       Down), at 2% of the bankroll x tilt with a $25 cap
+#   12:59:44Z .. 2026-09-12 07:01  flat $10 (band $10-$10, tilt off) from
+#       12:59:44Z; guards off from 13:05:44Z; LIMIT orders from 18:29Z; a
+#       tau 150-270 window from 04:10Z; a server-only two-sided mode 04:17-06:43
+#       that never existed in this workspace. 215 fills, -$7.69 (-1.09%/$1).
+#       Nothing in this stretch pools with anything else: every knob moved.
+#   from 2026-09-12 07:01Z  digital model both sides, calibrated benched.
+#       Market orders, tau 60-210, 2% x tilt floored at the venue minimum,
+#       guards ON (20% daily, 5-loss halt). Justified by the tick-level test in
+#       FINDINGS.md (2026-09-12): same 973 settled rounds, digital's gate
+#       +0.0775/$1 against the calibrated gate's +0.0123/$1.
+#   from 2026-09-12 07:25Z  entry_mode=impulse: the model is NOT consulted for
+#       entries. Live arm (A) trades a >=4 bps / 1 s move in the underlying,
+#       one entry per round, at the venue minimum with the guards ON. The model
+#       gate keeps being evaluated and recorded, so arm (B) -- the same rounds
+#       scored by the gate -- is reconstructible offline from `quotes`+`rounds`.
+#       Validation (1,641 rounds, one entry per round, net of the measured
+#       1.32c/$1 slip): +0.1145 1st half / +0.0815 2nd half, against the gate's
+#       +0.0288 / -0.0081 on the same rounds.
+#   07:25Z .. 2026-09-12 09:38:33Z  the same impulse logic, but the trigger was
+#       evaluated once per poll (1002 ms median) while the venue sits 5.3 ms
+#       away -- so ~500 ms median of the trigger-to-order path was our own
+#       sleep. One fill in this window, and it paid 0.703 on a 0.660 quote
+#       (+4.3c, 6.5% of stake). NOT pooled with what follows: the fill process
+#       changed, so the price paid is a different quantity.
+#   from 2026-09-12 09:38:33Z  entry_mode=impulse with the trigger on the
+#       FEED's clock (impulse_on_tick): evaluated on every bookTicker update
+#       (~33/s) instead of once a second, so an order leaves ~20 ms after the
+#       window closes rather than ~500 ms. Same statistic, same threshold, one
+#       entry per round, guards unchanged. This is the era to measure fill
+#       price against the trigger price in.
+#   09:38:33Z .. 2026-09-12 11:23:46Z  the above with MARKET+FOK orders. Two
+#       fills, both of which FAILED first (the bundle's reference was the
+#       DISPLAYED price, stale by more than slippageBps) and then paid the
+#       repriced price -- 0.81 against an ask of 0.60, and 0.84 against 0.17.
+#   from 2026-09-12 11:23:46Z  order_type=limit_take: the order crosses the book
+#       at max(quote, fair - safety_margin) and fills AT THE BOOK'S ASK (measured
+#       with one real crossing order: limit 0.18 vs ask 0.15 -> filled 0.1526),
+#       with the impulse arm's fair now a real digital rather than its own quote.
+#       The fill process changed again, so this does not pool with the two fills
+#       above either. The ticket arm also went live in this era (ticket_live,
+#       10/day) and books as mode='live' -- separate it by joining fills to
+#       decisions.reason LIKE 'ticket %'.
 #
 # The scaling rule's ~1,000-trade clock starts at the cut, not at the config
 # switch: those 55 trades cannot be pooled with these.
-CONFIG_CHANGE = "2026-09-11T09:41:59Z"
+CONFIG_CHANGE = "2026-09-12T11:23:46Z"
 
 
 def parse_when(s: str) -> int:

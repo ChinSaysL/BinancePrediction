@@ -9,6 +9,19 @@ from btcpredict.execution.paper import PaperBroker
 from btcpredict.risk.guards import RiskGuard
 
 
+@pytest.fixture(autouse=True)
+def _market_orders(monkeypatch):
+    """Pin the order path this file exercises.
+
+    main._place_order branches on `settings.order_type`, which the LIVE .env
+    sets -- so without this the same code passes on a laptop and fails on the
+    box (observed 2026-09-11: the fourth .env-dependent test failure this
+    session). These tests are about the market-FOK path, so they say so
+    instead of inheriting whichever arm happens to be live.
+    """
+    monkeypatch.setattr("btcpredict.config.settings.order_type", "market")
+
+
 def guard(**kw):
     return RiskGuard(**{"daily_loss_cap": 3.0, "max_consecutive_losses": 3,
                         "max_open_rounds": 1, **kw})
@@ -60,6 +73,41 @@ def test_daily_cap_can_be_switched_off_entirely():
     g.on_settle("r1", -5.0)
     assert not g.state.halted
     assert g.check("r2")[0]
+
+
+def test_a_streak_limit_of_zero_switches_the_streak_rule_off():
+    """0 = off, like the caps. This needs its own code path in all three
+    places the comparison appears (check, on_settle, seed_daily): a bare
+    `consecutive_losses >= max_consecutive_losses` is `0 >= 0` on the first
+    call, so a disabled rule would halt the bot on its first settled trade."""
+    g = guard(daily_loss_cap=0.0, max_consecutive_losses=0)
+    for i in range(10):
+        g.on_open(f"r{i}")
+        g.on_settle(f"r{i}", -1.0)
+    allowed, why = g.check("next")
+    assert allowed, why
+    assert not g.state.halted
+    # the counter still counts -- it is just not a reason to stop
+    assert g.state.consecutive_losses == 10
+    # ...and a restart must not invent a halt from yesterday's run either
+    g2 = guard(daily_loss_cap=0.0, max_consecutive_losses=0)
+    g2.seed_daily(-240.0, 12)
+    assert not g2.state.halted
+    assert g2.check("r")[0]
+
+
+def test_with_the_shipped_guards_off_nothing_halts_on_pnl():
+    """Both PnL rules off. The open-round limits still apply: those are
+    position rules, not tolerance for losses."""
+    g = guard(daily_loss_cap=0.0, daily_loss_cap_pct=0.0,
+              max_consecutive_losses=0)
+    for i in range(6):
+        g.on_open(f"r{i}")
+        g.on_settle(f"r{i}", -40.0)          # -$240, far past any daily cap
+    assert g.effective_daily_cap() == float("inf")
+    assert g.check("next")[0]
+    g.on_open("held")
+    assert g.check("held") == (False, "already positioned in this round")
 
 
 def test_percentage_daily_cap_keeps_its_meaning_as_the_account_grows():
@@ -290,6 +338,20 @@ class _StubBroker:
         self.last_failure = None
         self.buys = 0
         self.quotes = 0
+        self.limits: list[tuple] = []
+
+    async def buy_limit(self, *, slug, side, token_id, limit_px, stake, wait_s,
+                        poll_s=0.75, fill_break=0.999):
+        # Mirrors LiveBroker.buy_limit's signature. `fill_break` is the fraction
+        # at which the wait loop calls the order done and cancels the remainder;
+        # a stub that does not accept it hides a real call-site mismatch.
+        self.limits.append((limit_px, wait_s))
+        self.fill_breaks = getattr(self, "fill_breaks", [])
+        self.fill_breaks.append(fill_break)
+        from btcpredict.execution.base import Fill
+        return Fill(slug=slug, side=side, requested_px=limit_px,
+                    filled_px=limit_px, shares=stake / limit_px, stake=stake,
+                    fee_paid=0.0, order_id="lim1", ts_ms=0, raw="{}")
 
     async def get_quote(self, token_id, stake, side="BUY"):
         self.quotes += 1
@@ -339,6 +401,178 @@ def _place(broker):
     fill = asyncio.run(bot._place_order(_Round(), _Sig(), fair_up=0.28,
                                         token="tok", stake=10.0))
     return bot, fill
+
+
+def test_the_candle_open_gate_holds_by_default(monkeypatch):
+    """The main arm only trades at the candle open, and that gate is deliberate."""
+    monkeypatch.setattr("btcpredict.main.settings.trade_on_candle_open", True)
+    monkeypatch.setattr("btcpredict.main.sec_into_candle", lambda ms: 285)
+
+    b = _StubBroker(["fill"])
+    bot, fill = _place(b)
+    assert fill is None
+    assert b.buys == 0
+
+
+def test_a_taker_limit_crosses_at_our_own_valuation(monkeypatch):
+    """order_type=limit_take must reach buy_limit (which matches the BOOK) and
+    never buy() (which goes through trade/get-quote + place-order-bundle, priced
+    off the venue's DISPLAYED price -- measured lagging its own book by up to
+    0.40, with the quote above the ask in 5-7% of live samples).
+
+    The ceiling is fair_side - limit_take_margin, and the DOWN side's fair is
+    1 - fair_up, so passing P(Up) is what keeps this from pricing a Down order
+    at the Up price.
+    """
+    monkeypatch.setattr("btcpredict.main.settings.order_type", "limit_take")
+    monkeypatch.setattr("btcpredict.main.settings.limit_take_margin", 0.01)
+
+    b = _StubBroker(["fill"])
+    bot = _bot(b)
+    # Signal is Down at 0.57; P(Up) = 0.10 -> the Down fair is 0.90, so the ceiling
+    # is fair - margin = 0.89. But the ceiling ALONE is not enough: a live fill on
+    # 2026-09-12 13:02 crossed a 0.90 limit against an ask of 0.7326 and landed at
+    # 0.8919 (ev_at_fill -0.195), because our fair is the miscalibrated estimator
+    # here. The limit is clamped to ask + one tick = 0.58, which still crosses the
+    # book and still fills at the ask -- the only price the taker leg ever pays.
+    fill = asyncio.run(bot._place_order(_Round(), _Sig(), fair_up=0.10,
+                                        token="tok", stake=10.0))
+    assert fill is not None
+    assert b.buys == 0, "a taker limit must not use the market path"
+    assert len(b.limits) == 1
+    limit_px, wait = b.limits[0]
+    assert limit_px == 0.58
+    assert wait <= 20.0
+
+
+def test_a_taker_limit_never_prices_an_arm_above_its_own_quote(monkeypatch):
+    """An arm with no valuation of its own passes `take_px`, and that floors the
+    limit -- the ticket's premise is that the venue's price is wrong, so its limit
+    must come out at exactly the ask it read, never below it (which would never
+    fill) and never above it (which would pay more than it decided to)."""
+    monkeypatch.setattr("btcpredict.main.settings.order_type", "limit_take")
+    monkeypatch.setattr("btcpredict.main.settings.limit_take_margin", 0.04)
+
+    b = _StubBroker(["fill"])
+    bot = _bot(b)
+    # Down at 0.04, so P(Up) = 0.96 and the Down fair is 0.04.
+    fill = asyncio.run(bot._place_order(_Round(), _Sig(), fair_up=0.96,
+                                        token="tok", stake=1.0,
+                                        skip_pretrade_gates=True,
+                                        take_px=0.57))
+    assert fill is not None
+    assert len(b.limits) == 1
+    limit_px, wait = b.limits[0]
+    assert limit_px == 0.57, "the limit must be the arm's own price, not 1 - it"
+    assert wait <= 20.0
+
+
+def test_a_stale_high_quote_cannot_lift_the_limit_above_fair(monkeypatch):
+    """The case the ceiling exists for: the venue repriced BEFORE us, so the
+    displayed price is stale HIGH.
+
+    With max(quote, fair - margin) -- what shipped first -- a display of 0.90
+    would have beaten a fair minus margin of 0.86 and authorised a fill ABOVE our
+    own valuation: a negative-EV entry, taken by the very arm the ceiling exists
+    to stop. The limit is now the valuation and nothing else.
+    """
+    monkeypatch.setattr("btcpredict.main.settings.order_type", "limit_take")
+    # Pinned, so this measures the ceiling and not whichever margin ships.
+    monkeypatch.setattr("btcpredict.main.settings.limit_take_margin", 0.01)
+
+    class StaleHigh:
+        act, side, quote, fair, edge = True, "Down", 0.90, 0.87, 0.0
+
+    b = _StubBroker(["fill"])
+    bot = _bot(b)
+    # P(Up) = 0.13 -> the Down fair is 0.87, so the ceiling is 0.86, under the
+    # 0.90 the venue is displaying.
+    fill = asyncio.run(bot._place_order(_Round(), StaleHigh(), fair_up=0.13,
+                                        token="tok", stake=10.0))
+    assert fill is not None
+    limit_px, _ = b.limits[0]
+    assert limit_px == 0.86
+    assert limit_px < StaleHigh.quote, \
+        "a stale-high display must not raise the price we are willing to pay"
+
+
+def test_the_hurdle_and_the_take_ceiling_are_separate_knobs(monkeypatch):
+    """`safety_margin` moves the signal's HURDLE; the take ceiling has its own
+    setting. They used to be one number, so sweeping the ceiling -- which is what
+    `--sweep-margin` does, 0.00 to 0.10 -- would also have moved the entry gate,
+    an unmeasured change smuggled in with a measured one. The ceiling must follow
+    `limit_take_margin` and ignore `safety_margin`.
+    """
+    monkeypatch.setattr("btcpredict.main.settings.order_type", "limit_take")
+
+    class Sig:                     # same shape as the stale-high case below
+        act, side, quote, fair, edge = True, "Down", 0.90, 0.87, 0.0
+
+    # A 9% ceiling margin with the hurdle left at 1%: the ceiling is
+    # 0.87 - 0.09 = 0.78, NOT 0.87 - 0.01.
+    monkeypatch.setattr("btcpredict.main.settings.safety_margin", 0.01)
+    monkeypatch.setattr("btcpredict.main.settings.limit_take_margin", 0.09)
+    b = _StubBroker(["fill"])
+    bot = _bot(b)
+    asyncio.run(bot._place_order(_Round(), Sig(), fair_up=0.13, token="tok",
+                                 stake=10.0))
+    limit_px, _ = b.limits[0]
+    assert limit_px == 0.78, "the ceiling must follow limit_take_margin"
+
+    # ...and the reverse: a 9% HURDLE with a 1% ceiling must leave the ceiling
+    # where it was. While the two were one setting this came out 0.78.
+    monkeypatch.setattr("btcpredict.main.settings.safety_margin", 0.09)
+    monkeypatch.setattr("btcpredict.main.settings.limit_take_margin", 0.01)
+    b2 = _StubBroker(["fill"])
+    bot2 = _bot(b2)
+    asyncio.run(bot2._place_order(_Round(), Sig(), fair_up=0.13, token="tok",
+                                  stake=10.0))
+    limit_px2, _ = b2.limits[0]
+    assert limit_px2 == 0.86, "raising safety_margin must NOT move the ceiling"
+
+
+def test_a_limit_never_rests_past_the_end_of_the_round(monkeypatch):
+    """A ticket fires 3-30s before the bell; the configured 20s wait would
+    outlive the round, so the wait is capped by the time left."""
+    from btcpredict.main import Bot
+
+    monkeypatch.setattr("btcpredict.main.settings.order_type", "limit_take")
+    monkeypatch.setattr("btcpredict.main.settings.limit_wait_s", 20.0)
+
+    class ShortRound(_Round):
+        def tau_s(self, now_ms):
+            return 6.0
+
+    b = _StubBroker(["fill"])
+    bot = Bot.__new__(Bot)
+    bot.broker = b
+    bot._order_cooldown_until = 0.0
+    fill = asyncio.run(bot._place_order(ShortRound(), _Sig(), fair_up=0.10,
+                                        token="tok", stake=1.0))
+    assert fill is not None
+    _, wait = b.limits[0]
+    assert wait <= 5.0, "the limit must not outlive the round it trades in"
+
+
+def test_the_ticket_can_skip_the_candle_open_gate(monkeypatch):
+    """A ticket fires at the END of a round -- 4-5 minutes into a 5m candle.
+
+    With `trade_on_candle_open` on and no way to skip it, every live ticket
+    would be withheld while still writing a `decisions` row, so the arm would
+    look like it was trading and never place a single order. The skip must apply
+    to those two decision gates only -- the retry loop's venue-position check and
+    the booking path are untouched.
+    """
+    monkeypatch.setattr("btcpredict.main.settings.trade_on_candle_open", True)
+    monkeypatch.setattr("btcpredict.main.sec_into_candle", lambda ms: 285)
+
+    b = _StubBroker(["fill"])
+    bot = _bot(b)
+    fill = asyncio.run(bot._place_order(_Round(), _Sig(), fair_up=0.28,
+                                        token="tok", stake=1.0,
+                                        skip_pretrade_gates=True))
+    assert fill is not None
+    assert b.buys == 1
 
 
 def test_a_down_order_is_rechecked_against_its_own_price(monkeypatch):
@@ -662,6 +896,100 @@ def test_unreadable_status_with_a_position_is_booked_as_verified():
     assert fill.order_id == "o1"
 
 
+def test_a_limit_fill_carries_the_token_it_bought():
+    """`settle()` verifies an unverified fill by asking the venue's position list
+    whether it holds that TOKEN. bind() needs the same id to persist the fill, so
+    a restored fill without one can never be verified -- the check answers "not
+    held" and voids a real position after 20 attempts. The market path always set
+    it; buy_limit did not."""
+    from btcpredict.execution import live
+
+    b = live.LiveBroker(None, "k", "s", wallet_address="w", wallet_id="1")
+
+    async def quote(*a, **kw):
+        return {"quoteId": "q1", "averagePrice": 0.70, "expireAt": 0}
+
+    async def request(method, path, params=None):
+        return {"orderId": "o1"}
+
+    async def record(order_id, **kw):
+        return {"orderId": "o1", "status": "CLOSED", "fillPercentage": "1",
+                "filledUsdtAmount": "1.00", "filledShareQty": "1.4286",
+                "marketProviderFee": "0.02"}
+
+    b.get_quote = quote
+    b._request = request
+    b.order_record = record
+    fill = asyncio.run(b.buy_limit(slug="s", side="Up", token_id="tok-42",
+                                   limit_px=0.69, stake=1.0, wait_s=0.1))
+    assert fill is not None
+    assert fill.token_id == "tok-42"
+
+
+def test_an_unverified_fill_survives_a_restart_with_its_token(tmp_path):
+    """The whole point of persisting token_id: after a restart the fill must still
+    be verifiable, or settle() voids a position we actually hold."""
+    from btcpredict.execution.base import Fill
+    from btcpredict.store.db import Store
+
+    store = Store(tmp_path / "t.db")
+    store.insert("fills", {
+        "decision_id": 1, "slug": "s", "ts_ms": 1, "mode": "live", "side": "Up",
+        "requested_px": 0.6, "filled_px": 0.6, "shares": 1.6, "stake": 1.0,
+        "fee_paid": 0.0, "order_id": "o9", "raw": "{}", "token_id": "tok-42",
+        "ev_at_fill": None,
+    })
+    bot = _bot(_StubBroker([]))
+    bot.store = store
+    bot.open_fills = {}
+    from btcpredict.risk.guards import RiskGuard
+    bot.guard = RiskGuard(daily_loss_cap=0.0, max_consecutive_losses=5,
+                          max_open_rounds=1, daily_loss_cap_pct=0.2,
+                          bankroll=lambda: 10.0)
+    bot._restore_open_positions()
+
+    _fid, (slug, restored) = next(iter(bot.open_fills.items()))
+    assert slug == "s"
+    assert isinstance(restored, Fill)
+    assert restored.token_id == "tok-42", \
+        "a restored fill must keep the token, or its verification is blind"
+    store.close()
+
+
+def test_a_limit_fill_converts_its_fee_from_shares():
+    """`marketProviderFee` is denominated in SHARES, like the quote's feeAmount.
+
+    Measured on a real crossing limit (2026-09-12): 0.111 shares on a $0.83 fill
+    at 0.1526 -- i.e. 2.0% of the stake, the 200bps the venue advertises. Read as
+    dollars it books 13.4% of the stake, overstating the fee 6.7x and, at the
+    cheap end (0.02-0.05), by 20-50x.
+    """
+    from btcpredict.execution import live
+
+    b = live.LiveBroker(None, "k", "s", wallet_address="w", wallet_id="1")
+
+    async def quote(*a, **kw):
+        return {"quoteId": "q1", "averagePrice": 0.15, "expireAt": 0}
+
+    async def request(method, path, params=None):
+        return {"orderId": "o1"}
+
+    async def record(order_id, **kw):
+        return {"orderId": "o1", "status": "CLOSED", "fillPercentage": "1",
+                "filledUsdtAmount": "0.83", "filledShareQty": "5.44",
+                "marketProviderFee": "0.111"}
+
+    b.get_quote = quote
+    b._request = request
+    b.order_record = record
+    fill = asyncio.run(b.buy_limit(slug="s", side="Up", token_id="t",
+                                   limit_px=0.18, stake=1.0, wait_s=0.1))
+    assert fill is not None
+    assert fill.filled_px == pytest.approx(0.83 / 5.44, abs=1e-4)
+    assert fill.fee_paid == pytest.approx(0.111 * (0.83 / 5.44), abs=1e-4)
+    assert fill.fee_paid < 0.03, "2% of the stake, not 13% of it"
+
+
 def test_unreadable_status_and_unreadable_positions_books_provisionally():
     """Neither endpoint answered: hold the fill as provisional rather than
     dropping it, because dropping a real position strands its winnings. settle()
@@ -669,6 +997,70 @@ def test_unreadable_status_and_unreadable_positions_books_provisionally():
     b = _buy_broker(status=None, held=None)
     fill = _buy(b)
     assert fill is not None and fill.unverified
+
+
+# --- the venue's reason, and how long we wait for it -------------------------
+#
+# 2026-09-12: the last two live orders were logged as "status=FAILED with no
+# position held" and then "unverifiable ... NOT booking", with no cause shown.
+# The venue had written the cause into the order-history record the whole time
+# (`errorMessage: "Failed to execute the market order"`), and it had FILLED the
+# second order at +0.75s -- order/history did not show it within the old 2s
+# budget and the position list was still empty at 3.5s, so the patience was the
+# other half of the problem.
+
+def test_the_venues_own_reason_is_read_and_kept():
+    """A FAILED record carries `errorMessage`; it must not be thrown away."""
+    from btcpredict.execution import live
+
+    b = live.LiveBroker(None, "k", "s", wallet_address="w", wallet_id="1")
+    payload = {"orders": [{"orderId": "o9", "status": "FAILED",
+                           "errorMessage": "Failed to execute the market order"}]}
+
+    async def request(method, path, params):
+        return payload
+
+    b._request = request
+    assert asyncio.run(b._order_status("o9")) == "FAILED"
+    assert b.last_order_error == "Failed to execute the market order"
+
+
+def test_a_slow_history_read_still_finds_the_fill():
+    """The 2026-09-12 discard: the fill existed but history lagged.
+
+    Four empty reads used to be the whole budget, so an order the venue had
+    already FILLED was reported unreadable, the position list was asked too
+    early, and the fill was dropped. History that answers on the fifth read must
+    now be found and booked.
+    """
+    from btcpredict.execution import live
+
+    b = live.LiveBroker(None, "k", "s", wallet_address="w", wallet_id="1")
+    calls = {"n": 0}
+
+    async def quote(*a, **kw):
+        return {"quoteId": "q1", "amountOut": to_wei(17.5),
+                "feeAmount": to_wei(0.1), "averagePrice": 0.57, "expireAt": 0}
+
+    async def request(method, path, params):
+        if path == live.ORDER_HISTORY:
+            calls["n"] += 1
+            if calls["n"] < 5:
+                return {"orders": []}          # lagging, as the live venue is
+            return {"orders": [{"orderId": "o1", "status": "FILLED"}]}
+        return {"orderId": "o1"}
+
+    async def positions():
+        return set()                           # would have said "not held"
+
+    b.get_quote = quote
+    b._request = request
+    b._position_token_ids = positions
+    fill = asyncio.run(b.buy(slug="s", side="Up", token_id="tok",
+                             price=0.57, stake=10.0))
+    assert fill is not None, "a lagging history read must not discard a real fill"
+    assert fill.order_id == "o1"
+    assert b.last_failure is None
 
 
 def test_a_confirmed_status_needs_no_position_lookup():
@@ -683,3 +1075,210 @@ def test_a_confirmed_status_needs_no_position_lookup():
 def test_a_position_in_another_token_does_not_confirm_this_order():
     b = _buy_broker(status=None, held={"someone-elses-token"})
     assert _buy(b) is None
+
+
+class TestTheReservedSlot:
+    """A reserved arm (the cross) holds a slot of its own, alongside one main position.
+
+    ADDED 2026-09-13. `check()` refused the cross arm on any round the main arm
+    held, and since the main arm enters at tau 60-210 and holds to settlement
+    while the cross fires at tau 3-60, that was most rounds the ticket wanted.
+    The two are different signals at different prices and frequently opposite
+    sides, so the collision was crowding-out rather than risk control.
+
+    What must NOT change: every halt, and the daily loss cap, still stop it.
+    """
+
+    def _guard(self):
+        from btcpredict.risk.guards import RiskGuard
+        return RiskGuard(daily_loss_cap=0.0, max_consecutive_losses=5,
+                         max_open_rounds=1, daily_loss_cap_pct=0.20,
+                         bankroll=lambda: 50.0)
+
+    def test_a_reserved_arm_may_enter_a_round_the_main_arm_holds(self):
+        g = self._guard()
+        g.on_open("r1")
+        assert g.check("r1")[0] is False, "the main arm still dedups itself"
+        assert g.check_reserved("r1")[0] is True, "the reserved arm has its own slot"
+
+    def test_the_main_arm_is_not_given_the_reserved_slot(self):
+        """max_open_rounds stays 1 for the main arm: the second slot is the
+        reserved arm's, not a second model position."""
+        g = self._guard()
+        g.on_open("r1")
+        assert g.check("r2")[0] is False, "one main position at a time"
+
+    def test_the_reserved_slot_is_single(self):
+        g = self._guard()
+        g.on_open("r1", reserved=True)
+        assert g.check_reserved("r2")[0] is False
+        assert g.check_reserved("r1")[0] is False
+
+    def test_settling_releases_the_right_slot(self):
+        g = self._guard()
+        g.on_open("r1")                       # main
+        g.on_open("r1", reserved=True)          # ticket, same round
+        g.on_settle("r1", 0.5, reserved=True)
+        assert g.state.reserved_rounds == set(), "the ticket slot is freed"
+        assert g.state.open_rounds == {"r1"}, "the main position still stands"
+        g.on_settle("r1", 0.5)
+        assert g.state.open_rounds == set()
+
+    def test_a_halt_still_stops_the_reserved_arm(self):
+        g = self._guard()
+        g._halt("daily", "daily loss cap hit")
+        assert g.check_reserved("r1")[0] is False
+
+    def test_the_daily_cap_still_stops_the_reserved_arm(self):
+        g = self._guard()
+        g.state.daily_pnl = -10_000.0
+        assert g.check_reserved("r1")[0] is False
+
+    def test_the_loss_streak_still_stops_the_reserved_arm(self):
+        g = self._guard()
+        g.state.consecutive_losses = 5
+        assert g.check_reserved("r1")[0] is False
+
+
+# --- voids must give the slot back (regression, 2026-09-13) -----------------
+#
+# The settle loop's void branch `continue`d past on_settle, but _book_fill had
+# already claimed the slot via on_open. The claim then outlived the process.
+# One void was enough to silence the MAIN arm, whose pool is a set bounded by
+# max_open_rounds=1; the cross arm needed cross_max_per_round of them. It
+# self-healed on restart -- a voided fill has a settlement row, so
+# _restore_open_positions does not replay it -- which is why a bot restarting
+# hundreds of times a day never surfaced it.
+
+def _guard(**kw):
+    kw.setdefault("daily_loss_cap", 0.0)
+    kw.setdefault("max_consecutive_losses", 5)
+    kw.setdefault("max_open_rounds", 1)
+    return RiskGuard(**kw)
+
+
+def test_a_void_releases_the_main_slot():
+    g = _guard()
+    g.on_open("r1")
+    assert g.check("r2")[0] is False, "the main pool is full while r1 is held"
+    g.release("r1")
+    assert g.check("r2")[0] is True, "a void must hand the slot back"
+
+
+def test_a_void_releases_the_reserved_slot():
+    g = _guard()
+    g.on_open("r1", reserved=True)
+    assert g.check_reserved("r1", max_open=1)[0] is False
+    g.release("r1", reserved=True)
+    assert g.check_reserved("r1", max_open=1)[0] is True
+
+
+def test_a_void_releases_a_named_pool():
+    g = _guard()
+    g.on_open("r1", pool="impulse")
+    assert g.check_pool("r2", pool="impulse", max_open=1)[0] is False
+    g.release("r1", pool="impulse")
+    assert g.check_pool("r2", pool="impulse", max_open=1)[0] is True
+
+
+def test_a_void_records_no_pnl_and_no_loss_streak():
+    """The reason this is `release` and not `on_settle(pnl=0.0)`.
+
+    A void deployed no stake, so it is neither a win nor a loss. Settling it at
+    zero would count as a non-loss and RESET consecutive_losses, laundering a
+    real streak the guard is meant to halt on.
+    """
+    g = _guard()
+    g.on_open("r1", reserved=True)
+    g.on_settle("prev", -1.0)              # a real loss on an earlier round
+    g.on_settle("prev2", -1.0)
+    before_pnl = g.state.daily_pnl
+    before_streak = g.state.consecutive_losses
+    assert before_streak == 2
+    g.release("r1", reserved=True)
+    assert g.state.daily_pnl == before_pnl, "a void moves no money"
+    assert g.state.consecutive_losses == before_streak, (
+        "a void must not launder a live loss streak")
+
+
+def test_repeated_voids_cannot_drive_the_reserved_count_negative():
+    g = _guard()
+    g.on_open("r1", reserved=True)
+    for _ in range(5):
+        g.release("r1", reserved=True)
+    assert g.state.reserved_open == 0
+
+
+# --- the daily seed must not be truncated by a row limit (2026-09-13) -------
+
+@pytest.fixture
+def store():
+    import pathlib as _pl
+    import tempfile as _tf
+    from btcpredict.store.db import Store
+    with _tf.TemporaryDirectory() as d:
+        st = Store(_pl.Path(d) / "seed.db")
+        yield st
+        st.close()
+
+
+
+def _seed_bot(store, pnls, mode="live"):
+    """A bot whose only job is to run _seed_guard_state over `pnls`."""
+    import time as _t
+    from types import SimpleNamespace
+    from btcpredict.main import Bot
+    bot = Bot.__new__(Bot)
+    bot.store = store
+    bot.broker = SimpleNamespace(mode="live")
+    bot.guard = RiskGuard(daily_loss_cap=0.0, max_consecutive_losses=0,
+                          max_open_rounds=1, daily_loss_cap_pct=0.20,
+                          bankroll=lambda: 50.0)
+    now = _t.time()
+    midnight = now - (now % 86400.0)
+    for i, p in enumerate(pnls):
+        fid = store.insert("fills", {
+            "decision_id": None, "slug": f"btc-updown-5m-{i}",
+            "ts_ms": int((midnight + i) * 1000), "mode": mode, "side": "Up",
+            "requested_px": 0.5, "filled_px": 0.5, "shares": 2.0, "stake": 1.0,
+            "fee_paid": 0.0, "order_id": str(i), "raw": "{}", "token_id": "1"})
+        store.insert("settlements", {
+            "fill_id": fid, "slug": f"btc-updown-5m-{i}",
+            "ts_ms": int((midnight + i) * 1000), "won": int(p > 0),
+            "payout": max(p, 0.0), "pnl": p, "mode": mode, "void": 0})
+    return bot
+
+
+def test_the_daily_seed_sums_the_whole_day_not_the_last_50(store):
+    """REGRESSION 2026-09-13: the bot halted itself out of a WINNING day.
+
+    The seed shared one `ORDER BY ts_ms DESC LIMIT 50` with the streak walk.
+    The day held 145 settlements worth +$2.49; its newest 50 summed to -$7.85.
+    Every restart re-seeded that phantom loss, two real losses tripped the
+    $9.49 cap, and it re-halted on every restart because the seed is re-read
+    each time.
+
+    Shaped like the real day: 100 winners first, then 50 losers.
+    """
+    pnls = [1.0] * 100 + [-0.5] * 50            # true total +$75, last 50 = -$25
+    bot = _seed_bot(store, pnls)
+    bot._seed_guard_state()
+    assert bot.guard.state.daily_pnl == pytest.approx(75.0), (
+        "the daily total must cover the whole day, not a row window")
+    assert not bot.guard.state.halted
+
+
+def test_the_streak_still_reads_only_the_newest_settlements(store):
+    """The limit is correct for the streak: it only needs the newest few."""
+    bot = _seed_bot(store, [1.0] * 100 + [-0.5] * 3)
+    bot.guard.max_consecutive_losses = 5
+    bot._seed_guard_state()
+    assert bot.guard.state.consecutive_losses == 3
+
+
+def test_a_genuinely_losing_day_still_halts(store):
+    """The fix must not disarm the cap -- only stop it firing on a good day."""
+    bot = _seed_bot(store, [-1.0] * 60)          # -$60 against a $10 cap
+    bot._seed_guard_state()
+    assert bot.guard.state.halted
+    assert bot.guard.state.halt_kind == "daily"

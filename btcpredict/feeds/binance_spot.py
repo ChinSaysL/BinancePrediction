@@ -15,6 +15,7 @@ import contextlib
 import json
 import logging
 import time
+from collections import deque
 
 import aiohttp
 
@@ -31,6 +32,14 @@ class SpotFeed:
         self._ts_ms: int = 0
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
+        # Every update in arrival order, with the clock reading at which we saw
+        # it. The impulse trigger reads THIS series rather than the once-a-second
+        # poll sample: the venue is 5 ms away, so sampling the price only when
+        # the poll wakes is what put a 500 ms median between the move and the
+        # order. Sized for minutes of updates (BTC bookTicker ran 33/s).
+        self.ticks: deque[tuple[int, float]] = deque(maxlen=4000)
+        # Set on every update so the decision loop can wake on the price itself.
+        self.tick_event = asyncio.Event()
 
     @property
     def price(self) -> float | None:
@@ -49,6 +58,28 @@ class SpotFeed:
     def is_fresh(self, max_age_s: float) -> bool:
         return self._price is not None and self.age_s <= max_age_s
 
+    def _publish(self) -> None:
+        """Record the update and wake anything waiting on the price."""
+        if self._price is None:
+            return
+        self.ticks.append((self._ts_ms, self._price))
+        self.tick_event.set()
+
+    async def wait_tick(self, timeout: float) -> bool:
+        """Wait for the next price update; True if one arrived.
+
+        Clears first, then waits: the caller re-reads the whole buffer
+        afterwards, so an update that landed while it was busy is not lost --
+        it is already in `ticks`. Any side effect of a cleared event is bounded
+        by the next update, which on this stream is ~30 ms away.
+        """
+        self.tick_event.clear()
+        try:
+            await asyncio.wait_for(self.tick_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return False
+        return True
+
     async def refresh_rest(self) -> float | None:
         """One-shot REST read. Used to seed the feed and as a fallback."""
         url = f"{SPOT_REST}/api/v3/ticker/bookTicker?symbol={self.symbol}"
@@ -60,6 +91,7 @@ class SpotFeed:
             bid, ask = float(d["bidPrice"]), float(d["askPrice"])
             self._price = (bid + ask) / 2.0
             self._ts_ms = int(time.time() * 1000)
+            self._publish()
             return self._price
         except Exception as e:
             log.warning("spot REST failed: %s: %s", type(e).__name__, e)
@@ -87,6 +119,7 @@ class SpotFeed:
                             continue
                         self._price = (bid + ask) / 2.0
                         self._ts_ms = int(time.time() * 1000)
+                        self._publish()
             except Exception as e:
                 if self._stop.is_set():
                     break

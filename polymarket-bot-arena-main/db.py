@@ -1,0 +1,441 @@
+"""SQLite database for all trades, bot performance, evolution history."""
+
+import sqlite3
+import json
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
+import config
+
+DB_PATH = config.DB_PATH
+
+
+def init_db():
+    with get_conn() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_name TEXT NOT NULL,
+                market_id TEXT NOT NULL,
+                market_question TEXT,
+                side TEXT NOT NULL,
+                amount REAL NOT NULL,
+                confidence REAL,
+                reasoning TEXT,
+                trade_features TEXT,
+                venue TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                trade_id TEXT,
+                shares_bought REAL,
+                outcome TEXT,
+                pnl REAL,
+                resolved_at TEXT,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS bot_configs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_name TEXT NOT NULL,
+                strategy_type TEXT NOT NULL,
+                generation INTEGER DEFAULT 0,
+                lineage TEXT,
+                params TEXT NOT NULL,
+                active INTEGER DEFAULT 1,
+                created_at TEXT DEFAULT (datetime('now')),
+                retired_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS evolution_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_number INTEGER NOT NULL,
+                survivors TEXT NOT NULL,
+                replaced TEXT NOT NULL,
+                new_bots TEXT NOT NULL,
+                rankings TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS daily_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_name TEXT NOT NULL,
+                date TEXT NOT NULL,
+                trades_count INTEGER DEFAULT 0,
+                wins INTEGER DEFAULT 0,
+                losses INTEGER DEFAULT 0,
+                total_pnl REAL DEFAULT 0,
+                mode TEXT NOT NULL,
+                UNIQUE(bot_name, date, mode)
+            );
+
+            CREATE TABLE IF NOT EXISTS bot_learning (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_name TEXT NOT NULL,
+                feature_key TEXT NOT NULL,
+                wins INTEGER DEFAULT 0,
+                losses INTEGER DEFAULT 0,
+                updated_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(bot_name, feature_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS arena_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS copytrading_wallets (
+                address TEXT PRIMARY KEY,
+                label TEXT,
+                tracked_since TEXT DEFAULT (datetime('now')),
+                total_trades INTEGER DEFAULT 0,
+                win_rate REAL,
+                total_pnl REAL DEFAULT 0,
+                active INTEGER DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS copytrading_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                wallet_address TEXT NOT NULL,
+                market_id TEXT,
+                side TEXT,
+                amount REAL,
+                our_trade_id TEXT,
+                outcome TEXT,
+                pnl REAL,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+        """)
+
+        # Migrations
+        for migration in [
+            "ALTER TABLE bot_configs ADD COLUMN trading_mode TEXT DEFAULT 'paper'",
+            "ALTER TABLE copytrading_trades ADD COLUMN source_tx_hash TEXT",
+            "ALTER TABLE copytrading_wallets ADD COLUMN trading_mode TEXT DEFAULT 'paper'",
+        ]:
+            try:
+                conn.execute(migration)
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
+
+@contextmanager
+def get_conn():
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def log_trade(bot_name, market_id, side, amount, venue, mode, confidence=None,
+              reasoning=None, market_question=None, trade_id=None, shares_bought=None,
+              trade_features=None):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO trades (bot_name, market_id, market_question, side, amount,
+               confidence, reasoning, trade_features, venue, mode, trade_id, shares_bought)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (bot_name, market_id, market_question, side, amount,
+             confidence, reasoning,
+             json.dumps(trade_features) if trade_features else None,
+             venue, mode, trade_id, shares_bought)
+        )
+
+
+def resolve_trade(internal_id, outcome, pnl):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE trades SET outcome=?, pnl=?, resolved_at=datetime('now') WHERE id=?",
+            (outcome, pnl, internal_id)
+        )
+
+
+def get_bot_trades(bot_name, hours=None, limit=50):
+    with get_conn() as conn:
+        if hours:
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+            rows = conn.execute(
+                "SELECT * FROM trades WHERE bot_name=? AND created_at>=? ORDER BY created_at DESC LIMIT ?",
+                (bot_name, cutoff, limit)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM trades WHERE bot_name=? ORDER BY created_at DESC LIMIT ?",
+                (bot_name, limit)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_bot_performance(bot_name, hours=12, mode=None):
+    """Get bot performance stats. hours=None means all-time. mode filters by trading mode."""
+    with get_conn() as conn:
+        conditions = ["bot_name=?", "outcome IN ('win', 'loss', 'exit_tp', 'exit_sl')"]
+        params = [bot_name]
+        if hours is not None:
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+            conditions.append("created_at>=?")
+            params.append(cutoff)
+        if mode is not None:
+            conditions.append("mode=?")
+            params.append(mode)
+        where = " AND ".join(conditions)
+        row = conn.execute(f"""
+            SELECT
+                COUNT(*) as total_trades,
+                SUM(CASE WHEN outcome IN ('win', 'exit_tp') THEN 1 ELSE 0 END) as wins,
+                SUM(CASE WHEN outcome IN ('loss', 'exit_sl') THEN 1 ELSE 0 END) as losses,
+                COALESCE(SUM(pnl), 0) as total_pnl,
+                COALESCE(AVG(pnl), 0) as avg_pnl
+            FROM trades WHERE {where}
+        """, params).fetchone()
+        result = dict(row)
+        result["wins"] = result["wins"] or 0
+        result["losses"] = result["losses"] or 0
+        total = result["wins"] + result["losses"]
+        result["win_rate"] = result["wins"] / total if total > 0 else 0
+        return result
+
+
+def get_all_bots_performance(hours=12):
+    with get_conn() as conn:
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+        rows = conn.execute("""
+            SELECT
+                bot_name,
+                COUNT(*) as total_trades,
+                SUM(CASE WHEN outcome IN ('win', 'exit_tp') THEN 1 ELSE 0 END) as wins,
+                SUM(CASE WHEN outcome IN ('loss', 'exit_sl') THEN 1 ELSE 0 END) as losses,
+                COALESCE(SUM(pnl), 0) as total_pnl
+            FROM trades
+            WHERE created_at>=? AND outcome IN ('win', 'loss', 'exit_tp', 'exit_sl')
+            GROUP BY bot_name
+        """, (cutoff,)).fetchall()
+        results = {}
+        for r in rows:
+            d = dict(r)
+            d["wins"] = d["wins"] or 0
+            d["losses"] = d["losses"] or 0
+            total = d["wins"] + d["losses"]
+            d["win_rate"] = d["wins"] / total if total > 0 else 0
+            results[d["bot_name"]] = d
+        return results
+
+
+def save_bot_config(bot_name, strategy_type, generation, params, lineage=None):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO bot_configs (bot_name, strategy_type, generation, lineage, params)
+               VALUES (?, ?, ?, ?, ?)""",
+            (bot_name, strategy_type, generation, lineage, json.dumps(params))
+        )
+
+
+def retire_bot(bot_name):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE bot_configs SET active=0, retired_at=datetime('now') WHERE bot_name=? AND active=1",
+            (bot_name,)
+        )
+
+
+def add_copy_wallet(address: str, label: str = None, mode: str = "paper"):
+    """Add or reactivate a wallet to copy-trade. mode: 'paper' or 'live'."""
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO copytrading_wallets (address, label, trading_mode, active)
+               VALUES (?, ?, ?, 1)
+               ON CONFLICT(address) DO UPDATE SET
+                 label=excluded.label,
+                 trading_mode=excluded.trading_mode,
+                 active=1""",
+            (address.lower(), label or address[:16], mode),
+        )
+
+
+def remove_copy_wallet(address: str):
+    """Stop copying a wallet (soft delete)."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE copytrading_wallets SET active=0 WHERE address=?",
+            (address.lower(),),
+        )
+
+
+def list_copy_wallets():
+    """Return all active copy-trade wallets."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT address, label, trading_mode, tracked_since FROM copytrading_wallets WHERE active=1"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_active_bots():
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM bot_configs WHERE active=1 ORDER BY created_at"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def log_evolution(cycle_number, survivors, replaced, new_bots, rankings):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO evolution_events (cycle_number, survivors, replaced, new_bots, rankings)
+               VALUES (?, ?, ?, ?, ?)""",
+            (cycle_number, json.dumps(survivors), json.dumps(replaced),
+             json.dumps(new_bots), json.dumps(rankings))
+        )
+
+
+def get_evolution_history(limit=20):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM evolution_events ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_total_daily_loss(mode="paper"):
+    with get_conn() as conn:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        row = conn.execute("""
+            SELECT COALESCE(SUM(pnl), 0) as total_loss
+            FROM trades
+            WHERE mode=? AND date(created_at)=? AND pnl < 0 AND outcome IS NOT NULL
+        """, (mode, today)).fetchone()
+        return abs(dict(row)["total_loss"])
+
+
+def get_bot_daily_loss(bot_name, mode="paper"):
+    with get_conn() as conn:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        row = conn.execute("""
+            SELECT COALESCE(SUM(pnl), 0) as total_loss
+            FROM trades
+            WHERE bot_name=? AND mode=? AND date(created_at)=? AND pnl < 0 AND outcome IS NOT NULL
+        """, (bot_name, mode, today)).fetchone()
+        return abs(dict(row)["total_loss"])
+
+
+def get_total_daily_risk(mode="paper"):
+    """Return today's realized losses plus unresolved capital at risk.
+
+    Pending prediction-market positions can still lose their full cost. Counting
+    them at the worst case prevents a burst of orders from exceeding the daily
+    loss limit before any of those markets resolve.
+    """
+    with get_conn() as conn:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        row = conn.execute("""
+            SELECT COALESCE(SUM(
+                CASE
+                    WHEN outcome IS NULL THEN amount
+                    WHEN pnl < 0 THEN -pnl
+                    ELSE 0
+                END
+            ), 0) AS total_risk
+            FROM trades
+            WHERE mode=? AND date(created_at)=?
+        """, (mode, today)).fetchone()
+        return float(row["total_risk"])
+
+
+def get_bot_daily_risk(bot_name, mode="paper"):
+    """Return one bot's realized losses plus unresolved capital at risk today."""
+    with get_conn() as conn:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        row = conn.execute("""
+            SELECT COALESCE(SUM(
+                CASE
+                    WHEN outcome IS NULL THEN amount
+                    WHEN pnl < 0 THEN -pnl
+                    ELSE 0
+                END
+            ), 0) AS total_risk
+            FROM trades
+            WHERE bot_name=? AND mode=? AND date(created_at)=?
+        """, (bot_name, mode, today)).fetchone()
+        return float(row["total_risk"])
+
+
+def get_dashboard_stats():
+    with get_conn() as conn:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+
+        # Exclude phantom trades (pnl=0 resolved from voting era)
+        today_stats = conn.execute("""
+            SELECT COUNT(*) as trades, COALESCE(SUM(pnl), 0) as pnl,
+                   SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
+                   SUM(CASE WHEN pnl < 0 AND outcome IS NOT NULL THEN 1 ELSE 0 END) as losses
+            FROM trades WHERE date(created_at)=?
+                AND NOT (outcome IS NOT NULL AND pnl = 0)
+        """, (today,)).fetchone()
+
+        week_stats = conn.execute("""
+            SELECT COUNT(*) as trades, COALESCE(SUM(pnl), 0) as pnl,
+                   SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
+                   SUM(CASE WHEN pnl < 0 AND outcome IS NOT NULL THEN 1 ELSE 0 END) as losses
+            FROM trades WHERE created_at>=?
+                AND NOT (outcome IS NOT NULL AND pnl = 0)
+        """, (week_ago,)).fetchone()
+
+        all_stats = conn.execute("""
+            SELECT COUNT(*) as trades, COALESCE(SUM(pnl), 0) as pnl,
+                   SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
+                   SUM(CASE WHEN pnl < 0 AND outcome IS NOT NULL THEN 1 ELSE 0 END) as losses
+            FROM trades
+                WHERE NOT (outcome IS NOT NULL AND pnl = 0)
+        """).fetchone()
+
+        return {
+            "today": dict(today_stats),
+            "week": dict(week_stats),
+            "all_time": dict(all_stats),
+        }
+
+
+def get_arena_state(key, default=None):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT value FROM arena_state WHERE key=?", (key,)
+        ).fetchone()
+        return row["value"] if row else default
+
+
+def set_arena_state(key, value):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO arena_state (key, value) VALUES (?, ?)
+               ON CONFLICT(key) DO UPDATE SET value=?, updated_at=datetime('now')""",
+            (key, str(value), str(value))
+        )
+
+
+def get_bot_mode(bot_name):
+    """Get per-bot trading mode ('paper' or 'live')."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT trading_mode FROM bot_configs WHERE bot_name=? AND active=1",
+            (bot_name,)
+        ).fetchone()
+        if row:
+            return row["trading_mode"] or "paper"
+        return "paper"
+
+
+def set_bot_mode(bot_name, mode):
+    """Set per-bot trading mode ('paper' or 'live')."""
+    if mode not in ("paper", "live"):
+        raise ValueError("Mode must be 'paper' or 'live'")
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE bot_configs SET trading_mode=? WHERE bot_name=? AND active=1",
+            (mode, bot_name)
+        )
+
+
+init_db()

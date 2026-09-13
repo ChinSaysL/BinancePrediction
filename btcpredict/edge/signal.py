@@ -28,7 +28,21 @@ from enum import Enum
 # Fits every sample: 0.51->174, 0.73->67, 0.83->37, 0.89->23.
 # A flat rate is wrong in both directions -- far too low for cheap contracts
 # (180 bps, not 64) and too high for favourites (~21 bps at 0.90).
-FEE_MAX_BPS = 180.0
+# Re-measured 2026-09-12 on the 311 live fills that actually paid a fee,
+# bucketed by price (charged bps of stake against this constant):
+#   209.9 at px < 0.50     175.1 at 0.50-0.60   116.0 at 0.60-0.70
+#    72.7 at 0.70-0.80      38.1 at 0.80-0.90    19.8 at 0.90+
+# The SHAPE is confirmed -- the fee falls as (1-px)/px -- but the LEVEL was
+# 15-21% low in every single band, and the venue reports its own rate as
+# fee_rate_bps=200 on 278,011 of 278,929 recorded ticks. So the coefficient is
+# the venue's own number, not a hand-fitted 180. Callers that have the round's
+# reported rate (main does) should pass it through as `fee=`.
+FEE_MAX_BPS = 200.0
+
+# When a fraction-based stake is floored to the venue minimum, the floor is
+# only allowed while it stays under this share of the bankroll. $1 is 10% of
+# $10 (trade) and 50% of $2 (do not).
+FLOOR_MAX_BANKROLL_FRACTION = 0.25
 
 
 def fee_bps_for_price(px: float) -> float:
@@ -205,6 +219,73 @@ def evaluate_hybrid(fair_up_down_model: float, fair_up_up_model: float,
     return max(cands, key=lambda s: s.ev_per_dollar)
 
 
+def take_limit_px(fair_side: float, margin: float, quote: float | None,
+                  tick: float = 0.01,
+                  take_px: float | None = None) -> float:
+    """The taker limit: our valuation minus a margin, but never more than one
+    tick above the ask we actually measured.
+
+    The ceiling alone is not enough, because the ceiling is OUR fair and our fair
+    is the miscalibrated estimator on this venue (Brier 0.124 against the venue's
+    0.106, log-loss 0.57 against 0.35). On a fast move it overshoots. Measured
+    live on 2026-09-12 13:02: the trigger saw the ask at 0.7326, our digital said
+    P(Down) = 0.94, so the limit went out at 0.90 -- and it FILLED at 0.8919, a
+    trade the arm's own `ev_at_fill` scores at -0.195 per $1.
+
+    Clamping to `quote + tick` costs nothing measurable: the backtest's taker leg
+    only ever fills AT the ask (it filters to `ask <= fair - margin`, so the ask
+    is always under the ceiling), which means this cap is exactly what makes live
+    execution match what was measured. `take_px` stays a FLOOR -- an arm with no
+    valuation of its own (the ticket) must still cross at the ask it read.
+    """
+    # A fair outside the open interval is not a valuation, it is a missing
+    # input -- or a model disagreeing with the market by more than the contract
+    # can express. Pricing a taker limit from one produced max(0.01, 0 - 0.04) =
+    # 0.01 against a 0.730 book on 2026-09-12 (a +9.8bps/2s Up impulse fired
+    # while spot was still ~14bps below the round's strike, so the digital said
+    # P(Up) ~ 0). That order cannot fill: it rested the full wait, was
+    # cancelled, and cost the round plus a 30s order pause. A NaN would be
+    # worse, poisoning the min/max below. Fall back to the ask we measured.
+    if quote and not (0.0 < fair_side < 1.0):
+        fair_side = quote
+    limit = max(0.01, round(fair_side - margin, 2))
+    if take_px is not None:
+        limit = max(limit, round(take_px, 2))
+    if quote:
+        limit = min(limit, round(quote + tick, 2))
+    return max(0.01, limit)
+
+
+def impulse_price_refusal(entry_mode: str, real_px: float | None,
+                          cap: float) -> str | None:
+    """Why an impulse order must not be placed at THIS price, or None to go.
+
+    The impulse trigger checks `impulse_min_price..impulse_max_price` against the
+    last ask the poll saw -- and the code already notes in `_impulse_tick` that
+    this is `Band sanity only`: the price that binds is the one that comes back
+    with the order's own quote, which `_place_order` fetches and crosses at. In
+    impulse mode the model re-valuation that would otherwise re-price the trade
+    is deliberately skipped (there is no model fair to re-check), so nothing else
+    stands between a 0.70 trigger and a 0.90 fill except this function.
+
+    That gap is not hypothetical: MARKET fills landed a mean +0.16 ABOVE the ask
+    on offer at the trigger (6 of 8 fills), and the venue's displayed price lags
+    its own book by up to 0.40. It also matters because the top of the band is
+    where the money is lost -- `tools/backtest_impulse_orders --by-price` finds
+    the only negative cells in the entire decomposition above 0.75 (EV/$1 -0.081
+    and -0.104), and the reason is arithmetic rather than fitted: the fee fixes a
+    break-even win rate of px/0.98, so at 0.90 a win pays +0.09 and needs 92%.
+
+    Only the CAP is enforced. A quote cheaper than the trigger is a gift; a quote
+    above the cap is the trade the band exists to refuse.
+    """
+    if entry_mode != "impulse" or cap >= 1.0 or real_px is None:
+        return None
+    if real_px > cap:
+        return (f"real quote {real_px:.3f} above the impulse cap {cap:.2f}")
+    return None
+
+
 def stake_for_edge(edge: float, *, min_edge: float, min_stake: float,
                    max_stake: float, edge_at_max: float) -> float:
     """Scale the stake between min_stake and max_stake by signal strength.
@@ -246,7 +327,7 @@ def tilt_factor(moneyness_sd: float, *, reference: float, lo: float,
 
 
 def stake_for_fraction(bankroll: float, *, fraction: float, min_stake: float,
-                       cap: float) -> float:
+                       cap: float, floor_to_minimum: bool = False) -> float:
     """Fixed percentage of the bankroll.
 
     The alternative to a dollar band. A band bet $5-10 regardless of size, so
@@ -260,6 +341,18 @@ def stake_for_fraction(bankroll: float, *, fraction: float, min_stake: float,
     Rounding up would silently raise the real fraction, which is the one thing
     this mode exists to control; below about a $20 bankroll the account is too
     small to subdivide further and sitting out is the honest answer.
+
+    `floor_to_minimum` changes exactly that case from SKIP to the venue
+    minimum: the account keeps trading, at a stake that is a LARGER fraction
+    than asked (at $28 a $1 floor is 3.6%). It is off by default because that
+    is a deliberate choice about small accounts, not an accident -- but "too
+    small to size" and "too small to trade" are different statements, and the
+    venue's floor is $1 whatever the account holds.
+
+    The floor stops at FLOOR_MAX_BANKROLL_FRACTION of the bankroll. Above it
+    the rule is doing what it says (keep a small account in the market); below
+    it the floor is betting a large share of a nearly-empty account -- $1 is
+    10% of $10 and 50% of $2 -- and sitting out is the honest answer again.
     """
     if bankroll <= 0 or fraction <= 0:
         return 0.0
@@ -270,7 +363,11 @@ def stake_for_fraction(bankroll: float, *, fraction: float, min_stake: float,
         stake = min(stake, cap)
     stake = min(stake, bankroll)
     if stake < min_stake:
-        return 0.0
+        if not floor_to_minimum:
+            return 0.0
+        if min_stake > bankroll * FLOOR_MAX_BANKROLL_FRACTION:
+            return 0.0
+        return min_stake
     return stake
 
 

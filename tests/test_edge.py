@@ -116,18 +116,27 @@ def test_min_quote_floor_rejects_cheap_longshots():
 
 
 def test_fee_curve_matches_the_venue():
-    """Regression lock on 61 live quote samples.
+    """Regression lock re-measured 2026-09-12 on the 311 live fills that paid.
 
-    fee_bps = 180 * min(1, (1-px)/px) -- the fee is 1.8% of potential winnings,
-    capped at 1.8% of notional below px 0.50. A flat rate understates the cost of
-    cheap contracts by ~3x and overstates it for favourites by ~3x, which
-    inflated the backtest's per-trade edge roughly 15-fold.
+    Shape (1-px)/px, capped at the coefficient below px 0.50 -- confirmed. The
+    LEVEL was 15-21% low in every band with the old 180 constant, so the
+    coefficient is now the venue's own reported rate (fee_rate_bps=200, stated
+    on 278,011 of 278,929 recorded ticks). The 0.90+ band has n=6 and both
+    coefficients fall short of its 19.8 mean, so it is checked loosely.
+
+    Passing fee_rate_bps/1e4 as a flat `fee=` would be a bug: that is the
+    coefficient, not the charge.
     """
     from btcpredict.edge.signal import fee_bps_for_price
-    for px, observed in ((0.25, 180), (0.46, 180), (0.51, 174), (0.73, 67),
-                         (0.83, 37), (0.90, 21)):
-        assert abs(fee_bps_for_price(px) - observed) <= 1.5, px
-    assert fee_bps_for_price(0.50) == pytest.approx(180.0)
+    for px, charged in ((0.45, 209.9), (0.55, 175.1), (0.65, 116.0),
+                        (0.75, 72.7), (0.85, 38.1)):
+        modelled = fee_bps_for_price(px)
+        assert 0.75 * charged <= modelled <= 1.25 * charged, (px, modelled, charged)
+        # never under-charge a taker by more than 15%
+        assert modelled >= 0.85 * charged, (px, modelled, charged)
+    assert fee_bps_for_price(0.50) == pytest.approx(200.0)
+    assert fee_bps_for_price(0.90) == pytest.approx(22.2, abs=0.5)
+    assert fee_bps_for_price(0.60) > fee_bps_for_price(0.80) > fee_bps_for_price(0.95)
 
 
 def test_edge_haircut_shrinks_the_claim_toward_the_venue_price():
@@ -263,6 +272,30 @@ def test_stake_for_fraction_respects_min_and_cap():
 def test_stake_for_fraction_never_exceeds_the_bankroll():
     assert stake_for_fraction(30.0, fraction=0.9, min_stake=1.0,
                               cap=0.0) == pytest.approx(27.0)
+
+
+def test_the_floor_is_opt_in_and_stakes_the_venue_minimum():
+    """Below the minimum, SKIP is the default and the floor is a choice.
+
+    The venue's floor is $1 at any account size, so a $28 account can still
+    trade -- it just cannot trade 2%. The stake that comes back is $1 whatever
+    the fraction says, which is the whole point and the whole cost.
+    """
+    kw = dict(fraction=0.02, min_stake=1.0, cap=25.0)
+    assert stake_for_fraction(28.02, **kw) == 0.0                  # default
+    assert stake_for_fraction(28.02, **kw,
+                              floor_to_minimum=True) == pytest.approx(1.0)
+    # still proportional once the fraction CAN be expressed
+    assert stake_for_fraction(200.0, **kw,
+                              floor_to_minimum=True) == pytest.approx(4.0)
+    # the floor never reaches below the minimum, and it stops at a quarter of
+    # the bankroll: $1 is fine at $4 (25%), not at $2 (50%)
+    assert stake_for_fraction(4.0, **kw, floor_to_minimum=True) == pytest.approx(1.0)
+    assert stake_for_fraction(3.99, **kw, floor_to_minimum=True) == 0.0
+    assert stake_for_fraction(2.0, **kw, floor_to_minimum=True) == 0.0
+    assert stake_for_fraction(0.0, **kw, floor_to_minimum=True) == 0.0
+    assert stake_for_fraction(28.02, fraction=0.0, min_stake=1.0, cap=25.0,
+                              floor_to_minimum=True) == 0.0
 
 
 def test_tilt_factor_rewards_undecided_rounds():

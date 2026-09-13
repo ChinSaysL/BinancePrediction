@@ -47,9 +47,10 @@ def test_unsettled_fill_is_restored(store):
     bot = make_bot(store)
     bot._restore_open_positions()
 
-    assert "btc-updown-5m-1" in bot.open_fills
-    restored_id, fill = bot.open_fills["btc-updown-5m-1"]
-    assert restored_id == fid
+    # Keyed by fill id now, so two fills in one round cannot collide.
+    assert fid in bot.open_fills
+    restored_slug, fill = bot.open_fills[fid]
+    assert restored_slug == "btc-updown-5m-1"
     assert fill.side == "Up"
     assert fill.shares == pytest.approx(1.6129)
     assert fill.stake == pytest.approx(1.0)
