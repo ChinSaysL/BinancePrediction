@@ -5842,3 +5842,59 @@ Gate 12 takes 82 fills against 70, at day-t +3.24 vs +2.82 and growth +0.745 vs
 is +0.066 against 10's +0.212, so it is the less robust of the two, and the
 evidence is btc-only (eth has 24 triggers in the corpus, bnb none). Recorded as
 the best candidate if frequency has to come from somewhere.
+
+## The gate-12 increment, priced; the 22:25 refusals, audited (2026-09-14, night)
+
+Two follow-ups, because both of the lines above rest on tests that are weaker
+than they look.
+
+### Gate 12 is not "more trades, same money" -- it is more trades, less money
+
+The two samples are NESTED, so comparing their 95% CIs answers the wrong
+question. What matters is what the triggers gate 12 ADDS are worth -- and
+growth is additive in log space, so `growth(g12) - growth(g10)` IS the (10,12]
+band's own ledger. No overlapping-sample bootstrap needed
+(`tools/cross_gate_increment.py`):
+
+    band        n   win    ask    edge    growth   day-t
+    (0,8]      56  0.875  0.726  +0.149   +0.487   +1.39
+    (8,10]     14  0.929  0.680  +0.249   +0.294   +2.21
+    (10,12]    12  0.667  0.648  +0.018   -0.036   -0.24   <- the "free" fills
+    (12,15]     9  0.444  0.652  -0.208   -0.257   -3.50
+    (15,20]    10  0.400  0.615  -0.215   -0.271   -0.70
+    (20,+)     13  0.692  0.595  +0.098   +0.027   +0.21
+
+The edge dies exactly AT the shipped gate. (10,12] pays +0.018 against ~0.06
+of cost (buffer 0.125*(1-0.648) + 169bp fee) and its growth contribution is
+NEGATIVE on both substrates (-0.036 here; gate 12 vs 10 on the 7-day recorded
+book is +1.816 vs +1.917, i.e. -0.101). So the extra fills are the marginal
+trades the gate exists to refuse, just slower losers than (12,20]. Keep 10,
+now on the right instrument. The (20,+) row is n=13: no power either way, and
+everything above 12 that HAS power points the same direction.
+
+### The two live refusals could not have been taken the way they look
+
+Audited the 22:29:41 refusals (round ...-1789424700, tau 19s) against the
+venue's own recorded tape (VPS DB, quotes for the two slugs). Both numbers
+reproduce exactly (btc 14.4 bps open->trigger, eth 18.6 -- the gate input is
+the quotes tape) and both paths really did oscillate around the strike
+(btc +6.9/-7.5 bps, eth +12.2/-6.3) before popping ~+5 bps through it inside
+one second. Both settled Up -- refused winners. But the venue repriced within
+that same crossing second (btc up-ask 0.07 -> 0.90, eth 0.11 -> 0.95):
+
+  - the ETH trade sat OUTSIDE the arm's own band at the crossing second
+    (0.95 > cross_max_price 0.90) -- no range-gate setting makes it tradeable;
+  - the BTC trade sat exactly AT the ceiling (0.90): best case ~+0.09, and the
+    price band, not the range gate, would bind on the sweep price anyway.
+
+So "the gate refused two winners" is true and says nothing new: the refused
+class stays under cost, and on these two the lag the arm harvests was already
+repriced by the time the cross was visible.
+
+Also swept for anything salvageable inside the refused set: range bands
+(12,15] and (15,20] are strongly negative, (20,+) is 13 fills of noise; a
+split by strike-crossing count resolves nothing on the priced book (cells of
+8-59 fills, inconsistent across substrates), and the corpus side of that split
+is mechanically N-vs-k parity -- won == (N === k mod 2), exact on 1.0000 of 524
+recomputed triggers -- i.e. it measures whether the crossing gets revisited,
+not where it settles. There is no subclass here worth a gate change.
