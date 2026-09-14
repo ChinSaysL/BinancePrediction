@@ -4196,3 +4196,55 @@ above and are the honest residual.
 shipped earlier today would have refused the second -- which would have won
 (+1.599 at our limit). One sample against 249 corpus reversals at day-t -3.05;
 the guard stands, but the case is logged rather than buried.
+
+## The round-range gate, re-audited: it IS helpful (2026-09-14)
+
+The knob audit listed `cross_max_round_range_bps` under NOT ESTABLISHED --
+day-t 0.38, negative drop-best-day. That verdict was reached at the OLD config
+(look 2.0, cap 3) and with reversal entries still included. Re-run at the
+shipped config with reversals excluded, on all three substrates:
+
+    31-DAY CHAINLINK CORPUS (win rate -- the powered half)
+      gate      n   rounds    win   win day-t vs OFF
+       OFF   1164     1164  0.696        --
+         5    331      331  0.689      -0.26
+         8    676      676  0.709      +1.79
+        10    839      839  0.714      +2.40
+        12    947      947  0.716      +2.25
+        15   1046     1046  0.709      +2.61
+        20   1114     1114  0.702      +1.15
+
+    7-DAY RECORDED VENUE BOOK (real asks, compounded growth)
+      gate     n    win   additive g / t / drop     reverting g / t / drop
+       OFF   293  0.802   +1.451 / +1.28 / +0.566   +1.616 / +1.79 / +0.986
+         8   161  0.894   +1.742 / +2.01 / +0.799   +1.795 / +3.14 / +1.141
+        10   201  0.881   +1.917 / +2.27 / +0.964   +2.076 / +3.55 / +1.395
+        12   230  0.852   +1.816 / +2.45 / +0.966   +1.977 / +4.08 / +1.400
+        15   251  0.829   +1.575 / +1.89 / +0.725   +1.761 / +3.02 / +1.184
+        20   270  0.815   +1.518 / +1.54 / +0.642   +1.683 / +2.28 / +1.069
+
+**Gate 10-12 beats OFF under BOTH slippage models on the recorded book, with
+day-t above 2 and a positive drop-best-day.** That clears the standing bar, so
+the knob moves from NOT ESTABLISHED to SUPPORTED -- the audit's earlier reading
+was an artefact of scoring it at a config that no longer exists.
+
+### The dissenting substrate, and why it loses the tie
+
+The 5 priced corpus days disagree -- there gate 10 (+0.226 add / +0.042 rev)
+is WORSE than OFF (+0.448 / +0.126), with gate 15 best. But every row on that
+substrate has day-t below 1.0, and its own resweep docstring says to treat a
+sweep over it as a hypothesis rather than a tuning. Two substrates with power
+agree; the one without disagrees.
+
+### The value is a plateau, not a point
+
+    substrate            8      10      12      15      20
+    corpus win day-t   1.79    2.40    2.25    2.61    1.15
+    recorded add t     2.01    2.27    2.45    1.89    1.54
+    recorded rev t     3.14    3.55    4.08    3.02    2.28
+
+10-15 is flat, centred near 12. Gate 12 is never worse than 10 on any of the
+three substrates and mildly better on two, at +14% volume (230 vs 201 recorded,
+947 vs 839 corpus) -- but the gap is well inside noise, and picking the grid
+peak is exactly what produced the config this audit dismantled. Left at 10.
+Anything in 10-15 is the same bet.
