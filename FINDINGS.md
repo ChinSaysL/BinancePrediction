@@ -4319,3 +4319,90 @@ Nothing measured suggests we have one, and no knob creates one.
 
 Reopening it is a modelling project (a better predictor), not a configuration
 change. Left off.
+
+## The model arm, replayed PROPERLY -- and the reason it cannot be tuned (2026-09-14)
+
+### Method correction first
+
+`tools/model_regime_rescue.py` scored only the 690 orders that actually FILLED,
+under whatever config happened to be live at the time. Both halves are wrong:
+fills are survivorship-conditioned (the cross work proved unfilled attempts are
+systematically the cheap, high-payoff ones), and that week pooled several
+config eras -- the repo has a commit for exactly that mistake. It also ran at
+config.py DEFAULTS rather than the deployed `.env` values, the error FINDINGS
+already records twice.
+
+`tools/model_regime_replay.py` replays every trigger the gate WOULD take from
+the recorded book, under ONE fixed configuration, at the deployed values
+(min_edge 0.01, band [0.45,0.80], haircut 1.0), one position per round.
+
+    regime (causal)      n    win    ask    edge  book g/t/drop     additive g/t/drop  reverting g/t/drop
+    no gate           1657  0.655  0.639  +0.016  +0.441/+2.17/+.28  -4.127/-4.79/-3.95  -3.029/-5.31/-2.92
+    0-3 bps            615  0.600  0.594  +0.006  -0.099/-0.27/-.23  -1.871/-5.06/-1.81  -1.861/-4.86/-1.83
+    3-5 bps            371  0.652  0.644  +0.008  +0.032/+0.09/-.25  -0.975/-2.96/-1.02  -0.713/-2.50/-0.81
+    5-8 bps            336  0.696  0.674  +0.023  +0.190/+0.84/+.03  -0.702/-1.99/-0.75  -0.311/-1.09/-0.41
+    8-12 bps           199  0.734  0.674  +0.060  +0.356/+2.89/+.24  -0.201/-1.37/-0.24  +0.043/+0.41/-0.02
+    12-20 bps          107  0.682  0.685  -0.003  -0.052/-0.36/-.13  -0.317/-2.11/-0.31  -0.173/-1.20/-0.20
+    WINDOW 5-12        535  0.710  0.674  +0.037  +0.546/+2.19/+.29  -0.904/-1.91/-0.99  -0.268/-0.79/-0.43
+
+**Not one window clears the two-model bar.** Every single row is negative under
+the additive model. The best (8-12 bps) is +0.043 under mean-reversion with a
+NEGATIVE drop-best-day.
+
+### The one number that explains the whole arm
+
+    model arm edge at the book:  +0.016 ungated, +0.060 in its best regime
+    measured slippage:           +0.088 additive
+
+**The edge is smaller than the slippage.** That is why the arm reads positive at
+the book ask (+0.441, day-t 2.17) and hugely negative once filled properly
+(-4.127). For contrast the cross arm's first-entry edge on the same book is
++0.209 -- roughly 2.4x its slippage, which is why one survives execution and
+the other cannot.
+
+Any replacement model must clear **edge > ~0.09 after gating**, out of sample.
+That is the bar, stated quantitatively.
+
+## Is there anything to recalibrate? No -- the signal is not informative (2026-09-14)
+
+`tools/model_information_test.py`, 133,289 evaluations over 1,336 rounds,
+thinned to 12/round, every interval bootstrapped over ROUNDS. Discrimination
+(AUC), not Brier, because `quote` is an ASK and AUC is invariant to the
+monotone spread bias that would otherwise flatter or punish it.
+
+    predictor                     AUC       95% CI (round-clustered)
+    venue quote (the ask)      0.7129   [0.6938, 0.7304]
+    our fair                   0.6938   [0.6716, 0.7134]
+    our edge = fair - quote    0.4906   [0.4656, 0.5127]   <- a coin flip
+
+    tau band     AUC quote  AUC fair   fair beats quote?
+    0-60            0.6701    0.6282         no
+    60-120          0.7142    0.6923         no
+    120-210         0.7188    0.7118         no
+    210-270         0.7179    0.6872         no
+
+    incremental beta of (fair-quote) on (outcome-quote):
+        -0.1141   95% CI [-0.4486, +0.1865]   INDISTINGUISHABLE FROM ZERO
+    Brier: our fair 0.20562   venue quote 0.20074
+
+**The quantity the arm trades on -- its disagreement with the venue -- ranks
+outcomes at AUC 0.49.** It is noise. Our fair is worse than the quote at every
+tau band, and adds nothing on top of it.
+
+So the arm is not miscalibrated-but-real. There is no transform of `fair` that
+rescues it, because a perfectly calibrated version of our fair would still rank
+worse than the price it is betting against. Recalibration is the wrong project.
+
+### What this does and does not rule out
+
+It rules out: tuning knobs, recalibrating the digital, reweighting sigma --
+anything that is a function of (spot, strike, tau, sigma), because that is the
+entire input to `fair` and the venue prices it better.
+
+It does NOT rule out: a model with DIFFERENT INPUTS. The digital knows only
+where spot is relative to the strike and how fast it moves. `btc5m_ml.parquet`
+carries ~70 engineered features per window -- order-flow (cvd, taker_buy_ratio,
+vol_surge, n_trades), path shape (efficiency, path_over_net, crossings),
+momentum at 9 horizons -- none of which enter `fair`. Whether any of them
+predicts the outcome beyond what the book already knows is an open and testable
+question, and it is the only remaining modelling path.
