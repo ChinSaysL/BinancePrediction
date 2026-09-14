@@ -5796,3 +5796,49 @@ the ordering, with a companion asserting the start-time stamp cannot return.
 Note the interaction with the same day's `cross_limit_wait_s` change (20s -> 2s):
 a shorter rest frees the arm to re-trigger sooner, so this bug would have grown
 worse, not better, had it been left.
+
+## The range gate survives the corrected entry price (and the old reason for it did not)
+
+A cross fired live at 22:29:41 and both families refused it:
+
+    cross eth-updown-5m-1789424700 Up not taken: round already moved 18.6bps, gate is 12.9
+    cross btc-updown-5m-1789424700 Up not taken: round already moved 14.4bps, gate is 10.0
+
+The gate's recorded justification was arithmetic on a number that turned out to
+be wrong: "blocked triggers' +0.018 edge cannot survive the measured +0.088
+slippage". That +0.088 was never slippage — it was `cross_limit_buffer_inv`,
+the arm's own limit, which this venue fills at — and it was halved the same day.
+At a blocked trigger's mean ask the buffer is now ~0.049. **The bar the gate was
+calibrated against moved by half**, so the gate had to be re-asked, not assumed.
+
+`tools/cross_range_gate_recheck.py`, btc-5m, entry AT the limit under the new
+`inv = 0.125`, 169bp fee, 2s rest, bootstrapped over rounds:
+
+    gate bps      n    win    ask   growth   day-t  drop-best            95% CI
+     8           56  0.875  0.726   +0.487   +1.39     +0.242   [-0.041, +0.941]
+    10           70  0.886  0.717   +0.781   +2.82     +0.553   [+0.212, +1.289]  shipped
+    12           82  0.854  0.707   +0.745   +3.24     +0.489   [+0.066, +1.376]
+    15           91  0.813  0.701   +0.488   +1.69     +0.232   [-0.322, +1.201]
+    20          101  0.772  0.693   +0.217   +0.35     -0.080   [-0.685, +1.046]
+    OFF         114  0.763  0.681   +0.244   +0.34     -0.052   [-0.780, +1.171]
+
+It holds. The gate is the single most valuable knob in the arm: switching it off
+buys 44 more fills and costs two thirds of the growth, with the CI falling
+through zero.
+
+And on this subset the refused triggers are not merely thin — they lose:
+
+    refused by the shipped gate: n=44  win 0.568  ask 0.626  EDGE -0.058
+                                growth -0.536  day-t -1.04
+
+That is a stronger statement than the earlier correction, which measured a
+different subset (all markets, a different gate) and found blocked edge +0.018.
+Both can be true; the bar remains the mean ask OF THE SAME SUBSET.
+
+### The one frequency lever with evidence behind it
+
+Gate 12 takes 82 fills against 70, at day-t +3.24 vs +2.82 and growth +0.745 vs
++0.781 — 17% more trades for no measurable loss. NOT shipped: its CI lower bound
+is +0.066 against 10's +0.212, so it is the less robust of the two, and the
+evidence is btc-only (eth has 24 triggers in the corpus, bnb none). Recorded as
+the best candidate if frequency has to come from somewhere.
