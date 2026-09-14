@@ -6001,3 +6001,77 @@ Time-boxed: ~2 days or ~20 probe orders, whichever first, then OFF and read
 `tools/cross_catch_report.py`. Revert = one line + restart. The probe's fills
 decide the thesis: fills at run >= +0.2 -> catch real -> gate raise is next;
 runners consistently no-fill -> catch dead for jumps, gate stays 10.
+
+### First probe fire (2026-09-14 23:29:18 UTC): the runner does not fill
+
+Probe 1 (of 6 that day) fired on `btc-updown-5m-1789428300` Down: decided
+0.180, tau 41s, normal size ($3.00; decisions row `cross probe Down @0.180
+tau41s run+0.000`, `stake 3.0`, `acted=0`). The book walked exactly as the
+thesis says -- and the fill did not come:
+
+    t+0.00s   trigger, book 0.17-0.18        (limit posted: 0.28)
+    t+0.25s   meter s25  = 0.17              <- still the stale price
+    t+0.50s   meter s50  = 0.46              <- the walk happens inside this 0.25s
+    t+1.00s   meter s100 = 0.53
+    t+2.90s   exec window closes: NO FILL, committed $0, book-now 0.51 (run +0.23)
+
+The round settled **Down**: the missed order would have paid ~+2.57/$1 at its
+limit (~+1.17 at the +0.50s ask), gross of fee. That is the adverse-selection
+shape in a single observation, not a reopened case -- the misses are exactly
+where the move continues, and the 09-14 seven-sample table above priced it:
++7.17/$1 at our bids, -0.73 at the price actually on offer. Two neighbours on
+the same move -- a btc 15m entry (limit 0.28 vs book 0.52, run +0.24) and an
+eth entry whose book-now ended BELOW its limit yet never filled (run -0.12,
+the documented dark-book residual) -- also NO FILL. Fill-honouring table now:
+
+    run < 0     9/11 filled
+    0 - 0.1     4/4  filled
+    0.2 - 0.35  0/2
+    > 0.35      0/2
+
+Mechanism read: the pre-reprice window is real but ~0.4s wide (trigger price
+still on s25; 0.46 by s50), while our order -- out ~0.1s after the trigger --
+did not transact inside it; from +0.5s the ask sat 0.18 above our limit and
+never came back. One sample cannot split "venue make-live slower than the
+window" from "that ask was never tradeable for our size", and neither reading
+reopens the case: the first is venue-side (nothing of ours to tune), the
+second was already tested flat (`stale_maker`).
+
+#### Correction to the earlier meter read
+
+The first pass of this note said the reprice completed "within 250ms". Wrong
+mark: the meter's three values are s25/s50/s100, and this row shows s25 still
+AT the trigger price. The correct aggregate over the 7 metered triggers is
+s100 - s25 median **+0.17** (q25 +0.02, q75 +0.26, n=7): the venue keeps
+repricing for at least a second (Sep 13 shape holds), and our fill path loses
+the race at the +0.5s mark, not at +0.25s.
+
+#### Cross-references: this question was answered before (09-12..14)
+
+  * "The cancelled orders: adverse selection, and why NOT to widen the buffer"
+    (above): 7 missed fills, +7.17/$1 at our bids vs -0.73 at the real ask;
+    "we fill when the book stays put and miss when it runs -- and it runs
+    precisely when we are right." Standing rule: do not raise
+    `cross_limit_buffer*`; nothing shipped then, and nothing here changes it.
+  * Sub-0.40 fill-rate table (same section): "below 0.40 nothing fills, ever"
+    -- 0/5 then, 0/6 with this probe. The probe's decided 0.18 is that class;
+    informative probe samples would be at 0.40+, which the gate refuses less
+    often, so do not read one sub-0.40 no-fill as a new anomaly.
+  * `stale_maker` (09-12/13): the literal rest-before-the-move design
+    (`stale_maker_px`; "the measured edge is ENTIRELY in the fill price: at
+    the ask +0.0175/$1, at the mid +0.3449"). Live: n=24 flat (+1.4 pts,
+    0.1 SE). The closest prior to the remaining "pre-cross quoting" item --
+    it did not rescue the execution-edge theory.
+  * `impulse` (09-12): the other catch-the-move attempt. "The fill price, not
+    the trigger, decides this strategy"; market path paid +0.16 mean drift
+    over the ask (impulse entries +0.21/+0.67). Converted to limit@fair, then
+    switched off.
+
+#### Status after read #1
+
+Probe continues under the pre-registration (~2 days / ~20 orders; counter
+resets 00:00 UTC). **No knob changes anywhere** -- gate 10, buffer, sizing all
+stand; sizing was verified live ($3.00, normal formula). The read pushes the
+posterior to "catch dead for jumps" (the walk is real; transacting inside it
+is not ours to do); the remaining fires mostly test whether any 0.40+ refused
+crossing behaves differently. Early revert = one `.env` line + restart.
