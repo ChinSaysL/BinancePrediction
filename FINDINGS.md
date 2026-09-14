@@ -4248,3 +4248,74 @@ three substrates and mildly better on two, at +14% volume (230 vs 201 recorded,
 947 vs 839 corpus) -- but the gap is well inside noise, and picking the grid
 peak is exactly what produced the config this audit dismantled. Left at 10.
 Anything in 10-15 is the same bet.
+
+## Can a regime gate rescue the model arm? No -- and the test is the point (2026-09-14)
+
+Raised because the cross arm's round-range gate went NOT ESTABLISHED ->
+SUPPORTED hours after the model arm was switched off, and the sweep that
+switched it off never tested a range window. The arm deserved the same question.
+
+`tools/model_regime_rescue.py`: 690 settled live fills, real filled prices,
+range-so-far measured round-open -> ENTRY instant, growth under both slippage
+models, day-clustered t and drop-best-day.
+
+    range at entry      n    win    ask    edge   growth(realised)/t/drop
+    0-3 bps           293  0.553  0.568  -0.015   -0.289 / -1.11 / -0.397
+    3-5 bps           146  0.678  0.643  +0.035   +0.121 / +0.37 / -0.133
+    5-8 bps           115  0.739  0.683  +0.056   +0.152 / +0.83 / +0.038
+    8-12 bps           67  0.761  0.710  +0.051   +0.118 / +0.72 / +0.004
+    12-20 bps          45  0.778  0.729  +0.049   +0.078 / +0.80 / +0.014
+    20+ bps            24  0.708  0.738  -0.030   -0.049 / -1.10 / -0.065
+
+    window 5-12       182  0.747  0.693  +0.054   +0.270 / +2.08 / +0.153
+    as shipped (all)  690  0.651  0.633  +0.017   +0.131 / +0.23 / -0.180
+
+The 5-12 window looks like a rescue. It is not:
+
+    model 5-12, day-t +2.08, df 6      nominal p = 0.083   (not even p<0.05)
+    after the 12 post-hoc slices I took           p = 0.645
+    edge +0.054, 95% CI [-0.009, +0.117]          STRADDLES ZERO
+
+    for contrast, the cross gate that DID pass:
+    gate 10 recorded reverting t +3.55            p = 0.012
+    gate 12 recorded reverting t +4.08            p = 0.007
+    and it replicated on three independent substrates.
+
+The model arm's best regime slice is what picking the maximum of twelve looks
+like under the null. The cross gate is not.
+
+### The simplest statement of the problem
+
+    model arm, 7 days of REALISED P/L
+      total          +47.27
+      best day       +48.58   (09-09)
+      DROP BEST DAY   -1.31
+      mean/day        +6.75   sd 26.42   day-t +0.68
+
+**The entire week's profit is one day.** That is the same drop-best-day failure
+the knob audit found, restated in dollars and immune to any slicing argument.
+
+### CORRECTION to the reason it was switched off
+
+The switch-off note said the arm "re-arms `cross_skip_opposite_to_main`, which
+was suppressing ~half of cross's triggers". That 52% figure came from an
+earlier config and no longer holds:
+
+    post-detection cross outcomes, lifetime : 29
+    refused to the model arm                :  2   (6.9%)
+
+So the interaction cost is ~7%, not ~50%. The case against the model arm rests
+on the arm's own record, not on what it does to cross. The other cost -- that
+it spends the account-wide 20% daily stop that halts cross -- still stands.
+
+### Why this is not a knob problem
+
+Lifetime the arm won 0.64971 against an average ask of 0.64967 over 688 fills:
+zero margin to four decimals. Its own EV estimate was measured ANTI-informative
+(n=121). Cross's edge is MECHANICAL -- spot crossed, the venue has not repriced
+yet, and that is a latency fact. The model arm's edge would have to be
+PREDICTIVE: a better estimate of P(up) at tau 60-210 than the venue's own book.
+Nothing measured suggests we have one, and no knob creates one.
+
+Reopening it is a modelling project (a better predictor), not a configuration
+change. Left off.
