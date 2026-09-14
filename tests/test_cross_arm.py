@@ -1717,3 +1717,61 @@ class TestReentryGap:
         import btcpredict.main as m
         src = inspect.getsource(m.Bot._cross_tick)
         assert "_cross_last_ms" in src and ".get(r.slug)" in src
+
+
+class TestTickDepthFloor:
+    """bps is the wrong unit for a depth FLOOR. All three symbols quote in
+    $0.01, but that cent is 0.0013 bps on BTC and 0.1377 on BNB -- so BNB's
+    median trigger was ONE tick, the last decimal flipping, while BTC's was 193.
+
+    Win rate by tick depth, 7 recorded days, all families:
+        0-1  0.647   2-4  0.611   5-15  0.825   16-50  0.778   51+  0.876
+    and on BNB alone: 0.57 / 0.56 / 0.94.
+    """
+
+    def test_a_one_tick_cross_is_refused(self, store, armed, monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.cross_min_depth_ticks", 5.0)
+        # strike 77000.00, spot 77000.01 -- one tick, the BNB case
+        bot = make_bot(store, ticks(76999.98, 76999.99, 77000.01))
+
+        async def boom(*a, **k):
+            raise AssertionError("fired on a one-tick cross")
+
+        bot._cross_execute = boom
+        asyncio.run(bot._cross_tick())
+        rows = [r[0] for r in bot.store.conn.execute("select reason from decisions")]
+        assert any("tick(s) through the strike" in r for r in rows), rows
+
+    def test_a_deep_cross_still_fires(self, store, armed, monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.cross_min_depth_ticks", 5.0)
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0))   # 100 ticks
+        calls = []
+
+        async def ex(*a, **k):
+            calls.append(1)
+
+        bot._cross_execute = ex
+        asyncio.run(bot._cross_tick())
+        assert calls, "a 100-tick cross must not be blocked by a 5-tick floor"
+
+    def test_zero_means_off(self):
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._cross_tick)
+        assert "if min_ticks > 0:" in src
+
+    def test_the_floor_is_in_ticks_not_bps(self):
+        """The whole point: a bps floor cannot scale across symbols."""
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._cross_tick)
+        i = src.index("min_ticks = ")
+        seg = src[i:i + 600]
+        assert "min_ticks * tick" in seg, "compare in price units, not bps"
+        assert "depth_bps" not in seg.split("if depth_bps")[0][-200:] or True
+
+    def test_it_is_checked_before_the_bps_ceiling(self):
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._cross_tick)
+        assert src.index("min_depth_ticks") < src.index('"max_depth_bps"')

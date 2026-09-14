@@ -5294,3 +5294,85 @@ at 24% + 24% against the 30% account cap.
 
 Three rounds traded under the regression: +6.73, -6.30, -6.04 = **-$5.61**.
 Bot was stopped on discovery and restarted with the gap in place.
+
+## A depth FLOOR in ticks, because bps is the wrong unit for one (2026-09-14)
+
+Spotted live by the operator: eth entered at spot 2544.48 against a strike of
+2544.47, and bnb at 726.05 against 726.04. One-cent "crossings".
+
+`cross_max_depth_bps` is a ceiling with no floor, and bps cannot express a
+floor correctly here. All three symbols quote in $0.01, but that cent is:
+
+    BTC @79138   0.0013 bps        ETH @2541   0.0394 bps
+    BNB @726     0.1377 bps
+
+so the median trigger depth in TICKS is:
+
+    btc-5m 193    eth-5m 13    bnb-5m 1    eth-15m 4    bnb-15m 2
+
+**BNB's median cross is one tick** -- the last decimal flipping. The flagged
+trade was not unusual; it was the median BNB trade.
+
+Win rate by tick depth (7 recorded days, all families, re-entry gap applied):
+
+    ticks    n    win
+    0-1     34   0.647 +-0.161
+    2-4     36   0.611 +-0.159
+    5-15    57   0.825 +-0.099
+    16-50   54   0.778 +-0.111
+    51+    145   0.876 +-0.054
+
+    bnb-5m alone:  <=1 tick 0.57 (n=14) | 2-4 0.56 (n=18) | 5-15 0.94 (n=18)
+
+SHIPPED `cross_min_depth_ticks = 5`. BTC is untouched at any sane value, so the
+unit does the per-symbol scaling that a bps floor could not, and no per-market
+table is needed.
+
+### Why the earlier depth-floor test missed this
+
+A depth floor was tested and rejected the same morning. That test was in BPS
+and BTC-ONLY, where the median trigger is 193 ticks and a floor only removes
+real moves. Asking the same question on a symbol whose median trigger is one
+tick is a different question, and the earlier answer did not transfer. The
+error was answering a per-market question on the one market where it does not
+arise.
+
+## The model arm, on the population it actually trades (2026-09-14)
+
+The shutdown case rested partly on AUC(edge) = 0.49 over all 133k evaluations,
+which was challenged on two correct grounds: the statistic is MARGINAL where
+the question is conditional, and it was computed on every tau snapshot rather
+than the region the arm trades. Re-run on the gate region, bootstrapped over
+ROUNDS (`tools/model_gate_region.py`):
+
+    population                          n     AUC(edge)  95% CI          b_fair|quote  95% CI
+    ALL evaluations (the old test)  133289    0.5057  [0.479,0.530]    -0.0365  [-0.373,+0.274]
+    GATE REGION (edge>hurdle, band)  63331    0.4982  [0.469,0.526]    -0.7290  [-1.402,-0.066]
+      ...and tau 60-210 (deployed)   33095    0.4974  [0.460,0.536]    -1.0229  [-2.018,+0.040]
+
+On the right population the answer is not softer, it is harder. AUC(edge) is
+0.498 -- a coin flip -- and the incremental slope of `fair` given `quote` is
+**-0.729 with a CI that excludes zero**. The arm's disagreement with the venue
+is not merely uninformative in the region it trades; it is anti-informative.
+
+The edge quartiles inside the gate region say the same thing monotonically:
+
+    quartile      n   mean edge    win   mean quote   margin
+    q1        15833      0.0225  0.639        0.606   +0.0336
+    q2        15833      0.0334  0.636        0.639   -0.0027
+    q3        15832      0.0452  0.652        0.664   -0.0119
+    q4        15833      0.0885  0.632        0.674   -0.0418
+
+**More edge is worse.** Raising `min_edge` -- the obvious next move once the
+slippage error was corrected -- would select harder for the losing quartile.
+
+### What this does and does not overturn
+
+Two pillars of the original shutdown case were WRONG and stay corrected: the
+arm was scored with the cross arm's slippage (+0.088 against a measured
++0.0037, 23x), and drop-best-day was computed over fills outside its own tau
+window (-10.31 vs +4.06 in-window). Both were real errors.
+
+The prediction pillar survives, and this test makes it stronger rather than
+weaker. The arm stays OFF -- now on the population it trades, with a
+conditional statistic, and with the two bad pillars removed rather than leaned on.

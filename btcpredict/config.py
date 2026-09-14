@@ -1347,6 +1347,42 @@ class Settings(BaseSettings):
     # self-consistent with cross_look_s: once look_s has passed, `crossed_side`
     # stops returning a side for the same crossing anyway, because its reference
     # tick has moved to the near side.
+    # Minimum depth through the strike, in TICKS. 0 = OFF.
+    #
+    # `cross_max_depth_bps` is a ceiling with no floor, and bps is the wrong
+    # unit for a floor because a tick means a different thing on each symbol.
+    # All three quote in $0.01, but that cent is:
+    #     BTC @79138  0.0013 bps      ETH @2541  0.0394 bps
+    #     BNB @726    0.1377 bps
+    # so the median trigger depth, in ticks, is:
+    #     btc-5m 193    eth-5m 13    bnb-5m 1    eth-15m 4    bnb-15m 2
+    #
+    # BNB's median cross is ONE CENT -- the last decimal flipping. Spotted live
+    # on 2026-09-14: eth at spot 2544.48 vs strike 2544.47 and bnb at 726.05 vs
+    # 726.04, both one-tick "crossings" that the arm treated exactly like BTC's
+    # 193-tick ones.
+    #
+    # Win rate by tick depth (7 recorded days, all families, re-entry gap
+    # applied):
+    #     ticks    n    win
+    #     0-1     34   0.647 +-0.161
+    #     2-4     36   0.611 +-0.159
+    #     5-15    57   0.825 +-0.099
+    #     16-50   54   0.778 +-0.111
+    #     51+    145   0.876 +-0.054
+    # and on BNB specifically: 0.57 at <=1 tick, 0.56 at 2-4, 0.94 at 5-15.
+    #
+    # 5 is where the break is. BTC is untouched at any sane value (median 193),
+    # so this is a per-symbol correction that needs no per-market table -- the
+    # unit does the scaling a bps floor could not.
+    #
+    # NOTE this is NOT the depth floor tested and rejected earlier the same day.
+    # That test was in BPS and BTC-ONLY, where the median trigger is 193 ticks
+    # and a floor only removes real moves. The question is different on a symbol
+    # whose median trigger is one tick.
+    cross_min_depth_ticks: float = 5.0
+    # Venue price increment per symbol, used only by the floor above.
+    cross_tick_size: float = 0.01
     cross_reentry_gap_s: float = 1.0
     cross_max_round_stake_mult: float = 2.0
     cross_max_open_stake_pct: float = 0.30

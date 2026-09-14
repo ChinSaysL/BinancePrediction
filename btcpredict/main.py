@@ -1738,6 +1738,19 @@ class Bot:
         if not sigma_now:
             sigma_now = getattr(self, "_sigma", 0.0) or 0.0
         depth_bps = 1e4 * abs(spot_now - r.strike) / r.strike if r.strike else 1e9
+        # MINIMUM depth, in TICKS. bps is the wrong unit for a floor: the same
+        # $0.01 is 0.0013 bps on BTC and 0.1377 on BNB, so BNB's median trigger
+        # was ONE tick -- the last decimal flipping. See config.
+        min_ticks = self._ck("min_depth_ticks", r)
+        if min_ticks > 0:
+            tick = self._ck("tick_size", r) or 0.01
+            if abs(spot_now - r.strike) < min_ticks * tick - 1e-12:
+                self._cross_refuse(
+                    r, side,
+                    f"only {abs(spot_now - r.strike) / tick:.0f} tick(s) through "
+                    f"the strike, floor is {min_ticks:.0f}",
+                    tau=tau, spot=spot_now, sigma=sigma_now)
+                return
         if depth_bps > self._ck("max_depth_bps", r):
             self._cross_refuse(r, side,
                                f"{depth_bps:.2f}bps through the strike, gate is "
