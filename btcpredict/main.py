@@ -268,6 +268,16 @@ class Bot:
         # The side already taken in a round, so a later crossing cannot buy the
         # opposite one. See config.cross_allow_reversal.
         self._cross_side: dict[str, str] = {}
+        # Rounds with a cross decision IN FLIGHT. `_cross_fired` and
+        # `_cross_last_ms` are not written until after the venue read in
+        # _cross_tick, so on the websocket clock (~114/s) every tick that
+        # arrives during that round-trip re-reads them unset, passes the
+        # same gates and claims again. The re-entry gap cannot cover it:
+        # it is stamped WITH the claim, i.e. after the await, while the
+        # measured order latency is 2.7-5.2s. A set, not a counter --
+        # entries within a round are serialised, not blocked, so
+        # cross_max_per_round still admits the ones it is meant to.
+        self._cross_inflight: set[str] = set()
         self._cross_day = ""
         self._cross_count = 0
         # Rounds this process has already triggered in, so one impulse cannot
@@ -1957,78 +1967,92 @@ class Bot:
         # slot counts unsettled cross fills because _restore_open_positions replays
         # them through guard.on_open(reserved=True), so check_reserved below
         # already sees a position this process never booked.
-        if self.broker.mode == "live" and self.book:
-            unbooked = await self._unbooked_round_tokens(r, up, down)
-            if unbooked is None:
-                log.info("cross %s %s not taken: venue position list "
-                         "unavailable", r.slug, side)
-                return
-            if unbooked:
-                log.info("cross %s %s not taken: venue holds %d token(s) here "
-                         "the ledger cannot explain", r.slug, side,
-                         len(unbooked))
-                return
-        # The one losing cell of this arm: the side OPPOSITE a position the
-        # MAIN arm already holds. See config.cross_skip_opposite_to_main for
-        # the measurement. Only the main arm counts -- a cross opposite an
-        # earlier CROSS is the alternating-hedge case cross_max_per_round
-        # exists to allow.
-        if self._ck("skip_opposite_to_main", r):
-            for fid, (fslug, held) in list(self.open_fills.items()):
-                if fslug != r.slug or getattr(held, "side", None) == side:
-                    continue
-                reserved, _pool = pool_for_mode(self._fill_mode(fid))
-                if reserved:
-                    continue                      # an earlier cross, not the main arm
-                self._cross_refuse(
-                    r, side,
-                    "the main arm holds the opposite side here (measured "
-                    "EV/$1 -0.107 against +0.356 same-side)",
-                    tau=tau, spot=spot_now, sigma=sigma_now)
-                return
-        # The RESERVED slot, not the main one. The main arm enters at tau
-        # 60-210 and holds to settlement, which covers this arm's whole window,
-        # so `check` refused 82% of cross triggers as "already positioned" --
-        # and 61% of those wanted the OPPOSITE side, i.e. hedges were being
-        # blocked rather than double exposure prevented. Both sides are taken;
-        # see check_reserved for what that gives up.
-        # `max_open` is ACCOUNT-WIDE (guards.state.reserved_open counts every
-        # open reserved position), so it must NOT be the per-round knob. The
-        # per-round limit is enforced separately at the top of this method via
-        # `_cross_fired[r.slug]`. Passing max_per_round here was harmless with
-        # one family and would have capped all six at 5 concurrent positions.
-        # Minus the orders already in flight: `reserved_open` only counts
-        # positions that have BOOKED, and since placement moved off the poll
-        # loop several can be outstanding at once.
-        cap_open = settings.cross_max_open_positions or 10 ** 6
-        cap_open -= getattr(self, "_pending_n", 0)
-        if cap_open <= 0:
-            self._cross_refuse(r, side, "reserved slots full (orders in flight)",
-                               tau=tau, spot=spot_now, sigma=sigma_now)
+        # Claim the round across the ONLY await in this method (the venue
+        # position read below). Everything else here is synchronous, so
+        # this is the whole window in which two ticks can both pass the
+        # per-round gates above and both claim. try/finally rather than a
+        # release at each return: there are five refusal paths inside and
+        # an exception must not leave the round latched shut.
+        if not isinstance(getattr(self, "_cross_inflight", None), set):
+            self._cross_inflight = set()
+        if r.slug in self._cross_inflight:
             return
-        allowed, why = self.guard.check_reserved(r.slug, max_open=cap_open)
-        if not allowed:
-            self._cross_refuse(r, side, why, tau=tau, spot=spot_now, sigma=sigma_now)
-            return
-        # Claim before ordering, so a rejection skips the round rather than
-        # risking a second attempt at it.
-        self._cross_fired[r.slug] = self._cross_fired.get(r.slug, 0) + 1
-        # Cumulative stake for the ROUND, claimed with the slot. Pruned to live
-        # rounds so the map cannot grow all day.
-        rs = getattr(self, "_round_stake", None)
-        if not isinstance(rs, dict):
-            rs = self._round_stake = {}
-        rs[r.slug] = rs.get(r.slug, 0.0) + stake
-        # Stamp the entry time with the claim, for the re-entry gap above.
-        lm = getattr(self, "_cross_last_ms", None)
-        if not isinstance(lm, dict):
-            lm = self._cross_last_ms = {}
-        lm[r.slug] = now_ms
-        self._cross_last_ms = {k: v for k, v in lm.items() if k in live}
-        self._round_stake = {k: v for k, v in rs.items() if k in live}
-        # Remember the side, not just the count: the reversal guard reads it.
-        self._cross_side[r.slug] = side
-        self._cross_count += 1
+        self._cross_inflight.add(r.slug)
+        try:
+            if self.broker.mode == "live" and self.book:
+                unbooked = await self._unbooked_round_tokens(r, up, down)
+                if unbooked is None:
+                    log.info("cross %s %s not taken: venue position list "
+                             "unavailable", r.slug, side)
+                    return
+                if unbooked:
+                    log.info("cross %s %s not taken: venue holds %d token(s) here "
+                             "the ledger cannot explain", r.slug, side,
+                             len(unbooked))
+                    return
+            # The one losing cell of this arm: the side OPPOSITE a position the
+            # MAIN arm already holds. See config.cross_skip_opposite_to_main for
+            # the measurement. Only the main arm counts -- a cross opposite an
+            # earlier CROSS is the alternating-hedge case cross_max_per_round
+            # exists to allow.
+            if self._ck("skip_opposite_to_main", r):
+                for fid, (fslug, held) in list(self.open_fills.items()):
+                    if fslug != r.slug or getattr(held, "side", None) == side:
+                        continue
+                    reserved, _pool = pool_for_mode(self._fill_mode(fid))
+                    if reserved:
+                        continue                      # an earlier cross, not the main arm
+                    self._cross_refuse(
+                        r, side,
+                        "the main arm holds the opposite side here (measured "
+                        "EV/$1 -0.107 against +0.356 same-side)",
+                        tau=tau, spot=spot_now, sigma=sigma_now)
+                    return
+            # The RESERVED slot, not the main one. The main arm enters at tau
+            # 60-210 and holds to settlement, which covers this arm's whole window,
+            # so `check` refused 82% of cross triggers as "already positioned" --
+            # and 61% of those wanted the OPPOSITE side, i.e. hedges were being
+            # blocked rather than double exposure prevented. Both sides are taken;
+            # see check_reserved for what that gives up.
+            # `max_open` is ACCOUNT-WIDE (guards.state.reserved_open counts every
+            # open reserved position), so it must NOT be the per-round knob. The
+            # per-round limit is enforced separately at the top of this method via
+            # `_cross_fired[r.slug]`. Passing max_per_round here was harmless with
+            # one family and would have capped all six at 5 concurrent positions.
+            # Minus the orders already in flight: `reserved_open` only counts
+            # positions that have BOOKED, and since placement moved off the poll
+            # loop several can be outstanding at once.
+            cap_open = settings.cross_max_open_positions or 10 ** 6
+            cap_open -= getattr(self, "_pending_n", 0)
+            if cap_open <= 0:
+                self._cross_refuse(r, side, "reserved slots full (orders in flight)",
+                                   tau=tau, spot=spot_now, sigma=sigma_now)
+                return
+            allowed, why = self.guard.check_reserved(r.slug, max_open=cap_open)
+            if not allowed:
+                self._cross_refuse(r, side, why, tau=tau, spot=spot_now, sigma=sigma_now)
+                return
+            # Claim before ordering, so a rejection skips the round rather than
+            # risking a second attempt at it.
+            self._cross_fired[r.slug] = self._cross_fired.get(r.slug, 0) + 1
+            # Cumulative stake for the ROUND, claimed with the slot. Pruned to live
+            # rounds so the map cannot grow all day.
+            rs = getattr(self, "_round_stake", None)
+            if not isinstance(rs, dict):
+                rs = self._round_stake = {}
+            rs[r.slug] = rs.get(r.slug, 0.0) + stake
+            # Stamp the entry time with the claim, for the re-entry gap above.
+            lm = getattr(self, "_cross_last_ms", None)
+            if not isinstance(lm, dict):
+                lm = self._cross_last_ms = {}
+            lm[r.slug] = now_ms
+            self._cross_last_ms = {k: v for k, v in lm.items() if k in live}
+            self._round_stake = {k: v for k, v in rs.items() if k in live}
+            # Remember the side, not just the count: the reversal guard reads it.
+            self._cross_side[r.slug] = side
+            self._cross_count += 1
+        finally:
+            self._cross_inflight.discard(r.slug)
         spot = spot_now
         sigma = sigma_now
         # `ask` is the last POLLED book price, and the poll runs ~1/s while the

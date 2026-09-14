@@ -1775,3 +1775,80 @@ class TestTickDepthFloor:
         import btcpredict.main as m
         src = inspect.getsource(m.Bot._cross_tick)
         assert src.index("min_depth_ticks") < src.index('"max_depth_bps"')
+
+
+class TestTheInFlightGuard:
+    """Two ticks must not both claim the same round across the venue read.
+
+    `_cross_fired`, `_round_stake` and `_cross_last_ms` are all written AFTER
+    `_unbooked_round_tokens`, which is the only await in `_cross_tick`. The arm
+    runs on the websocket clock (~114/s) while a venue round-trip takes the
+    measured 2.7-5.2s, so without a claim held across that await every tick
+    arriving inside it re-reads the per-round state unset and claims again.
+
+    The re-entry gap cannot cover this: it is stamped WITH the claim, i.e. on
+    the far side of the await. These tests set it to 0 so the only thing that
+    can stop a double is the in-flight guard itself.
+    """
+
+    def _live_bot(self, store, monkeypatch, gate):
+        monkeypatch.setattr("btcpredict.config.settings.cross_reentry_gap_s", 0.0)
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_per_round", 5)
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_open_stake_pct", 0.0)
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_round_stake_mult", 0.0)
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0))
+        # the await only runs on the live path; the default fixture is paper
+        bot.broker = SimpleNamespace(mode="live")
+        bot.book = object()
+        calls = []
+
+        async def execute(*a, **k):
+            calls.append(1)
+        bot._cross_execute = execute
+
+        async def unbooked(*a, **k):
+            await gate()                      # hold the round-trip open
+            return set()
+        bot._unbooked_round_tokens = unbooked
+        return bot, calls
+
+    def test_two_concurrent_ticks_claim_the_round_once(self, store, armed, monkeypatch):
+        async def gate():
+            await asyncio.sleep(0.02)         # stand in for the venue latency
+
+        bot, calls = self._live_bot(store, monkeypatch, gate)
+
+        async def go():
+            await asyncio.gather(bot._cross_tick(), bot._cross_tick())
+            await asyncio.sleep(0)
+        asyncio.run(go())
+        assert len(calls) == 1, (
+            "both ticks passed the per-round gates inside the venue read")
+        assert bot._cross_fired[bot._round.slug] == 1
+
+    def test_the_round_is_not_latched_shut_afterwards(self, store, armed, monkeypatch):
+        """Serialised, not blocked -- cross_max_per_round still admits its own."""
+        async def gate():
+            await asyncio.sleep(0)
+
+        bot, calls = self._live_bot(store, monkeypatch, gate)
+
+        async def go():
+            await asyncio.gather(bot._cross_tick(), bot._cross_tick())
+            await asyncio.sleep(0)
+            await bot._cross_tick()           # a later tick, state now settled
+            await asyncio.sleep(0)
+        asyncio.run(go())
+        assert len(calls) == 2, "the guard must release, not latch the round"
+        assert bot._round.slug not in bot._cross_inflight
+
+    def test_an_exception_inside_releases_the_claim(self, store, armed, monkeypatch):
+        """finally, not a release at each return: five refusal paths sit inside."""
+        async def gate():
+            raise RuntimeError("venue blew up")
+
+        bot, _calls = self._live_bot(store, monkeypatch, gate)
+        with pytest.raises(RuntimeError):
+            asyncio.run(bot._cross_tick())
+        assert bot._round.slug not in bot._cross_inflight, (
+            "an exception must not leave the round permanently claimed")
