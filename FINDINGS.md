@@ -5136,3 +5136,98 @@ exists for, two triggers inside the same second.
 
 Also recorded: these stalls put holes in the recorded tape, so every replay in
 this file that counts triggers from `quotes` has been UNDERCOUNTING them.
+
+## CORRECTION: `rev_prev == 0` is not the shipped reversal guard (2026-09-14)
+
+Caught in review. `cross_reversal_recorded.replay` marks a reversal against the
+IMMEDIATELY PRECEDING entry:
+
+    int(prev_side is not None and side != prev_side)
+
+so a round going Up, Down, Down marks the first Down and NOT the second -- it
+matches the entry before it. Filtering `rev_prev == 0` therefore keeps `Up` AND
+that second `Down`: a mixed-side round, and an entry the live guard would never
+have taken. The shipped guard compares against the last side ACTUALLY TAKEN, so
+a skipped entry never becomes the reference.
+
+    trade set               entries  rounds  mixed-side  max/round
+    raw (guard off)             215     150          11          5
+    rev_prev==0 (what I used)   201     150           5          3
+    live guard (correct)        199     150           0          4
+
+The correct set has ZERO mixed-side rounds -- a round really is one bet -- and
+contains a 4-ENTRY round that the filter hid.
+
+### What it changes
+
+    trade set                 win   additive g/t        reverting g/t
+    rev_prev==0 (mine)      0.881   +2.494/t+2.27       +2.736/t+3.52
+    live guard (correct)    0.874   +2.319/t+1.98       +2.567/t+2.99
+
+Re-scored on the correct set, every conclusion SURVIVES but the confidence was
+overstated:
+
+    range gate   OFF +1.705/t1.07 | gate 10 +2.319/t1.98 | gate 12 +2.145/t2.03
+                 -> still SUPPORTED, but the headline "day-t 2.27-4.08" is
+                    wrong; it is 1.98-2.99.
+    depth        5.0 +2.319 vs 1.0 +1.837 -> 5.0 still wins on growth (though
+                 tighter depth has the higher t, 2.58 vs 1.98)
+    price band   [0.10,0.90] +1.988 vs [0.45,0.90] +1.389 -> shipped still wins
+                 on growth; the floor still buys t (3.45 vs 2.46) and not growth
+    stake        growth still monotone in size; t flat at ~1.98 throughout
+
+Tools that already applied the guard correctly and are UNAFFECTED:
+cross_buffer_sweep, cross_limit_rules, cross_market_scan, cross_depth_floor,
+cross_dynamic_gate, cross_lock_hedge, cross_multi_exposure.
+
+## The ROUND is the risk unit, not the order (2026-09-14)
+
+`cross_max_open_stake_pct` treats the account as 0.945-correlated positions.
+Entries in the SAME round are not that: with the reversal guard on they are the
+same side of the same round and settle on ONE oracle print. Correlation 1.000 --
+a second entry is an add, not a second trade.
+
+On the corrected set: 105 rounds with 1 entry, 42 with 2, 2 with 3, and ONE
+WITH 4 -- 26.9% of bankroll on a single print, which is 1.17x full Kelly (22.9%)
+against a per-entry posture of 0.29x. The 3 -> 5 raise of cross_max_per_round
+was justified on per-entry EV, correctly; what it also did, silently, was move
+worst-round exposure past full Kelly.
+
+    cap    binds   max/print   additive g/t      reverting g/t
+    none       0       26.9%   +2.319/t+1.98     +2.567/t+2.99
+    3.0x       1       20.2%   +2.301/t+1.99     +2.543/t+3.02
+    2.0x       3       13.4%   +2.360/t+2.11     +2.582/t+3.26
+    1.0x      45        6.7%   +2.309/t+2.25     +2.205/t+3.51
+
+SHIPPED 2.0x: bounds one print at 13.4% = 0.59x Kelly, the same posture the
+per-entry stake takes, binding on 3 of 150 rounds. Its apparent +2% growth gain
+is NOT claimed -- 3 rounds is the same n that would reverse it. 3.0x was
+rejected for being invisible: it binds once and blesses 0.88x Kelly on a single
+print as standing policy, which makes the decision unrecorded rather than made.
+
+## A locked-loss guard for EVERY arm, and why it does not rescue the model arm
+
+Of 720 settled rounds, 25 hold both sides -- 21 of them the model arm colliding
+with ITSELF, seconds apart:
+
+    09-12 04:40  pair 1.135 -> -0.49
+    09-12 06:11  pair 1.212 -> -0.43
+    09-12 06:15  pair 1.192 -> -0.43
+
+Mixed-side rounds returned -4.0% on $61.12 against +5.6% on $1,705 elsewhere.
+The cross arm got `cross_allow_reversal` after the 12:05 round; the model arm
+never had one, because "arms are independent" meant nothing inspected the
+combined book. `max_paired_price = 1.0` now refuses any order that would hold
+both sides above break-even, for every arm. 1.0 is arithmetic, not a tuned
+number.
+
+**It does not rescue the model arm, and it is not why that arm is off.**
+
+    as-is                total +47.27  drop-best -1.31  day-t +0.68
+    collisions removed   total +49.36  drop-best +0.78  day-t +0.71
+
+drop-best flips sign, which looks like a rescue and is not: 98.4% of the fixed
+total is still a single day (09-09, +48.58 of +49.36), day-t moves 0.68 -> 0.71,
+and the arm's own edge is untouched -- lifetime win 0.64971 against a mean ask
+of 0.64967, its `fair - quote` ranking outcomes at AUC 0.4906. The guard removes
+a landmine before that arm is ever switched back on. The arm stays OFF.

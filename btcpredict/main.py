@@ -1879,6 +1879,27 @@ class Bot:
             ask = sweep_px
         if stake < settings.min_order_usdt or self.bankroll < stake:
             return
+        # THE ROUND is one bet: with the reversal guard on, every entry in a
+        # round is the same side of the same round and settles on ONE oracle
+        # print. So the round's CUMULATIVE stake is the risk unit, not the
+        # order's. See config.cross_max_round_stake_mult -- without this a
+        # 4-entry round put 26.9% of bankroll on a single print, 1.17x full
+        # Kelly, against a per-entry posture of 0.29x.
+        rmult = settings.cross_max_round_stake_mult
+        if rmult > 0:
+            spent = (getattr(self, "_round_stake", None) or {}).get(r.slug, 0.0)
+            room = rmult * stake - spent
+            if room < settings.min_order_usdt:
+                self._cross_refuse(
+                    r, side,
+                    f"round already holds ${spent:.2f}, cap is "
+                    f"{rmult:.1f}x ${stake:.2f}",
+                    tau=tau, spot=spot_now, stake=stake, sigma=sigma_now)
+                return
+            if room < stake:
+                log.info("cross %s %s: sizing down $%.2f -> $%.2f (round cap)",
+                         r.slug, side, stake, room)
+                stake = round(room, 2)
         # ACCOUNT-WIDE exposure, across every family. See
         # config.cross_max_open_stake_pct: with six markets 0.945 of
         # simultaneously-open positions sit on the SAME side, so this is one bet
@@ -1969,6 +1990,13 @@ class Bot:
         # Claim before ordering, so a rejection skips the round rather than
         # risking a second attempt at it.
         self._cross_fired[r.slug] = self._cross_fired.get(r.slug, 0) + 1
+        # Cumulative stake for the ROUND, claimed with the slot. Pruned to live
+        # rounds so the map cannot grow all day.
+        rs = getattr(self, "_round_stake", None)
+        if not isinstance(rs, dict):
+            rs = self._round_stake = {}
+        rs[r.slug] = rs.get(r.slug, 0.0) + stake
+        self._round_stake = {k: v for k, v in rs.items() if k in live}
         # Remember the side, not just the count: the reversal guard reads it.
         self._cross_side[r.slug] = side
         self._cross_count += 1
@@ -2348,6 +2376,29 @@ class Bot:
         # the whole pre-trade path: a spent quoteId cannot be re-sent, and both
         # the edge and the candle-open window can evaporate in the second or
         # two a failed attempt costs.
+        # LOCKED-LOSS GUARD, ahead of every attempt and NOT behind
+        # `skip_pretrade_gates` -- that flag skips signal re-checks, and this is
+        # a risk check. Holding both sides of a round pays exactly 1.000, so a
+        # pair costing more than `max_paired_price` is a loss by arithmetic and
+        # cannot be undone on a venue with no sell. See config.
+        cap_pair = settings.max_paired_price
+        if cap_pair > 0 and sig.side in ("Up", "Down"):
+            mine = float(getattr(sig, "quote", 0.0) or 0.0)
+            # getattr: fixtures build Bot via __new__ and have no open_fills.
+            _of = getattr(self, "open_fills", None) or {}
+            for _fid, (fslug, held) in list(_of.items()):
+                if fslug != r.slug or getattr(held, "side", None) == sig.side:
+                    continue
+                other = float(getattr(held, "filled_px", 0.0) or 0.0)
+                if other <= 0 or mine <= 0:
+                    continue
+                if other + mine > cap_pair:
+                    log.info("%s %s not taken: would hold both sides of this "
+                             "round at %.3f + %.3f = %.3f (> %.2f); a matched "
+                             "pair pays 1.000, so that is a locked loss",
+                             r.slug, sig.side, other, mine, other + mine,
+                             cap_pair)
+                    return None
         attempts = max(1, settings.order_max_attempts)
         fill = None
         for attempt in range(attempts):

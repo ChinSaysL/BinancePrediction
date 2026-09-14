@@ -1260,6 +1260,70 @@ class Settings(BaseSettings):
     # the 30% dollar cap binds first, at 4 positions. This is the backstop; the
     # dollar cap is the control.
     cross_max_open_positions: int = 10
+    # Cap on the CUMULATIVE stake of one ROUND, in units of the per-entry
+    # stake. 0 = OFF.
+    #
+    # `cross_max_open_stake_pct` treats the account as a portfolio of
+    # 0.945-correlated positions. Entries in the SAME round are not that: with
+    # cross_allow_reversal=False they are the same side of the same round, so
+    # they settle on ONE oracle print. Correlation is 1.000 -- a second entry is
+    # an add to an existing position, not a second trade.
+    #
+    # That was unguarded. Measured on the recorded week (199 entries / 150
+    # rounds, reversal guard applied correctly):
+    #     1 entry  105 rounds     3 entries   2 rounds
+    #     2 entries 42 rounds     4 entries   1 round   <- 26.9% of bankroll
+    # and 26.9% on a single print is 1.17x FULL Kelly (22.9%), while the
+    # per-entry stake is deliberately 0.29x Kelly because 18 live fills cannot
+    # tell a 0.714 win rate from 0.881. The 3 -> 5 raise of cross_max_per_round
+    # was justified on per-entry EV, which is correct and unchanged; what it
+    # silently also did was move worst-round exposure past full Kelly.
+    #
+    #     cap   binds   max/print   additive g/t      reverting g/t
+    #     none      0       26.9%   +2.319/t+1.98     +2.567/t+2.99
+    #     3.0x      1       20.2%   +2.301/t+1.99     +2.543/t+3.02
+    #     2.0x      3       13.4%   +2.360/t+2.11     +2.582/t+3.26
+    #     1.0x     45        6.7%   +2.309/t+2.25     +2.205/t+3.51
+    #
+    # 2.0 bounds one print at 13.4% = 0.59x Kelly, which is the same posture the
+    # per-entry stake takes, and it binds on 3 of 150 rounds. Its apparent +2%
+    # growth gain is NOT claimed -- that is 3 rounds, the same n it would take
+    # to reverse it. What is real is the a priori bound.
+    #
+    # 3.0 was the alternative and is rejected for being invisible: it binds on
+    # one round and blesses 0.88x Kelly on a single print as standing policy.
+    # A cap that never binds makes the decision unrecorded rather than made.
+    # Refuse an order that would hold BOTH sides of one round at a combined
+    # price above this. 0 = OFF. Applies to EVERY arm, not just cross.
+    #
+    # Holding matched shares of both sides pays exactly 1.000 whatever the
+    # oracle prints, so the pair's cost decides the outcome outright:
+    #     entry_px + other_px < 1.0  -> locked profit
+    #     entry_px + other_px > 1.0  -> locked loss, and it cannot be undone
+    #                                   (this venue has no sell, only buy)
+    #
+    # The cross arm got `cross_allow_reversal` after btc-updown-5m-1789387500
+    # on 2026-09-14 (Up 0.611 + Down 0.589 = 1.199, a locked -$0.87 that could
+    # not win). The MODEL arm never had one, and "arms are independent" means
+    # nothing was inspecting the combined book. Measured over 720 settled
+    # rounds: 25 hold both sides, 21 of them the model arm colliding with
+    # ITSELF, seconds apart --
+    #     09-12 04:40  pair 1.135 -> -0.49     09-12 06:11  pair 1.212 -> -0.43
+    #     09-12 06:15  pair 1.192 -> -0.43
+    # Mixed-side rounds returned -4.0% on $61.12 against +5.6% on $1,705 for
+    # every other round.
+    #
+    # 1.0 is the break-even, not a tuned number: above it the pair is a loss by
+    # arithmetic. It does NOT block a hedge that locks a profit (pair < 1.0),
+    # which is measured separately and also rejected -- for a different reason,
+    # that it forfeits an 88% win rate for certainty.
+    #
+    # This does not rescue the model arm and is not why it is off. Removing
+    # every collision moves its day-t from 0.68 to 0.71 and leaves 98.4% of its
+    # profit in a single day. It is a landmine, removed before that arm is ever
+    # switched back on.
+    max_paired_price: float = 1.0
+    cross_max_round_stake_mult: float = 2.0
     cross_max_open_stake_pct: float = 0.30
     cross_ws_follow_all: bool = True
     cross_overrides: dict[str, dict[str, float]] = {

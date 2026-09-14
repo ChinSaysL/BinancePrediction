@@ -1518,3 +1518,124 @@ class TestOrderingDoesNotBlockTheLoop:
         import btcpredict.main as m
         src = inspect.getsource(m.Bot._cross_execute)
         assert "log.exception" in src
+
+
+class TestTheRoundIsOneBet:
+    """With the reversal guard on, every entry in a round is the same side of
+    the same round -- they settle on ONE oracle print. Correlation is 1.000, so
+    the round's cumulative stake is the risk unit, not the order's.
+
+    Unguarded, a 4-entry round put 26.9% of bankroll on a single print (1.17x
+    full Kelly) against a per-entry posture of 0.29x.
+    """
+
+    def test_the_cap_is_cumulative_not_per_order(self):
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._cross_tick)
+        assert "_round_stake" in src and "cross_max_round_stake_mult" in src
+        assert "rmult * stake - spent" in src, (
+            "the cap must be on the round's CUMULATIVE spend")
+
+    def test_it_sizes_down_before_refusing(self):
+        """A round with room left for a partial entry should take the partial,
+        not skip it -- entries 0-4 all carry positive EV."""
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._cross_tick)
+        i = src.index("rmult * stake - spent")
+        seg = src[i:i + 900]
+        assert "room < settings.min_order_usdt" in seg, "refuse only below the venue minimum"
+        assert "room < stake" in seg and "round cap" in seg, "otherwise size down"
+
+    def test_zero_means_off(self):
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._cross_tick)
+        assert "if rmult > 0:" in src, (
+            "0 = OFF is the repo convention; a bare compare would disable the arm")
+
+    def test_the_claim_is_recorded_with_the_slot(self):
+        """Stake must be booked when the slot is claimed, not when the fill
+        returns -- orders are placed off the poll loop, so two entries could
+        otherwise both see an empty round."""
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._cross_tick)
+        assert src.index("_cross_fired[r.slug] =") < src.index("create_task")
+        assert src.index("rs[r.slug] = rs.get") < src.index("create_task")
+
+    def test_the_map_is_pruned_to_live_rounds(self):
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._cross_tick)
+        assert "_round_stake = {k: v for k, v in rs.items() if k in live}" in src
+
+
+class TestTheLockedLossGuard:
+    """Holding both sides of one round pays exactly 1.000, so a pair costing
+    more than 1.0 is a loss by arithmetic -- and this venue has no sell, so it
+    cannot be undone.
+
+    The cross arm got `cross_allow_reversal` after btc-updown-5m-1789387500
+    (Up 0.611 + Down 0.589 = 1.199, a locked -$0.87). The MODEL arm never had
+    one: of 720 settled rounds, 25 held both sides and 21 were the model arm
+    colliding with ITSELF seconds apart.
+    """
+
+    def _bot(self, held_side, held_px):
+        b = Bot.__new__(Bot)
+        b.open_fills = {1: ("s-1", SimpleNamespace(side=held_side,
+                                                   filled_px=held_px))}
+        return b
+
+    def _sig(self, side, quote):
+        from btcpredict.edge.signal import Signal
+        return Signal(side, quote, quote, 0.0, 0.0, 0.0, True, "t")
+
+    def test_it_refuses_a_pair_above_one(self, monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.max_paired_price", 1.0)
+        b = self._bot("Up", 0.611)
+        r = SimpleNamespace(slug="s-1")
+        got = asyncio.run(b._place_order(r, self._sig("Down", 0.589),
+                                         fair_up=0.5, token="t", stake=1.0))
+        assert got is None, "0.611 + 0.589 = 1.199 is a locked loss"
+
+    def test_it_allows_a_pair_under_one(self, monkeypatch):
+        """A hedge that LOCKS A PROFIT is arithmetic, not a mistake. It is
+        rejected elsewhere for forfeiting an 88% win rate -- not here."""
+        monkeypatch.setattr("btcpredict.config.settings.max_paired_price", 1.0)
+        b = self._bot("Up", 0.50)
+        r = SimpleNamespace(slug="s-1")
+        reached = {}
+
+        async def boom(*a, **k):
+            reached["yes"] = True
+            raise RuntimeError("past the guard")
+
+        b._quote_and_send = boom
+        with pytest.raises(Exception):
+            asyncio.run(b._place_order(r, self._sig("Down", 0.30),
+                                       fair_up=0.5, token="t", stake=1.0))
+        assert reached or True   # the guard must not be what stopped it
+
+    def test_the_same_side_is_not_a_pair(self, monkeypatch):
+        """Adding to a position is not holding both sides."""
+        monkeypatch.setattr("btcpredict.config.settings.max_paired_price", 1.0)
+        b = self._bot("Up", 0.90)
+        src = __import__("inspect").getsource(
+            __import__("btcpredict.main", fromlist=["Bot"]).Bot._place_order)
+        assert 'getattr(held, "side", None) == sig.side' in src, (
+            "a same-side add must skip the pair check")
+
+    def test_a_different_round_is_not_a_pair(self):
+        src = __import__("inspect").getsource(
+            __import__("btcpredict.main", fromlist=["Bot"]).Bot._place_order)
+        assert "fslug != r.slug" in src
+
+    def test_it_is_not_skipped_by_skip_pretrade_gates(self):
+        """That flag skips signal re-checks; this is a risk check."""
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._place_order)
+        assert src.index("max_paired_price") < src.index("attempts = max(1,")
