@@ -8,6 +8,7 @@ a test could pass while the market it named was ignored.
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -144,49 +145,96 @@ class TestEntryModeOff:
         import inspect
         body = inspect.getsource(m.Bot._record)
         assert 'settings.entry_mode == "off"' in body
-        assert body.index("_cross_tick") < body.index('entry_mode == "off"'), \
+        # The cross arm is dispatched from tick(), not from _record, since it
+        # was widened to every CROSS_TRADED family on 2026-09-14. The invariant
+        # is unchanged and now sits one level up: _record's `off` return cannot
+        # skip the cross arm, because tick() calls _cross_all() after the market
+        # loop and outside any entry_mode branch.
+        tick = inspect.getsource(m.Bot.tick)
+        assert "_cross_all()" in tick, \
             "turning the main arm off must not skip the cross arm"
+        assert "entry_mode" not in tick, \
+            "the cross dispatch must not sit behind an entry_mode branch"
+        # ...and _record must still register the per-market context before that
+        # `off` return, or an off main arm would empty the cross arm's world.
+        assert body.index("self._mkt") < body.index('entry_mode == "off"'), \
+            "the cross arm's per-market context must be built before the off gate"
 
 
-class TestRecordedMarketsAreRefreshedSlowly:
-    """Trade latency must not depend on an unrelated market's popularity."""
+class TestRoundsAreCachedUntilTheyRoll:
+    """Trade latency must not depend on an unrelated market's popularity.
 
-    def _bot(self, asked, follows=None):
+    `rounds_by_prefixes` pages a volume-sorted list and stops only once EVERY
+    requested prefix is found, so one quiet family sinks through the day --
+    bnb-updown-5m sat at offset 1450, 30 pages, 3.95s, and took the decision
+    loop from a 1.00s median to 4.15s. With six TRADED families that sweep
+    cannot run every poll.
+
+    It does not have to: a round's metadata (strike, token ids, end time) is
+    fixed once it opens, and the two things that move -- spot and the ask --
+    arrive on their own feeds. So a family is re-swept only when its round has
+    actually rolled. This replaces the older RECORDED_REFRESH_S interval, which
+    could not work once the recorded families became tradeable.
+    """
+
+    def _bot(self, asked, rounds):
         b = Bot.__new__(Bot)
         b.ws_book = SimpleNamespace(follow=lambda ids: None)
         b.market = SimpleNamespace(
-            rounds_by_prefixes=lambda prefixes: _capture(prefixes, asked))
+            rounds_by_prefixes=lambda prefixes: _capture(prefixes, asked, rounds))
         b.refresh_vol_if_stale = _noop
         b._record = _noop_record
         return b
 
+    @staticmethod
+    def _live(end_ms):
+        return {p: SimpleNamespace(market_id=100 + i, slug=f"{p}-1",
+                                   end_ms=end_ms, strike=100.0)
+                for i, (p, _, _) in enumerate(MARKETS)}
+
     def test_first_tick_sweeps_everything(self):
         asked = []
-        asyncio.run(self._bot(asked).tick())
-        assert len(asked[0]) == len(MARKETS)
+        live = self._live(int(time.time() * 1000) + 300_000)
+        asyncio.run(self._bot(asked, live).tick())
+        assert len(asked[0]) == len(MARKETS), "a cold cache must sweep all"
 
-    def test_the_next_tick_asks_only_for_the_traded_family(self):
+    def test_a_live_round_is_not_swept_again(self):
         asked = []
-        b = self._bot(asked)
+        live = self._live(int(time.time() * 1000) + 300_000)
+        b = self._bot(asked, live)
         asyncio.run(b.tick())
         asyncio.run(b.tick())
-        assert asked[1] == [MARKETS[0][0]], \
-            "a quiet recorded market must not be paged for on every poll"
+        assert asked[1] == [MARKETS[0][0]], (
+            "a family whose round is still live must not be paged for again; "
+            "only the primary is refetched every poll")
 
-    def test_it_sweeps_again_once_the_interval_lapses(self):
-        from btcpredict.config import RECORDED_REFRESH_S
+    def test_a_rolled_round_is_swept_again(self):
         asked = []
-        b = self._bot(asked)
+        live = self._live(int(time.time() * 1000) + 300_000)
+        b = self._bot(asked, live)
         asyncio.run(b.tick())
-        b._recorded_at -= RECORDED_REFRESH_S + 1
+        for r in b._round_cache.values():
+            r.end_ms = int(time.time() * 1000) - 1
+        asyncio.run(b.tick())
+        assert len(asked[1]) == len(MARKETS), (
+            "once a round has rolled its family must be swept again")
+
+    def test_a_round_without_a_strike_is_never_cached(self):
+        """A strikeless round cannot be traded and must not pin the cache."""
+        asked = []
+        live = self._live(int(time.time() * 1000) + 300_000)
+        for r in live.values():
+            r.strike = None
+        b = self._bot(asked, live)
+        asyncio.run(b.tick())
         asyncio.run(b.tick())
         assert len(asked[1]) == len(MARKETS)
 
 
-def _capture(prefixes, sink):
+def _capture(prefixes, sink, rounds):
     sink.append(list(prefixes))
     async def _c():
-        return {}
+        return {p: rounds[p] for p in prefixes if p in rounds}
     return _c()
 
 
@@ -233,3 +281,78 @@ class TestCrossRunsOnTheFeedClock:
 
 async def _never(timeout):
     return False
+
+
+class TestCrossRunsAcrossEveryTradedMarket:
+    """The cross arm was widened from BTC-5m to every family in CROSS_TRADED on
+    2026-09-14. These pin the parts of that widening which fail SILENTLY."""
+
+    def _bot(self, mkt):
+        b = Bot.__new__(Bot)
+        b.mode = "live"
+        b._mkt = mkt
+        return b
+
+    def test_every_market_is_ticked(self):
+        seen = []
+
+        async def one(ctx=None):
+            seen.append(ctx["round"].slug)
+
+        b = self._bot({p: {"round": SimpleNamespace(slug=f"{p}-1")}
+                       for p, _, _ in MARKETS})
+        b._cross_tick = one
+        asyncio.run(b._cross_all())
+        assert len(seen) == len(MARKETS), "every traded family must be ticked"
+
+    def test_one_market_raising_does_not_stop_the_others(self):
+        """A six-market arm whose whole loop dies because one family returned a
+        malformed round is strictly worse than the single-market one."""
+        seen = []
+
+        async def one(ctx=None):
+            if ctx["round"].slug.startswith("eth-updown-5m"):
+                raise ValueError("malformed round")
+            seen.append(ctx["round"].slug)
+
+        b = self._bot({p: {"round": SimpleNamespace(slug=f"{p}-1")}
+                       for p, _, _ in MARKETS})
+        b._cross_tick = one
+        asyncio.run(b._cross_all())
+        assert len(seen) == len(MARKETS) - 1
+
+    def test_no_context_falls_back_to_the_single_market_path(self):
+        calls = []
+
+        async def one(ctx=None):
+            calls.append(ctx)
+
+        b = self._bot({})
+        b._cross_tick = one
+        asyncio.run(b._cross_all())
+        assert calls == [None], "an empty world must still tick the primary"
+
+    def test_knobs_resolve_against_the_round_not_self_round(self):
+        """`_ck` reads the round it is handed. Reading `self._round` here would
+        price eth-updown-15m with BTC's range gate -- and since the gate is in
+        BPS while a 15m round has 3x as long to travel, BTC's 10.0 blocks 77%
+        of eth-15m's rounds against 40% of BTC's."""
+        b = Bot.__new__(Bot)
+        b._round = SimpleNamespace(slug="btc-updown-5m-1")
+        btc = b._ck("max_round_range_bps", SimpleNamespace(slug="btc-updown-5m-1"))
+        eth15 = b._ck("max_round_range_bps", SimpleNamespace(slug="eth-updown-15m-1"))
+        assert btc != eth15, "per-market overrides must actually apply"
+        assert b._ck("max_round_range_bps") == btc, "None falls back to _round"
+
+    def test_per_round_state_survives_other_markets(self):
+        """`_cross_fired` used to be pruned to the CURRENT round's slug, which
+        with six families means each market wipes the others -- every market
+        would forget it had fired and the per-round cap would never bind."""
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._cross_tick)
+        assert "if k == r.slug" not in src, (
+            "per-round state is pruned to a single slug; with six families that "
+            "erases every other market's fired count"
+        )
+        assert "live" in src and "_cross_fired = {" in src

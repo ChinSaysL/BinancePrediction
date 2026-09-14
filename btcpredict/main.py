@@ -26,7 +26,7 @@ import aiohttp
 
 from btcpredict.calibration.report import PnLSummary
 from btcpredict.edge.impulse import impulse_bps, impulse_side
-from btcpredict.config import (MARKETS, RECORDED_REFRESH_S, cross_knob,
+from btcpredict.config import (CROSS_TRADED, MARKETS, cross_knob,
                                market_prefix, settings)
 from btcpredict.edge.signal import (FeeModel, Signal, evaluate,
                                     evaluate_hybrid, expected_value,
@@ -587,33 +587,65 @@ class Bot:
     # -- main tick ----------------------------------------------------------
     async def tick(self) -> None:
         await self.refresh_vol_if_stale()
-        # The TRADED family is swept every poll; the recorded-only ones at
-        # RECORDED_REFRESH_S. `rounds_by_prefixes` stops paging only when every
-        # requested prefix is found, and the venue's list is volume-sorted, so
-        # one quiet family sitting deep (bnb-updown-5m at offset 1450) dragged
-        # the whole loop from 1.00s to 4.15s. The tape does not need 1s
-        # resolution; the arm that trades does.
-        primary_only = [MARKETS[0][0]]
-        now_s = time.time()
-        due = now_s - getattr(self, "_recorded_at", 0.0) >= RECORDED_REFRESH_S
-        want = [p for p, _, _ in MARKETS] if due else primary_only
-        found = await self.market.rounds_by_prefixes(want)
-        if due:
-            self._recorded_at = now_s
-        # MARKETS holds one market (BTC 5m), so this loop runs once and the
-        # trade flag is always true. Both the loop and the flag are kept: they
-        # are what stops a newly added market from being traded before it has
-        # been evaluated, and removing that guard is how the daily loss cap was
-        # once bypassed.
         primary = MARKETS[0][0]
+        now_s = time.time()
+        now_ms = int(now_s * 1000)
+        cache = getattr(self, "_round_cache", None)
+        if cache is None:
+            cache = self._round_cache = {}
+        # A round's METADATA -- strike, token ids, end time -- is fixed once the
+        # round opens. Only spot and the ask move, and both arrive on their own
+        # feeds. So a family needs the paginated sweep only when its round has
+        # actually ROLLED, which is what makes six traded families affordable:
+        # `rounds_by_prefixes` stops early only when EVERY requested prefix is
+        # found, and a quiet family sinks through the day (bnb-updown-5m hit
+        # offset 1450 -- 30 pages, 3.95s). Re-sweeping all six every poll is
+        # precisely the coupling that made short crossings invisible.
+        stale = [p for p, _, _ in MARKETS
+                 if cache.get(p) is None
+                 or getattr(cache[p], "end_ms", 0) <= now_ms
+                 or getattr(cache[p], "strike", None) is None]
+        # The primary is refetched every poll regardless: it is page 1 (highest
+        # volume) so it costs one request, and the model arm reads its live
+        # displayed price, not just its strike.
+        want = sorted(set(stale) | {primary})
+        found = await self.market.rounds_by_prefixes(want)
+        for pfx, rr in found.items():
+            if rr:
+                cache[pfx] = rr
+        # Spot history for EVERY symbol, appended HERE rather than in _record.
+        # The range gate reads this buffer, and a family whose round is only
+        # refetched on a roll would otherwise measure its range on a handful of
+        # samples -- the gate would return None ("no opinion") and silently not
+        # apply. Costs no network: the spot feeds are websockets.
+        buf = getattr(self, "_ticks", None)
+        if buf is None:
+            buf = self._ticks = {}
+        # Guarded: fixtures build a Bot via __new__ and have no `spots`.
+        spots = getattr(self, "spots", None) or {}
+        for sym in {s for _, s, _ in MARKETS}:
+            f = spots.get(sym)
+            px = getattr(f, "price", None) if f is not None else None
+            if px:
+                tbuf = buf.setdefault(sym, [])
+                tbuf.append((now_ms, px))
+                if len(tbuf) > 2400:
+                    del tbuf[: len(tbuf) - 2400]
+        # `trade` is membership of CROSS_TRADED, NOT "is primary". The two are
+        # deliberately separate: MARKETS widens the tape, CROSS_TRADED widens
+        # the risk, and collapsing them is how the daily loss cap was once
+        # bypassed.
+        self._mkt = {}
         for prefix, sym, _ in MARKETS:
-            r = found.get(prefix)
+            r = cache.get(prefix)
             if r:
-                await self._record(r, sym, trade=(prefix == primary))
+                await self._record(r, sym,
+                                   trade=(prefix in CROSS_TRADED),
+                                   primary=(prefix == primary))
         # The websocket book follows EVERY market, not just the traded one. The
-        # recorded-only families had no book at all (the REST fetch below is
-        # gated on `trade` because it costs SAPI quota and we have been rate
-        # limited), so their tape carried win rates but no executable price --
+        # recorded-only families had no book at all (the REST fetch in _record
+        # is gated on `primary` because it costs SAPI quota and we have been
+        # rate limited), so their tape carried win rates but no price --
         # and win rate alone cannot clear a market, whose break-even is ~0.665
         # at live fills. The websocket costs no quota, and `follow` puts all of
         # them in ONE topic, so this is the cheap half of that fix.
@@ -626,26 +658,52 @@ class Bot:
         # the same one a stale book already takes.
         wsb = getattr(self, "ws_book", None)
         if wsb is not None:
-            # ONLY the traded market. Following all six was measured to cost
-            # 3-4x the decision cadence -- the book feed ingests ~6x the message
-            # volume in this process, and the poll loop went from a 1.00s median
-            # to 4.15s (3.04s after the handshake fix). That is not a background
-            # cost: the cross arm compares the newest tick with one 2-4s old, so
-            # a slower poll widens the window in which a real crossing is
-            # invisible. btc-updown-5m 1789336500 is the worked example --
-            # spot crossed the strike to 77336.00 for ~1.5s and the arm never
-            # saw it, because the polls either side both sampled below.
-            # The recorded families were subscribed to price a multi-market
-            # expansion; the corpus has since answered that question (BTC is the
-            # only family individually significant), so the cost buys nothing.
-            r0 = found.get(MARKETS[0][0])
-            if r0 is not None and r0.market_id:
-                wsb.follow([r0.market_id])
+            # EVERY family the cross arm may order in. Off-primary there is no
+            # REST book and no displayed-price fallback (see _cross_tick), so a
+            # market without a websocket book simply cannot trade.
+            #
+            # THIS IS THE MEASURED RISK OF THE WIDENING. Following all six once
+            # took the poll from a 1.00s median to 4.15s (3.04s after the
+            # handshake fix) because the book feed ingests ~6x the message
+            # volume in this process -- and that is not a background cost: the
+            # cross arm compares the newest tick with one 1-3s old, so a slow
+            # poll makes short crossings invisible. btc-updown-5m 1789336500 is
+            # the worked case, a ~1.5s crossing the arm never sampled.
+            #
+            # Two things are different now. The paginated sweep no longer runs
+            # every poll (rounds are cached until they roll), which was the
+            # other half of that 4.15s; and `poll_ms` below reports the cadence
+            # continuously, so this is monitored rather than assumed. If it
+            # degrades, `cross_ws_follow_all` turns it off without a deploy.
+            ids = [c["round"].market_id
+                   for pfx, c in (getattr(self, "_mkt", None) or {}).items()
+                   if c.get("round") is not None and c["round"].market_id
+                   and (settings.cross_ws_follow_all or pfx == primary)]
+            if not ids:
+                r0 = cache.get(primary)
+                if r0 is not None and r0.market_id:
+                    ids = [r0.market_id]
+            if ids:
+                wsb.follow(ids)
+        # AFTER the subscription, not before. The arm refuses off-primary
+        # without a fresh websocket book, so evaluating first would spend the
+        # poll in which a newly-appeared family could have traded -- and on a
+        # round roll that is every family at once.
+        await self._cross_all()
 
-    async def _record(self, r, symbol: str, *, trade: bool) -> None:
+    async def _record(self, r, symbol: str, *, trade: bool,
+                      primary: bool = False) -> None:
         self.store.upsert_round(round_row(r))
-        self.spot = self.spots[symbol]
-        self.vol = self.vols[symbol]
+        feed = self.spots[symbol]
+        vol = self.vols[symbol]
+        # self.spot / self.vol are the PRIMARY's and are set once. They used to
+        # be reassigned on every market in the loop, so after the loop they held
+        # the LAST family's feed while _round still held BTC -- which on
+        # 2026-09-12 compared ETH's price to BTC's strike (-9672 bps) and bought
+        # BTC Down because ETH had ticked. Everything below reads the locals.
+        if primary:
+            self.spot = feed
+            self.vol = vol
 
         now_ms = int(time.time() * 1000)
         tau = r.tau_s(now_ms)
@@ -653,14 +711,19 @@ class Bot:
         if not up or not down or r.strike is None:
             return
 
-        spot = self.spot.price
-        sigma = self.vol.sigma_1m()
+        spot = feed.price
+        sigma = vol.sigma_1m()
 
         # Buy prices come from the real book (the ask), not the displayed
         # last-trade price, which was observed 2-3 cents away from the mid.
         up_bid = up_ask = down_bid = down_ask = None
-        if self.book and r.market_id and trade:
-            # Only the market we are allowed to trade: the untraded market's
+        if self.book and r.market_id and primary:
+            # Only the PRIMARY, not every traded family: the REST book costs
+            # SAPI quota and we have been rate limited, so six families would
+            # be twelve calls a second. The other families price off the
+            # websocket book instead, and _cross_one REFUSES them outright when
+            # that book is stale rather than falling back to a displayed price
+            # that may be seconds old. The untraded market's
             # books were fetched every second purely for the recorder, tripling
             # SAPI calls for data no replay uses (the tool is BTC-only). If the
             # venue rate-limits, best_prices() returns None and the bot silently
@@ -711,7 +774,7 @@ class Bot:
             "up_price": up.price, "down_price": down.price,
             "up_chance": up.chance, "down_chance": down.chance,
             "liquidity": r.liquidity, "trade_volume": r.trade_volume,
-            "spot": spot, "spot_ts_ms": self.spot.ts_ms,
+            "spot": spot, "spot_ts_ms": feed.ts_ms,
             "oracle": None, "oracle_ts_ms": None,
             "strike": r.strike,
             "up_bid": up_bid, "up_ask": up_ask,
@@ -720,6 +783,21 @@ class Bot:
         })
 
         if self.mode == "record" or not trade or spot is None or tau <= 0:
+            return
+
+        # Per-market context for the cross arm, which now runs across every
+        # family in CROSS_TRADED. tick() clears and rebuilds this each poll, so
+        # a family that stops reporting drops out rather than going stale.
+        mkt = getattr(self, "_mkt", None)
+        if mkt is None:
+            mkt = self._mkt = {}
+        mkt[market_prefix(r.slug) or r.slug] = {
+            "round": r, "asks": (buy_up, buy_down), "feed": feed,
+            "symbol": symbol, "sigma": sigma, "primary": primary,
+        }
+        # Everything below is the PRIMARY-only path: the model, impulse and
+        # double arms were measured on BTC 5m and are not widened here.
+        if not primary:
             return
 
         # What the fast impulse path needs to act between polls (see
@@ -739,21 +817,15 @@ class Bot:
         # -9672 bps) and bought BTC Down because ETH had ticked. The same
         # nonsense fair priced an Up take-limit at max(0.01, 0 - 0.04) = 0.01,
         # which is the unfillable order that stalled the arm for an hour.
-        self._primary_spot = self.spot
-        await self._cross_tick()
+        self._primary_spot = feed
         await self._double_tick()
 
         hist = self.histories[symbol]
         hist.add_tick(spot)
+        # tick() now appends `_ticks` for EVERY symbol, so this only reads it.
         # Guarded lookup: fixtures build a Bot without running __init__, and the
         # tick buffer must not be the thing that breaks them.
-        buf = getattr(self, "_ticks", None)
-        if buf is None:
-            buf = self._ticks = {}
-        ticks = buf.setdefault(symbol, [])
-        ticks.append((now_ms, spot))
-        if len(ticks) > 2400:
-            del ticks[: len(ticks) - 2400]
+        ticks = (getattr(self, "_ticks", None) or {}).get(symbol) or []
 
         # entry_mode "off" stops the MAIN arm here: the cross and double ticks
         # above have already run, the tape is already recorded, and the history
@@ -1350,15 +1422,20 @@ class Bot:
                               # otherwise disagree about which budget it spends.
                               mode="impulse")
 
-    def _ck(self, name: str):
-        """A cross knob for the round this arm is looking at.
+    def _ck(self, name: str, r=None):
+        """A cross knob for ONE round.
 
-        Falls back to the global `settings.cross_<name>` for any market that
-        has no entry in `cross_overrides`, so widening MARKETS cannot change
-        how BTC trades. See config.cross_overrides for the measured per-market
-        spreads that motivate overriding at all.
+        `r` is explicit because the arm now runs across every family in
+        CROSS_TRADED and the knobs differ between them -- reading `self._round`
+        here would price eth-updown-15m with BTC's range gate. It falls back to
+        `self._round` only for the single-market call path.
+
+        Unknown markets fall through to the global `settings.cross_<name>`, so
+        widening MARKETS cannot silently change how BTC trades. See
+        config.cross_overrides for the measured per-market spreads.
         """
-        r = getattr(self, "_round", None)
+        if r is None:
+            r = getattr(self, "_round", None)
         return cross_knob(market_prefix(getattr(r, "slug", None)), name)
 
     def _round_range_bps(self, r) -> float | None:
@@ -1381,7 +1458,7 @@ class Bot:
         return 1e4 * (max(seen) - min(seen)) / r.strike
 
     def _cross_refuse(self, r, side, reason: str, *, tau: float = 0.0,
-                      spot=None, stake: float = 0.0) -> None:
+                      spot=None, stake: float = 0.0, sigma=None) -> None:
         """Record a cross trigger that was DETECTED and then refused.
 
         Two problems this fixes, both found on 2026-09-14 while reconstructing
@@ -1398,26 +1475,88 @@ class Bot:
           for 11 rounds. Deduped per (round, reason), so a refusal that persists
           for a whole round is one line and one row.
         """
-        # getattr, not attribute access: the fixtures build a Bot with
-        # __new__ and never run __init__, which is the same reason `_ticks`
-        # is looked up that way a few methods down.
+        # Keyed BY SLUG, one entry per live round. It used to hold a single
+        # {"slug", "seen"} pair and reset whenever the slug changed, which was
+        # right for one family and defeats the dedupe entirely with six: each
+        # market's refusal resets the previous market's memory, so on the
+        # websocket clock (~114/s) every refusal logs and inserts a row on every
+        # evaluation -- the exact spam this method was written to stop.
+        #
+        # getattr, not attribute access: the fixtures build a Bot with __new__
+        # and never run __init__, the same reason `_ticks` is looked up that way.
         seen = getattr(self, "_cross_refused", None)
-        if not isinstance(seen, dict) or seen.get("slug") != r.slug:
-            seen = self._cross_refused = {"slug": r.slug, "seen": set()}
-        if reason in seen["seen"]:
+        if not isinstance(seen, dict) or "seen" in seen:
+            seen = self._cross_refused = {}         # drop the old single-slug shape
+        live = {c["round"].slug
+                for c in (getattr(self, "_mkt", None) or {}).values()
+                if c.get("round") is not None} | {r.slug}
+        for k in [k for k in seen if k not in live]:
+            del seen[k]
+        bucket = seen.setdefault(r.slug, set())
+        if reason in bucket:
             return
-        seen["seen"].add(reason)
+        bucket.add(reason)
         log.info("cross %s %s not taken: %s", r.slug, side, reason)
         with contextlib.suppress(Exception):
             self.store.insert("decisions", {
                 "slug": r.slug, "ts_ms": int(time.time() * 1000), "tau_s": tau,
                 "side": side, "fair": None, "quote": None, "edge": 0.0,
-                "hurdle": 0.0, "sigma_1m": getattr(self, "_sigma", 0.0),
+                "hurdle": 0.0,
+                # the REFUSED market's sigma; `self._sigma` is the primary's,
+                # which would mislabel every eth/bnb row.
+                "sigma_1m": (sigma if sigma is not None
+                             else getattr(self, "_sigma", 0.0)),
                 "spot": spot, "oracle": None, "strike": r.strike,
                 "stake": stake, "acted": 0, "reason": f"cross refused: {reason}",
             })
 
-    async def _cross_tick(self) -> None:
+    def _open_cross_stake(self) -> float:
+        """Total stake in cross positions that have not settled yet.
+
+        Read from the LEDGER, not tracked in memory: a restart must not reset it
+        to zero, which is precisely how an exposure cap silently stops capping.
+        Cached for a second because the arm asks once per family per poll.
+
+        On a query failure this returns the LAST KNOWN value rather than 0.0 --
+        unknown exposure must never read as no exposure.
+        """
+        now = time.time()
+        if now - getattr(self, "_open_stake_at", 0.0) < 1.0:
+            return getattr(self, "_open_stake", 0.0)
+        try:
+            rows = self.store.query(
+                "SELECT COALESCE(SUM(f.stake), 0.0) AS s FROM fills f "
+                "LEFT JOIN settlements st ON st.fill_id = f.id "
+                "WHERE st.id IS NULL AND f.mode = 'cross'")
+            val = float(rows[0]["s"] or 0.0) if rows else 0.0
+        except Exception:                                   # pragma: no cover
+            return getattr(self, "_open_stake", 0.0)
+        self._open_stake, self._open_stake_at = val, now
+        return val
+
+    async def _cross_all(self) -> None:
+        """Run the cross arm over every family in CROSS_TRADED.
+
+        One family raising must not stop the others -- a six-market arm whose
+        whole loop dies because eth-updown-15m returned a malformed round is
+        strictly worse than the single-market one it replaced.
+
+        With no per-market context (fixtures, or a poll that recorded nothing)
+        this falls back to the single-market path so the arm behaves exactly as
+        it did before it was widened.
+        """
+        mkt = getattr(self, "_mkt", None)
+        if not mkt:
+            await self._cross_tick()
+            return
+        for prefix, ctx in list(mkt.items()):
+            try:
+                await self._cross_tick(ctx)
+            except Exception as e:                      # pragma: no cover
+                log.exception("cross tick failed for %s: %s: %s",
+                              prefix, type(e).__name__, e)
+
+    async def _cross_tick(self, ctx=None) -> None:
         """Buy the side the spot JUST crossed into, while the venue undershoots.
 
         See config.cross_* for the measurement and for why it is thin. It is
@@ -1436,14 +1575,29 @@ class Bot:
             (see _unbooked_round_tokens), not on any held token. Blocking on
             any token refused 52% of its triggers, all of them to the main arm.
         """
-        if not self._ck("enabled") or self.mode not in ("live", "paper"):
+        # getattr: tick() now calls this directly (via _cross_all) rather than
+        # only from _record, and fixtures build Bot via __new__ with no `mode`.
+        if getattr(self, "mode", None) not in ("live", "paper"):
             return
-        r = getattr(self, "_round", None)
-        # NOT self.spot: the poll rewrites it once per market as it walks
-        # MARKETS, so on the websocket clock it holds the LAST symbol's feed.
-        feed = getattr(self, "_primary_spot", None)
-        if feed is None:
-            feed = self.spots.get(MARKETS[0][1])
+        # `ctx` is one family's state, built by _record and dispatched by
+        # _cross_all. None means the single-market path (the primary), which is
+        # kept so the arm stays directly callable and testable.
+        if ctx is None:
+            r = getattr(self, "_round", None)
+            # NOT self.spot: the poll used to rewrite it once per market as it
+            # walked MARKETS, so on the websocket clock it held the LAST
+            # symbol's feed.
+            feed = getattr(self, "_primary_spot", None)
+            if feed is None:
+                feed = self.spots.get(MARKETS[0][1])
+            primary = True
+        else:
+            r, feed = ctx["round"], ctx["feed"]
+            primary = ctx.get("primary", False)
+        asks = (getattr(self, "_asks", (None, None)) if ctx is None
+                else ctx.get("asks", (None, None)))
+        if not self._ck("enabled", r):
+            return
         ticks = getattr(feed, "ticks", None)
         if r is None or not ticks or r.strike is None:
             return
@@ -1457,17 +1611,19 @@ class Bot:
         # skips __init__ (the same trap `_cross_refused` hit on 2026-09-14).
         if not isinstance(getattr(self, "_cross_side", None), dict):
             self._cross_side = {}
-        if self._cross_fired.get(r.slug, 0) >= self._ck("max_per_round"):
+        if self._cross_fired.get(r.slug, 0) >= self._ck("max_per_round", r):
             return
-        # Only the live round is worth remembering; the map would otherwise
-        # grow all day.
-        self._cross_fired = {k: v for k, v in self._cross_fired.items()
-                             if k == r.slug}
-        self._cross_side = {k: v for k, v in self._cross_side.items()
-                            if k == r.slug}
+        # Keep every LIVE round, not just this one. Pruning to `r.slug` was
+        # correct with a single family and is a bug with six: each family's call
+        # would wipe the others' per-round state, so every market would forget
+        # it had already fired and the per-round cap would never bind.
+        live = {c["round"].slug for c in (getattr(self, "_mkt", None) or {}).values()
+                if c.get("round") is not None} | {r.slug}
+        self._cross_fired = {k: v for k, v in self._cross_fired.items() if k in live}
+        self._cross_side = {k: v for k, v in self._cross_side.items() if k in live}
         now_ms = int(time.time() * 1000)
         tau = r.tau_s(now_ms)
-        if not (self._ck("min_tau_s") <= tau <= self._ck("max_tau_s")):
+        if not (self._ck("min_tau_s", r) <= tau <= self._ck("max_tau_s", r)):
             return
         up, down = r.up, r.down
         if not up or not down:
@@ -1484,10 +1640,10 @@ class Bot:
         # rather than a bare `>=`: at cap 0 a bare compare reads 0 >= 0 as
         # "budget exhausted" and silently disables the arm outright, which is
         # the exact opposite of what setting it to 0 is meant to express.
-        cap_per_day = self._ck("max_per_day")
+        cap_per_day = self._ck("max_per_day", r)
         if cap_per_day > 0 and self._cross_count >= cap_per_day:
             return
-        side = crossed_side(list(ticks), r.strike, self._ck("look_s"))
+        side = crossed_side(list(ticks), r.strike, self._ck("look_s", r))
         if side is None:
             return
         # A crossing BACK through the strike is not a hedge on what we already
@@ -1505,7 +1661,7 @@ class Bot:
         # the websocket clock, and blocking on any held token is exactly the
         # arms-independence rule this arm exists outside of. The window is one
         # round and the observed failure (two entries 22s apart) is in-process.
-        if not self._ck("allow_reversal"):
+        if not self._ck("allow_reversal", r):
             held = self._cross_side.get(r.slug)
             if held is not None and held != side:
                 self._cross_refuse(
@@ -1517,13 +1673,19 @@ class Bot:
         # deep has been seen and repriced (that cell measures -0.19/$1); the
         # edge lives in the nick the venue has not registered yet.
         spot_now = feed.price
-        sigma_now = getattr(self, "_sigma", 0.0)
+        # THIS family's sigma. `self._sigma` is the primary's, so before the
+        # widening it was the same object; with six families it would size
+        # eth/bnb's moneyness tilt off BTC's volatility and label every
+        # recorded row with it.
+        sigma_now = (ctx.get("sigma") if ctx else getattr(self, "_sigma", 0.0))
+        if not sigma_now:
+            sigma_now = getattr(self, "_sigma", 0.0) or 0.0
         depth_bps = 1e4 * abs(spot_now - r.strike) / r.strike if r.strike else 1e9
-        if depth_bps > self._ck("max_depth_bps"):
+        if depth_bps > self._ck("max_depth_bps", r):
             self._cross_refuse(r, side,
                                f"{depth_bps:.2f}bps through the strike, gate is "
                                f"{self._ck('max_depth_bps'):.2f}",
-                               tau=tau, spot=spot_now)
+                               tau=tau, spot=spot_now, sigma=sigma_now)
             return
         # How far this round has ALREADY travelled, open -> now. A round that
         # has swung wide is one where a late crossing reverses again; a calm
@@ -1533,7 +1695,7 @@ class Bot:
         # ticks, which at BTC's live ~114/s is 35 seconds -- it does not span a
         # 5-minute round. `self._ticks` is appended once per poll and holds
         # 2400 samples, so it does.
-        rng_gate = self._ck("max_round_range_bps")
+        rng_gate = self._ck("max_round_range_bps", r)
         if rng_gate > 0:
             rng_bps = self._round_range_bps(r)
             if rng_bps is not None:
@@ -1542,7 +1704,7 @@ class Bot:
                         r, side,
                         f"round already moved {rng_bps:.1f}bps, gate is "
                         f"{rng_gate:.1f}",
-                        tau=tau, spot=spot_now)
+                        tau=tau, spot=spot_now, sigma=sigma_now)
                     return
         # The price that binds is the order's own quote; this is band sanity on
         # the last asks the poll saw. The ceiling is what makes the arm pay --
@@ -1573,14 +1735,27 @@ class Bot:
             # sub-second; gating on it from that evidence would be fitting.
             # The websocket samples at ~250ms, so a day of live triggers
             # measures it properly and then the gate is a decision, not a bet.
-            stale_ref = self._asks[0] if side == "Up" else self._asks[1]
+            stale_ref = asks[0] if side == "Up" else asks[1]
             book_run = (ask - stale_ref) if stale_ref is not None else None
-        else:
-            ask = self._asks[0] if side == "Up" else self._asks[1]
+        elif primary:
+            # `asks`, not `self._asks`: with six families in flight the
+            # attribute holds the PRIMARY's book, so a non-primary market would
+            # have priced its order off BTC's ask.
+            ask = asks[0] if side == "Up" else asks[1]
             depth_usd = None                    # unknown: do not cap on it
             book_run = None
-        if ask is None or not (self._ck("min_price") <= ask
-                               <= self._ck("max_price")):
+        else:
+            # OFF-PRIMARY THERE IS NO FALLBACK. Only the primary fetches the
+            # REST book (it is the one that costs SAPI quota), and its round is
+            # the only one refetched every poll -- so for the other families the
+            # displayed price behind `asks` can be a whole round old. Pricing a
+            # live order off that is how a stale book becomes a filled trade, so
+            # a stale websocket means no trade rather than a guessed one.
+            self._cross_refuse(r, side, "no fresh websocket book off-primary",
+                               tau=tau, spot=spot_now, sigma=sigma_now)
+            return
+        if ask is None or not (self._ck("min_price", r) <= ask
+                               <= self._ck("max_price", r)):
             self._cross_refuse(
                 r, side,
                 ("no ask on the book" if ask is None else
@@ -1604,8 +1779,8 @@ class Bot:
         # tilt_factor returns 1.0 (NOT tilt_max) when z is exactly 0, which is
         # its "no information" path, so a zero sigma or zero tau sizes neutral
         # rather than doubling on a reading we do not have.
-        if self._ck("stake_usdt") is not None:
-            stake = self._ck("stake_usdt")
+        if self._ck("stake_usdt", r) is not None:
+            stake = self._ck("stake_usdt", r)
         else:
             mz = (abs(math.log(spot_now / r.strike))
                   / (sigma_now * math.sqrt(tau / 60.0))
@@ -1616,7 +1791,7 @@ class Bot:
             # This arm only: see config.cross_stake_mult for the sweep. The
             # cap still binds -- the multiplier scales the arm, it does not
             # exempt it from stake_cap_usdt.
-            stake = round(stake * self._ck("stake_mult"), 2)
+            stake = round(stake * self._ck("stake_mult", r), 2)
             if settings.stake_cap_usdt > 0:      # 0 = no cap, see config
                 stake = min(stake, settings.stake_cap_usdt)
         # Size to what is actually resting at the touch. On 2026-09-13 the arm
@@ -1643,12 +1818,12 @@ class Bot:
             # The gate applies to what we will PAY, not to the touch we happen
             # to see. cross_max_price is the load-bearing gate of this arm; a
             # sweep price outside it is a trade the measurement never blessed.
-            if not (self._ck("min_price") <= sweep_px
-                    <= self._ck("max_price")):
+            if not (self._ck("min_price", r) <= sweep_px
+                    <= self._ck("max_price", r)):
                 log.info("cross %s %s not taken: sweep price %.3f for $%.2f "
                          "is outside %.2f-%.2f (touch was %.3f)", r.slug, side,
-                         sweep_px, stake, self._ck("min_price"),
-                         self._ck("max_price"), ask)
+                         sweep_px, stake, self._ck("min_price", r),
+                         self._ck("max_price", r), ask)
                 return
             if sweep_px > ask + 1e-9:
                 log.info("cross %s %s: $%.2f sweeps to %.3f (touch %.3f, "
@@ -1657,6 +1832,22 @@ class Bot:
             ask = sweep_px
         if stake < settings.min_order_usdt or self.bankroll < stake:
             return
+        # ACCOUNT-WIDE exposure, across every family. See
+        # config.cross_max_open_stake_pct: with six markets 0.945 of
+        # simultaneously-open positions sit on the SAME side, so this is one bet
+        # held many times, and the daily loss cap cannot help because they
+        # expire together. Checked here -- after depth sizing, before ordering
+        # -- so the number compared is the stake actually about to be committed.
+        cap_pct = settings.cross_max_open_stake_pct
+        if cap_pct > 0 and self.bankroll > 0:
+            open_stake = self._open_cross_stake()
+            if open_stake + stake > cap_pct * self.bankroll:
+                self._cross_refuse(
+                    r, side,
+                    f"open cross exposure ${open_stake:.2f} + ${stake:.2f} "
+                    f"exceeds {100 * cap_pct:.0f}% of ${self.bankroll:.2f}",
+                    tau=tau, spot=spot_now, stake=stake, sigma=sigma_now)
+                return
         # The venue list is consulted to confirm we can still READ it: an
         # unreadable position list means we cannot reason about exposure at
         # all, so the arm sits the round out.
@@ -1691,7 +1882,7 @@ class Bot:
         # the measurement. Only the main arm counts -- a cross opposite an
         # earlier CROSS is the alternating-hedge case cross_max_per_round
         # exists to allow.
-        if self._ck("skip_opposite_to_main"):
+        if self._ck("skip_opposite_to_main", r):
             for fid, (fslug, held) in list(self.open_fills.items()):
                 if fslug != r.slug or getattr(held, "side", None) == side:
                     continue
@@ -1702,7 +1893,7 @@ class Bot:
                     r, side,
                     "the main arm holds the opposite side here (measured "
                     "EV/$1 -0.107 against +0.356 same-side)",
-                    tau=tau, spot=spot_now)
+                    tau=tau, spot=spot_now, sigma=sigma_now)
                 return
         # The RESERVED slot, not the main one. The main arm enters at tau
         # 60-210 and holds to settlement, which covers this arm's whole window,
@@ -1710,10 +1901,16 @@ class Bot:
         # and 61% of those wanted the OPPOSITE side, i.e. hedges were being
         # blocked rather than double exposure prevented. Both sides are taken;
         # see check_reserved for what that gives up.
+        # `max_open` is ACCOUNT-WIDE (guards.state.reserved_open counts every
+        # open reserved position), so it must NOT be the per-round knob. The
+        # per-round limit is enforced separately at the top of this method via
+        # `_cross_fired[r.slug]`. Passing max_per_round here was harmless with
+        # one family and would have capped all six at 5 concurrent positions.
         allowed, why = self.guard.check_reserved(
-            r.slug, max_open=self._ck("max_per_round"))
+            r.slug, max_open=(settings.cross_max_open_positions
+                              or 10 ** 6))
         if not allowed:
-            self._cross_refuse(r, side, why, tau=tau, spot=spot_now)
+            self._cross_refuse(r, side, why, tau=tau, spot=spot_now, sigma=sigma_now)
             return
         # Claim before ordering, so a rejection skips the round rather than
         # risking a second attempt at it.
@@ -1783,9 +1980,9 @@ class Bot:
         #
         # `cross_limit_buffer` stays the absolute cap; see config for the
         # limit-pinning sweep that chose 0.25 over the more aggressive 0.35/0.50.
-        buf = max(0.01, min(self._ck("limit_buffer"),
-                            self._ck("limit_buffer_inv") * (1.0 - ask)))
-        ceil_side = min(self._ck("max_price"), round(ask + buf, 2))
+        buf = max(0.01, min(self._ck("limit_buffer", r),
+                            self._ck("limit_buffer_inv", r) * (1.0 - ask)))
+        ceil_side = min(self._ck("max_price", r), round(ask + buf, 2))
         # INSTRUMENTATION. Three explanations for the gate->fill gap have now
         # been wrong: a stale gate (the websocket made it fresh and the gap
         # stayed), order latency (get_quote round-trips measure 43ms), and
@@ -1964,7 +2161,7 @@ class Bot:
                 if want_impulse:
                     await self._impulse_tick()
                 if want_cross:
-                    await self._cross_tick()
+                    await self._cross_all()
             except Exception as e:                      # noqa: BLE001
                 # Never let a trigger bug take down the loop: recording,
                 # settlement and the risk guard all live in the poll.
@@ -2487,6 +2684,19 @@ class Bot:
                 log.info("stats: rounds=%d quotes=%d decisions=%d fills=%d | %s",
                          c["rounds"], c["quotes"], c["decisions"], c["fills"], self.pnl)
             elapsed = time.time() - t0
+            # The cadence this arm's edge depends on. Reported rather than
+            # assumed, because widening the websocket book to six families is
+            # the one change in this repo measured to slow it (1.00s -> 4.15s).
+            pm = getattr(self, "_poll_ms", None)
+            if pm is None:
+                pm = self._poll_ms = []
+            pm.append(elapsed * 1000.0)
+            if len(pm) >= 120:
+                q = sorted(pm)
+                log.info("poll cadence over %d ticks: median %.0fms p90 %.0fms "
+                         "max %.0fms", len(q), q[len(q) // 2],
+                         q[int(len(q) * 0.9)], q[-1])
+                self._poll_ms = []
             # In impulse mode this is spent waiting on the price feed rather
             # than on the clock, so the trigger fires ~20 ms after the move
             # instead of up to a poll interval later (see _idle).

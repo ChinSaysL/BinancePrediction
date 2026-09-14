@@ -55,19 +55,40 @@ def test_impulse_tick_does_not_read_the_shared_spot_attribute() -> None:
 
 
 def test_record_captures_the_primary_feed() -> None:
-    """`_primary_spot` is set where the traded round is bound."""
+    """`_primary_spot` is set where the traded round is bound.
+
+    It now captures the LOCAL `feed`, not `self.spot`. That is strictly
+    stronger: `self.spot` was shared state rewritten once per market, so
+    capturing it depended on loop order; the local cannot be another family's.
+    """
     src = _method_source("_record")
-    assert "self._primary_spot = self.spot" in src, (
+    assert "self._primary_spot = feed" in src, (
         "_record must capture the primary feed next to `self._round = r`"
     )
 
 
-def test_the_primary_market_is_the_one_captured() -> None:
-    """_primary_spot is assigned AFTER the trade check, so a recorded-only
-    market can never become the feed the impulse arm trades on."""
+def test_record_never_reads_shared_spot_state_for_a_recorded_row() -> None:
+    """The quotes row must describe the family being recorded, not whichever
+    feed `self.spot` happens to hold. This caught a real bug when the arm was
+    widened to six families: `spot_ts_ms` was still reading `self.spot.ts_ms`,
+    which for a non-primary family is the PRIMARY's timestamp."""
     src = _method_source("_record")
-    guard = src.index("if self.mode == \"record\" or not trade")
-    capture = src.index("self._primary_spot = self.spot")
+    row = src[src.index('self.store.insert("quotes"'):]
+    row = row[:row.index("})")]
+    assert "self.spot" not in row, (
+        "the quotes row reads shared spot state; it must use the local `feed`"
+    )
+
+
+def test_the_primary_market_is_the_one_captured() -> None:
+    """_primary_spot is assigned after the `not primary` return, so no other
+    family -- traded or merely recorded -- can become the impulse arm's feed.
+
+    Tightened when the cross arm was widened to six families: the guard used to
+    be `not trade`, which now admits eth/bnb/15m."""
+    src = _method_source("_record")
+    guard = src.index("if not primary:")
+    capture = src.index("self._primary_spot = feed")
     assert capture > guard, (
         "_primary_spot must be captured after the `not trade` return, or an "
         "untraded family (ETH/BNB/15m) becomes the impulse arm's price feed"

@@ -145,7 +145,7 @@ def test_an_actionable_signal_reaches_sizing_without_raising(store, monkeypatch,
         return None                             # rejected: no fill row
 
     bot._place_order = fake_place
-    asyncio.run(bot._record(make_round(), "BTCUSDT", trade=True))
+    asyncio.run(bot._record(make_round(), "BTCUSDT", trade=True, primary=True))
 
     assert bot.store.counts()["quotes"] == 1
     rows = bot.store.query("SELECT * FROM decisions")
@@ -168,7 +168,7 @@ def test_a_gated_signal_is_recorded_but_not_ordered(store, monkeypatch,
         raise AssertionError("a gated signal must not be ordered")
 
     bot._place_order = boom
-    asyncio.run(bot._record(make_round(), "BTCUSDT", trade=True))
+    asyncio.run(bot._record(make_round(), "BTCUSDT", trade=True, primary=True))
 
     rows = bot.store.query("SELECT * FROM decisions")
     assert len(rows) == 1
@@ -201,7 +201,7 @@ def test_impulse_mode_poll_never_falls_through_to_the_model(store, monkeypatch,
         raise AssertionError("impulse mode must never order from the poll")
 
     bot._place_order = boom
-    asyncio.run(bot._record(make_round(), "BTCUSDT", trade=True))
+    asyncio.run(bot._record(make_round(), "BTCUSDT", trade=True, primary=True))
 
     assert bot.store.counts()["quotes"] == 1, "the poll still records the tick"
     assert bot.store.counts()["decisions"] == 0
@@ -236,7 +236,7 @@ def test_both_mode_falls_through_to_the_model_when_the_impulse_is_quiet(
         return None
 
     bot._place_order = capture
-    asyncio.run(bot._record(make_round(), "BTCUSDT", trade=True))
+    asyncio.run(bot._record(make_round(), "BTCUSDT", trade=True, primary=True))
 
     assert asked, "both mode must consult the model when the impulse is quiet"
     assert bot.store.counts()["decisions"] == 1
@@ -269,7 +269,7 @@ def test_both_mode_still_lets_the_impulse_own_the_round(store, monkeypatch,
         raise AssertionError("the model re-entered a round it already holds")
 
     bot._place_order = boom
-    asyncio.run(bot._record(r, "BTCUSDT", trade=True))
+    asyncio.run(bot._record(r, "BTCUSDT", trade=True, primary=True))
 
     assert bot.store.counts()["decisions"] == 1, "the refusal is still recorded"
 
@@ -306,7 +306,7 @@ def test_a_stale_display_rests_below_the_book_instead_of_crossing(
         raise AssertionError("a stale display must NOT be crossed with a taker")
 
     bot._place_order = boom
-    asyncio.run(bot._record(make_round(), "BTCUSDT", trade=True))
+    asyncio.run(bot._record(make_round(), "BTCUSDT", trade=True, primary=True))
 
     assert posted, "it must post a resting bid"
     assert posted["limit_px"] == 0.41, "post at the stale display plus the offset"
@@ -326,7 +326,7 @@ def test_an_unfilled_rest_leaves_the_attempt_recorded(store, monkeypatch,
         return None
 
     bot.broker = SimpleNamespace(mode="paper", buy_limit=buy_limit)
-    asyncio.run(bot._record(make_round(), "BTCUSDT", trade=True))
+    asyncio.run(bot._record(make_round(), "BTCUSDT", trade=True, primary=True))
 
     rows = bot.store.query("SELECT acted FROM decisions")
     assert len(rows) == 1, "the attempt is recorded"
@@ -351,7 +351,7 @@ def test_a_fresh_display_still_takes_the_normal_taker_path(store, monkeypatch,
 
     bot.broker = SimpleNamespace(mode="paper", buy_limit=buy_limit)
     bot._place_order = taker
-    asyncio.run(bot._record(make_round(), "BTCUSDT", trade=True))
+    asyncio.run(bot._record(make_round(), "BTCUSDT", trade=True, primary=True))
     assert took, "it must fall back to the taker order"
 
 
@@ -372,7 +372,7 @@ def test_the_arm_is_inert_while_the_flag_is_off(store, monkeypatch, no_gates):
 
     bot.broker = SimpleNamespace(mode="paper", buy_limit=buy_limit)
     bot._place_order = taker
-    asyncio.run(bot._record(make_round(), "BTCUSDT", trade=True))
+    asyncio.run(bot._record(make_round(), "BTCUSDT", trade=True, primary=True))
     assert took, "with the flag off the taker path is unchanged"
 
 

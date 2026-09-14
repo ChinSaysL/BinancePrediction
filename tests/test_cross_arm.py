@@ -553,8 +553,14 @@ class TestTheArm:
         """The reserved slots are a small POOL, not one seat -- the cross arm
         takes several crosses per round -- but it is still bounded, so a choppy
         round cannot open unlimited correlated exposure against the daily cap.
+
+        The bound is `cross_max_open_positions`, NOT `cross_max_per_round`:
+        `reserved_open` counts every open reserved position ACROSS FAMILIES, and
+        since the arm was widened to six markets a per-round knob can no longer
+        stand in for an account-wide one.
         """
-        monkeypatch.setattr("btcpredict.config.settings.cross_max_per_round", 2)
+        monkeypatch.setattr(
+            "btcpredict.config.settings.cross_max_open_positions", 2)
         bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0))
         bot.guard.state.reserved_open = 2          # pool already full
 
@@ -1362,3 +1368,94 @@ class TestModelRoundRangeWindow:
         from btcpredict.config import settings as s
         assert s.cross_max_round_range_bps <= s.model_max_round_range_bps, \
             "cross owns the calm end, model the moving end"
+
+
+class TestOpenExposureCap:
+    """`cross_max_open_stake_pct` is the only thing standing between the
+    six-market widening and a single-move wipeout.
+
+    Measured on the 7 recorded days (tools/cross_multi_exposure.py): up to 9
+    positions open at once, 0.945 of them on the SAME side, and a worst expiry
+    of 7 simultaneous losses = 47% of bankroll. The 20% daily loss cap cannot
+    cover that, because those positions settle at the same instant.
+    """
+
+    def _bot(self, open_stake, bankroll=100.0):
+        b = Bot.__new__(Bot)
+        b.bankroll = bankroll
+        b._open_stake, b._open_stake_at = open_stake, time.time()
+        return b
+
+    def test_it_reads_the_ledger_not_memory(self):
+        """A restart must not reset open exposure to zero -- that is exactly
+        how an exposure cap silently stops capping."""
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._open_cross_stake)
+        assert "FROM fills" in src and "settlements" in src, (
+            "open exposure must come from the ledger, not an in-memory counter")
+
+    def test_an_unreadable_ledger_is_not_zero_exposure(self):
+        """Unknown exposure must never read as NO exposure."""
+        b = self._bot(41.0)
+        b._open_stake_at = 0.0                      # force a refresh
+        b.store = SimpleNamespace(
+            query=lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db gone")))
+        assert b._open_cross_stake() == 41.0
+
+    def test_the_cap_is_a_fraction_of_bankroll(self, monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_open_stake_pct", 0.30)
+        b = self._bot(28.0, bankroll=100.0)
+        # 28 open + 3 more = 31 > 30
+        assert b._open_cross_stake() + 3.0 > 0.30 * b.bankroll
+        # ...but 28 + 1.5 fits
+        assert b._open_cross_stake() + 1.5 < 0.30 * b.bankroll
+
+    def test_zero_means_off(self, monkeypatch):
+        """0 = OFF is the repo's convention for every other limit
+        (daily_loss_cap, max_consecutive_losses, cross_max_per_day)."""
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._cross_tick)
+        assert "cap_pct > 0" in src, (
+            "the cap must be written `> 0 and ...`; a bare >= reads 0 as "
+            "'no exposure allowed' and disables the arm outright")
+
+    def test_it_is_checked_after_depth_sizing(self):
+        """The number compared must be the stake actually about to be
+        committed, not the one before the book sized it down."""
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._cross_tick)
+        assert src.index("sizing down") < src.index("cross_max_open_stake_pct")
+
+
+class TestPerRoundAndAccountWideAreDifferentLimits:
+    """Two limits must not share one number.
+
+    `check_reserved` compares `guards.state.reserved_open`, which counts open
+    positions across EVERY family, against whatever `max_open` it is handed.
+    Handing it `cross_max_per_round` was harmless while one family traded and
+    would have capped all six at 5 concurrent positions -- so raising the
+    per-round knob to admit more entries in a choppy round would also have
+    raised account-wide concurrency.
+    """
+
+    def test_the_guard_is_not_given_the_per_round_knob(self):
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._cross_tick)
+        call = src[src.index("check_reserved("):]
+        call = call[:call.index(")")]
+        assert "max_per_round" not in call, (
+            "check_reserved counts positions account-wide; giving it the "
+            "per-round knob conflates two different limits")
+        assert "cross_max_open_positions" in call
+
+    def test_the_per_round_limit_is_still_enforced(self):
+        """...and dropping it from the guard must not drop it entirely: the
+        per-round cap lives in `_cross_fired[r.slug]` at the top of the arm."""
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._cross_tick)
+        assert '_cross_fired.get(r.slug, 0) >= self._ck("max_per_round", r)' in src

@@ -22,20 +22,28 @@ EVENT_SLUG = "btc-up-or-down-5m"
 ROUND_SECONDS = 300
 
 # Markets to record, as (slug prefix, Binance symbol, round seconds).
-# MARKETS[0] is the ONLY family that trades: main.tick passes
-# trade=(prefix == primary), so every later entry is recorded, stored and
-# measurable but never ordered. That is the deliberate growth path -- widen the
-# tape (more symbols, more timeframes) without widening the risk.
+# MARKETS[0] is the PRIMARY: the model, impulse and double arms only ever look
+# at it, and it is the only family whose round is re-swept every poll.
 #
-# BTC 5m stays primary because it is the only family whose edge survived the
-# battery on REAL asks (tools/venue_growth_scan.py: |delta| 0.05-0.10% at
-# tau~60s, +2.7% per $1 staked, n=251, t +2.36, day-t +1.82, drop1 +0.011).
-# ETH 5m looked comparable (0.02-0.05%, +7.3%) but failed pooled-t (1.30), and
-# BNB/15m have no measured history at all. They are recorded so the same scan
-# can clear or bury them on their own data, not on a guess.
+# The CROSS arm trades every family in CROSS_TRADED (below). Widened from
+# BTC-5m-only on 2026-09-14 at the operator's explicit instruction, with the
+# risk stated and accepted. What the data does and does not say:
+#
+#   * the WIN RATE is now measurable on every family, because the bot records
+#     the venue's own strike and winner (tools/cross_market_scan.py):
+#         btc-5m 0.884 [0.821,0.943] 25.9 trig/day   eth-5m 0.783 [0.681,0.876] 18.4
+#         bnb-5m 0.723 [0.591,0.845] 41.5            btc-15m 0.810 [0.545,1.000] 10.5
+#         eth-15m 0.688 [0.357,0.941] 8.0            bnb-15m: no triggers yet
+#   * the EV is NOT measurable for anything but BTC-5m, because the websocket
+#     book followed only the traded market, so the others have ~zero recorded
+#     ask. Break-even at live fills is ~0.665-0.69.
+#   * this substrate reads BTC at 0.884 against the 31-day Chainlink corpus's
+#     0.714. If that same 0.17 haircut applies, eth -> ~0.61 and bnb -> ~0.55,
+#     i.e. BELOW break-even. That is the live risk being taken.
 #
 # Note: models/sniper.py still hardcodes ROUND_SECONDS=300 for the (disabled)
 # model arm, so a 900s market must never become primary without fixing that.
+#
 # How often the RECORDED-only families are refreshed, in seconds. The traded
 # family is fetched every poll; everything else is a tape for later analysis and
 # does not need 1s resolution.
@@ -52,13 +60,19 @@ ROUND_SECONDS = 300
 RECORDED_REFRESH_S = 30.0
 
 MARKETS = [
-    ("btc-updown-5m", "BTCUSDT", 300),      # primary: the only one traded
-    ("eth-updown-5m", "ETHUSDT", 300),      # recorded only
-    ("bnb-updown-5m", "BNBUSDT", 300),      # recorded only
-    ("btc-updown-15m", "BTCUSDT", 900),     # recorded only
-    ("eth-updown-15m", "ETHUSDT", 900),     # recorded only
-    ("bnb-updown-15m", "BNBUSDT", 900),     # recorded only
+    ("btc-updown-5m", "BTCUSDT", 300),      # primary (model/impulse/double too)
+    ("eth-updown-5m", "ETHUSDT", 300),
+    ("bnb-updown-5m", "BNBUSDT", 300),
+    ("btc-updown-15m", "BTCUSDT", 900),
+    ("eth-updown-15m", "ETHUSDT", 900),
+    ("bnb-updown-15m", "BNBUSDT", 900),
 ]
+
+# Families the CROSS arm may order in. Everything not listed here is recorded
+# only. Kept separate from MARKETS so widening the tape and widening the risk
+# stay two different edits -- removing that separation is how the daily loss cap
+# was once bypassed.
+CROSS_TRADED = frozenset(p for p, _, _ in MARKETS)
 
 
 class Settings(BaseSettings):
@@ -1173,7 +1187,88 @@ class Settings(BaseSettings):
     # ATM spread is what separates them: btc 0.010, eth 0.025-0.050, bnb 0.250.
     # Nothing is overridden yet: snapshots inside a round are autocorrelated,
     # so those n are not independent rounds and none has cleared the day-t bar.
-    cross_overrides: dict[str, dict[str, float]] = {}
+    # PER-MARKET knobs. Only `max_round_range_bps` needs one, and the reason is
+    # arithmetic rather than taste: the gate is in BPS, and a 15m round has
+    # three times as long to travel as a 5m one, so BTC's 10.0 is a completely
+    # different filter on each family. Measured share of rounds a 10 bps gate
+    # would BLOCK (2026-09-14):
+    #     bnb-5m 25%   btc-5m 40%   eth-5m 57%   btc-15m 56%   eth-15m 77%
+    #     bnb-15m 95%  <- BTC's number would switch that family off entirely
+    #
+    # So each family gets the gate that admits the SAME SHARE of its own rounds
+    # that 10.0 admits of BTC-5m's (59.5%) -- matched selectivity, not a copied
+    # constant. Medians for context: bnb-5m 6.7 bps, btc-5m 8.4, btc-15m 11.3,
+    # eth-5m 11.3, eth-15m 17.0, bnb-15m 18.0.
+    #
+    # NOTHING ELSE is overridden, and that is a measurement too: |depth| at the
+    # trigger is 0.48-0.93 bps median and 1.47-2.23 at p90 on EVERY family, so
+    # the 5.0 depth gate binds on 0-3% of triggers everywhere and needs no
+    # per-market value. tau and look are in seconds and the mechanism they
+    # encode (the venue has not repriced yet) is time-based, not size-based.
+    # The price band and stake are left at BTC's because no other family has a
+    # recorded ask to set them from -- see MARKETS for that gap.
+    #
+    # bnb-15m's 21.1 rests on 62 rounds and produced ZERO triggers in the
+    # recording window; it is the least supported number here.
+    # Whether the websocket book follows every CROSS_TRADED family or only the
+    # primary. ON is required for the widening to trade at all -- off-primary
+    # there is no REST book and no displayed-price fallback. It exists as a
+    # knob because following all six once took the poll from a 1.00s median to
+    # 4.15s, and a slow poll is what makes short crossings invisible. Watch the
+    # "poll cadence" line; if the median climbs past ~1.5s, set this False and
+    # the arm falls back to BTC-5m-only without a deploy.
+    # Ceiling on TOTAL unsettled cross stake, as a fraction of bankroll.
+    # 0 = OFF, the repo's convention for every other limit.
+    #
+    # MEASURED, after an earlier draft of this knob was (rightly) rejected for
+    # being reasoned rather than measured. tools/cross_multi_exposure.py replays
+    # the shipped gate across all six families on the 7 recorded days and walks
+    # a clock over the open positions:
+    #
+    #     concurrency   peak 9   median 1   p90 4   p99 7
+    #     at 6.72%/trade -> p90 26.9%, p99 47.0%, peak 60.5% of bankroll at risk
+    #     same-side share when several are open: 0.945
+    #     worst single expiry: 7 simultaneous LOSSES = 47.0% of bankroll
+    #
+    # 0.945 is the number that matters. These are not six diversified markets;
+    # BTC, ETH and BNB cross their strikes on the same move and
+    # btc-updown-5m / btc-updown-15m are the SAME ASSET on two clocks, so this
+    # is one directional bet held up to nine times.
+    #
+    # And the daily loss cap CANNOT cover it: those positions expire at the same
+    # instant, so a 20% cap is evaluated after the 47% has already happened. It
+    # stops tomorrow's trading, not this loss.
+    #
+    # 0.30 is chosen off that table: it never binds at p90 (26.9%) and cuts the
+    # p99 case from 47% to ~27%, at the cost of the top ~10% of overlapping
+    # moments. It also sits just above single-market full Kelly (22.9%), so it
+    # cannot bind on BTC-5m alone and leaves the sizing decision untouched.
+    # Account-wide RESERVED SLOTS: how many cross positions may be open at once
+    # across every family. 0 = OFF.
+    #
+    # This exists because `check_reserved` was being passed `max_per_round`,
+    # and `reserved_open` is an ACCOUNT-WIDE counter. With one family those two
+    # meant the same thing (only one round was ever live). With six they do
+    # not: `cross_max_per_round` would silently have become "5 open positions
+    # in total", so raising the per-round knob to admit more entries in a choppy
+    # round would also have raised account-wide concurrency. Two different
+    # limits must not share one number.
+    #
+    # 10 sits just above the measured peak concurrency of 9
+    # (tools/cross_multi_exposure.py, 7 recorded days) so it bounds the
+    # pathological case without being the everyday limiter -- at 6.72% a trade
+    # the 30% dollar cap binds first, at 4 positions. This is the backstop; the
+    # dollar cap is the control.
+    cross_max_open_positions: int = 10
+    cross_max_open_stake_pct: float = 0.30
+    cross_ws_follow_all: bool = True
+    cross_overrides: dict[str, dict[str, float]] = {
+        "eth-updown-5m": {"max_round_range_bps": 12.9},
+        "bnb-updown-5m": {"max_round_range_bps": 7.8},
+        "btc-updown-15m": {"max_round_range_bps": 13.6},
+        "eth-updown-15m": {"max_round_range_bps": 21.0},
+        "bnb-updown-15m": {"max_round_range_bps": 21.1},
+    }
     # Entries per ROUND. Consecutive crosses alternate sides by construction, so
     # a choppy round is naturally hedged rather than doubled. MEASURED, taking
     # every qualifying cross instead of only the first:

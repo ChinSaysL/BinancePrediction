@@ -4708,3 +4708,89 @@ does not share its event loop, so the trading poll is untouched.
 Three to five days of that turns points 1 and 2 into a normal EV question
 answerable on real asks -- the same bar btc-5m had to clear. Until then, more
 markets is a hypothesis with a good win rate and no price.
+
+## Shipping the cross arm across six families (2026-09-14)
+
+Widened at the operator's explicit instruction, with the risk stated and
+accepted. Recorded here is what the audit found, because three of the five bugs
+below fail SILENTLY and would not have shown up as errors.
+
+### The exposure cap, chosen from measurement not reasoning
+
+An earlier draft of this added a cap from first principles and was rightly
+rejected. `tools/cross_multi_exposure.py` replays the shipped gate across all
+six families on the 7 recorded days and walks a clock over the open positions:
+
+    concurrency   peak 9   median 1   p90 4   p99 7
+    at 6.72%/trade -> p90 26.9%, p99 47.0%, peak 60.5% of bankroll at risk
+    same-side share when several are open: 0.945
+    worst single expiry: 7 simultaneous LOSSES = 47.0% of bankroll
+
+**0.945 is the number that decides it.** These are not six diversified markets:
+BTC, ETH and BNB cross their strikes on the same move, and btc-updown-5m and
+btc-updown-15m are the SAME ASSET on two clocks. It is one directional bet held
+up to nine times.
+
+And the 20% daily loss cap cannot cover it -- those positions expire at the same
+instant, so the cap is evaluated after the 47% has already happened.
+`cross_max_open_stake_pct = 0.30` never binds at p90 and cuts the p99 case from
+47% to ~27%.
+
+Two of my own errors in producing that table, both caught before it was used:
+the tool first read config.py's `stake_fraction` default (0.04) instead of the
+deployed 0.0224, overstating every figure by 1.8x; and a shadowed loop variable
+printed "700% of bankroll".
+
+### Bugs the audit found, all introduced by the widening
+
+1. **`check_reserved` was handed `cross_max_per_round`.** `reserved_open` counts
+   open positions ACROSS families, so with six markets a per-round knob silently
+   became "5 open positions in total" -- and raising it to admit more entries in
+   a choppy round would also have raised account-wide concurrency. Split into
+   `cross_max_open_positions` (10, just above the measured peak of 9).
+
+2. **`_cross_refused` held ONE slug.** Its dedupe reset whenever the slug
+   changed, which is correct for one family and defeats it entirely for six:
+   each market's refusal erases the previous market's memory, so on the
+   websocket clock (~114/s) every refusal logs and inserts a row on every
+   evaluation. Re-keyed by slug, pruned to live rounds.
+
+3. **`_cross_fired` was pruned to the current round's slug.** Same shape of bug:
+   each family's tick wiped the others' fired counts, so the per-round cap would
+   never have bound anywhere.
+
+4. **`self._asks` is the PRIMARY's book.** The non-websocket fallback path would
+   have priced an eth/bnb order off BTC's ask. Off-primary now refuses outright
+   rather than falling back -- only the primary fetches the REST book, and only
+   its round is refetched every poll, so off-primary the displayed price can be
+   a whole round old.
+
+5. **`sigma_now` and `spot_ts_ms` read primary state.** The first sized the
+   moneyness tilt for every family off BTC's volatility; the second stamped
+   every recorded eth/bnb quote row with BTC's timestamp.
+
+### The cadence problem, and why it is no longer the blocker
+
+Following all six books once took the poll from a 1.00s median to 4.15s, and a
+slow poll is what makes short crossings invisible. The other half of that cost
+was `rounds_by_prefixes` paging a volume-sorted list every poll to find a quiet
+family (bnb-updown-5m at offset 1450 -- 30 pages, 3.95s).
+
+That half is now gone: a round's metadata is fixed once it opens, so a family is
+re-swept only when its round has ROLLED. Verified end to end -- the second tick
+sweeps only `btc-updown-5m`, and all six again after a roll. What remains is the
+websocket message volume, which is reported every 120 ticks as a "poll cadence"
+line and can be turned off with `cross_ws_follow_all` without a deploy.
+
+### Per-market knobs: one needed, the rest did not
+
+Only `max_round_range_bps`, and for an arithmetic reason -- the gate is in BPS
+and a 15m round has three times as long to travel, so BTC's 10.0 blocks 25% of
+bnb-5m's rounds and 95% of bnb-15m's. Each family gets the gate admitting the
+same share of its OWN rounds that 10.0 admits of BTC-5m's (59.5%).
+
+Nothing else is overridden, and that is also a measurement: |depth| at the
+trigger is 0.48-0.93 bps median on EVERY family, so the 5.0 depth gate binds on
+0-3% of triggers everywhere. tau and look are in seconds and the mechanism they
+encode is time-based. The price band and stake stay at BTC's because no other
+family has a recorded ask to set them from.
