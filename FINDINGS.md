@@ -4565,3 +4565,83 @@ Raising size multiplies whatever the true edge is -- including a thinner one.
 Sizing is a risk decision for the operator, not a measurement, and the honest
 input to it is the table above plus the fact that 16 trades cannot tell 0.71
 from 0.81.
+
+## The limit rule was backwards, and is now inverse in the ask (2026-09-14)
+
+Nine live attempts have been cancelled unfilled and EVERY ONE was cheap
+(decided ask 0.14-0.57, median 0.36); no attempt at a decided ask of 0.60+ has
+ever missed. The rule was
+
+    buf = max(0.01, min(cross_limit_buffer 0.10, cross_limit_buffer_pct 0.20 * a))
+
+which shrinks the buffer as the ask falls -- 0.10 at a>=0.50, 0.064 at 0.32,
+0.028 at 0.14. That is backwards with respect to the mechanism. A cheap ask
+means the venue has NOT yet repriced a fresh cross, so it is precisely where
+the book is about to run furthest. The rule bid least where it had to bid most.
+
+Replaced by `cross_limit_buffer_inv`:  buf = min(cap, 0.25 * (1 - ask))
+
+    ask     OLD limit     NEW limit
+    0.14        0.17         0.35
+    0.32        0.38         0.49
+    0.45        0.54         0.59
+    0.55        0.65         0.66
+    0.70        0.80         0.77
+    0.85        0.90         0.89
+
+More room where the book runs, LESS where it does not.
+
+### Chosen on robustness to limit-pinning, not on the point estimate
+
+`tools/cross_limit_rules.py` sweeps limit RULES (flat / proportional / inverse /
+bid-to-target / side-conditional) on the recorded book with the measured 3s
+order latency. The decisive axis is P(the venue pins the limit rather than
+filling at the book) -- measured ~1/3 across the live fills. Growth vs the old
+rule:
+
+    rule              P=0.0    P=0.33   P=0.66    P=1.0
+    inverse .25(1-a)  +0.013   +0.070   +0.118   +0.171
+    inverse .35(1-a)  +0.086   +0.067   +0.028   +0.014
+    inverse .50(1-a)  +0.136   +0.033   -0.090   -0.227
+
+0.25 is the only coefficient positive across the WHOLE range. 0.50 looks best
+if the venue never pins and collapses if it always does, and P rests on few
+fills. At the measured P~1/3 all three are within 0.004 of each other, so
+robustness decides rather than the peak.
+
+### Counterfactual on the real misses
+
+Five of the nine have a known forward ask path:
+
+    time      dec   ask ran to   new limit   fills   result    P/L
+    00:04:15  0.45        0.89        0.59    yes      WIN   +0.681
+    01:44:00  0.39        0.62        0.54    yes     LOSS   -1.000
+    03:14:11  0.14        0.47        0.35    yes      WIN   +1.820
+    08:44:00  0.33        0.96        0.50    yes      WIN   +0.980
+    12:14:01  0.37        0.64        0.53    yes     LOSS   -1.000
+    ------------------------------------------------------------------
+    5 of 5 fill, net +1.481/$1 (mean +0.296)   against 0.000 today
+
+For contrast, paying the FULL real ask on these was -0.73/$1: the gain comes
+from capping the chase, not from chasing without limit. inverse .35 also fills
+all five but at worse prices (+0.114).
+
+### CAVEAT: the recorded book is the wrong population for this question
+
+    decided ask      1s replay    LIVE
+    < 0.45               6.8%     28.6%
+    median              0.715     0.500
+
+The replay polls at 1s and catches crossings AFTER the venue has repriced; live
+runs the websocket at ~114/s and catches them fresh and cheap. So the sweep is
+weighted 93% toward triggers that never miss anyway, and it UNDERSTATES this
+change -- live is 4.2x richer in exactly the case the rule targets.
+
+This caveat applies to EVERY recorded-book conclusion in this session (the
+range-gate re-audit, the depth sweep, the band sweep, the sizing sweep). None
+of them are wrong, but all are measured on a more expensive trigger population
+than the arm actually trades.
+
+REVERT trigger: if realised fills start landing AT the limit more than ~half
+the time, P is heading to 1 and the advantage shrinks toward +0.171 with any
+larger coefficient going negative.

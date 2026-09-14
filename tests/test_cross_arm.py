@@ -179,17 +179,24 @@ class TestTheArm:
         bot._place_order = place
         asyncio.run(bot._cross_tick())
         assert seen, "the cross must reach the order path"
-        # side is Up, so fair_up IS the limit. buffer is the SMALLER of the
-        # flat 0.10 and 20% of the ask -> 0.30 + 0.06 = 0.36
-        assert seen["fair_up"] == pytest.approx(0.36)
-        assert seen.get("limit_ceiling") == pytest.approx(0.36)
+        # side is Up, so fair_up IS the limit.
+        # ask 0.30 -> buffer 0.25*(1-0.30) = 0.175 -> limit 0.47
+        assert seen["fair_up"] == pytest.approx(0.47)
+        assert seen.get("limit_ceiling") == pytest.approx(0.47)
         assert seen["take_px"] == pytest.approx(0.30), "the trigger ask is the floor"
 
-    def test_a_cheap_entry_gets_a_PROPORTIONAL_buffer(self, store, armed):
-        """A flat +0.10 on this arm's most profitable bucket (ask 0.02-0.30)
-        is a 33-500% markup on the limit -- and the limit IS the price when
-        the venue fills the whole order. So the buffer scales at the cheap end
-        and only caps out on expensive entries."""
+    def test_a_cheap_entry_gets_a_BIGGER_buffer(self, store, armed):
+        """INVERTED 2026-09-14. The buffer used to be min(0.10, 0.20 * ask),
+        which shrank as the ask fell. That is backwards: a cheap ask means the
+        venue has not yet repriced a fresh cross, so it is exactly where the
+        book is about to run furthest. It bid least where it had to bid most --
+        all nine live cancellations were cheap (decided 0.14-0.57, median 0.36)
+        and no attempt at 0.60+ has ever missed.
+
+        The buffer is now 0.25 * (1 - ask), capped at cross_limit_buffer. The
+        old concern it encoded (the limit IS the price when the venue fills the
+        whole order) survives as that cap and as the choice of 0.25 over the
+        more aggressive 0.35/0.50 -- see config for the P(pin) sweep."""
         bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0), asks=(0.05, 0.95))
         seen = {}
 
@@ -200,14 +207,18 @@ class TestTheArm:
         bot._place_order = place
         asyncio.run(bot._cross_tick())
         assert seen, "0.05 is inside the armed band"
-        # 20% of 0.05 = 0.01, not the flat 0.10
-        assert seen.get("limit_ceiling") == pytest.approx(0.06), (
-            "a flat buffer here would have doubled the price we commit at")
+        # 0.25 * (1 - 0.05) = 0.2375 -> limit 0.29
+        assert seen.get("limit_ceiling") == pytest.approx(0.29), (
+            "a cheap entry must be given room to chase the reprice")
 
-    def test_the_buffer_never_falls_below_one_tick(self, store, armed):
-        """Proportional must not collapse to zero on a very cheap entry, or
-        the limit lands on the ask and we are back to the no-fill this whole
-        mechanism exists to avoid (btc-updown-5m-1789285500, rested at 0.21)."""
+    def test_the_buffer_shrinks_as_the_ask_rises(self, store, armed):
+        """The direction of the rule, which is the whole point of inverting it.
+
+        The one-tick floor this test used to guard is now unreachable inside
+        the armed band -- 0.25 * (1 - ask) only falls under 0.01 above an ask
+        of 0.96, and cross_max_price caps at 0.90 long before that -- so what
+        is worth pinning is the SHAPE: the cheaper the entry, the more room it
+        gets to chase a reprice that has not happened yet."""
         bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0), asks=(0.02, 0.98))
         seen = {}
 
@@ -218,8 +229,8 @@ class TestTheArm:
         bot._place_order = place
         asyncio.run(bot._cross_tick())
         assert seen
-        assert seen.get("limit_ceiling") == pytest.approx(0.03), (
-            "20% of 0.02 is 0.004; the floor of one tick must win")
+        # 0.25 * (1 - 0.02) = 0.245 -> limit 0.27
+        assert seen.get("limit_ceiling") == pytest.approx(0.27)
 
     def test_the_limit_never_exceeds_the_price_ceiling(self, store, armed):
         """cross_max_price still caps it: ask 0.48 + 0.10 would be 0.58, but
@@ -251,12 +262,12 @@ class TestTheArm:
         bot._place_order = place
         asyncio.run(bot._cross_tick())
         assert seen, "the cross must reach the order path"
-        # Down ask 0.30 -> buffer 0.06 -> limit 0.36; fair_up is its
-        # complement. The invariant under test is unchanged: a Down entry
-        # passes 1 - limit, or the taker limit inverts.
-        assert seen["fair_up"] == pytest.approx(0.64), (
+        # Down ask 0.30 -> buffer 0.25*(1-0.30) = 0.175 -> limit 0.47; fair_up
+        # is its complement. The invariant under test is unchanged: a Down
+        # entry passes 1 - limit, or the taker limit inverts.
+        assert seen["fair_up"] == pytest.approx(0.53), (
             "a Down entry passes 1 - limit so the Down side prices at the limit")
-        assert seen.get("limit_ceiling") == pytest.approx(0.36)
+        assert seen.get("limit_ceiling") == pytest.approx(0.47)
 
     def test_it_is_inert_with_the_flag_off(self, store, armed, monkeypatch):
         monkeypatch.setattr("btcpredict.config.settings.cross_enabled", False)
@@ -534,8 +545,8 @@ class TestTheArm:
         # cross arm (limit pinned at 0.90) slipped +0.1408. The limit now sits
         # a buffer above the observed ask: still slack to chase the reprice,
         # but the worst case is ask+buffer instead of 0.90.
-        assert seen.get("limit_ceiling") == pytest.approx(0.24), (
-            "ask 0.20 + min(0.10, 20% of 0.20) = 0.24")
+        assert seen.get("limit_ceiling") == pytest.approx(0.40), (
+            "ask 0.20 + 0.25 * (1 - 0.20) = 0.40")
         assert seen["take_px"] == pytest.approx(0.20), "the trigger ask is the floor"
 
     def test_the_reserved_pool_is_bounded(self, store, armed, monkeypatch):

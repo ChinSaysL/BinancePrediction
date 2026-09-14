@@ -1772,8 +1772,19 @@ class Bot:
         # while the ask was 0.960), so a limit pinned at 0.90 commits at 0.90
         # and the venue sometimes fills exactly that commitment. See
         # config.cross_limit_buffer for the measurement that forced this.
+        # INVERSE in the ask, not proportional to it. The old rule was
+        # `min(0.10, 0.20 * ask)`, which shrinks the buffer as the ask falls --
+        # 0.10 at 0.50+, 0.064 at 0.32, 0.028 at 0.14. That is backwards with
+        # respect to the mechanism: a cheap ask means the venue has NOT yet
+        # repriced a fresh cross, so it is exactly the case where the book is
+        # about to run furthest. It bid least where it had to bid most, and all
+        # nine live cancellations were cheap (decided ask 0.14-0.57, median
+        # 0.36) while no attempt at 0.60+ has ever missed.
+        #
+        # `cross_limit_buffer` stays the absolute cap; see config for the
+        # limit-pinning sweep that chose 0.25 over the more aggressive 0.35/0.50.
         buf = max(0.01, min(self._ck("limit_buffer"),
-                            self._ck("limit_buffer_pct") * ask))
+                            self._ck("limit_buffer_inv") * (1.0 - ask)))
         ceil_side = min(self._ck("max_price"), round(ask + buf, 2))
         # INSTRUMENTATION. Three explanations for the gate->fill gap have now
         # been wrong: a stale gate (the websocket made it fresh and the gap

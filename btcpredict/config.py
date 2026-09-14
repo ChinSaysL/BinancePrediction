@@ -1046,17 +1046,57 @@ class Settings(BaseSettings):
     # REVERT to 2.25 if the live win rate settles below ~0.70, or if realised
     # EV/$1 over the next ~30 fills comes in under +0.10.
     cross_stake_mult: float = 3.0
-    cross_limit_buffer: float = 0.10
-    # ...but PROPORTIONAL at the cheap end. A flat +0.10 on this arm's most
-    # profitable bucket (ask 0.02-0.30, see cross_max_price) is a 33-500%
-    # markup on the limit -- and the limit IS the price whenever the venue
-    # fills the whole order (measured 2026-09-13: the one cross that filled
-    # 100% of its intended stake paid its limit to the tick, while the two
-    # that filled 72-76% beat it). So the buffer is the SMALLER of the flat
-    # amount and this fraction of the ask, floored at one tick so a cheap
-    # entry still has somewhere to move:
-    #     ask 0.15 -> +0.03 (limit 0.18)    ask 0.60 -> +0.10 (limit 0.70)
+    # The absolute CAP on the buffer. RAISED 0.10 -> 0.25 on 2026-09-14 so it
+    # stops binding at the cheap end, where cross_limit_buffer_inv now wants
+    # more room (at ask 0.14 the inverse rule asks for 0.215).
+    #
+    # The concern the old 0.10 encoded is still real and still governs the cap:
+    # the limit IS the price whenever the venue fills the whole order (measured
+    # 2026-09-13 -- the one cross that filled 100% of its intended stake paid
+    # its limit to the tick, while the two that filled 72-76% beat it). That is
+    # the P(pin) risk swept in cross_limit_buffer_inv below, and it is why the
+    # inverse coefficient is 0.25 rather than 0.50.
+    cross_limit_buffer: float = 0.25
+    # SUPERSEDED 2026-09-14 by cross_limit_buffer_inv. Kept only so an
+    # existing cross_overrides entry naming it does not KeyError; nothing
+    # reads it.
     cross_limit_buffer_pct: float = 0.20
+    # The limit is `ask + max(0.01, min(cross_limit_buffer, inv * (1 - ask)))`.
+    # INVERSE in the ask: bid MOST where the book is about to run furthest.
+    #
+    # Nine live cancellations, every one cheap (decided 0.14-0.57, median 0.36);
+    # no attempt at 0.60+ has ever missed. The old proportional rule gave the
+    # SMALLEST buffer exactly there (0.064 at ask 0.32 -> limit 0.38, missed).
+    #
+    # Swept over limit RULES, not one buffer (tools/cross_limit_rules.py), on
+    # the recorded book with the measured 3s order latency. Growth vs the old
+    # rule, by P(the venue pins the limit rather than filling at the book) --
+    # measured at ~1/3 over the live fills:
+    #
+    #   rule              P=0.0    P=0.33   P=0.66    P=1.0
+    #   inverse .25(1-a)  +0.013   +0.070   +0.118   +0.171
+    #   inverse .35(1-a)  +0.086   +0.067   +0.028   +0.014
+    #   inverse .50(1-a)  +0.136   +0.033   -0.090   -0.227
+    #
+    # 0.25 is chosen because it is the only one positive across the WHOLE range
+    # -- 0.50 looks best if the venue never pins and collapses if it always
+    # does, and P is known from few fills. At the measured P~1/3 the three are
+    # within 0.004 of each other, so robustness decides, not the point estimate.
+    #
+    # Counterfactual on the 5 real misses with a known forward ask path: all 5
+    # fill, net +1.481/$1 (mean +0.296) against 0.000 today. 0.35 also fills
+    # all 5 but at worse prices (+0.114).
+    #
+    # CAVEAT on the substrate: the 1s replay is 6.8% cheap triggers while live
+    # is 28.6% (live runs the websocket at ~114/s and catches crossings before
+    # the venue reprices; the replay catches them after). So the sweep is
+    # weighted toward triggers that never miss anyway, and it UNDERSTATES this
+    # rule -- the live population is 4.2x richer in the case it targets.
+    #
+    # REVERT to the proportional rule if realised fill prices start landing AT
+    # the limit more than ~half the time (that is P -> 1, where the advantage
+    # shrinks to +0.171 -> and any larger inv goes negative).
+    cross_limit_buffer_inv: float = 0.25
     cross_skip_opposite_to_main: bool = True
     # RAISED 0.5 -> 2.0 on 2026-09-13. The old 0.5 was picked by a fill-aware
     # sweep that called it a "clear peak", but that sweep could not have seen
