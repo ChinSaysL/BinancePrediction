@@ -4871,3 +4871,77 @@ The inverse-buffer change shipped hours earlier is what bought this trade. That
 is the rule working as designed (it exists to fill cheap entries that used to
 rest and cancel), and the first one it caught lost. One sample: it is expected
 to fill several more, and they will not all win.
+
+## The six-market widening is INERT: the book feed delivers only one topic (2026-09-14)
+
+Deployed, verified, and then found not to work for five of the six families.
+Recording it in full because the venue lies about it.
+
+### Symptom
+
+Since the multi-market restart, only the primary carries an executable price:
+
+    market              rows   with ask
+    btc-updown-5m        327        303   (93%)
+    eth-updown-5m        327          0
+    bnb-updown-5m        327          0
+    btc-updown-15m       327          0
+    eth-updown-15m       327          0
+    bnb-updown-15m       327          0
+
+Not a subscription failure in the log -- the feed reports
+`prediction book ws connected: [6 ids]` and the venue answers
+`{"type":"COMMAND","data":"SUCCESS","subType":"REGISTER","code":"00000000"}`.
+
+### It is not liquidity, and not topic order
+
+* the 15m families have REAL REST books right now (btc-15m 0.630/0.640,
+  eth-15m 0.400/0.410, bnb-15m 0.290/0.360), so there is a book to push.
+* the delivering id is always a btc-updown-5m one but its POSITION varies --
+  11074289 at index [0] and 11075128 at index [6] both delivered -- so it is
+  not "the first topic wins".
+
+### Cause, measured
+
+`follow()` joins per-market topics with "|" into ONE connection:
+
+    topic = "|".join(TOPIC_FMT.format(m) for m in mids)
+
+Probed read-only with a SINGLE topic for eth-updown-5m: **94 frames in 30
+seconds**. The same market receives NOTHING when it is one of six pipe-joined
+topics on one connection.
+
+**The venue accepts a multi-topic subscription, answers SUCCESS, and then
+delivers only one of them.** This is the same trap already recorded at the top
+of prediction_book.py for the AGGREGATED topic
+(`web3_prediction_orderbook_data` "registers with SUCCESS and then pushes
+NOTHING") -- it turns out to apply to pipe-joined per-market topics too, which
+is why MAX_TOPICS and the additive `follow()` were built on an assumption that
+was never true.
+
+### What this means right now
+
+The bot is SAFE but effectively BTC-5m-only. The off-primary guard added with
+the widening -- refuse when the websocket book is not fresh, rather than fall
+back to a displayed price that may be a round old -- is doing exactly its job:
+
+    cross bnb-updown-5m-1789404600 Up not taken: no fresh websocket book off-primary
+
+So the five new families take no trades rather than bad ones. Everything else
+shipped today (the 30% exposure cap, per-market range gates, the round cache,
+the inverse limit buffer, the 3.0x stake) is live and working; the poll cadence
+is median 133ms / p90 148ms with all six subscribed, which settles the old
+"4.15s" fear -- that was the deep page sweep, now cached, not websocket volume.
+
+### The fix, not yet made
+
+One websocket CONNECTION PER MARKET instead of one connection with a joined
+topic. Unknown until tried: whether the venue caps concurrent connections per
+API key. That is the next piece of work, and until it lands the widening buys
+nothing.
+
+Also found while reading the log: `follow()` never drops expired rounds, so the
+topic set grows every roll (6 -> 7 -> 12 within five minutes) until MAX_TOPICS
+trims oldest-first. Harmless while only one topic delivers, but it must be
+fixed alongside -- with per-market connections a dead round should close its
+connection rather than hold a slot.
