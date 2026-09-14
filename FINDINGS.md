@@ -4645,3 +4645,66 @@ than the arm actually trades.
 REVERT trigger: if realised fills start landing AT the limit more than ~half
 the time, P is heading to 1 and the advantage shrinks toward +0.171 with any
 larger coefficient going negative.
+
+## Where the extra trades are: the other five markets (2026-09-14)
+
+The operator's bottleneck is trade count. Taking the levers in order of cost:
+
+### Nothing left on BTC alone
+
+    cap/round    3      5      8     12     99
+    triggers   197    201    201    201    201
+
+`cross_max_per_round` DOES NOT BIND -- 5, 8, 12 and unlimited all produce the
+same 201 triggers. The reversal guard, the depth gate and the range gate are
+what limit entries per round, not the cap. Raising it buys literally nothing.
+The tau window cannot widen (5-270 turns +0.226/+0.042 into -1.288/-1.204), and
+depth is already at its flat optimum. BTC-5m is fully harvested at ~26
+triggers/day.
+
+### The volume is in the families we record and do not trade
+
+`tools/cross_market_scan.py` -- the venue's OWN strike and OWN winner for every
+recorded family, which is the substrate the 2026-09-13 retraction said did not
+exist. Bootstrap over ROUNDS:
+
+    market            trig  rounds  days  trig/day    win   95% CI        ask rows
+    btc-updown-5m      181     132     7      25.9  0.884  [0.821,0.943]   330,763
+    bnb-updown-5m       83      52     2      41.5  0.723  [0.591,0.845]         0
+    eth-updown-5m       92      76     5      18.4  0.783  [0.681,0.876]    32,857
+    btc-updown-15m      21      12     2      10.5  0.810  [0.545,1.000]         2
+    eth-updown-15m      16      11     2       8.0  0.688  [0.357,0.941]         2
+    bnb-updown-15m       0       -     3         -      -                        2
+
+**eth-5m + bnb-5m would take the arm from 25.9 to 85.8 triggers/day -- 3.3x.**
+Every 5m family's CI excludes 0.5.
+
+### Three reasons this is not yet a trade
+
+1. **No prices.** Four of six families have effectively zero recorded ask, so
+   EV is unmeasurable. A win rate alone cannot clear a market whose break-even
+   at live fills is ~0.665-0.69.
+
+2. **The substrate overstates.** BTC reads 0.884 here against 0.714 on the
+   31-day Chainlink corpus -- a 0.17 haircut, because a 1s replay selects late,
+   already-repriced triggers. Apply the same haircut and eth 0.783 -> ~0.61 and
+   bnb 0.723 -> ~0.55, BOTH BELOW break-even. That is speculative, but it is the
+   reason a good win rate here is not a green light.
+
+3. **Subscribing their book in-process costs the BTC arm.** Measured: following
+   all six took the poll from a 1.00s median to 4.15s, and a slower poll widens
+   the window where a real crossing is invisible (btc-updown-5m 1789336500 --
+   spot crossed for ~1.5s and the arm never saw it). The book feed ingests ~6x
+   the message volume IN THIS PROCESS.
+
+### The unblock
+
+Point 3 is the only one that is an engineering problem rather than a
+measurement, and it has a clean fix: a SEPARATE recorder process subscribing to
+the non-traded families' books and writing quotes to the same store. The cost
+that was measured is contention inside the trading process; a second process
+does not share its event loop, so the trading poll is untouched.
+
+Three to five days of that turns points 1 and 2 into a normal EV question
+answerable on real asks -- the same bar btc-5m had to clear. Until then, more
+markets is a hypothesis with a good win rate and no price.
