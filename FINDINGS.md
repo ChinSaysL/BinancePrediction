@@ -4024,6 +4024,22 @@ The growth improvement is small and rests on 14 recorded reversals over 7 days;
 its value is that it is consistently signed across three pricings and two
 substrates, not that any single number is significant.
 
+## RETRACTED: "the missed fills were a fixed bug" (2026-09-14)
+
+**This section's query was wrong and its conclusion with it.** `acted` in the
+`decisions` table means THE ORDER FILLED, not "an order was placed" (main.py:
+"`acted` means an order actually filled, so it is written as 0 here"; it is
+promoted to 1 only after the broker confirms). So "acted=1 with no fill" can
+never find an unfilled attempt -- it searches for a state that by construction
+does not exist. The right predicate is a decision whose `reason` records an
+attempt (`cross into ...`) and which has no fill row. See the section below for
+what that actually shows: a live fill rate of 0.650, not 1.000.
+
+What follows is still true about the 09-08 cluster, and still wrong about
+"there has not been an unfilled attempt since".
+
+### Original text
+
 ## The "missed fills" were a fixed bug, not a design choice (2026-09-14)
 
 133 decisions in the whole ledger have `acted=1` and no fill:
@@ -4098,3 +4114,85 @@ which `cross_reversal_recorded.py` still does -- is detecting crossings on
 fewer than half the ticks and will UNDERCOUNT triggers. It does not flip the
 reversal result (the 31-day corpus, which has no such holes, agrees in sign and
 carries the power), but recorded-book trigger COUNTS are a floor, not a census.
+
+## The cancelled orders: adverse selection, and why NOT to widen the buffer (2026-09-14)
+
+Two CANCELLED orders on the venue at 12:14:01 and 12:14:37 that the ledger's
+`acted` flag could not surface. Both real, both `orderType: LIMIT`, both
+`filledShareQty: 0`, both with `makerShareQty` > 0 -- they RESTED below the
+book instead of taking it, and terminated ~21s later (`limit_wait_s` is 20).
+
+    12:14:01  Down  decided 0.37  limit 0.44  makerShareQty 5.93  CANCELLED
+    12:14:37  Up    decided 0.32  limit 0.38  makerShareQty 6.86  CANCELLED
+
+### The real fill rate is 0.650, not 1.000
+
+Counting attempts properly (`reason like 'cross into%'`, no fill row):
+
+    day          attempts  unfilled  fill rate
+    2026-09-13          9         1      0.889
+    2026-09-14         15         7      0.533
+
+And it collapses with price:
+
+    decided ask    n   filled   rate
+    0.00-0.40      5        0   0.00
+    0.40-0.50      4        3   0.75
+    0.50-0.60      7        6   0.86
+    0.60-1.00      4        4   1.00
+
+**Below 0.40 nothing fills, ever.** That is the arm's most profitable bucket.
+
+### Mechanism: a proportional buffer against an additive move
+
+`buf = max(0.01, min(cross_limit_buffer 0.10, cross_limit_buffer_pct 0.20 * ask))`
+
+so the buffer SHRINKS as the ask falls -- 0.10 at ask 0.50+, 0.064 at 0.32,
+0.028 at 0.14 -- while the thing it has to cover does not. When a fill happens
+it lands at the LIMIT, not at the decided ask (mean got-limit -0.028, versus
+got-decided +0.063), so the limit is effectively the price.
+
+### Why widening it anyway would be a mistake
+
+Tracking what the ask actually did in the 25s after each miss:
+
+    time      side  decided  limit  ask went to   winner  P/L @limit  P/L @real
+    00:04:15  Up       0.45   0.54         0.89       Up      +0.835     +0.121
+    01:44:00  Up       0.39   0.47         0.62     Down      -1.000     -1.000
+    03:14:11  Down     0.14   0.17         0.47     Down      +4.785     +1.105
+    08:44:00  Down     0.33   0.40         0.96     Down      +1.470     +0.041
+    08:54:47  Down     0.57   0.67          n/a     Down      +0.483        n/a
+    12:14:01  Down     0.37   0.44         0.64       Up      -1.000     -1.000
+    12:14:37  Up       0.32   0.38          n/a       Up      +1.599        n/a
+    ----------------------------------------------------------------------------
+    total per $1:                                            +7.171     -0.733
+
+**At the price we bid these are worth +7.17/$1. At the price actually on offer
+they are worth -0.73/$1.** The book moved 0.23-0.63 on every miss, not the
+~0.09 a wider buffer could plausibly cover. 5 of 7 would have won, and it does
+not matter: at the real ask the two losers (-1.000 each) swamp the winners
+(+0.121, +1.105, +0.041).
+
+This is textbook adverse selection. We fill when the book stays put and miss
+when it runs -- and it runs precisely when we are right. The limit refusing to
+chase is the mechanism working, not failing. A corpus EV of +0.257/$1 for
+paying "ask + 0.10" on sub-0.40 entries is irrelevant, because +0.10 does not
+reach the book; the real price is +0.23 to +0.63.
+
+**Do not raise `cross_limit_buffer_pct` or `cross_limit_buffer` on this
+evidence.** Nothing shipped from this investigation.
+
+### Two misses were a dark book, not a runaway one
+
+08:54:47 and 12:14:37 show an ask that never rose above the decided price, yet
+a limit 0.10 above it did not fill -- and in both the recorded ask series stops
+at the attempt instant. That is the missing-ask problem (48.4% of quote rows
+carry no ask), not a pricing one. Those two are unexplained by the mechanism
+above and are the honest residual.
+
+### Counter-example against today's reversal guard, recorded for fairness
+
+12:14:01 Down / 12:14:37 Up is another same-round reversal pair, so the guard
+shipped earlier today would have refused the second -- which would have won
+(+1.599 at our limit). One sample against 249 corpus reversals at day-t -3.05;
+the guard stands, but the case is logged rather than buried.
