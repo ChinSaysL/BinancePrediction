@@ -5026,3 +5026,62 @@ This is the third time in this file that comparing a win rate to the wrong mean
 ask produced a wrong conclusion. The bar is ALWAYS the mean ask OF THE SAME
 SUBSET, and the test is whether `win - ask` clears ~0.09, not whether it clears
 zero.
+
+## Should the range gate be dynamic? The premise is right, the fix is not (2026-09-14)
+
+Asked because a fixed bps gate has drifting SELECTIVITY -- it was set to admit
+59.5% of rounds at the volatility of the week it was measured on, and during a
+2x-volatility stretch it was admitting 16%. The arm took one trade in 95
+minutes across six families.
+
+The premise is correct and measurable. Share of triggers the shipped static
+gate keeps, per day:
+
+    2026-09-12 (median range 2.5 bps)  100% kept
+    2026-09-08 (median range 11.8)      45% kept
+    spread across 7 days:               55 points
+
+A trailing-median gate (`refuse if range > k * median of the last 40 CLOSED
+rounds of this market`, strictly causal) does stabilise that: 36-point spread
+at k=1.2, 26 at k=2.0.
+
+### But it does not pay
+
+Paired by day against the static gate, BTC-5m, 240 triggers, 7 days:
+
+    k      n   kept   additive diff / t     reverting diff / t    sel. spread
+    1.0  141    59%   -0.449 / t-1.59       -0.593 / t-2.27            42p
+    1.1  155    65%   -0.187 / t-0.61       -0.303 / t-1.16            40p
+    1.2  171    71%   +0.020 / t+0.05       -0.009 / t-0.02            36p
+    1.3  175    73%   -0.018 / t-0.04       -0.018 / t-0.05            36p
+    1.4  184    77%   -0.299 / t-0.74       -0.272 / t-0.78            33p
+    2.0  213    89%   -0.565 / t-0.81       -0.471 / t-0.72            26p
+
+**No k beats static.** k=1.2/1.3 is a narrow break-even flanked by losses on
+both sides -- the signature of a fitted point, not an effect. A sigma-normalised
+variant (`range > k * sigma_1m * sqrt(elapsed/60)`) behaves the same way.
+
+Note what this means for the single-rule table that provoked the idea: scored
+alone, trailing x1.2 looked clearly better than static (day-t 3.72 vs 2.40
+additive, 4.94 vs 3.20 reverting, on more trades). The PAIRED comparison says
+the two rules earn the same thing on the same days. A higher t on its own
+returns is not evidence that a rule beats another rule.
+
+### Why the static gate is right, which is not obvious
+
+"Calm rounds only" appears to mean calm in ABSOLUTE terms, not calm relative to
+what has been normal lately. A gate that widens during a storm trades the
+storm, and the storm is where this arm's edge is not. That is why stabilising
+selectivity -- which is the mechanically correct thing to do -- does not
+improve returns: the thing worth conditioning on was never selectivity.
+
+### The live consequence, stated plainly
+
+In today's regime the dynamic gate would have traded the refusals (trailing
+median ~14.4 puts k=1.2 at 17.3 bps against triggers of 10.9). It would have
+traded MORE and earned the same or less. So the arm trading very little in a
+volatile stretch is the design working, not a fault to be tuned away.
+
+NOTHING SHIPPED. Limits: 7 days, BTC-5m only. A dynamic gate's advantage should
+show up across REGIME CHANGES, and seven days may not hold enough of them --
+that argues for revisiting with more data, not for shipping on this.
