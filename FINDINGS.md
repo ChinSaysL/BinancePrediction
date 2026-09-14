@@ -6186,3 +6186,25 @@ NOTHING SHIPPED. Limits: n=20 reversed (sign flips on 1-2 rounds), BTC-5m,
 7 days -- the powered corpus is the substrate that decides, and it already
 had. Not "very wrong": it is the refused reversal entry in disguise, and its
 net measured effect under realistic fills is zero, not catastrophic.
+
+## PROBE OFF (2026-09-15 ~00:00 UTC) -- final record
+
+Turned off by operator instruction after 2 shots / 0 fills, both in the
+decisive runner class:
+
+  * shot 1 (23:29, btc-5m Down, limit 0.28): book 0.17 -> 0.46 -> 0.53
+    within a second; no fill, run +0.23.
+  * shot 2 (23:54, eth-5m Down, limit 0.36): book 0.27 -> 0.57 -> 0.72;
+    rested the designed 2s window and was cancelled; the round then whipsawed
+    (Down traded 0.72 mid-round) and settled Up -- a fill would have lost the
+    full stake. The operator flagged exactly that, and it is the class's
+    adverse-selection shape: the runner class is not fillable, and anything
+    that WOULD fill in it is a coin-flip bought at a spread.
+
+The direct question ("does a range-refused crossing's early quote fill while
+its book runs") is answered negative on the live record, consistent with
+every prior: the fill-honouring table (runs >= +0.2 -> 0/4 ever), the sub-0.40
+zero-fill bucket, the buffer sweep, and the adverse-selection table
+(+7.17/$1 at our bids vs -0.73 at the real ask -- do not chase). Range gate
+stays 10; no knobs changed anywhere. Revert path: `CROSS_PROBE_ENABLED=true`
++ restart. The day's order count is back to the normal arm alone.
