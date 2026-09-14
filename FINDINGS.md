@@ -4041,3 +4041,60 @@ priced off the venue's stale *displayed* price never matched its real book.
 `order_type=limit_take` shipped 2026-09-12 and there has not been an unfilled
 acted decision since. The last 60 acted decisions all filled; no voids since
 09-09, no orphaned fills, nothing in the log. Not by design, and already fixed.
+
+## The 12:45 "missed fills" were the tau window doing its job (2026-09-14)
+
+Two crossings around 12:45 UTC were not traded. They were real, and they would
+have won -- and skipping them was still right.
+
+    btc-updown-5m-1789389900   12:45:00   strike 77918.005   settled Down
+       12:45:07  tau 292.7  Down  depth 0.00  ask 0.510
+       12:45:19  tau 280.7  Down  depth 0.93  ask 0.500
+       12:45:37  tau 262.3  Down  depth 0.00  ask 0.460
+       12:45:39  tau 260.3  Up    depth 1.03  ask 0.580
+       12:45:57  tau 242.3  Down  depth 0.00  ask 0.490
+       12:45:59  tau 240.3  Down  depth 0.26  ask 0.540
+
+Six crossings, all in the round's FIRST minute (tau 240-293). The arm trades
+tau 5-60, so it never looked. No decision row is written on that path because
+`crossed_side` is never reached -- the tau test precedes it.
+
+### Why the window is not a candidate for widening
+
+Swept on the corpus, reversals already excluded:
+
+    tau band      n(31d)   win     |  n(priced)   ask    edge   growth add / rev
+    5-60             839  0.714    |       169  0.663  +0.083   +0.226 / +0.042
+    60-120          1005  0.662    |       150  0.657  +0.043   -0.275 / -0.255
+    120-180         1101  0.641    |       121  0.635  +0.034   -0.595 / -0.441
+    180-270         1505  0.664    |       171  0.635  +0.032   -0.849 / -0.614
+    5-270           2486  0.708    |       420  0.652  +0.036   -1.288 / -1.204
+
+**tau 5-60 is the only band that compounds positively, and it does so under
+both slippage models.** Every longer band is negative under both. Widening to
+5-270 to catch rounds like this one turns +0.226/+0.042 into -1.288/-1.204.
+
+The mechanism is the arm's own premise: the edge is "the nick the venue has not
+registered yet", and that requires the round to end before the venue reprices
+or the spot crosses back. At tau 280 there are four more minutes for both.
+
+This round is a genuine counter-example -- both early Down entries at ~0.505
+would have paid ~+0.96/$1. It is one round against 2,486 corpus triggers
+pointing the other way.
+
+Note the model arm used to cover tau 60-210 and is now off, so that stretch is
+traded by nothing. That is correct rather than a gap: cross has no usable edge
+there (above) and the model arm had none either, which is why it was switched
+off.
+
+### Caveat found while doing this: over half the recorded quote rows have no ask
+
+    quotes rows with a spot                     749,458
+    quotes rows that also carry up_ask/down_ask 362,981   (48.4%)
+
+The 12:45 round alone is 85 of 263 rows missing an ask. Any replay that filters
+on `up_ask is not null` -- which the first pass of this investigation did, and
+which `cross_reversal_recorded.py` still does -- is detecting crossings on
+fewer than half the ticks and will UNDERCOUNT triggers. It does not flip the
+reversal result (the 31-day corpus, which has no such holes, agrees in sign and
+carries the power), but recorded-book trigger COUNTS are a floor, not a census.
