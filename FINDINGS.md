@@ -5956,3 +5956,30 @@ the ~0.06 buffer+fee. If instead the +0.25s ask is already ~equal to +1.0s --
 our market repricing faster than the recorded one -- there is no catch, the
 gate stays at 10, and the "detect/execute earlier" idea closes for good. NO
 GATE CHANGE until that read exists.
+
+### Addendum (23:16 UTC): the second half of the question gets its own instrument
+
+The read tool (`tools/cross_catch_report.py`) is live, and its first output --
+bucketing the 34 historical orders by how far the book ran past OUR limit --
+already says something the catch thesis needs to hear:
+
+    run < 0      9/9 filled
+    0 - 0.1      3/3 filled
+    > 0.35       0/2 filled   (one round, two orders)
+
+Honouring is clean while the book stays near the limit, and the single case
+where it ran +0.35 away did NOT fill. That is the JUMP-SIZED regime the catch
+thesis lives on, and natural fills cannot settle it: the range gate refuses
+those crossings before the venue can answer, so they never produce a fill to
+watch. So the question gets a real-money probe instead:
+
+  * `cross_probe_enabled` (default FALSE): quotes RANGE-REFUSED crossings at a
+    fixed `cross_probe_stake` ($1), capped `cross_probe_max_per_day` (6),
+    labelled "cross probe" in decisions.reason. Guard, caps, reserved slot and
+    exposure checks are UNCHANGED. Revert = one config line.
+  * It spends money to buy mechanics data, not edge. Worst case ~-$6/day.
+
+With the meter, this settles both halves: (a) how fast OUR market's book walks,
+and (b) whether the venue fills a quote taken while it walks. Those are the two
+numbers the gate decision needs; neither exists yet. NO GATE CHANGE, and the
+probe stays OFF, until the owner says otherwise.
