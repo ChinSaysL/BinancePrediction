@@ -1672,6 +1672,16 @@ class Bot:
         tau = r.tau_s(now_ms)
         if not (self._ck("min_tau_s", r) <= tau <= self._ck("max_tau_s", r)):
             return
+        # RE-ENTRY GAP. Without it the websocket clock (~114/s) takes the same
+        # crossing dozens of times; the substrate this arm's multi-entry EV was
+        # measured on was sampled at 1s and could never contain such a pair.
+        # See config.cross_reentry_gap_s. Checked before any venue call so a
+        # duplicate costs nothing.
+        gap = self._ck("reentry_gap_s", r)
+        if gap > 0:
+            last = (getattr(self, "_cross_last_ms", None) or {}).get(r.slug)
+            if last is not None and (now_ms - last) < gap * 1000.0:
+                return
         up, down = r.up, r.down
         if not up or not down:
             return
@@ -1996,6 +2006,12 @@ class Bot:
         if not isinstance(rs, dict):
             rs = self._round_stake = {}
         rs[r.slug] = rs.get(r.slug, 0.0) + stake
+        # Stamp the entry time with the claim, for the re-entry gap above.
+        lm = getattr(self, "_cross_last_ms", None)
+        if not isinstance(lm, dict):
+            lm = self._cross_last_ms = {}
+        lm[r.slug] = now_ms
+        self._cross_last_ms = {k: v for k, v in lm.items() if k in live}
         self._round_stake = {k: v for k, v in rs.items() if k in live}
         # Remember the side, not just the count: the reversal guard reads it.
         self._cross_side[r.slug] = side

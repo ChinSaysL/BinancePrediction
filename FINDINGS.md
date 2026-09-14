@@ -5231,3 +5231,66 @@ total is still a single day (09-09, +48.58 of +49.36), day-t moves 0.68 -> 0.71,
 and the arm's own edge is untouched -- lifetime win 0.64971 against a mean ask
 of 0.64967, its `fair - quote` ranking outcomes at AUC 0.4906. The guard removes
 a landmine before that arm is ever switched back on. The arm stays OFF.
+
+## REGRESSION: non-blocking placement removed an accidental rate limit (2026-09-14)
+
+Moving order placement off the poll loop (correct, and it fixed a 21s blindness
+bug) had a consequence I did not anticipate: it removed a rate limit the arm
+had been relying on without anyone knowing.
+
+Live, minutes after the deploy:
+
+    19:34:00,179  CROSS bnb Up $3.54 -> 23 today
+    19:34:00,240  CROSS bnb Up $3.54 -> 24 today     <- 61ms later
+    19:49:01,614  CROSS eth Up $3.12 -> 27 today
+    19:49:01,674  CROSS eth Up $3.12 -> 28 today     <- 60ms later
+
+and one round took FOUR fills for $11.64 on a ~$45 bankroll -- 26% on a single
+oracle print.
+
+### Cause
+
+`crossed_side` returns a side for as long as `look_s` of tick history still
+straddles the strike, so ONE crossing is detectable for about a second. The arm
+runs on the websocket clock at ~114 ticks/s, so it can see that one crossing
+~114 times. While placement AWAITED the fill, the first entry blocked the loop
+for 2-3s and the crossing had resolved by the time the arm looked again. That
+await was the rate limit.
+
+### Why the multi-entry measurement never showed this
+
+`cross_max_per_round = 5` and "entries 0-4 all carry positive EV" were measured
+on a substrate sampled once per SECOND. Gaps between consecutive entries in a
+round, on that substrate:
+
+    min 0.9s   p10 1.0s   MEDIAN 1.0s   p90 1.0s   max 41.0s
+
+That median is the sampling interval, not a market property: 92% of its "second
+entries" are the same crossing re-detected on the next sample. The substrate
+could not contain a 0.06s pair, so the measurement never priced one.
+
+### Fix
+
+`cross_reentry_gap_s = 1.0` -- minimum gap between entries in one round,
+stamped when the slot is claimed (not when the fill returns, since placement is
+now off the poll loop and several duplicates could otherwise pass while the
+first order was still in flight). It reproduces the substrate the EV was
+measured on, and it is self-consistent with `cross_look_s`: after look_s the
+same crossing stops being detectable anyway.
+
+### What DID work, and is worth recording
+
+The `cross_max_round_stake_mult = 2.0` cap shipped 25 minutes earlier behaved
+exactly as designed. The 4-fill round PREDATES it; after it, bnb took 2 fills
+for $6.30 against a $7.08 budget and eth 2 for $6.04 against $6.24. The cap
+caught the symptom while the cause was still unknown -- which is the argument
+for a priori bounds over fitted ones.
+
+The in-flight exposure reservation also worked: a unit test isolating the
+per-round cap failed because `_pending_stake` correctly blocked a second entry
+at 24% + 24% against the 30% account cap.
+
+### Cost
+
+Three rounds traded under the regression: +6.73, -6.30, -6.04 = **-$5.61**.
+Bot was stopped on discovery and restarted with the gap in place.

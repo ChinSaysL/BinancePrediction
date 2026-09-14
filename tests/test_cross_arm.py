@@ -606,16 +606,27 @@ class TestTheArm:
         the strike is naturally hedged rather than doubled -- taking every one
         measured +$31.37 against +$14.16 for the first alone."""
         monkeypatch.setattr("btcpredict.config.settings.cross_max_per_round", 2)
+        # the re-entry gap, the account exposure cap and the round-stake cap
+        # are SEPARATE limits with their own tests. Disable them here so this
+        # test measures cross_max_per_round and nothing else -- in this fixture
+        # the stake is 24% of bankroll, so the 30% exposure cap would bind on
+        # the second entry first.
+        monkeypatch.setattr("btcpredict.config.settings.cross_reentry_gap_s", 0.0)
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_open_stake_pct", 0.0)
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_round_stake_mult", 0.0)
         bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0))
         calls = []
 
-        async def place(*a, **k):
+        async def execute(*a, **k):
             calls.append(1)
-            return None
 
-        bot._place_order = place
-        for _ in range(4):
-            asyncio.run(bot._cross_tick())
+        bot._cross_execute = execute
+
+        async def go():
+            for _ in range(4):
+                await bot._cross_tick()
+                await asyncio.sleep(0)      # let the spawned task start
+        asyncio.run(go())
         assert len(calls) == 2, "capped at cross_max_per_round, not unlimited"
 
     def test_no_cross_touches_nothing(self, store, armed):
@@ -1639,3 +1650,70 @@ class TestTheLockedLossGuard:
         import btcpredict.main as m
         src = inspect.getsource(m.Bot._place_order)
         assert src.index("max_paired_price") < src.index("attempts = max(1,")
+
+
+class TestReentryGap:
+    """The websocket clock is ~114 ticks/s. `crossed_side` keeps returning a
+    side for as long as `look_s` of history still straddles the strike, so
+    without a gap the arm takes ONE crossing dozens of times.
+
+    This was masked while placement awaited the fill (the first entry blocked
+    2-3s). Moving placement off the poll loop on 2026-09-14 removed that
+    accidental rate limit and the arm immediately took paired entries 0.06s
+    apart at the same price, spending the round's budget in 60ms.
+
+    1.0s reproduces the substrate the multi-entry EV was measured on: gaps
+    between consecutive entries there are min 0.9s / median 1.0s / p90 1.0s --
+    the 1s sampling interval.
+    """
+
+    def test_a_second_entry_inside_the_gap_is_refused(self, store, armed,
+                                                      monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.cross_reentry_gap_s", 1.0)
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_open_stake_pct", 0.0)
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_round_stake_mult", 0.0)
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0))
+        calls = []
+
+        async def execute(*a, **k):
+            calls.append(1)
+
+        bot._cross_execute = execute
+
+        async def go():
+            for _ in range(5):
+                await bot._cross_tick()
+                await asyncio.sleep(0)
+        asyncio.run(go())
+        assert len(calls) == 1, (
+            "five looks inside one second is one crossing, not five")
+
+    def test_the_gap_is_checked_before_any_venue_call(self):
+        """A duplicate must cost nothing -- no quote, no order, no log spam."""
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._cross_tick)
+        body = src[src.index('"""', src.index('"""') + 3):]   # past the docstring
+        assert body.index("reentry_gap_s") < body.index("_unbooked_round_tokens")
+
+    def test_zero_means_off(self):
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._cross_tick)
+        assert "if gap > 0:" in src
+
+    def test_the_stamp_is_taken_with_the_claim(self):
+        """Stamped when the slot is claimed, not when the fill returns --
+        placement is off the poll loop, so a fill-time stamp would let several
+        duplicates through while the first order was still in flight."""
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._cross_tick)
+        assert src.index("lm[r.slug] = now_ms") < src.index("create_task")
+
+    def test_it_is_per_market(self):
+        """One family's entry must not gag another's."""
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._cross_tick)
+        assert "_cross_last_ms" in src and ".get(r.slug)" in src

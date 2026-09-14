@@ -1323,6 +1323,31 @@ class Settings(BaseSettings):
     # profit in a single day. It is a landmine, removed before that arm is ever
     # switched back on.
     max_paired_price: float = 1.0
+    # Minimum gap between two entries in the SAME round. 0 = OFF.
+    #
+    # `cross_max_per_round` (5) and the "entries 0-4 all carry positive EV"
+    # measurement behind it were computed on a substrate sampled once per
+    # SECOND. Measured on that substrate, the gap between consecutive entries in
+    # a round is: min 0.9s, p10 1.0s, MEDIAN 1.0s, p90 1.0s. That is the
+    # sampling interval, not a property of the market -- 92% of its "second
+    # entries" are the SAME crossing re-detected on the next sample.
+    #
+    # Live, the arm runs on the websocket clock at ~114 ticks/s, so it detects
+    # that one crossing ~114 times. That was masked for as long as placement
+    # AWAITED the fill: the first entry blocked for 2-3s and the crossing had
+    # resolved by the time the arm looked again. Moving placement off the poll
+    # loop on 2026-09-14 removed that accidental rate limit, and the arm
+    # immediately took paired entries 0.06s apart at the same price --
+    #     19:34:00,179  CROSS bnb Up $3.54 -> 23 today
+    #     19:34:00,240  CROSS bnb Up $3.54 -> 24 today
+    # which is not five looks at a changing book, it is one bet at double size,
+    # and it spends the round's budget before any later crossing can be taken.
+    #
+    # 1.0 reproduces the substrate the EV was measured on. It is also
+    # self-consistent with cross_look_s: once look_s has passed, `crossed_side`
+    # stops returning a side for the same crossing anyway, because its reference
+    # tick has moved to the near side.
+    cross_reentry_gap_s: float = 1.0
     cross_max_round_stake_mult: float = 2.0
     cross_max_open_stake_pct: float = 0.30
     cross_ws_follow_all: bool = True
