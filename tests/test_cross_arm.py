@@ -1445,12 +1445,12 @@ class TestPerRoundAndAccountWideAreDifferentLimits:
         import inspect
         import btcpredict.main as m
         src = inspect.getsource(m.Bot._cross_tick)
-        call = src[src.index("check_reserved("):]
+        call = src[src.index("guard.check_reserved("):]
         call = call[:call.index(")")]
         assert "max_per_round" not in call, (
             "check_reserved counts positions account-wide; giving it the "
             "per-round knob conflates two different limits")
-        assert "cross_max_open_positions" in call
+        assert "cross_max_open_positions" in src
 
     def test_the_per_round_limit_is_still_enforced(self):
         """...and dropping it from the guard must not drop it entirely: the
@@ -1459,3 +1459,62 @@ class TestPerRoundAndAccountWideAreDifferentLimits:
         import btcpredict.main as m
         src = inspect.getsource(m.Bot._cross_tick)
         assert '_cross_fired.get(r.slug, 0) >= self._ck("max_per_round", r)' in src
+
+
+class TestOrderingDoesNotBlockTheLoop:
+    """`buy_limit` waits up to limit_wait_s (20s) for a fill, and _cross_all
+    walks six families sequentially inside the poll loop -- so awaiting the
+    order inline stopped everything.
+
+    Measured 2026-09-14: every unfilled attempt produced a quote gap the length
+    of its own wait (21.2s -> 21.4s, 21.5s -> 26.0s, 12.4s -> 16.3s). No market
+    was polled and no crossing on ANY family could be detected for that long,
+    starting the instant a trigger fired.
+    """
+
+    def test_the_order_is_placed_off_the_poll_loop(self):
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._cross_tick)
+        assert "create_task(self._cross_execute" in src, (
+            "the order must be spawned, not awaited, or one resting limit "
+            "blinds all six families for up to 20 seconds")
+        assert "await self._place_order" not in src, (
+            "_cross_tick must not await placement")
+        assert "await self._place_order" in inspect.getsource(m.Bot._cross_execute)
+
+    def test_the_task_is_kept_so_it_cannot_vanish(self):
+        """A bare create_task can be garbage-collected mid-flight, and an
+        exception in a dropped task is never reported."""
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._cross_tick)
+        assert "_order_tasks" in src and "add_done_callback" in src
+
+    def test_in_flight_stake_counts_against_the_exposure_cap(self):
+        """Two orders in flight could each pass a 30% check and land at 60%."""
+        b = Bot.__new__(Bot)
+        b._pending_stake = 7.5
+        b._open_stake, b._open_stake_at = 10.0, time.time()
+        assert b._open_cross_stake() == 17.5
+
+    def test_in_flight_orders_count_against_the_slot_cap(self):
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._cross_tick)
+        assert "_pending_n" in src and "cap_open -=" in src, (
+            "reserved_open only counts BOOKED positions, so orders in flight "
+            "must be subtracted from the slot cap")
+
+    def test_the_reservation_is_released_even_on_failure(self):
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._cross_execute)
+        assert "finally:" in src and "_pending_n" in src.split("finally:")[1]
+        assert "_pending_stake" in src.split("finally:")[1]
+
+    def test_a_failing_order_is_logged_not_swallowed(self):
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._cross_execute)
+        assert "log.exception" in src

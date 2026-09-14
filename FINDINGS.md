@@ -5085,3 +5085,54 @@ volatile stretch is the design working, not a fault to be tuned away.
 NOTHING SHIPPED. Limits: 7 days, BTC-5m only. A dynamic gate's advantage should
 show up across REGIME CHANGES, and seven days may not hold enough of them --
 that argues for revisiting with more data, not for shipping on this.
+
+## THE frequency bug: a resting order blinded the whole bot (2026-09-14)
+
+The operator's complaint was trade frequency, and I spent several rounds
+testing gates -- the depth floor, the confirmation delay, depth sizing, a
+dynamic range gate -- all of which came back "ship nothing". The gates were
+never the problem.
+
+`buy_limit` AWAITS the fill for up to `limit_wait_s` (20s). `_cross_all` walks
+the six families sequentially inside the poll loop. So the entire decision loop
+stopped while any one order rested. Measured against the recorded tape -- every
+unfilled attempt produced a quote gap the length of its own wait:
+
+    order waited 21.2s  ->  quote gap 21.4s
+    order waited 21.2s  ->  quote gap 25.1s
+    order waited 21.5s  ->  quote gap 26.0s
+    order waited 12.4s  ->  quote gap 16.3s
+    order waited 21.1s  ->  quote gap 21.7s
+    order waited  7.6s  ->  quote gap 11.5s
+
+A quote gap means nothing was recorded, nothing was polled, and no crossing on
+ANY family could be detected for that long.
+
+Three things make it worse than the raw seconds suggest:
+
+  * it blocks ALL SIX families, not the one ordering. A resting bnb order
+    blinds btc.
+  * it starts the instant a trigger fires -- when the market is moving and
+    further crossings are most likely.
+  * a FILLED order blocks ~3.7s, a MISSED one 21s, so the 35% of attempts that
+    miss burn six times the blind time of the ones that work.
+
+### The fix
+
+Placement moved to a background task (`_cross_execute`); the poll loop no
+longer waits. The slot was already claimed before ordering (`_cross_fired`), so
+the await was pure dead time.
+
+What the split must not lose is the cap arithmetic. `reserved_open` and the
+ledger's open-stake query both only count positions that have BOOKED, so with
+several orders outstanding two triggers could each pass a 30% exposure check
+and land at 60% together. Stake and slot are therefore RESERVED at claim
+(`_pending_stake`, `_pending_n`) and released in the task's `finally`.
+
+A test caught a real bug in the first version of that: `_open_cross_stake`
+returns a 1-second cache, and the cached path returned the bare ledger figure
+without adding in-flight -- defeating the reservation in exactly the case it
+exists for, two triggers inside the same second.
+
+Also recorded: these stalls put holes in the recorded tape, so every replay in
+this file that counts triggers from `quotes` has been UNDERCOUNTING them.

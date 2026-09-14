@@ -1555,7 +1555,10 @@ class Bot:
         """
         now = time.time()
         if now - getattr(self, "_open_stake_at", 0.0) < 1.0:
-            return getattr(self, "_open_stake", 0.0)
+            # + in-flight on the CACHED path too. Returning the bare cached
+            # figure here defeated the whole reservation: two triggers inside
+            # the same second is precisely the case it exists for.
+            return getattr(self, "_open_stake", 0.0) + self._inflight_stake()
         try:
             rows = self.store.query(
                 "SELECT COALESCE(SUM(f.stake), 0.0) AS s FROM fills f "
@@ -1563,9 +1566,20 @@ class Bot:
                 "WHERE st.id IS NULL AND f.mode = 'cross'")
             val = float(rows[0]["s"] or 0.0) if rows else 0.0
         except Exception:                                   # pragma: no cover
-            return getattr(self, "_open_stake", 0.0)
+            return getattr(self, "_open_stake", 0.0) + self._inflight_stake()
         self._open_stake, self._open_stake_at = val, now
-        return val
+        return val + self._inflight_stake()
+
+    def _inflight_stake(self) -> float:
+        """Stake committed to orders that have not booked a fill yet.
+
+        Orders are placed off the poll loop, so without this two triggers could
+        each pass a 30% exposure check while neither had reached the ledger,
+        and land at 60% together. NOT cached -- the cached ledger figure is a
+        second old by construction and this is the part that changes between
+        two triggers in the same poll.
+        """
+        return float(getattr(self, "_pending_stake", 0.0) or 0.0)
 
     async def _cross_all(self) -> None:
         """Run the cross arm over every family in CROSS_TRADED.
@@ -1939,9 +1953,16 @@ class Bot:
         # per-round limit is enforced separately at the top of this method via
         # `_cross_fired[r.slug]`. Passing max_per_round here was harmless with
         # one family and would have capped all six at 5 concurrent positions.
-        allowed, why = self.guard.check_reserved(
-            r.slug, max_open=(settings.cross_max_open_positions
-                              or 10 ** 6))
+        # Minus the orders already in flight: `reserved_open` only counts
+        # positions that have BOOKED, and since placement moved off the poll
+        # loop several can be outstanding at once.
+        cap_open = settings.cross_max_open_positions or 10 ** 6
+        cap_open -= getattr(self, "_pending_n", 0)
+        if cap_open <= 0:
+            self._cross_refuse(r, side, "reserved slots full (orders in flight)",
+                               tau=tau, spot=spot_now, sigma=sigma_now)
+            return
+        allowed, why = self.guard.check_reserved(r.slug, max_open=cap_open)
         if not allowed:
             self._cross_refuse(r, side, why, tau=tau, spot=spot_now, sigma=sigma_now)
             return
@@ -2024,40 +2045,84 @@ class Bot:
         # with run+0.000 filled at 0.9008 four seconds later and none of those
         # account for it. So record what the book was doing WHILE the order was
         # in flight instead of inferring it again.
-        t_send = time.monotonic()
-        book_at_send = ask
-        fill = await self._place_order(
-            r, sig,
-            fair_up=(ceil_side if side == "Up" else 1.0 - ceil_side),
-            token=token, stake=stake, skip_pretrade_gates=True, take_px=ask,
-            # Bid up to the ceiling, not to the stale quote plus a tick. See
-            # limit_ceiling in _place_order for the round this cost us.
-            limit_ceiling=ceil_side)
-        elapsed = time.monotonic() - t_send
-        top_now = (wsb.best(r.market_id, settings.ws_book_max_age_s)
-                   if wsb is not None else None)
-        book_now = top_now.ask(side) if top_now is not None else None
-        got = getattr(fill, "filled_px", None) if fill else None
-        # The four numbers that let the buffer be tuned from data instead of
-        # intuition: what we decided on, what limit we actually sent, what we
-        # got, and how much of the intended stake filled. The last one is the
-        # discriminator -- a 100% fill paid its limit, partial fills beat it.
-        cash = getattr(fill, "stake", None) if fill else None
-        shares = getattr(fill, "shares", None) if fill else None
-        log.info("cross exec %s %s: decided %.4f limit %.2f -> %s in %.2fs | "
-                 "committed $%s of $%.2f (%s) | shares %s | cash/shares %s | "
-                 "book now %s", r.slug, side, book_at_send, ceil_side,
-                 ("%.4f" % got) if got else "NO FILL", elapsed,
-                 ("%.4f" % cash) if cash else "0", stake,
-                 ("%.0f%%" % (100 * cash / stake)) if cash and stake else "0%",
-                 ("%.4f" % shares) if shares else "0",
-                 ("%.4f" % (cash / shares)) if (cash and shares) else "n/a",
-                 ("%.4f" % book_now) if book_now is not None else "n/a")
-        if not fill:
-            return
-        await self._book_fill(r, sig, fill, did=did, up=up, spot=spot,
-                              sigma=sigma, tau=tau, token=token, mode="cross")
+        # NON-BLOCKING FROM HERE. `buy_limit` awaits the fill for up to
+        # limit_wait_s (20s) and `_cross_all` walks the six families
+        # sequentially inside the poll loop, so awaiting the order here stopped
+        # EVERYTHING. Measured 2026-09-14: every unfilled attempt produced a
+        # quote gap the length of its own wait --
+        #     waited 21.2s -> gap 21.4s     waited 21.5s -> gap 26.0s
+        #     waited 12.4s -> gap 16.3s     waited  7.6s -> gap 11.5s
+        # -- no market polled, no crossing on ANY family detectable, for that
+        # long. The stall begins the instant a trigger fires, which is when the
+        # market is moving and further crossings are most likely. A filled
+        # order cost ~3.7s, a missed one 21s, so the 35% of attempts that miss
+        # burned six times the blind time of the ones that worked.
+        #
+        # The slot is already claimed above (`_cross_fired`), so the await was
+        # pure dead time. What the task must not lose is the cap arithmetic:
+        # two orders in flight could each pass a 30% exposure check and land at
+        # 60% together, so stake and slot are RESERVED here and released in the
+        # task's `finally`.
+        self._pending_n = getattr(self, "_pending_n", 0) + 1
+        self._pending_stake = getattr(self, "_pending_stake", 0.0) + stake
+        task = asyncio.create_task(self._cross_execute(
+            r=r, sig=sig, side=side, token=token, stake=stake, ask=ask,
+            ceil_side=ceil_side, did=did, up=up, spot=spot, sigma=sigma,
+            tau=tau, wsb=wsb))
+        tasks = getattr(self, "_order_tasks", None)
+        if tasks is None:
+            tasks = self._order_tasks = set()
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
 
+    async def _cross_execute(self, *, r, sig, side, token, stake, ask,
+                             ceil_side, did, up, spot, sigma, tau, wsb) -> None:
+        """Place one cross order and book it, OFF the poll loop.
+
+        Same code that used to run inline in `_cross_tick`; what changed is
+        that the decision loop no longer waits for it.
+        """
+        try:
+            t_send = time.monotonic()
+            book_at_send = ask
+            fill = await self._place_order(
+                r, sig,
+                fair_up=(ceil_side if side == "Up" else 1.0 - ceil_side),
+                token=token, stake=stake, skip_pretrade_gates=True, take_px=ask,
+                # Bid up to the ceiling, not to the stale quote plus a tick. See
+                # limit_ceiling in _place_order for the round this cost us.
+                limit_ceiling=ceil_side)
+            elapsed = time.monotonic() - t_send
+            top_now = (wsb.best(r.market_id, settings.ws_book_max_age_s)
+                       if wsb is not None else None)
+            book_now = top_now.ask(side) if top_now is not None else None
+            got = getattr(fill, "filled_px", None) if fill else None
+            # The four numbers that let the buffer be tuned from data instead of
+            # intuition: what we decided on, what limit we actually sent, what we
+            # got, and how much of the intended stake filled. The last one is the
+            # discriminator -- a 100% fill paid its limit, partial fills beat it.
+            cash = getattr(fill, "stake", None) if fill else None
+            shares = getattr(fill, "shares", None) if fill else None
+            log.info("cross exec %s %s: decided %.4f limit %.2f -> %s in %.2fs | "
+                     "committed $%s of $%.2f (%s) | shares %s | cash/shares %s | "
+                     "book now %s", r.slug, side, book_at_send, ceil_side,
+                     ("%.4f" % got) if got else "NO FILL", elapsed,
+                     ("%.4f" % cash) if cash else "0", stake,
+                     ("%.0f%%" % (100 * cash / stake)) if cash and stake else "0%",
+                     ("%.4f" % shares) if shares else "0",
+                     ("%.4f" % (cash / shares)) if (cash and shares) else "n/a",
+                     ("%.4f" % book_now) if book_now is not None else "n/a")
+            if not fill:
+                return
+            await self._book_fill(r, sig, fill, did=did, up=up, spot=spot,
+                                  sigma=sigma, tau=tau, token=token, mode="cross")
+        except Exception as e:                              # pragma: no cover
+            log.exception("cross order failed for %s %s: %s: %s",
+                          r.slug, side, type(e).__name__, e)
+        finally:
+            self._pending_n = max(0, getattr(self, "_pending_n", 1) - 1)
+            self._pending_stake = max(
+                0.0, getattr(self, "_pending_stake", stake) - stake)
 
     @staticmethod
     def double_trigger(*, entry_px: float | None, ask: float | None, tau: float,
