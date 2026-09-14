@@ -5696,3 +5696,45 @@ is unchanged, since every row there shares the same entry price.
 
 **Shipped**: `cross_limit_buffer_inv` 0.25 -> 0.125, `cross_limit_wait_s` 2.0.
 537 tests pass. Deployed and restarted 2026-09-14 21:29 UTC.
+
+## Polymarket as a DATA SOURCE carries no information Binance's own quote lacks
+
+Execution stays on Binance; the question was whether Polymarket's price for the
+same round — same slug, same window, same Chainlink stream — predicts Binance's
+settlement well enough to trade on Binance alone.
+
+It does not. 1,504 observations over 344 rounds and 3 families, joined from
+Polymarket's `prices-history` (60s granularity, 5 points per 5m round) to this
+bot's own 1s quote feed and its recorded winners (`tools/pm_signal_collect.py`):
+
+    AUC(bn_mid)  0.8530     the venue we trade
+    AUC(pm_up)   0.8113     polymarket alone -- strictly WORSE
+    AUC(gap)     0.5111     the gap: a coin flip
+
+    conditional on the binance price:
+      bn_mid band      n   AUC(gap)   lo-gap win   hi-gap win
+      0.00-0.35      492     0.5070        0.222        0.242
+      0.35-0.50      262     0.5143        0.362        0.455
+      0.50-0.65      280     0.4894        0.685        0.662
+      0.65-1.01      470     0.4847        0.837        0.835
+
+The gaps are not small — |gap| > 0.05 in 60.4% of observations, IQR +-0.07 — but
+they are symmetric noise around zero (median +0.0000). Polymarket is simply the
+less accurate venue, which is the same fact the cross-venue pricing work found
+from the other side: its 5m books are 11-40 shares deep and lag.
+
+Traded on Binance at the REAL cost (`ask + max(0.01, min(0.25, 0.125*(1-ask)))`,
+169bp fee), buying whichever side Polymarket calls underpriced:
+
+    rule                          n    EV/$1    growth
+    any gap                    1232  -0.2399   -22.140
+    |gap| > 0.05                864  -0.1975   -13.142
+    |gap| > 0.10                547  -0.1697    -7.352
+    |gap| > 0.20                188  -0.1367    -2.174
+    |gap|>0.10, bn_mid .35-.65  252  -0.1332    -2.723
+
+Every threshold loses 13-24 cents per dollar. The sample spans a single day, so
+day-t is undefined — but a loss of that size is not a sampling artifact, and
+AUC(gap) = 0.51 says the same thing independently.
+
+**Nothing to ship. Polymarket is closed as a venue, as a hedge and as a signal.**
