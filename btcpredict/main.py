@@ -910,6 +910,16 @@ class Bot:
                            f"{settings.trade_candle_opens}")
         elif not (min_tau_eff <= tau <= settings.max_tau_s):
             gate_reason = f"tau {tau:.0f}s outside window"
+        elif (settings.model_max_round_range_bps > 0
+              and (rng := self._round_range_bps(r)) is not None
+              and not (settings.model_min_round_range_bps
+                       <= rng <= settings.model_max_round_range_bps)):
+            # This arm only pays in rounds that have MOVED. Outside 5-20bps it
+            # is a measured loser in both directions -- -0.127/$1 in calm rounds
+            # and -0.177/$1 past 20bps. See config.model_min_round_range_bps.
+            gate_reason = (f"round range {rng:.1f}bps outside "
+                           f"[{settings.model_min_round_range_bps:.0f},"
+                           f"{settings.model_max_round_range_bps:.0f}]")
         elif not self.spot.is_fresh(settings.max_spot_age_s):
             gate_reason = f"spot stale ({self.spot.age_s:.1f}s)"
         elif self.broker.mode == "live" and sig.act and self.book:
@@ -1348,6 +1358,25 @@ class Bot:
         r = getattr(self, "_round", None)
         return cross_knob(market_prefix(getattr(r, "slug", None)), name)
 
+    def _round_range_bps(self, r) -> float | None:
+        """How far this round has travelled, open -> now, in bps of the strike.
+
+        Read from `self._ticks`, NOT `feed.ticks`: the feed deque is 4000 ticks,
+        which at BTC's live ~114/s is 35 seconds and does not span a 5-minute
+        round. `self._ticks` is appended once per poll and holds 2400 samples.
+
+        Returns None when there is not enough history to judge -- callers must
+        treat that as "no opinion" and NOT as a refusal, or a cold start would
+        silently disable the arm.
+        """
+        if not r or not getattr(r, "strike", None):
+            return None
+        buf = (getattr(self, "_ticks", None) or {}).get(getattr(r, "symbol", "")) or []
+        seen = [px for t_ms, px in buf if t_ms >= r.start_ms and px > 0]
+        if len(seen) < 2:
+            return None
+        return 1e4 * (max(seen) - min(seen)) / r.strike
+
     def _cross_refuse(self, r, side, reason: str, *, tau: float = 0.0,
                       spot=None, stake: float = 0.0) -> None:
         """Record a cross trigger that was DETECTED and then refused.
@@ -1464,6 +1493,25 @@ class Bot:
                                f"{self._ck('max_depth_bps'):.2f}",
                                tau=tau, spot=spot_now)
             return
+        # How far this round has ALREADY travelled, open -> now. A round that
+        # has swung wide is one where a late crossing reverses again; a calm
+        # one is where it sticks (see config.cross_max_round_range_bps).
+        #
+        # Read from `self._ticks`, NOT `feed.ticks`: the feed's deque is 4000
+        # ticks, which at BTC's live ~114/s is 35 seconds -- it does not span a
+        # 5-minute round. `self._ticks` is appended once per poll and holds
+        # 2400 samples, so it does.
+        rng_gate = self._ck("max_round_range_bps")
+        if rng_gate > 0:
+            rng_bps = self._round_range_bps(r)
+            if rng_bps is not None:
+                if rng_bps > rng_gate:
+                    self._cross_refuse(
+                        r, side,
+                        f"round already moved {rng_bps:.1f}bps, gate is "
+                        f"{rng_gate:.1f}",
+                        tau=tau, spot=spot_now)
+                    return
         # The price that binds is the order's own quote; this is band sanity on
         # the last asks the poll saw. The ceiling is what makes the arm pay --
         # above it the favourite is overpriced and the cell measures negative.

@@ -468,6 +468,36 @@ class Settings(BaseSettings):
     # a coin flip with extra steps. The model arm is judged on historical data
     # like everything else; see the L2 measurement below cross_max_depth_bps.
     entry_mode: Literal["model", "impulse", "both", "off"] = "model"
+    # The MODEL arm's regime window, in bps of how far the round has travelled
+    # from its open to the entry instant. 0/0 = OFF.
+    #
+    # Its lifetime margin is famously zero -- win 0.64971 against an ask of
+    # 0.64967 over 688 live fills -- but that is the AVERAGE of two opposite
+    # halves, and the split is the opposite of the cross arm's:
+    #     range-so-far    n     ask     win   margin   per$1   total $
+    #       <=5 bps     439   0.593   0.595   +0.002  -0.000    -1.24
+    #       5-8         112   0.683   0.750   +0.067  +0.092   +60.77
+    #       8-12         66   0.710   0.758   +0.048  +0.088   -15.48
+    #       12-20        45   0.729   0.778   +0.049  +0.090   +43.44
+    #       >20          24   0.738   0.708   -0.030  -0.083   -28.12
+    #
+    # Day-clustered on its own live fills, 7 days:
+    #     all fills        n=686 per$1 -0.0070 day-t -0.11 drop-best -0.0406
+    #     range <= 3.6     n=339 per$1 -0.1274 day-t -0.77 drop-best -0.2364
+    #     range 5-20       n=223 per$1 +0.1160 day-t +1.80 drop-best +0.0647
+    #     range > 20       n= 24 per$1 -0.1769 day-t -0.77 drop-best -0.3135
+    # 5-20 carries +$88.73 of the arm's +$59.37 lifetime total and is positive
+    # on 6 of 7 days. Outside it the arm is a measured loser in BOTH directions.
+    #
+    # This is the symmetric counterpart to cross_max_round_range_bps: the cross
+    # arm owns calm rounds (+0.661/$1 under 5bps, -0.074 when trending), this
+    # one owns moving rounds. Each arm's dead zone is the other's edge.
+    #
+    # CAVEAT: day-t 1.80 is under this repo's t=2 bar. It gates an arm that is
+    # otherwise OFF, so the question is where it may trade, not whether to add
+    # risk blindly.
+    model_min_round_range_bps: float = 5.0
+    model_max_round_range_bps: float = 20.0
     # --- stale-display maker ------------------------------------------------
     # MEASURED 2026-09-12, lead-lag cross-correlation over 1,372 rounds of the
     # 1 Hz quote tape (corr of the venue's implied-probability change against
@@ -988,6 +1018,34 @@ class Settings(BaseSettings):
     # mechanical argument above -- that 0.5 measures the strike, not the
     # strategy -- is what rules 0.5 out regardless of which column you read.
     cross_max_depth_bps: float = 5.0
+    # Skip a round that has ALREADY moved this far. 0 = OFF.
+    #
+    # The arm's edge is regime-dependent, and this is the causal way to say so:
+    # a round that has been calm is one where a late crossing STICKS; a round
+    # that has already swung wide is one where it reverses again. Measured on
+    # the recorded history (real Chainlink strikes, real venue asks, tau 5-60),
+    # with the range taken from the round open to the TRIGGER instant -- never
+    # the full-round range, which is not known when the order is placed:
+    #     range-so-far    n    ask     win    EV/$1
+    #       <=5 bps      74   0.762   0.865  +0.661
+    #       5-8          50   0.703   0.760  +0.086
+    #       8-12         45   0.674   0.711  +0.052
+    #       12-20        15   0.669   0.467  -0.324
+    #
+    # Chosen on COMPOUNDED growth, not on EV/$1 -- a tighter gate has a better
+    # per-trade edge but too few trades. Daily log-growth at the shipped 5.04%
+    # sizing, priced at what we actually fill at rather than the book ask:
+    #     gate      n/day  add-slippage   mean-revert
+    #     off        64.4     0.1535        0.2651
+    #     <=8        37.3     0.2436        0.3090
+    #     <=10       46.0     0.2473        0.3463   <- best under BOTH models
+    #     <=12       51.9     0.2347        0.3376
+    # 8/10/12 all beat OFF under both models, so this is not knife-edge.
+    #
+    # CAVEAT: day-t at <=10 is 1.72, under this repo's t=2 bar (<=8 is 2.07).
+    # It ships on the growth result being consistent across two independent
+    # slippage models, not on the day-t. Revisit at ~30 more fills.
+    cross_max_round_range_bps: float = 10.0
     # PER-MARKET overrides, {slug prefix: {knob-without-the-cross_-prefix: value}}.
     # Read through cross_knob() so an unset market falls back to the global
     # above and the live BTC config cannot drift by accident. Set from .env as

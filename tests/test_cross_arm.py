@@ -1190,3 +1190,127 @@ class TestRefusalsAreRecorded:
         bot._place_order = _swallow
         asyncio.run(bot._cross_tick())
         assert self._reasons(store) == []
+
+
+class TestRoundRangeGate:
+    """Skip rounds that have already swung wide (config.cross_max_round_range_bps).
+
+    Measured: a crossing in a calm round sticks, one in a round that has already
+    moved 12-20bps reverses (EV +0.661 vs -0.324). The range must be taken from
+    the round OPEN to the trigger -- never the full round, which is the future.
+    """
+
+    @staticmethod
+    def _bot_with_range(store, lo, hi):
+        """A bot whose round has already travelled from `lo` to `hi`."""
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0))
+        bot._place_order = _swallow
+        now = int(time.time() * 1000)
+        bot._ticks = {"BTCUSDT": [(bot._round.start_ms + 1000, lo),
+                                  (bot._round.start_ms + 2000, hi),
+                                  (now - 1000, 77001.0)]}
+        return bot
+
+    def _refusals(self, store):
+        return [r[0] for r in store.conn.execute(
+            "select reason from decisions where reason like 'cross refused:%'")]
+
+    def test_a_calm_round_is_taken(self, store, armed, monkeypatch):
+        monkeypatch.setattr(
+            "btcpredict.config.settings.cross_max_round_range_bps", 10.0)
+        bot = self._bot_with_range(store, 77000.0, 77002.0)   # ~0.3 bps
+        asyncio.run(bot._cross_tick())
+        assert bot._cross_fired != {}, "a calm round must still trade"
+
+    def test_a_round_that_already_swung_is_skipped(self, store, armed, monkeypatch):
+        monkeypatch.setattr(
+            "btcpredict.config.settings.cross_max_round_range_bps", 10.0)
+        bot = self._bot_with_range(store, 76900.0, 77100.0)   # ~26 bps
+        asyncio.run(bot._cross_tick())
+        assert bot._cross_fired == {}, "a wide round must be skipped"
+        got = self._refusals(store)
+        assert got and "already moved" in got[0], got
+
+    def test_zero_disables_the_gate(self, store, armed, monkeypatch):
+        """0 = OFF, the repo's convention for every other limit."""
+        monkeypatch.setattr(
+            "btcpredict.config.settings.cross_max_round_range_bps", 0.0)
+        bot = self._bot_with_range(store, 76900.0, 77100.0)   # very wide
+        asyncio.run(bot._cross_tick())
+        assert bot._cross_fired != {}, "cap 0 must mean unlimited, not zero"
+
+    def test_it_ignores_ticks_from_before_the_round(self, store, armed, monkeypatch):
+        """Only the CURRENT round's travel counts."""
+        monkeypatch.setattr(
+            "btcpredict.config.settings.cross_max_round_range_bps", 10.0)
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0))
+        bot._place_order = _swallow
+        bot._ticks = {"BTCUSDT": [
+            (bot._round.start_ms - 60_000, 70000.0),   # previous round, huge move
+            (bot._round.start_ms + 1000, 77000.0),
+            (bot._round.start_ms + 2000, 77002.0)]}
+        asyncio.run(bot._cross_tick())
+        assert bot._cross_fired != {}, "pre-round ticks must not count"
+
+    def test_no_tick_history_does_not_block(self, store, armed, monkeypatch):
+        monkeypatch.setattr(
+            "btcpredict.config.settings.cross_max_round_range_bps", 10.0)
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0))
+        bot._place_order = _swallow
+        bot._ticks = {}
+        asyncio.run(bot._cross_tick())
+        assert bot._cross_fired != {}, "missing history must not silently block"
+
+
+class TestModelRoundRangeWindow:
+    """The MODEL arm only trades rounds that have MOVED (5-20 bps).
+
+    Its lifetime margin is zero because two opposite halves cancel: -0.127/$1
+    in calm rounds, +0.116 in moving ones, -0.177 past 20bps. The window keeps
+    only the half with evidence.
+    """
+
+    @staticmethod
+    def _bot(store, lo, hi):
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0))
+        bot._ticks = {"BTCUSDT": [(bot._round.start_ms + 1000, lo),
+                                  (bot._round.start_ms + 2000, hi)]}
+        return bot
+
+    def test_range_is_measured_from_the_round_open(self, store):
+        bot = self._bot(store, 77000.0, 77010.0)          # 10 pts on a 77000 strike
+        rng = bot._round_range_bps(bot._round)
+        assert rng is not None and 1.0 < rng < 2.0, rng
+
+    def test_ticks_before_the_round_are_ignored(self, store):
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0))
+        bot._ticks = {"BTCUSDT": [
+            (bot._round.start_ms - 60_000, 70000.0),      # previous round
+            (bot._round.start_ms + 1000, 77000.0),
+            (bot._round.start_ms + 2000, 77002.0)]}
+        rng = bot._round_range_bps(bot._round)
+        assert rng is not None and rng < 1.0, rng
+
+    def test_too_little_history_is_no_opinion_not_a_refusal(self, store):
+        """None must mean 'cannot judge' -- a cold start must not disable an arm."""
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0))
+        bot._ticks = {}
+        assert bot._round_range_bps(bot._round) is None
+        bot._ticks = {"BTCUSDT": [(bot._round.start_ms + 1000, 77000.0)]}
+        assert bot._round_range_bps(bot._round) is None
+
+    def test_no_strike_is_no_opinion(self, store):
+        bot = self._bot(store, 77000.0, 77010.0)
+        bot._round.strike = None
+        assert bot._round_range_bps(bot._round) is None
+
+    def test_the_window_brackets_the_measured_sweet_spot(self):
+        from btcpredict.config import settings as s
+        assert s.model_min_round_range_bps == 5.0
+        assert s.model_max_round_range_bps == 20.0
+
+    def test_cross_and_model_windows_are_complementary(self):
+        """Each arm's dead zone is the other's edge -- that is the whole design."""
+        from btcpredict.config import settings as s
+        assert s.cross_max_round_range_bps <= s.model_max_round_range_bps, \
+            "cross owns the calm end, model the moving end"

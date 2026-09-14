@@ -3658,3 +3658,117 @@ One round, one reason, one row.
 Three tests asserted `decisions == 0` on refusal -- they encoded the old
 silence as correct, and now assert the invariant that actually matters (no
 ORDER went out) while allowing the refusal row.
+
+## The cross arm is regime-dependent, and that is a gate (2026-09-14)
+
+Chasing a 4-hour drought -- 3 attempts against ~45/day projected -- turned up
+something better than the bug I was looking for.
+
+**Crossings did not stop; they moved.** Over 48 rounds in the last 4h, 79% still
+crossed the strike somewhere, but ZERO did so inside tau 5-60:
+
+    window          rounds  crossed anywhere  tau<5  tau5-60  tau60-120  tau120-300
+    T-26h..T-14h       144      47 (65%)        11      35        60         115
+    last 4h             48      38 (79%)         1       0        22         124
+
+Not a data problem: the recorded tape's median sample spacing is 1.00s in both
+windows. Not the depth gate either -- in the last 4h there are zero DETECTIONS,
+before any gate, and when detections do occur their depth is a median 0.6-1.1bps
+against a 5.0 gate that never binds.
+
+What changed is the regime. Median 5-minute range went 5.8 -> 11.4 bps: price
+now crosses once early and trends away, instead of oscillating near the strike
+into expiry. The arm's window is built for the latter.
+
+### The edge depends on how far the round has already travelled
+
+Measured with the range taken from the round OPEN to the TRIGGER instant -- the
+causal version; an earlier cut used the full-round range, which is the future
+and therefore worthless as a gate:
+
+    range-so-far    n    ask     win    EV/$1
+      <=5 bps      74   0.762   0.865  +0.661
+      5-8          50   0.703   0.760  +0.086
+      8-12         45   0.674   0.711  +0.052
+      12-20        15   0.669   0.467  -0.324
+
+Monotonic, and mechanically sensible: a crossing in a calm round sticks, one in
+a round that has already swung wide reverses again.
+
+### Chosen on COMPOUNDED growth, not on EV/$1
+
+A tighter gate has the better per-trade edge and too few trades. Daily
+log-growth at the shipped 5.04% sizing, priced at what we actually fill at:
+
+    gate      n/day   add +0.088 slip   mean-revert 0.47x+0.40
+    off        64.4      0.1535            0.2651
+    <=8        37.3      0.2436            0.3090
+    <=10       46.0      0.2473            0.3463   <- best under BOTH
+    <=12       51.9      0.2347            0.3376
+
+**+61% daily growth under additive slippage, +31% under mean-reverting**, and
+8/10/12 all beat OFF under both -- so the choice is not knife-edge.
+
+Shipped `cross_max_round_range_bps = 10.0` (0 = OFF). Read from `self._ticks`,
+not `feed.ticks`: the feed deque is 4000 ticks, which at BTC's live ~114/s is 35
+seconds and does not span a 5-minute round.
+
+CAVEAT: day-t at <=10 is 1.72, under this repo's t=2 bar (<=8 is 2.07). It ships
+on the growth result holding across two independent slippage models, not on the
+day-t. Revisit at ~30 more fills.
+
+### Incidental: the 4h drought was protective, not costly
+
+In the trending regime the arm's own tau 5-60 cell measures NEGATIVE (-0.074/$1
+against +0.459 in calm rounds). The rounds it declined to trade were rounds it
+would have lost on.
+
+## Two arms, two regimes (2026-09-14)
+
+The model arm's zero lifetime margin -- win 0.64971 against an ask of 0.64967
+over 688 live fills -- is the AVERAGE OF TWO OPPOSITE HALVES, and the split runs
+the other way from the cross arm's. Range is measured open -> entry (causal).
+
+    range-so-far     CROSS arm        MODEL arm
+      <=5 bps        +0.661/$1        -0.000/$1
+      5-8            +0.086           +0.092
+      8-12           +0.052           +0.088
+      12-20          -0.324           +0.090
+      >20              --             -0.083
+
+Day-clustered on the model arm's own live fills, 7 days:
+
+    all fills     n=686 per$1 -0.0070 day-t -0.11 drop-best -0.0406 neg 3/7
+    range <= 3.6  n=339 per$1 -0.1274 day-t -0.77 drop-best -0.2364 neg 4/7
+    range 5-20    n=223 per$1 +0.1160 day-t +1.80 drop-best +0.0647 neg 1/7
+    range > 20    n= 24 per$1 -0.1769 day-t -0.77 drop-best -0.3135 neg 3/5
+
+5-20 carries +$88.73 of the arm's +$59.37 lifetime total. Outside that window it
+is a measured loser in BOTH directions. Shipped `model_min/max_round_range_bps`
+= 5/20, gated in the `gate_reason` chain so every refusal is recorded like any
+other model-arm gate. `_round_range_bps()` is now shared by both arms.
+
+### What cross should do alongside it -- measured, not assumed
+
+    OVERLAP band (5-20bps), where the model now trades
+      cross, model not in round   n=118  EV +0.142  day-t +1.52
+      cross SAME side as model    n= 73  EV +0.336  day-t +3.01
+      cross OPPOSITE to model     n= 78  EV -0.108  day-t -0.29
+
+    CALM band (<5bps), where the model now stands down
+      cross SAME side as model    n= 41  EV +0.466  day-t +3.10
+      cross OPPOSITE to model     n= 49  EV +0.222  day-t +2.60
+      cross, all of calm          n=151  EV +0.534  day-t +2.37
+
+**Keep cross ON and keep skip_opposite_to_main TRUE.** Same-side cross in the
+overlap is the strongest cell measured anywhere in this file (+0.336, day-t
+3.01); turning cross off would throw it away.
+
+The two changes interlock: opposite-side cross LOSES in the overlap (-0.108) but
+MAKES money in calm rounds (+0.222, day-t 2.60), so the skip gate was costing
+money below 5bps. Gating the model arm out of the calm band removes the model
+position there, so the skip stops applying exactly where it was harmful. Neither
+change is correct without the other.
+
+CAVEAT: model day-t 1.80 is under the t=2 bar. It gates an arm that was OFF, so
+the question is where it may trade rather than whether to add risk blindly.
