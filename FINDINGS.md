@@ -4794,3 +4794,80 @@ trigger is 0.48-0.93 bps median on EVERY family, so the 5.0 depth gate binds on
 0-3% of triggers everywhere. tau and look are in seconds and the mechanism they
 encode is time-based. The price band and stake stay at BTC's because no other
 family has a recorded ask to set them from.
+
+## "Only enter on a SIGNIFICANT cross": tested both readings, ship neither (2026-09-14)
+
+Prompted by btc-updown-5m-1789403700: spot dipped 0.51 bps below the strike at
+tau 58, the arm bought Down at a filled 0.5789, and the round settled 1.37 bps
+ABOVE. A marginal cross that immediately reversed. The arm has a depth CEILING
+but no floor, so a 0.01 bps nick counts the same as a decisive move.
+
+### The observation is correct
+
+Win rate DOES rise with depth. Round-clustered bootstrap over every recorded
+family (426 triggers, 7 days):
+
+    cut 0.25:  shallow 0.737  deep 0.811  diff +0.074  CI [-0.028,+0.180]  n.s.
+    cut 0.50:  shallow 0.753  deep 0.825  diff +0.072  CI [-0.014,+0.162]  n.s.
+    cut 1.00:  shallow 0.759  deep 0.874  diff +0.115  CI [+0.022,+0.200]  REAL
+
+Waiting for the cross to HOLD does the same: win 0.883 at no delay, 0.918 after
+8 seconds.
+
+### And it is already in the price
+
+    BTC-5m, real asks
+    depth band     n    win   mean ask   EDGE (win - ask)
+    0.00-0.25     33  0.909      0.617      +0.292
+    0.25-0.50     38  0.895      0.646      +0.249
+    0.50-1.00     49  0.837      0.691      +0.146
+    1.00-2.00     30  0.900      0.790      +0.110
+    2.00-5.01     12  0.917      0.787      +0.130
+
+    correlation(depth, ask) = +0.367
+
+**The edge is LARGEST at the shallowest depths and roughly halves by 1 bps.**
+The extra win rate is fully paid for, and then some. Same for waiting: the ask
+goes 0.691 -> 0.763 between a 0s and an 8s confirmation.
+
+That is the arm's own premise restated. Its edge is the nick the venue has not
+repriced yet, so a "significance" filter removes precisely the part that is
+mispriced and keeps the part the venue already understands.
+
+### Growth, which is what decides it
+
+    depth FLOOR        n    win    additive g/t/drop     reverting g/t/drop
+    none (shipped)   162  0.883   +1.943/+2.40/+1.095   +2.282/+3.20/+1.483
+    0.25             129  0.876   +1.050/+3.06/+0.694   +1.577/+4.07/+1.108
+    0.60              71  0.887   +0.423/+1.32/+0.128   +0.829/+2.53/+0.499
+    1.00              42  0.905   +0.087/+0.55/+0.014   +0.461/+2.19/+0.275
+
+    CONFIRMATION       n    win    additive              reverting
+    0s (shipped)     162  0.883   +1.943/+2.40/+1.095   +2.282/+3.20/+1.483
+    2s               137  0.876   +0.741/+1.99/+0.480   +1.563/+3.75/+1.069
+    8s               122  0.918   +0.615/+1.65/+0.291   +1.591/+3.94/+1.172
+
+    SIZE by depth      n  mean w   additive              reverting
+    flat (shipped)   162   1.000  +1.943/+2.40/+1.095   +2.282/+3.20/+1.483
+    x0.5 under 0.5   162   0.781  +1.217/+2.45/+0.719   +1.622/+3.17/+1.061
+    linear depth/1.0 162   0.595  +0.830/+2.29/+0.507   +1.222/+3.07/+0.811
+
+Every variant loses growth under BOTH slippage models, monotonically in the
+strength of the filter. Sizing by depth loses too -- flat is the best rule
+tested. NOTHING SHIPPED.
+
+Worth noting what a floor DOES buy: day-t rises (additive 2.40 -> 3.06 at a
+0.25 floor, reverting 3.20 -> 4.07). It is a more consistent, smaller edge.
+Growth is what compounds, so that is not a trade worth making here -- but it is
+the honest reason the idea felt right.
+
+### Footnote on the trade that prompted this
+
+    decided 0.460, filled 0.5789
+      OLD buffer limit 0.55 -> would have MISSED
+      NEW buffer limit 0.60 -> filled
+
+The inverse-buffer change shipped hours earlier is what bought this trade. That
+is the rule working as designed (it exists to fill cheap entries that used to
+rest and cancel), and the first one it caught lost. One sample: it is expected
+to fill several more, and they will not all win.
