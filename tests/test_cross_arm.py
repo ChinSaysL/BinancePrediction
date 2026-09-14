@@ -2033,3 +2033,71 @@ class TestConcurrentTicksCannotDoubleEnter:
             f"{len(calls)} entries {0.05:.2f}s apart -- the re-entry gap was "
             "stamped with the tick's START time, so a slow venue read expires "
             "it before it is even written")
+
+
+class TestTheCatchMeter:
+    """What the book did AFTER a trigger, and what a refusal actually saw.
+
+    The catch thesis (2026-09-14 night): the venue walks to its post-cross
+    price over ~1s, so an order that quotes during that walk pays less -- and
+    on the recorded Sep 13 book the walk takes ~0.5s to reach half its move.
+    Three explanations for the gate->fill gap have already been wrong, so this
+    is recorded rather than assumed: every refusal stores the ask it saw (it
+    used to store None) and every trigger meters the book at +0.25/+0.50/+1.00s.
+    Log-only; it cannot touch an order.
+    """
+
+    def _bot(self, store):
+        from btcpredict.feeds.prediction_book import BookTop, PredictionBook
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0), asks=(0.45, 0.55))
+        wsb = PredictionBook(api_key="k", api_secret="s", session=None,
+                             signer=None)
+        now = int(time.time() * 1000)
+        wsb.tops[bot._round.market_id] = BookTop(
+            up_bid=0.30, up_ask=0.35, up_ask_size=1000.0, up_bid_size=1000.0,
+            ts_ms=now, recv_ms=now,
+            asks=((0.35, 1000.0),), bids=((0.30, 1000.0),))
+        bot.ws_book = wsb
+        return bot
+
+    def test_a_refusal_records_the_ask_it_saw(self, store, armed):
+        bot = self._bot(store)
+        bot._cross_side = {bot._round.slug: "Down"}   # force a reversal refusal
+
+        async def boom(*a, **k):
+            raise AssertionError("a refused trigger must not order")
+
+        bot._cross_execute = boom
+        asyncio.run(bot._cross_tick())
+        rows = list(bot.store.conn.execute(
+            "select reason, quote from decisions "
+            "where reason like 'cross refused:%'"))
+        assert rows, "the reversal refusal must leave a row"
+        assert rows[0][1] == pytest.approx(0.35), (
+            "the refusal row must carry the WS ask, not None")
+        assert (bot._round.slug, "Up") in bot._meter_seen, (
+            "the refusal must also schedule the post-trigger meter")
+
+    def test_the_meter_samples_three_marks_and_logs_them(self, store, armed,
+                                                         monkeypatch):
+        import btcpredict.main as m
+        bot = self._bot(store)
+        seen = []
+
+        async def instant(_s):
+            return None
+
+        monkeypatch.setattr(asyncio, "sleep", instant)
+        monkeypatch.setattr(m, "log", SimpleNamespace(
+            info=lambda *a: seen.append(a)))
+        asyncio.run(bot._cross_meter(bot._round, "Up"))
+        assert seen and seen[0][0] == (
+            "cross meter %s %s: +0.25s=%s +0.50s=%s +1.00s=%s")
+        assert seen[0][2:] == ("Up", "0.350", "0.350", "0.350")
+
+    def test_it_is_inert_without_a_ws_book(self, store, armed):
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0))
+        assert getattr(bot, "ws_book", None) is None
+        asyncio.run(bot._cross_meter(bot._round, "Up"))    # must not raise
+        bot._schedule_cross_meter(bot._round, "Up")        # or schedule anything
+        assert not getattr(bot, "_meter_seen", None)

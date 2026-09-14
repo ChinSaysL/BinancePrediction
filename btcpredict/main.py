@@ -1540,10 +1540,23 @@ class Bot:
             return
         bucket.add(reason)
         log.info("cross %s %s not taken: %s", r.slug, side, reason)
+        # Record what the book showed at the refusal. A refusal is the only
+        # clean read of "the venue had not repriced yet" that arrives without
+        # an order, and the row used to carry quote=None -- which threw that
+        # read away. Meter the book's path after it too (see
+        # _schedule_cross_meter): the catch a faster trigger would buy is
+        # exactly how fast the book leaves this price.
+        quote = None
+        with contextlib.suppress(Exception):
+            wsb = getattr(self, "ws_book", None)
+            if wsb is not None:
+                top = wsb.best(r.market_id, settings.ws_book_max_age_s)
+                quote = top.ask(side) if top is not None else None
+        self._schedule_cross_meter(r, side)
         with contextlib.suppress(Exception):
             self.store.insert("decisions", {
                 "slug": r.slug, "ts_ms": int(time.time() * 1000), "tau_s": tau,
-                "side": side, "fair": None, "quote": None, "edge": 0.0,
+                "side": side, "fair": None, "quote": quote, "edge": 0.0,
                 "hurdle": 0.0,
                 # the REFUSED market's sigma; `self._sigma` is the primary's,
                 # which would mislabel every eth/bnb row.
@@ -1552,6 +1565,56 @@ class Bot:
                 "spot": spot, "oracle": None, "strike": r.strike,
                 "stake": stake, "acted": 0, "reason": f"cross refused: {reason}",
             })
+
+    def _schedule_cross_meter(self, r, side) -> None:
+        """Sample the book after a trigger, once per (round, side).
+
+        The trigger path records what the book showed at the decision; this
+        records what it did NEXT. That is the number the catch question stands
+        on -- how much of the repricing a faster trigger would still find in
+        front of it -- and it has never been measured on OUR market at a
+        resolution finer than the 1s poll. Log-only: it cannot place, price or
+        change an order, and a failure here must never touch the arm.
+        """
+        if getattr(self, "ws_book", None) is None:
+            return
+        seen = getattr(self, "_meter_seen", None)
+        if not isinstance(seen, set):
+            seen = self._meter_seen = set()
+        if (r.slug, side) in seen:
+            return
+        if len(seen) > 400:                 # ~a day of triggers; keep it bounded
+            seen.clear()
+        seen.add((r.slug, side))
+        try:
+            task = asyncio.create_task(self._cross_meter(r, side))
+        except RuntimeError:                # no running loop (sync/fixture use)
+            return
+        tasks = getattr(self, "_meter_tasks", None)
+        if tasks is None:
+            tasks = self._meter_tasks = set()
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    async def _cross_meter(self, r, side) -> None:
+        """The book at +0.25s / +0.5s / +1.0s after a trigger. Log only."""
+        wsb = getattr(self, "ws_book", None)
+        if wsb is None:
+            return
+        out, prev = [], 0.0
+        try:
+            for mark in (0.25, 0.50, 1.00):
+                await asyncio.sleep(mark - prev)
+                prev = mark
+                top = wsb.best(r.market_id, settings.ws_book_max_age_s)
+                q = top.ask(side) if top is not None else None
+                out.append("n/a" if q is None else f"{q:.3f}")
+            log.info("cross meter %s %s: +0.25s=%s +0.50s=%s +1.00s=%s",
+                     r.slug, side, out[0], out[1], out[2])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
 
     def _open_cross_stake(self) -> float:
         """Total stake in cross positions that have not settled yet.
@@ -2113,6 +2176,7 @@ class Bot:
         # (we fill when the book moves AGAINST us, not for us).
         #
         # Pricing at cross_max_price gives the limit room to chase the book up
+        self._schedule_cross_meter(r, side)      # the +0.25/0.5/1.0s book path
         # to the ceiling and no further, which is the same shape that makes the
         # model arm fill 95%. `take_px` stays the trigger ask as the floor.
         # The limit sits just above the ask we actually observed, NOT at
