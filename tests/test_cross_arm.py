@@ -11,6 +11,7 @@ fire, and it never enters a round something else already holds.
 """
 from __future__ import annotations
 
+import types
 import asyncio
 import pathlib
 import tempfile
@@ -138,6 +139,19 @@ def armed(monkeypatch):
     monkeypatch.setattr("btcpredict.config.settings.cross_min_price", 0.02)
 
 
+
+def expected_limit(ask):
+    """The shipped rule, read from config rather than frozen as a literal.
+
+    `ask + max(one tick, min(cap, inv * (1 - ask)))`. Pinning the SHAPE keeps
+    these tests meaningful when the constant is retuned -- cross_limit_buffer_inv
+    was halved 0.25 -> 0.125 on 2026-09-14 after live fills showed the arm pays
+    its own buffer rather than being slipped.
+    """
+    from btcpredict.config import settings as S
+    buf = max(0.01, min(S.cross_limit_buffer, S.cross_limit_buffer_inv * (1.0 - ask)))
+    return round(ask + buf, 2)          # main.py rounds the ceiling to 2dp
+
 class TestTheArm:
     def test_it_fires_on_a_cross_and_reaches_the_order_path(self, store, armed):
         bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0), asks=(0.30, 0.70))
@@ -180,9 +194,8 @@ class TestTheArm:
         asyncio.run(bot._cross_tick())
         assert seen, "the cross must reach the order path"
         # side is Up, so fair_up IS the limit.
-        # ask 0.30 -> buffer 0.25*(1-0.30) = 0.175 -> limit 0.47
-        assert seen["fair_up"] == pytest.approx(0.47)
-        assert seen.get("limit_ceiling") == pytest.approx(0.47)
+        assert seen["fair_up"] == pytest.approx(expected_limit(0.30))
+        assert seen.get("limit_ceiling") == pytest.approx(expected_limit(0.30))
         assert seen["take_px"] == pytest.approx(0.30), "the trigger ask is the floor"
 
     def test_a_cheap_entry_gets_a_BIGGER_buffer(self, store, armed):
@@ -207,9 +220,10 @@ class TestTheArm:
         bot._place_order = place
         asyncio.run(bot._cross_tick())
         assert seen, "0.05 is inside the armed band"
-        # 0.25 * (1 - 0.05) = 0.2375 -> limit 0.29
-        assert seen.get("limit_ceiling") == pytest.approx(0.29), (
+        assert seen.get("limit_ceiling") == pytest.approx(expected_limit(0.05)), (
             "a cheap entry must be given room to chase the reprice")
+        assert (expected_limit(0.05) - 0.05) > (expected_limit(0.60) - 0.60), (
+            "the RULE: a cheaper ask must earn a bigger buffer")
 
     def test_the_buffer_shrinks_as_the_ask_rises(self, store, armed):
         """The direction of the rule, which is the whole point of inverting it.
@@ -229,8 +243,8 @@ class TestTheArm:
         bot._place_order = place
         asyncio.run(bot._cross_tick())
         assert seen
-        # 0.25 * (1 - 0.02) = 0.245 -> limit 0.27
-        assert seen.get("limit_ceiling") == pytest.approx(0.27)
+        assert seen.get("limit_ceiling") == pytest.approx(expected_limit(0.02))
+        assert (expected_limit(0.02) - 0.02) > (expected_limit(0.50) - 0.50)
 
     def test_the_limit_never_exceeds_the_price_ceiling(self, store, armed):
         """cross_max_price still caps it: ask 0.48 + 0.10 would be 0.58, but
@@ -262,12 +276,12 @@ class TestTheArm:
         bot._place_order = place
         asyncio.run(bot._cross_tick())
         assert seen, "the cross must reach the order path"
-        # Down ask 0.30 -> buffer 0.25*(1-0.30) = 0.175 -> limit 0.47; fair_up
-        # is its complement. The invariant under test is unchanged: a Down
-        # entry passes 1 - limit, or the taker limit inverts.
-        assert seen["fair_up"] == pytest.approx(0.53), (
+        # fair_up is the complement of the Down limit. The invariant under test
+        # is unchanged by any retune of the buffer: a Down entry passes
+        # 1 - limit, or the taker limit inverts.
+        assert seen["fair_up"] == pytest.approx(1.0 - expected_limit(0.30)), (
             "a Down entry passes 1 - limit so the Down side prices at the limit")
-        assert seen.get("limit_ceiling") == pytest.approx(0.47)
+        assert seen.get("limit_ceiling") == pytest.approx(expected_limit(0.30))
 
     def test_it_is_inert_with_the_flag_off(self, store, armed, monkeypatch):
         monkeypatch.setattr("btcpredict.config.settings.cross_enabled", False)
@@ -545,8 +559,8 @@ class TestTheArm:
         # cross arm (limit pinned at 0.90) slipped +0.1408. The limit now sits
         # a buffer above the observed ask: still slack to chase the reprice,
         # but the worst case is ask+buffer instead of 0.90.
-        assert seen.get("limit_ceiling") == pytest.approx(0.40), (
-            "ask 0.20 + 0.25 * (1 - 0.20) = 0.40")
+        assert seen.get("limit_ceiling") == pytest.approx(expected_limit(0.20)), (
+            "the limit is ask + the configured buffer, not the price ceiling")
         assert seen["take_px"] == pytest.approx(0.20), "the trigger ask is the floor"
 
     def test_the_reserved_pool_is_bounded(self, store, armed, monkeypatch):
@@ -1852,3 +1866,64 @@ class TestTheInFlightGuard:
             asyncio.run(bot._cross_tick())
         assert bot._round.slug not in bot._cross_inflight, (
             "an exception must not leave the round permanently claimed")
+
+
+class TestTheCrossRestsFarShorterThanTheModelArm:
+    """A cross limit that fills LATE fills because the ask came back down to it.
+
+    That is the move which makes the side just bought less likely to win, so a
+    long rest is adverse selection wearing patience as a disguise. Measured on
+    119 btc-5m triggers: every 20s cell has a bootstrap CI spanning zero, every
+    2s cell at inv <= 0.125 does not.
+
+    `limit_ceiling is not None` is what distinguishes the cross path from the
+    model arm inside the shared placement block, so that is what must select
+    the wait. The model arm keeps limit_wait_s.
+    """
+
+    def _wait_for(self, store, monkeypatch, *, ceiling):
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0), asks=(0.30, 0.70))
+        seen = {}
+
+        async def buy_limit(**k):
+            seen.update(k)
+            return None
+
+        async def buy(**k):
+            return None
+
+        async def get_quote(*a, **k):
+            return {"quoteId": "q", "averagePrice": 0.30, "expireAt": 0}
+
+        bot.broker.buy_limit = buy_limit
+        bot.broker.buy = buy
+        bot.broker.get_quote = get_quote
+        monkeypatch.setattr("btcpredict.config.settings.order_type", "limit_take")
+        bot.broker.mode = "live"
+        r = types.SimpleNamespace(slug="btc-updown-5m-1", tau_s=lambda _ms: 120.0)
+        sig = types.SimpleNamespace(side="Up", quote=0.30, fair=0.60, edge=0.1)
+        asyncio.run(bot._place_order(r, sig, fair_up=0.40, token="t", stake=1.0,
+                                     skip_pretrade_gates=True, take_px=0.30,
+                                     limit_ceiling=ceiling))
+        return seen.get("wait_s")
+
+    def test_the_cross_path_uses_the_short_wait(self, store, armed, monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.cross_limit_wait_s", 2.0)
+        monkeypatch.setattr("btcpredict.config.settings.limit_wait_s", 20.0)
+        w = self._wait_for(store, monkeypatch, ceiling=0.39)
+        assert w == pytest.approx(2.0), (
+            "a cross limit must not rest for the model arm's 20s")
+
+    def test_the_model_path_keeps_the_long_wait(self, store, armed, monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.cross_limit_wait_s", 2.0)
+        monkeypatch.setattr("btcpredict.config.settings.limit_wait_s", 20.0)
+        w = self._wait_for(store, monkeypatch, ceiling=None)
+        assert w == pytest.approx(20.0), (
+            "no limit_ceiling means the model arm, which still rests 20s")
+
+    def test_zero_falls_back_to_the_shared_wait(self, store, armed, monkeypatch):
+        """0 = OFF, the convention every other limit in this config follows."""
+        monkeypatch.setattr("btcpredict.config.settings.cross_limit_wait_s", 0.0)
+        monkeypatch.setattr("btcpredict.config.settings.limit_wait_s", 20.0)
+        w = self._wait_for(store, monkeypatch, ceiling=0.39)
+        assert w == pytest.approx(20.0)

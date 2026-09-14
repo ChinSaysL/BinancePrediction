@@ -5621,3 +5621,78 @@ not a free lunch nobody noticed.
     a real 4.91-share position, 2026-09-14), so an unwind exists.
 
 **Nothing shipped. No code path trades Polymarket.**
+
+## The cross arm pays its own limit — and the shipped buffer was eating the edge
+
+Asked to establish whether Binance's displayed ask is fillable at size. It is
+not the right question: the arm was never being slipped. It was paying exactly
+what it asked to pay.
+
+### What the live orders say (38 cross orders, 27 fills, 2026-09-14)
+
+    cross orders PLACED 38   FILLED 27   fill rate 71.1%
+    decision.quote IS the book ask       identical in 76% of orders
+    requested_px - book ask   +0.1000    the buffer cross_limit_buffer_inv chose
+    filled_px    - book ask   +0.0943    what was actually paid
+    requested_px - filled_px  +0.0113    price improvement: almost none
+
+Fills land AT the limit 33.3% of the time and within two ticks 55.6%. The venue
+quotes, then bundles the order, and fills at about the limit rather than
+price-improving to the book. `cross_limit_buffer_inv` is therefore a direct
+COST, not a safety margin — at an ask of 0.6 the old 0.25 sets
+`0.25 * (1 - 0.6) = 0.10`, which is the +0.10 observed.
+
+The config had already written down this exact revert condition:
+
+> REVERT to the proportional rule if realised fill prices start landing AT the
+> limit more than ~half the time.
+
+### The sweep (tools/cross_buffer_vs_fill.py, 119 btc-5m triggers)
+
+Priced at the LIMIT, at the MEASURED 169bp fee, with fills modelled as "the ask
+did not run past the limit within the rest window". Calibrated first: the model
+predicts 78% fill at the shipped setting against 71.1% live — close enough to
+trust the ordering, slightly optimistic as a queue-blind model should be.
+
+      inv   hold    n   growth  day-t  drop-best         95% CI growth
+     0.250    20   91   +0.445  +1.31     +0.201   [-0.229, +1.057]   WAS SHIPPED
+     0.125    20   83   +0.628  +1.84     +0.363   [-0.065, +1.283]
+     0.250     2   78   +0.492  +1.83     +0.282   [-0.093, +1.013]
+     0.125     2   67   +0.835  +3.62     +0.607   [+0.280, +1.325]   SHIPPED NOW
+     0.100     2   65   +0.838  +3.38     +0.597   [+0.281, +1.303]
+
+**The configuration that was live failed all three house tests** — day-t 1.31,
+and a bootstrap CI that spans zero. It was not distinguishable from no edge.
+Either fix alone still spans zero. Only both together clear day-t > 2,
+drop-best > 0 and a CI excluding zero.
+
+### Why the rest duration matters more than the buffer
+
+A cross limit that fills LATE fills because the ask came back DOWN to it — which
+is exactly the move that makes the side just bought less likely to win. Long
+rests are adverse selection wearing patience as a disguise. Every 20s row above
+has a CI spanning zero; the short-rest rows at inv <= 0.125 do not.
+
+`limit_wait_s` (20s) is shared with the model arm, where it is correct. The new
+`cross_limit_wait_s` (2.0, `0 = OFF` falls back to the shared value) is selected
+by `limit_ceiling is not None`, which is what marks the cross path inside the
+shared placement block.
+
+### The cost, stated plainly
+
+Modelled fills fall from 91 to 67 — about a quarter fewer trades, against a
+standing preference for MORE. That is the trade, and it is the right way round:
+the old cell was not distinguishable from zero, so its extra fills were not
+extra edge. The model also over-states fill rate by ~7 points, so live counts
+will come in below 67.
+
+### What this retracts
+
+Every prior score that priced cross entries at `ask + 0.0037` (the model arm's
+patient slippage) or at the raw ask is too optimistic. The arm pays about the
+buffer. The exit-probe table earlier in this file is affected and its absolute
+numbers should not be quoted; its RANKING (holding beats every stop and trail)
+is unchanged, since every row there shares the same entry price.
+
+**Shipped**: `cross_limit_buffer_inv` 0.25 -> 0.125, `cross_limit_wait_s` 2.0.
+537 tests pass. Deployed and restarted 2026-09-14 21:29 UTC.

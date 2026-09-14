@@ -1110,7 +1110,42 @@ class Settings(BaseSettings):
     # REVERT to the proportional rule if realised fill prices start landing AT
     # the limit more than ~half the time (that is P -> 1, where the advantage
     # shrinks to +0.171 -> and any larger inv goes negative).
-    cross_limit_buffer_inv: float = 0.25
+    #
+    # HALVED 0.25 -> 0.125 on 2026-09-14, and the revert condition above is the
+    # reason. Realised cross fills land AT the limit 33.3% of the time and
+    # within two ticks 55.6% (27 live fills), i.e. roughly the "more than half"
+    # the note set as the trigger. The arm is not being slipped -- it is paying
+    # the buffer it asked for:
+    #
+    #     decision.quote IS the book ask   (identical in 76% of 38 orders)
+    #     requested_px - ask   +0.1000     the buffer this knob chose
+    #     filled_px    - ask   +0.0943     what was actually paid
+    #
+    # Swept on 119 btc-5m triggers at the shipped gates, priced at the limit and
+    # at the MEASURED 169bp fee, with the fill modelled as "the ask did not run
+    # past the limit within `cross_limit_wait_s`":
+    #
+    #     inv   hold    n   growth  day-t  drop-best         95% CI growth
+    #    0.250    20   91   +0.445  +1.31     +0.201   [-0.229, +1.057]  was shipped
+    #    0.125    20   83   +0.628  +1.84     +0.363   [-0.065, +1.283]
+    #    0.250     2   78   +0.492  +1.83     +0.282   [-0.093, +1.013]
+    #    0.125     2   67   +0.835  +3.62     +0.607   [+0.280, +1.325]
+    #
+    # Both changes are needed. Either one alone leaves a CI that spans zero;
+    # together they clear day-t > 2, drop-best > 0 and a CI excluding zero --
+    # the three tests the old configuration failed on all counts.
+    #
+    # It costs frequency: 91 modelled fills become 67. That is the trade, and it
+    # is the right way round -- the old cell was not distinguishable from no edge.
+    cross_limit_buffer_inv: float = 0.125
+    # How long a cross limit rests before it is cancelled. The shared
+    # `limit_wait_s` (20s) is for the model arm. For the cross arm a long rest is
+    # ADVERSE SELECTION, not patience: the order fills only when the ask comes
+    # back DOWN to it, which is precisely the move that makes the side we bought
+    # less likely to win. Every 20s row in the sweep above has a CI spanning
+    # zero; every short-rest row at inv <= 0.125 does not. 0 keeps the shared
+    # limit_wait_s.
+    cross_limit_wait_s: float = 2.0
     cross_skip_opposite_to_main: bool = True
     # RAISED 0.5 -> 2.0 on 2026-09-13. The old 0.5 was picked by a fill-aware
     # sweep that called it a "clear peak", but that sweep could not have seen

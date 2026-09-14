@@ -2626,12 +2626,24 @@ class Bot:
                                        min(round(limit_ceiling, 2), 0.99))
                 # Never rest past the bell: the cross fires 3-60s before it, and
                 # the configured 20s would outlive the round.
+                #
+                # The cross arm rests far shorter than the model arm. A limit
+                # that fills late fills because the ask came back DOWN to it,
+                # which is the move that makes the bought side less likely to
+                # win -- adverse selection wearing patience as a disguise. On
+                # 119 btc-5m triggers every 20s cell has a bootstrap CI spanning
+                # zero; the 2s cells at inv <= 0.125 do not. `limit_ceiling` is
+                # what marks this as the cross path (see above); the model arm
+                # keeps limit_wait_s.
+                wait_cap = settings.limit_wait_s
+                if limit_ceiling is not None and settings.cross_limit_wait_s > 0:
+                    wait_cap = settings.cross_limit_wait_s
                 tau_fn = getattr(r, "tau_s", None)
                 tau_left = tau_fn(int(time.time() * 1000)) if tau_fn else 1e9
                 fill = await self.broker.buy_limit(
                     slug=r.slug, side=sig.side, token_id=token,
                     limit_px=limit_px, stake=stake,
-                    wait_s=min(settings.limit_wait_s, max(1.0, tau_left - 1.0)),
+                    wait_s=min(wait_cap, max(1.0, tau_left - 1.0)),
                     fill_break=settings.limit_fill_break)
                 if fill:
                     break
