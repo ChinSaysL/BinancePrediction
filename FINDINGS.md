@@ -4471,3 +4471,97 @@ spot tracks the strike to ~0, so sub-bps depth IS measurable, and
 `cross_max_depth_bps = 5.0` -- widened from 0.5 partly on this basis figure --
 has never been re-audited on the recorded book where the strike is real. That
 is the highest-value open item.
+
+## Debugging "too few trades, losses eat the profit" (2026-09-14)
+
+Four knobs tested against the operator's report. Three are already right; the
+fourth is a no-op; the real answer is sizing.
+
+### 1. Depth gate: 5.0 is RIGHT, and tightening it hurts
+
+Flagged earlier the same day as the highest-value open item, on the grounds
+that the 4 bps basis justifying the 0.5 -> 5.0 widening turned out to be a
+corpus artefact. Swept, the conclusion goes the OTHER way:
+
+    depth   n(book)  win    additive g/t/drop     | n(corpus 31d)  win
+     0.25        48  0.854  +0.630/+1.73/+0.254   |          208  0.659
+     0.5         93  0.871  +1.183/+2.71/+0.676   |          386  0.663
+     1.0        146  0.870  +1.526/+3.02/+0.922   |          603  0.683
+     2.0        183  0.874  +1.572/+2.87/+0.937   |          760  0.695
+     5.0        201  0.881  +1.917/+2.27/+0.964   |          839  0.714
+     8.0        202  0.881  +1.918/+2.27/+0.965   |          844  0.716
+
+Corpus win rate RISES monotonically with depth and recorded growth rises with
+it. The artefact correction does not imply a tighter gate. Open item closed.
+
+### 2. Range gate: correct, but its cost is volatility-dependent
+
+    day          gate10  gateOFF  blocked   median round range
+    2026-09-12       36       36        0       3.2 bps
+    2026-09-13       34       39        5       4.5 bps
+    2026-09-11       39       77       38      10.8 bps
+    2026-09-14        8       12        4      11.8 bps
+
+Nothing blocked on calm days, a third to a half on volatile ones. The blocked
+trades win **0.628** against a breakeven of ~0.69 -- they are losers, so the
+gate is right. **This is the whole explanation for a quiet day**: 09-14 had a
+median round range of 11.8 bps.
+
+### 3. Price band: raising the floor helps on paper, and is a no-op live
+
+    band          RECORDED n/win/add/rev            CORPUS n/win/add/rev
+    [0.10,0.90]   186 0.876 +1.655/+3.00  +1.939    120 0.700 -0.086  -0.132
+    [0.45,0.90]   174 0.897 +1.189/+4.30  +1.883     86 0.826 +0.081  +0.443
+    [0.50,0.90]   169 0.899 +1.093/+3.70  +1.818     80 0.850 +0.127  +0.512
+
+Both substrates prefer a floor near 0.45-0.50, and on the priced corpus it
+flips the sign under BOTH slippage models. But **20 of 20 live fills landed at
+0.54 or above** -- the sub-0.45 entries are the ones that never fill. Changing
+the floor would stop us ATTEMPTING them and change nothing we actually get.
+Not shipped, because it buys nothing real.
+
+### 4. Limit buffer: flat, no gain available
+
+`tools/cross_buffer_sweep.py`. The first version was meaningless -- it walked
+the ask forward from the trigger instant, where `ask <= ask + buf` always, and
+reported a 100% fill rate at every buffer. With the measured 2.7-5.2s order
+latency modelled:
+
+    buffer        fills  fill%   win   mean px   growth/t/drop   (latency 3s)
+    flat 0.02       104   64.2  0.827    0.656   +1.581/+2.44/+1.012
+    flat 0.04       114   70.4  0.842    0.667   +1.770/+2.86/+1.201
+    flat 0.06       119   73.5  0.849    0.679   +1.766/+2.98/+1.219
+    flat 0.10       132   81.5  0.856    0.699   +1.748/+2.94/+1.181
+    flat 0.15       144   88.9  0.868    0.722   +1.720/+2.90/+1.153
+    SHIPPED         132   81.5  0.856    0.698   +1.748/+2.94/+1.181
+
+Growth spans +1.581 to +1.770 across a 7x range of buffer, and the ranking
+flips with the latency assumption (0.06 wins at 2s, 0.04 at 3s, 0.15 at 4s). A
+smaller buffer buys a better price and loses fills, and the two cancel. Nothing
+to win here.
+
+### 5. The actual answer: we are at 0.22x Kelly
+
+    full Kelly at win 0.714 / ask 0.629 = 22.9% of bankroll
+    shipped stake 0.0224 x 2.25 = 5.04%  =  0.22 x Kelly
+
+Bootstrapping the 16 REAL cross returns, 8 trades/day, 30 days from $52.55:
+
+    mult   stake    median    p10     p90   median worst day
+    1.50   3.36%      254     167     386      -7.0%
+    2.25   5.04%      535     282   1,006     -10.5%   <- SHIPPED
+    3.00   6.72%    1,087     466   1,813     -13.5%
+    4.00   8.96%    1,621     866   2,346     -16.0%
+    5.00  11.20%    1,921   1,168   2,651     -17.8%
+
+Growth scales nearly linearly with stake over this range. "The trades do not
+pay off enough" is therefore accurate and has nothing to do with the gates:
+the per-trade edge is being harvested at a fifth of the size the edge supports.
+
+**Not shipped, and the reason matters.** The bootstrap resamples 16 trades whose
+realised win rate is 13/16 = 0.8125; the corpus says 0.714 and the corpus is the
+number that has been predicting. At 0.714 the P(loss) column would not be 0.000.
+Raising size multiplies whatever the true edge is -- including a thinner one.
+Sizing is a risk decision for the operator, not a measurement, and the honest
+input to it is the table above plus the fact that 16 trades cannot tell 0.71
+from 0.81.
