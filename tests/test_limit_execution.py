@@ -45,12 +45,15 @@ class Stub(LiveBroker):
 
 
 QUOTE = {"quoteId": "q1", "averagePrice": 0.70, "expireAt": 9_999_999_999_999}
-# `marketProviderFee` is denominated in SHARES, like the quote's feeAmount --
-# see live.LiveBroker.buy_limit. Measured first-hand on a real crossing limit
-# (2026-09-12): filledUsdtAmount 0.83, filledShareQty 5.44, marketProviderFee
-# 0.111 -- i.e. exactly 2.0% of the shares, which is the venue's advertised
-# 200bps. Read as dollars that fill would book 13.4% of the stake, ~7x the
-# advertised rate and consistent with nothing else in the record.
+# `marketProviderFee` on an order/history row is USDT -- NOT the convention of
+# the quote's `feeAmount`, which buy() rightly treats as shares. Settled against
+# the venue's own accounting over all 47 FILLED limit orders of 2026-09-14:
+# todayTotalCost $87.11308 minus sum(filledUsdtAmount) $85.81000 leaves $1.30308
+# of fee; summing the field as USDT gives $1.27158 (the 3c gap is the venue's
+# 2dp rounding of filledUsdtAmount), summing it as shares x price gives $0.75248.
+# A single 2026-09-12 fill (0.111 on $0.83 at px 0.1526) reads as exactly 2.0%
+# under the SHARE convention, which is what this file used to assert; the
+# 47-order reconciliation refutes it.
 RECORD_FILLED = {"orderId": "77", "status": "CLOSED", "fillPercentage": "1.00",
                  "filledUsdtAmount": "1.00", "filledShareQty": "1.4286",
                  "marketProviderFee": "0.02", "price": "0.70"}
@@ -84,10 +87,10 @@ def test_a_filled_limit_books_the_venue_s_price_not_ours():
     assert fill.filled_px == pytest.approx(1.00 / 1.4286, rel=1e-3)
     assert fill.stake == pytest.approx(1.00)
     assert fill.shares == pytest.approx(1.4286)
-    # 0.02 is 0.02 SHARES, so in USDT it is 0.02 x the fill price. The market
-    # path has always converted this way (see buy(): fee_shares * avg_px); only
-    # buy_limit read the field as dollars, and it is the same field.
-    assert fill.fee_paid == pytest.approx(0.02 * (1.00 / 1.4286), rel=1e-3)
+    # 0.02 is 0.02 USDT, booked as-is. Multiplying by the fill price books only
+    # `px` of the true fee (~58% of it at these prices), which is what made the
+    # ledger read -$18.55 on a day the venue realized -$19.87.
+    assert fill.fee_paid == pytest.approx(0.02, rel=1e-3)
     assert not b.cancelled                     # nothing left to cancel
     # JSON text, not a dict: the fill has ALREADY happened by the time the
     # booking runs, so a binding error here loses a real trade -- which is

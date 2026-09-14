@@ -956,13 +956,19 @@ def test_an_unverified_fill_survives_a_restart_with_its_token(tmp_path):
     store.close()
 
 
-def test_a_limit_fill_converts_its_fee_from_shares():
-    """`marketProviderFee` is denominated in SHARES, like the quote's feeAmount.
+def test_a_limit_fill_books_its_fee_in_usdt():
+    """`marketProviderFee` on an order/history row is USDT, booked as-is.
 
-    Measured on a real crossing limit (2026-09-12): 0.111 shares on a $0.83 fill
-    at 0.1526 -- i.e. 2.0% of the stake, the 200bps the venue advertises. Read as
-    dollars it books 13.4% of the stake, overstating the fee 6.7x and, at the
-    cheap end (0.02-0.05), by 20-50x.
+    Settled against the venue's own accounting over all 47 FILLED limit orders
+    of 2026-09-14: todayTotalCost $87.11308 minus sum(filledUsdtAmount)
+    $85.81000 leaves $1.30308 of fee. Summing the field as USDT gives $1.27158
+    -- the 3c gap is the venue's 2dp rounding of filledUsdtAmount. Summing it as
+    shares x price gives $0.75248, off by 42%.
+
+    This test used to assert the share convention, on one 2026-09-12 fill (0.111
+    on $0.83 at px 0.1526) that reads as exactly 2.0% that way. Under-booking the
+    fee makes every PnL figure optimistic: the ledger read -$18.55 on a day the
+    venue realized -$19.87.
     """
     from btcpredict.execution import live
 
@@ -986,8 +992,8 @@ def test_a_limit_fill_converts_its_fee_from_shares():
                                    limit_px=0.18, stake=1.0, wait_s=0.1))
     assert fill is not None
     assert fill.filled_px == pytest.approx(0.83 / 5.44, abs=1e-4)
-    assert fill.fee_paid == pytest.approx(0.111 * (0.83 / 5.44), abs=1e-4)
-    assert fill.fee_paid < 0.03, "2% of the stake, not 13% of it"
+    assert fill.fee_paid == pytest.approx(0.111, abs=1e-4), \
+        "the field is USDT; multiplying by px books only ~px of the real fee"
 
 
 def test_unreadable_status_and_unreadable_positions_books_provisionally():

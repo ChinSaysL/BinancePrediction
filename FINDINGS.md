@@ -5479,3 +5479,63 @@ built to sit through. `trail -0.10` shows a higher day-t (+4.27 vs +3.74) only
 because it flattens variance — it makes less money more smoothly.
 
 The sell path is genuine. It is not an edge. **No exit rule shipped.**
+
+## The ledger under-books the venue's fee: `marketProviderFee` is USDT, not shares
+
+`btcpredict/execution/live.py` read the venue's fee field on an order/history
+row as SHARES and multiplied it by the fill price. It is USDT. Every limit fill
+therefore booked roughly `px` of its real fee — about 58% at the prices this bot
+trades — and every PnL figure we have quoted was optimistic by the remainder.
+
+### How it was caught
+
+The settlement path assumes `payout = fill.shares` and `pnl = payout - stake`,
+neither read back from the venue, so the ledger had never been checked against
+the venue's own accounting. It can be: `position/list` returns a summary with
+`todayRealizedPnl`, `todayTotalCost` and `walletBalance`.
+
+    LEDGER  2026-09-14   47 settled   staked $85.81   fees booked $0.763   pnl -$18.55
+    VENUE   2026-09-14                cost   $87.11                        pnl -$19.87
+    gap                                                                        $ 1.32
+
+The 47 FILLED limit orders in `order/history` match the 47 settled fills
+exactly, which makes the decomposition unambiguous:
+
+    todayTotalCost          $87.11308
+    sum(filledUsdtAmount)   $85.81000
+    difference              $ 1.30308   <- the fee the venue actually charged
+    field summed as USDT    $ 1.27158   error +0.03  (2dp rounding of filledUsdtAmount)
+    field summed as shares*px $ 0.75248   error +0.55  <- what the code booked
+
+`payout = shares` is **correct** — the venue does pay 1.00 per winning share and
+takes nothing at redemption. The whole error is on the entry side.
+
+### The evidence that had supported the old reading
+
+One fill on 2026-09-12 — `marketProviderFee` 0.111 on `filledUsdtAmount` 0.83
+and `filledShareQty` 5.44, i.e. px 0.1526 — reads as exactly 2.0% of shares
+under the share convention and an implausible 13.4% of stake under the USDT
+one. That single observation is what the code, two tests and their comments all
+cited. It does not survive a 47-order reconciliation against the venue's own
+cost figure, and the fee is in any case not a constant rate: across 85 fills it
+ran 168.9 bps of notional in aggregate, 213.4 bps on the 71 that were charged,
+and **0 on 14 of them** — every one of those a `fillPercentage == 1.00` fill.
+
+Our own model, `fee_bps_for_price(px) = 180 * (1-px)/px` capped at 180, predicts
+123.8 bps against the 168.9 actually charged: it under-states the fee by 45 bps
+of stake even before the units bug.
+
+The market path in `buy()` is untouched. It reads the QUOTE's `feeAmount`, a
+different field with a different convention (deducted from delivered shares),
+and every order this bot places is a LIMIT.
+
+**Shipped.** `fee = amount_usdt(rec.get("marketProviderFee"))`, with the two
+tests that asserted the share convention inverted to pin the new one.
+
+### What it does and does not change
+
+It does not change any decision the bot makes — `fee_paid` is recorded, not
+gated on. It changes what the record MEANS: past PnL in this ledger is
+optimistic by roughly 0.6-1.5% of stake, which is the correct lens for every
+arm whose measured edge is thin. The cross arm's edge is not thin enough for
+this to reverse it. Nothing else was live.

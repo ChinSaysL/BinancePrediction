@@ -487,13 +487,24 @@ class LiveBroker:
         usdt = amount_usdt(rec.get("filledUsdtAmount")) or stake * filled
         shares = amount_usdt(rec.get("filledShareQty"))
         px = (usdt / shares) if shares > 0 else limit_px
-        # `marketProviderFee` is denominated in SHARES, not USDT, exactly as the
-        # quote's feeAmount is (see buy()). Verified on a real crossing limit on
-        # 2026-09-12: 0.111 shares on a $0.83 fill at 0.1526, i.e. 2.0% of the
-        # stake -- the 200bps the venue advertises. Read as dollars it books
-        # 13.4% of the stake, so every limit fill over-reported its fee by 1/px,
-        # and at the cheap end (px 0.02-0.05) by 20-50x.
-        fee = amount_usdt(rec.get("marketProviderFee")) * px
+        # `marketProviderFee` on an order/history row is USDT. It is NOT the
+        # same convention as the quote's `feeAmount`, which buy() correctly
+        # treats as shares.
+        #
+        # This line used to multiply by `px`, on a 2026-09-12 reading of one
+        # fill (0.111 on a $0.83 fill at px 0.1526) where the share convention
+        # happens to land on exactly 2.0%. The venue's own accounting refutes
+        # it. Over all 47 of today's FILLED limit orders (2026-09-14):
+        #
+        #     todayTotalCost        $87.11308
+        #     sum(filledUsdtAmount) $85.81000
+        #     difference            $ 1.30308   <- the fee the venue charged
+        #     summed as USDT        $ 1.27158   error +0.03 (2dp rounding)
+        #     summed as shares*px   $ 0.75248   error +0.55
+        #
+        # Under-booking the fee makes every PnL figure optimistic -- the
+        # ledger read -$18.55 against the venue's -$19.87 on the same day.
+        fee = amount_usdt(rec.get("marketProviderFee"))
         if filled < 0.999:                    # partial: cancel the remainder
             await self.cancel_orders([order_id])
         log.info("limit %s %s FILLED %.0f%% @%.4f ($%.2f -> %.4f shares, fee $%.4f)",
