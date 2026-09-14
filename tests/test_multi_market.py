@@ -175,7 +175,18 @@ class TestRoundsAreCachedUntilTheyRoll:
     arrive on their own feeds. So a family is re-swept only when its round has
     actually rolled. This replaces the older RECORDED_REFRESH_S interval, which
     could not work once the recorded families became tradeable.
+
+    The re-sweep also runs OFF the poll: only the primary is fetched inline.
+    Doing all six inline stalled the poll 4.4-4.7s at every 5m roll, which can
+    blind a 15m family sitting at tau 5-60 on its own schedule.
     """
+
+    @staticmethod
+    def _drain(b):
+        """Run the background round refresh to completion, if one was spawned."""
+        t = getattr(b, "_round_refresh", None)
+        if t is not None:
+            asyncio.get_event_loop().run_until_complete(t) if not t.done() else None
 
     def _bot(self, asked, rounds):
         b = Bot.__new__(Bot)
@@ -193,18 +204,46 @@ class TestRoundsAreCachedUntilTheyRoll:
                 for i, (p, _, _) in enumerate(MARKETS)}
 
     def test_first_tick_sweeps_everything(self):
+        """...but the PRIMARY inline and the rest in the background."""
         asked = []
         live = self._live(int(time.time() * 1000) + 300_000)
-        asyncio.run(self._bot(asked, live).tick())
-        assert len(asked[0]) == len(MARKETS), "a cold cache must sweep all"
+        b = self._bot(asked, live)
+
+        async def go():
+            await b.tick()
+            t = getattr(b, "_round_refresh", None)
+            if t is not None:
+                await t
+        asyncio.run(go())
+        assert asked[0] == [MARKETS[0][0]], "the primary is fetched inline"
+        assert len(asked[1]) == len(MARKETS) - 1, "the rest off the poll path"
+
+    def test_the_deep_sweep_never_blocks_the_poll(self):
+        """The whole point: a rolled family must not stall the decision loop."""
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot.tick)
+        inline = src[src.index("self.market.rounds_by_prefixes("):]
+        inline = inline[:inline.index(")")]
+        assert "primary" in inline, "only the primary may be swept inline"
+        assert "_refresh_rounds" in src and "create_task" in src
 
     def test_a_live_round_is_not_swept_again(self):
         asked = []
         live = self._live(int(time.time() * 1000) + 300_000)
         b = self._bot(asked, live)
-        asyncio.run(b.tick())
-        asyncio.run(b.tick())
-        assert asked[1] == [MARKETS[0][0]], (
+        async def go():
+            await b.tick()
+            t = getattr(b, "_round_refresh", None)
+            if t is not None:
+                await t
+            await b.tick()
+            t = getattr(b, "_round_refresh", None)
+            if t is not None and not t.done():
+                await t
+        asyncio.run(go())
+        # asked == [[primary], [the five others, in the background], [primary]]
+        assert asked[-1] == [MARKETS[0][0]], (
             "a family whose round is still live must not be paged for again; "
             "only the primary is refetched every poll")
 
@@ -212,11 +251,19 @@ class TestRoundsAreCachedUntilTheyRoll:
         asked = []
         live = self._live(int(time.time() * 1000) + 300_000)
         b = self._bot(asked, live)
-        asyncio.run(b.tick())
-        for r in b._round_cache.values():
-            r.end_ms = int(time.time() * 1000) - 1
-        asyncio.run(b.tick())
-        assert len(asked[1]) == len(MARKETS), (
+        async def go():
+            await b.tick()
+            t = getattr(b, "_round_refresh", None)
+            if t is not None:
+                await t
+            for r in b._round_cache.values():
+                r.end_ms = int(time.time() * 1000) - 1
+            await b.tick()
+            t = getattr(b, "_round_refresh", None)
+            if t is not None and not t.done():
+                await t
+        asyncio.run(go())
+        assert len(asked[-1]) == len(MARKETS) - 1, (
             "once a round has rolled its family must be swept again")
 
     def test_a_round_without_a_strike_is_never_cached(self):
@@ -226,9 +273,17 @@ class TestRoundsAreCachedUntilTheyRoll:
         for r in live.values():
             r.strike = None
         b = self._bot(asked, live)
-        asyncio.run(b.tick())
-        asyncio.run(b.tick())
-        assert len(asked[1]) == len(MARKETS)
+        async def go():
+            await b.tick()
+            t = getattr(b, "_round_refresh", None)
+            if t is not None:
+                await t
+            await b.tick()
+            t = getattr(b, "_round_refresh", None)
+            if t is not None and not t.done():
+                await t
+        asyncio.run(go())
+        assert len(asked[-1]) == len(MARKETS) - 1
 
 
 def _capture(prefixes, sink, rounds):

@@ -25,6 +25,13 @@ other side, and it holds on 99.5% of 126k recorded quotes:
 DOCS ERRATA (verified live; the published docs are wrong on all three):
   * the aggregated topic `web3_prediction_orderbook_data` registers with
     SUCCESS and then pushes NOTHING. Only per-market topics deliver.
+  * and MULTIPLE per-market topics joined with "|" on ONE connection behave the
+    same way: the venue answers COMMAND/REGISTER SUCCESS and then delivers
+    exactly one of them. Measured 2026-09-14 -- six families subscribed on one
+    socket produced asks for btc-updown-5m only and ZERO for the other five,
+    for 40 minutes, with no error anywhere; a probe of the SAME eth-updown-5m
+    market as a lone topic got 94 frames in 30 seconds. Hence one connection
+    per market below.
   * frames arrive as type "DATA", not the documented "TOPIC".
   * prices and sizes are JSON numbers, not the documented strings.
 """
@@ -127,7 +134,13 @@ class BookTop:
 
 @dataclass
 class PredictionBook:
-    """Latest top-of-book per marketId, kept current by one WS connection."""
+    """Latest top-of-book per marketId, one WS CONNECTION PER MARKET.
+
+    It was one connection carrying every market as pipe-joined topics, which
+    the venue accepts and then silently honours for a single market (see the
+    errata above). That made a six-family widening completely inert: five of
+    six carried no ask at all and nothing logged an error.
+    """
     api_key: str
     api_secret: str
     session: aiohttp.ClientSession
@@ -138,6 +151,12 @@ class PredictionBook:
     _resub: asyncio.Event = field(default_factory=asyncio.Event)
     connected: bool = False
     messages: int = 0
+    #: market id -> the last time follow() asked for it
+    _seen: dict[int, float] = field(default_factory=dict)
+    #: market id -> its connection task
+    _tasks: dict[int, asyncio.Task] = field(default_factory=dict)
+    #: market ids with an established socket right now
+    _live: set = field(default_factory=set)
 
     def best(self, market_id: int | None, max_age_s: float) -> BookTop | None:
         """The book for `market_id`, or None if missing or stale.
@@ -157,71 +176,112 @@ class PredictionBook:
     #: next one, plus slack.
     MAX_TOPICS = 16
 
+    #: Most markets to hold sockets for at once. Six families with a live round
+    #: is six; the headroom absorbs a roll where the old and new round overlap.
+    MAX_CONNECTIONS = 10
+    #: How long a market keeps its socket after follow() stops asking for it.
+    #: A market mid-roll drops out of the poll for a beat, and tearing its
+    #: connection down and back up each time is the churn the old additive
+    #: `follow` existed to avoid.
+    CLOSE_AFTER_ABSENT_S = 90.0
+
     def follow(self, market_ids: list[int]) -> None:
-        """Subscribe to these markets, ADDITIVELY.
+        """Declare the markets that should have a live book.
 
-        The topic is a CONNECT-TIME query parameter, so any change to the set
-        costs a handshake. Comparing the set for equality -- which is what this
-        did -- was fine while one market was followed and became a live
-        regression the moment six were: markets roll at different times, so on
-        most polls one id drops out and returns, and the feed re-handshaked
-        every 10-40s (63 reconnects in the first three minutes), leaving the
-        book stale for every market including the one that trades.
-
-        A market leaving the poll needs no action: its topic simply stops
-        pushing. So only ADDITIONS resubscribe, and the set is trimmed (oldest
-        first) only when it would exceed MAX_TOPICS.
+        AUTHORITATIVE (with a grace period), where this used to be purely
+        additive. That additive design was not a preference -- the topic was a
+        CONNECT-TIME parameter of the single shared socket, so any change to
+        the set re-handshaked EVERY market (63 reconnects in three minutes when
+        six were followed). With one socket per market that constraint is gone:
+        adding or dropping one market touches only its own connection, so a
+        round that has rolled can now actually release its slot instead of
+        holding one until MAX_TOPICS evicted it.
         """
-        ids = [int(m) for m in market_ids if m]
-        if not ids:
-            return
-        cur = list(self._markets)
-        added = [m for m in ids if m not in cur]
-        if not added:
-            return
-        merged = cur + added
-        if len(merged) > self.MAX_TOPICS:
-            merged = merged[-self.MAX_TOPICS:]
-        self._markets = tuple(merged)
-        self._resub.set()
+        now = time.time()
+        added = False
+        for m in market_ids:
+            if not m:
+                continue
+            m = int(m)
+            if m not in self._seen:
+                added = True
+            self._seen[m] = now
+        if added:
+            self._resub.set()
 
     def stop(self) -> None:
         self._stop.set()
         self._resub.set()
 
+    def _wanted(self) -> set:
+        """Markets that should hold a socket right now."""
+        now = time.time()
+        want = {m for m, ts in self._seen.items()
+                if now - ts <= self.CLOSE_AFTER_ABSENT_S}
+        for m in [m for m, ts in self._seen.items()
+                  if now - ts > self.CLOSE_AFTER_ABSENT_S]:
+            del self._seen[m]
+        if len(want) > self.MAX_CONNECTIONS:
+            # keep the most recently asked-for
+            want = set(sorted(want, key=lambda m: self._seen[m],
+                              reverse=True)[:self.MAX_CONNECTIONS])
+        return want
+
+    def _reconcile(self) -> None:
+        want = self._wanted()
+        for m, t in list(self._tasks.items()):
+            if m not in want or t.done():
+                self._tasks.pop(m, None)
+                self._live.discard(m)
+                if not t.done():
+                    t.cancel()
+        for m in want:
+            if m not in self._tasks:
+                self._tasks[m] = asyncio.create_task(self._run_one(m))
+
     async def run(self) -> None:
+        """Supervise one connection per followed market."""
+        try:
+            while not self._stop.is_set():
+                self._reconcile()
+                try:
+                    await asyncio.wait_for(self._resub.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    pass
+                self._resub.clear()
+        finally:
+            for t in self._tasks.values():
+                t.cancel()
+            self._tasks.clear()
+            self._live.clear()
+            self.connected = False
+
+    async def _run_one(self, mid: int) -> None:
+        """One market, one socket, reconnecting with backoff until cancelled."""
         backoff = 1.0
         while not self._stop.is_set():
-            if not self._markets:
-                await asyncio.sleep(1.0)
-                continue
-            mids = self._markets
-            topic = "|".join(TOPIC_FMT.format(m) for m in mids)
             qs = self.signer._sign({"random": secrets.token_hex(8),
-                                    "topic": topic})
+                                    "topic": TOPIC_FMT.format(mid)})
             try:
                 async with self.session.ws_connect(
                     f"{WS_URL}?{qs}",
                     headers={"X-MBX-APIKEY": self.api_key},
                     heartbeat=30.0, timeout=20,
                 ) as ws:
+                    self._live.add(mid)
                     self.connected = True
                     backoff = 1.0
-                    self._resub.clear()
-                    log.info("prediction book ws connected: %s", list(mids))
-                    # NOT `async for msg in ws`: that blocks until a frame
-                    # arrives, and a subscribed market goes SILENT the moment
-                    # its round ends. The resubscribe check would then never
-                    # run and the feed would sit on a dead topic forever --
-                    # every arm silently reverting to the 1s REST poll with no
-                    # error anywhere. Poll the socket instead so the loop stays
-                    # responsive to `follow()` through the quiet.
-                    while not (self._stop.is_set() or self._resub.is_set()):
+                    log.info("book ws connected: %s (%d live)", mid,
+                             len(self._live))
+                    while not self._stop.is_set():
+                        # NOT `async for msg in ws`: a market goes SILENT the
+                        # moment its round ends, and a blocking iterator would
+                        # never notice cancellation through the quiet.
                         try:
                             msg = await asyncio.wait_for(ws.receive(),
-                                                         timeout=1.0)
+                                                         timeout=5.0)
                         except asyncio.TimeoutError:
-                            continue                  # quiet: re-check _resub
+                            continue
                         if msg.type in (aiohttp.WSMsgType.CLOSED,
                                         aiohttp.WSMsgType.CLOSING,
                                         aiohttp.WSMsgType.ERROR):
@@ -229,13 +289,16 @@ class PredictionBook:
                         if msg.type is not aiohttp.WSMsgType.TEXT:
                             continue
                         self._ingest(msg.data)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:                       # noqa: BLE001
-                log.warning("prediction book ws dropped (%s: %s); retry in %.0fs",
-                            type(e).__name__, e, backoff)
+                log.warning("book ws %s dropped (%s: %s); retry in %.0fs",
+                            mid, type(e).__name__, e, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
             finally:
-                self.connected = False
+                self._live.discard(mid)
+                self.connected = bool(self._live)
 
     def _ingest(self, raw: str) -> None:
         try:

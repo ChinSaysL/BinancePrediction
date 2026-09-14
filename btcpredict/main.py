@@ -605,14 +605,33 @@ class Bot:
                  if cache.get(p) is None
                  or getattr(cache[p], "end_ms", 0) <= now_ms
                  or getattr(cache[p], "strike", None) is None]
-        # The primary is refetched every poll regardless: it is page 1 (highest
+        # The primary is refetched every poll INLINE: it is page 1 (highest
         # volume) so it costs one request, and the model arm reads its live
         # displayed price, not just its strike.
-        want = sorted(set(stale) | {primary})
-        found = await self.market.rounds_by_prefixes(want)
+        found = await self.market.rounds_by_prefixes([primary])
         for pfx, rr in found.items():
             if rr:
                 cache[pfx] = rr
+        # Everything else is refreshed OFF the poll. `rounds_by_prefixes` stops
+        # paging only once every requested prefix is found, and a quiet family
+        # sinks through the day (bnb-updown-5m at offset 1450 -- 30 pages,
+        # ~4s). At a 5m roll all three 5m families go stale at once, so doing
+        # that inline stalled the poll for 4.4-4.7s every five minutes
+        # (measured: median 133ms, max 4673ms).
+        #
+        # That stall is not harmless just because the NEW 5m round is at tau
+        # ~300 and out of the trade window: the 15m families roll on a
+        # different schedule, so a 5m roll can blind a 15m market sitting at
+        # tau 5-60. The refresh therefore runs as a background task and the
+        # poll keeps using the cache until it lands.
+        others = [p for p in stale if p != primary]
+        task = getattr(self, "_round_refresh", None)
+        if others and (task is None or task.done()):
+            if task is not None and task.done():
+                with contextlib.suppress(Exception):
+                    task.result()               # surface a crash, never swallow
+            self._round_refresh = asyncio.create_task(
+                self._refresh_rounds(others))
         # Spot history for EVERY symbol, appended HERE rather than in _record.
         # The range gate reads this buffer, and a family whose round is only
         # refetched on a roll would otherwise measure its range on a handful of
@@ -690,6 +709,20 @@ class Bot:
         # poll in which a newly-appeared family could have traded -- and on a
         # round roll that is every family at once.
         await self._cross_all()
+
+    async def _refresh_rounds(self, prefixes: list[str]) -> None:
+        """Re-sweep rolled families off the poll's critical path."""
+        try:
+            found = await self.market.rounds_by_prefixes(prefixes)
+        except Exception as e:                              # pragma: no cover
+            log.warning("round refresh failed (%s: %s)", type(e).__name__, e)
+            return
+        cache = getattr(self, "_round_cache", None)
+        if cache is None:
+            cache = self._round_cache = {}
+        for pfx, r in found.items():
+            if r:
+                cache[pfx] = r
 
     async def _record(self, r, symbol: str, *, trade: bool,
                       primary: bool = False) -> None:

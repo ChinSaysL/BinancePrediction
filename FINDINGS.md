@@ -4945,3 +4945,51 @@ topic set grows every roll (6 -> 7 -> 12 within five minutes) until MAX_TOPICS
 trims oldest-first. Harmless while only one topic delivers, but it must be
 fixed alongside -- with per-market connections a dead round should close its
 connection rather than hold a slot.
+
+## FIXED: one websocket connection per market (2026-09-14)
+
+The widening was inert because the venue accepts pipe-joined per-market topics
+on one socket, answers COMMAND/REGISTER SUCCESS, and delivers exactly one.
+
+Verified before changing anything -- 5 CONCURRENT single-topic connections on
+the same API key, 40 seconds:
+
+    btc-updown-5m    201 frames      eth-updown-5m     63
+    btc-updown-15m   173             bnb-updown-15m    53
+    eth-updown-15m   165
+    -> 5 of 5 delivered
+
+So `PredictionBook` now holds one connection per market. `run()` became a
+supervisor that reconciles a task per followed id; `_run_one` owns a single
+socket with its own backoff.
+
+### `follow()` is authoritative again, and that is the point
+
+It was purely additive, and that was NOT a preference: the topic was a
+connect-time parameter of the single shared socket, so any change to the set
+re-handshaked EVERY market (63 reconnects in three minutes with six followed).
+A rolled round therefore could not release its slot -- the live set grew 6 -> 12
+within five minutes and only MAX_TOPICS eviction bounded it.
+
+Per-socket removes that constraint: adding or dropping a market touches only
+its own connection. So `follow()` now declares the wanted set, with a 90s grace
+period (`CLOSE_AFTER_ABSENT_S`) because a family mid-roll drops out of the poll
+for a beat and tearing its socket down each time is the churn the additive
+design existed to avoid. The requirement survived; the mechanism changed.
+
+## FIXED: the deep sweep no longer stalls the poll (2026-09-14)
+
+    poll cadence: median 133ms  p90 148ms  max 4673ms
+
+The maxima landed on 5-minute boundaries, where all three 5m families go stale
+at once and `rounds_by_prefixes` pages to offset 1450 to find bnb-updown-5m.
+
+That stall is NOT harmless just because the new 5m round is at tau ~300 and out
+of the trade window: the 15m families roll on their own schedule, so a 5m roll
+can blind a 15m market sitting at tau 5-60 -- which is precisely the window the
+whole arm trades in.
+
+Now only the PRIMARY is swept inline (page 1, one request). Rolled families are
+refreshed in a background task while the poll keeps serving from the round
+cache. A crash in that task is surfaced via `task.result()` on the next pass
+rather than swallowed.

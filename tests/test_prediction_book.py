@@ -131,10 +131,9 @@ class TestStaleness:
 
 
 class TestItFollowsTheRollingRound:
-    """The topic is a CONNECT-TIME parameter, so following a 5-minute market
-    means re-handshaking. The failure mode this guards is silent: a market goes
-    quiet the moment its round ends, so a receive loop that blocks on frames
-    would never notice it should resubscribe."""
+    """A 5-minute market means a new id every round. The failure mode guarded
+    here is silent: a market goes quiet the moment its round ends, so a receive
+    loop that blocks on frames would never notice it should reconcile."""
 
     def test_following_a_new_market_requests_a_resubscribe(self):
         b = book()
@@ -156,7 +155,7 @@ class TestItFollowsTheRollingRound:
         b._resub.clear()
         b.follow([])
         assert not b._resub.is_set()
-        assert b._markets == (1,)
+        assert set(b._seen) == {1}
 
     def test_stop_releases_the_loop(self):
         b = book()
@@ -219,35 +218,60 @@ class TestSweepPricing:
         assert px == pytest.approx(0.50) and fill == pytest.approx(1.0)
 
 
-class TestFollowIsAdditive:
-    """Removals must not cost a handshake -- that was a live regression."""
+class TestOneConnectionPerMarket:
+    """The venue accepts pipe-joined per-market topics on one socket, answers
+    COMMAND/REGISTER SUCCESS, and then delivers exactly ONE of them.
+
+    Measured 2026-09-14: six families on one socket produced asks for
+    btc-updown-5m only and zero for the other five for 40 minutes, with no
+    error logged anywhere; a probe of the same eth-updown-5m market as a lone
+    topic got 94 frames in 30 seconds. So the feed holds one connection per
+    market, and these pin the behaviour that replaced the additive `follow`.
+    """
 
     def _book(self):
+        import asyncio
         from btcpredict.feeds.prediction_book import PredictionBook
         b = PredictionBook.__new__(PredictionBook)
-        b._markets = ()
-        import asyncio
+        b._seen, b._tasks, b._live = {}, {}, set()
         b._resub = asyncio.Event()
+        b._stop = asyncio.Event()
         return b
 
-    def test_a_new_market_resubscribes(self):
+    def test_a_new_market_asks_for_a_reconcile(self):
         b = self._book()
         b.follow([1, 2])
-        assert set(b._markets) == {1, 2} and b._resub.is_set()
+        assert set(b._seen) == {1, 2} and b._resub.is_set()
 
-    def test_a_market_dropping_out_does_NOT_resubscribe(self):
+    def test_a_market_dropping_out_keeps_its_socket_for_a_grace_period(self):
+        """A market mid-roll drops out of the poll for a beat. Tearing its
+        connection down and back up each time is the churn the old additive
+        `follow` existed to avoid -- the mechanism changed, the requirement
+        did not."""
         b = self._book()
         b.follow([1, 2, 3])
         b._resub.clear()
-        b.follow([1, 2])              # 3's round rolled over
-        assert not b._resub.is_set(), "a removal must not force a handshake"
-        assert 3 in b._markets, "the dead topic just goes quiet; keep it"
+        b.follow([1, 2])                      # 3's round rolled over
+        assert not b._resub.is_set(), "a removal must not force a reconnect"
+        assert 3 in b._wanted(), "still inside the grace period"
 
-    def test_flapping_market_handshakes_once_not_every_poll(self):
+    def test_a_long_absent_market_releases_its_slot(self):
+        """...but it must EVENTUALLY be released. Under the old design a dead
+        round held a topic slot until MAX_TOPICS evicted it, which is why the
+        live set grew 6 -> 12 within five minutes."""
+        import time
+        from btcpredict.feeds.prediction_book import PredictionBook
+        b = self._book()
+        b.follow([1, 2, 3])
+        b._seen[3] = time.time() - (PredictionBook.CLOSE_AFTER_ABSENT_S + 1)
+        assert 3 not in b._wanted()
+        assert 3 not in b._seen, "and it is forgotten, not merely filtered"
+
+    def test_flapping_market_reconciles_once_not_every_poll(self):
         b = self._book()
         b.follow([1, 2, 3])
         b._resub.clear()
-        for _ in range(20):           # 3 flapping in and out, as live did
+        for _ in range(20):                   # 3 flapping, as live did
             b.follow([1, 2])
             b.follow([1, 2, 3])
         assert not b._resub.is_set()
@@ -255,6 +279,16 @@ class TestFollowIsAdditive:
     def test_the_set_is_bounded(self):
         from btcpredict.feeds.prediction_book import PredictionBook
         b = self._book()
-        for i in range(PredictionBook.MAX_TOPICS * 3):
+        for i in range(PredictionBook.MAX_CONNECTIONS * 3):
             b.follow([1000 + i])
-        assert len(b._markets) <= PredictionBook.MAX_TOPICS
+        assert len(b._wanted()) <= PredictionBook.MAX_CONNECTIONS
+
+    def test_the_most_recently_asked_for_markets_win_the_slots(self):
+        from btcpredict.feeds.prediction_book import PredictionBook
+        b = self._book()
+        for i in range(PredictionBook.MAX_CONNECTIONS * 2):
+            b.follow([1000 + i])
+        want = b._wanted()
+        newest = 1000 + PredictionBook.MAX_CONNECTIONS * 2 - 1
+        assert newest in want, "the newest round must never be evicted"
+
