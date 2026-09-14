@@ -1016,7 +1016,36 @@ class Settings(BaseSettings):
     #
     # Only 7 priced corpus days exist, so the block bootstrap is lumpy; read the
     # shape of the table, not single cells.
-    cross_stake_mult: float = 2.25
+    #
+    # RAISED 2.25 -> 3.0 on 2026-09-14 (0.0224 x 3.0 = 6.72% of bankroll).
+    # The table above warned that 10% is "5x WORSE than 5% if the cheap tail is
+    # unfillable". That condition is now CONFIRMED -- 0 of 5 live fills below a
+    # decided ask of 0.40, all 8 unfilled attempts cheap -- so the fillable
+    # column is the live regime and the warning had to be re-checked before
+    # touching this. Re-swept on the CURRENT config's fillable triggers
+    # (tools/cross_buffer_sweep.simulate at the shipped buffer and the measured
+    # 3s order latency: 132 fills / 30 misses), resampled in whole-day blocks,
+    # 30 days from $50, under three edge estimates:
+    #
+    #   frac        EV +0.279 (rec book)   EV +0.098 (corpus)   EV +0.040 (thin)
+    #               median     p10         median     p10       median   p10
+    #   5.04%       $6,185   $4,601        $  482   $  136      $  92   $  27
+    #   6.72%       $6,984   $5,373        $  922   $  164      $  92   $  19
+    #   8.96%       $7,548   $5,915        $1,477   $  167      $  79   $   8
+    #
+    # 6.72% is better on BOTH median and p10 under the two central estimates and
+    # costs p10 $27 -> $19 under the pessimistic one. That asymmetry is why this
+    # is 3.0 and not 4.0: past ~9% the thin-edge column falls off a cliff
+    # (p10 $8, P(end below start) 0.39), and which edge is true is still the
+    # open question -- the recorded book says +0.279, the priced corpus +0.098,
+    # and 16 live trades say +0.202 at a win rate (0.8125) that 16 trades cannot
+    # distinguish from the corpus's 0.714.
+    #
+    # This supersedes the old table only for the 5-9% region. Its warning about
+    # 10%+ stands, and is now reinforced by the thin-edge column.
+    # REVERT to 2.25 if the live win rate settles below ~0.70, or if realised
+    # EV/$1 over the next ~30 fills comes in under +0.10.
+    cross_stake_mult: float = 3.0
     cross_limit_buffer: float = 0.10
     # ...but PROPORTIONAL at the cheap end. A flat +0.10 on this arm's most
     # profitable bucket (ask 0.02-0.30, see cross_max_price) is a 33-500%
