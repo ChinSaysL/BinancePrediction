@@ -5981,5 +5981,17 @@ watch. So the question gets a real-money probe instead:
 
 With the meter, this settles both halves: (a) how fast OUR market's book walks,
 and (b) whether the venue fills a quote taken while it walks. Those are the two
-numbers the gate decision needs; neither exists yet. NO GATE CHANGE, and the
-probe stays OFF, until the owner says otherwise.
+numbers the gate decision needs; neither exists yet. GATE STILL 10.
+
+TURNED ON 2026-09-14 23:21 UTC on explicit instruction, with exactly ONE knob
+changed: `CROSS_PROBE_ENABLED=true` in the server `.env` (backup
+`.env.bak-probe-*` beside it). Sizing is untouched -- stake $1.0 and cap 6/day
+are the built defaults, the box's `min_order_usdt` is $1.0 so the order passes,
+and no arm-sizing value was modified. Verified from a fresh interpreter:
+`probe True stake 1.0 cap 6 | min_order 1.0 | streak 12`. (Note the live
+streak halt turned out to be 12, not the 5 the older notes carry.)
+
+Time-boxed: ~2 days or ~20 probe orders, whichever first, then OFF and read
+`tools/cross_catch_report.py`. Revert = one line + restart. The probe's fills
+decide the thesis: fills at run >= +0.2 -> catch real -> gate raise is next;
+runners consistently no-fill -> catch dead for jumps, gate stays 10.
