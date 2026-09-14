@@ -4406,3 +4406,68 @@ vol_surge, n_trades), path shape (efficiency, path_over_net, crossings),
 momentum at 9 horizons -- none of which enter `fair`. Whether any of them
 predicts the outcome beyond what the book already knows is an open and testable
 question, and it is the only remaining modelling path.
+
+## STAGE 1: can any feature beat position-over-vol? No (2026-09-14)
+
+`tools/model_feature_search.py`. 67,488 snapshots, 8,436 windows, 31 days, tau
+60-210. 59 causal features; dropped 4 settlement leakers (final_cl,
+close_end_tape, true_delta_bps, y_tape) and 7 absolute price levels (a tree can
+use BTC's level to memorise which DAY a row came from). Expanding forward folds
+by day, never random.
+
+    fold   baseline  logistic     GBM   GBM-base
+     0      0.8319    0.8345    0.8250   -0.0069
+     1      0.8693    0.8744    0.8677   -0.0017
+     2      0.8248    0.8277    0.8076   -0.0172
+     3      0.8552    0.8561    0.8476   -0.0076
+     4      0.8635    0.8653    0.8620   -0.0015
+
+    paired by DAY (n=25 test days)
+      logistic  0.8510 vs 0.8479  diff +0.0031  t=+1.86  better on 16/25
+      GBM       0.8430 vs 0.8479  diff -0.0049  t=-2.34  better on  8/25
+
+**The GBM is significantly WORSE than the baseline and the logistic's +0.0031
+is not significant.** Order flow (cvd, taker_buy_ratio, vol_surge), path shape
+(efficiency, path_over_net, crossings) and momentum at nine horizons add
+nothing to position-over-volatility. Even taken at face value, +0.003 AUC is
+orders of magnitude short of the +0.09 edge needed to clear slippage.
+
+The modelling path is closed with the inputs available. Reopening the model arm
+needs an input this corpus does not contain -- not a better model over it.
+
+### The near-miss, recorded because it would have shipped
+
+The FIRST run of this scored against `z_tau` and produced logistic 0.8510 vs
+0.7799, **t=+5.53, better on 22/25 days** -- a decisive-looking win. It was an
+artefact. `z_tau` normalises the CHAINLINK delta, and in this corpus strike_cl
+sits a median -4.0 bps from the reconstructed tape strike, so any model wins by
+rediscovering `delta_bps` (permutation importance 0.276, against <=0.011 for
+every other feature). Against a baseline that already contains it, the entire
+gain disappears and reverses.
+
+A day-clustered t of +5.53 on 31 days was not enough to make it true.
+
+## CORRECTION: the "4 bps spot-vs-Chainlink basis" is a CORPUS artefact (2026-09-14)
+
+FINDINGS has stated since 2026-09-13 that "spot-vs-Chainlink basis is median
+4.01 bps, mean 5.73 -- ~8x the old 0.5 bps depth gate", and that measurement
+was used to argue a sub-bps depth gate measures the strike rather than the
+strategy. It is a property of `btc5m_ml.parquet`, not of the venue.
+
+    LIVE recorded book, 362,924 ticks / 2,097 rounds, venue strike vs our spot
+      all ticks     median +0.0000   mean +0.1033
+      per round     median +0.000    mean +0.173
+    CORPUS (strike_cl vs reconstructed strike_tape)
+                    median -4.012    mean -5.720
+
+The live number is zero-centred, and it agrees with this document's OWN earlier
+direct observation -- "the oracle tracks Binance spot to +-$0.005 ... 18 of 20
+matched to half a cent", which is 0.0006 bps, not 4. The corpus figure is a
+timestamp misalignment between its tape reconstruction and the Chainlink strike.
+
+The cross backtests are NOT affected: they use `strike_cl`, the real strike.
+What IS affected is the argument that a tight depth gate is unmeasurable. Live,
+spot tracks the strike to ~0, so sub-bps depth IS measurable, and
+`cross_max_depth_bps = 5.0` -- widened from 0.5 partly on this basis figure --
+has never been re-audited on the recorded book where the strike is real. That
+is the highest-value open item.
