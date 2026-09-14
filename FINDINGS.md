@@ -5376,3 +5376,106 @@ window (-10.31 vs +4.06 in-window). Both were real errors.
 The prediction pillar survives, and this test makes it stronger rather than
 weaker. The arm stays OFF -- now on the population it trades, with a
 conditional statistic, and with the two bad pillars removed rather than leaned on.
+
+## Structural arbitrage is impossible here: UP and DOWN are one mirrored book
+
+Two strategies were put forward, both premised on UP and DOWN being separate
+instruments that can drift apart:
+
+1. **Split-and-sell** — deposit $1.00, mint 1 UP + 1 DOWN at zero fee, rest
+   maker sells on both sides (UP at 0.52, DOWN at 0.51), collect 3% risk-free.
+2. **Discount pair merging** — when the combined ask dips under $1.00
+   (UP 0.62 + DOWN 0.35 = 0.97), take both sides and call MERGE for $1.00.
+
+Neither primitive exists on this venue. `btcpredict/execution/live.py` defines
+eleven endpoints — quote, place-order-bundle, order-book, market/list,
+wallet/list, position/list, payment-options, batch-redeem, order/history,
+order/list, batch-cancel — and none is split, merge or mint.
+
+That is not the real answer, though, because **merge is only a way to collect
+the dollar early**. Holding 1 UP + 1 DOWN to settlement pays exactly $1.00 for
+free, since exactly one side wins. So strategy 2 reduces to a question the
+corpus can answer: *does the combined ask ever fall below $1.00?*
+
+### The measurement (`tools/pair_arb_probe.py`, 366,148 snapshots, 7 days)
+
+It cannot, and the reason is structural rather than empirical:
+
+    down_ask == 1 - up_bid     |diff| < 1e-4 in 98.9% of rows
+    down_bid == 1 - up_ask     |diff| < 1e-4 in 98.9% of rows
+    up spread == down spread   in 98.8% of rows, median 0.0100 both sides
+
+UP and DOWN are **not two books. They are one book, mirrored.** Therefore
+
+    up_ask + down_ask == 1 + spread      (combined ask, by construction)
+    up_bid + down_bid == 1 - spread      (combined bid, by construction)
+
+Over the 362,010 rows where the mirror holds, the combined ask has a **minimum
+of exactly 1.0000** and a median of 1.0100. There is no discount pair. Not
+rarely — never.
+
+403 sub-dollar snapshots do appear in the raw data, and they are seductive
+(median net +0.0138/pair after fee, across 158 rounds). They are **100.0%
+rows where the mirror is broken** — one leg stale in the snapshot, not a real
+two-sided price. Their shape gives them away: at a combined 0.96–0.99 the
+minimum leg is 0.32–0.35 against a 0.50 counterpart. And they do not persist:
+
+    388 episodes; 96% last a SINGLE poll tick; maximum life 1.0s over 7 days
+
+Even taking them at face value, two taker buys are not atomic. Filling one leg
+of a pair in a ≤1s window leaves a naked coin flip at ~0.50 with the fee
+already paid — strictly negative EV. The strategy converts a theoretical
++1.4% into a 50/50 gamble every time the second leg slips.
+
+### The same identity dissolves strategy 1
+
+Because `down_bid == 1 - up_ask`, **buying DOWN at its bid IS selling UP at its
+ask**. So "rest buys on both sides and collect the pair for 0.99" is not a
+hedged pair at all: it is a flat book and a captured spread. Plain market
+making, in a costume. The per-row figure it produces —
+
+    pair-at-bid net of the 200bp fee: mean +0.0072, positive in 78.8% of rows
+
+— is the 1-cent spread minus the fee, arithmetic already known, and it carries
+the maker's whole problem with it: the leg that fills is the leg moving against
+you, measured here at **-4.7pts of adverse selection**. Minting would have
+sidestepped that by handing you both legs at once for free; without a mint
+endpoint there is nothing to sidestep it with.
+
+### Why this matters beyond these two strategies
+
+The venue's book is priced to the fee boundary: bid 0.99, ask 1.01, settlement
+1.00, fee ~200bp on the winner's profit ≈ 0.01. The entire spread **is** the
+fee. That single line retro-explains a run of independent negative results —
+hedging, the maker arm, the dynamic gate, the exit rules — which were all, in
+different clothing, attempts to collect a spread the fee had already claimed.
+
+**Nothing to ship. Both strategies are closed.**
+
+## An exit rule does not beat holding, even though SELL works
+
+The SELL path is real (a `side="SELL"` quote is refused for *inventory*, not as
+an unsupported operation), which reopened a question the buy-only framing had
+closed: a losing cross position need not lose its whole stake.
+
+`tools/cross_exit_probe.py` replays 119 btc-5m cross entries at the shipped
+config, captures the forward BID path on the held side, and prices exits at the
+raw bid against holding to settlement:
+
+    rule                  exits    EV/$1   growth   day-t
+    hold (shipped)            0  +0.4455   +3.248   +3.74
+    stop at -0.05            65  +0.2768   +1.940   +2.88
+    stop at -0.10            52  +0.3151   +2.236   +3.21
+    stop at -0.15            47  +0.3054   +2.149   +3.45
+    stop at -0.25            33  +0.3381   +2.401   +3.72
+    trail -0.05 from peak     81  +0.2220   +1.647   +3.57
+    trail -0.10 from peak     64  +0.2223   +1.666   +4.27
+    trail -0.20 from peak     42  +0.2883   +2.102   +4.03
+
+Every rule destroys roughly a third of the growth. Two reasons compound: a sale
+crosses to the bid, so a round trip pays the spread twice; and the arm enters
+*on* a strike crossing, so a bid dipping ten cents is precisely the noise it is
+built to sit through. `trail -0.10` shows a higher day-t (+4.27 vs +3.74) only
+because it flattens variance — it makes less money more smoothly.
+
+The sell path is genuine. It is not an edge. **No exit rule shipped.**
