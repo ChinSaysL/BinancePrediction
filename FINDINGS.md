@@ -6075,3 +6075,54 @@ stand; sizing was verified live ($3.00, normal formula). The read pushes the
 posterior to "catch dead for jumps" (the walk is real; transacting inside it
 is not ours to do); the remaining fires mostly test whether any 0.40+ refused
 crossing behaves differently. Early revert = one `.env` line + restart.
+
+### Does the DEPTH gate need to be dynamic? No -- measured (2026-09-15)
+
+Asked after the 23:39 UTC loss: `btc-updown-5m-1789428900` Up decided 0.561,
+filled 0.6165 (`ev_at_fill` **-0.1024** recorded at fill), depth +0.76 bps at
+the trigger, sigma ~3 bps/min, the round settled Down (end 78288.655 vs strike
+78299.995) -> **-$3.07 + $0.06 fee**. The question: should
+`cross_max_depth_bps` (static 5.0) become a function of volatility? Mirror of
+`cross_dynamic_gate.py` (same recorded book, same scoring), pointed at depth:
+`tools/cross_depth_dynamic.py`.
+
+BTC-5m, 162 triggers / 7 days post the shipped range-band gates, sigma median
+3.0 bps/min. Static sweep first -- what a cap tight enough to block that loss
+(0.76) costs:
+
+    cap    kept   win    ask    edge   additive g/t    reverting g/t
+    0.25    20%  0.909  0.617  +0.292   +0.893/+1.79    +0.705/+1.92
+    0.5     44%  0.901  0.633  +0.269   +1.502/+2.12    +1.343/+2.75
+    0.75    65%  0.876  0.646  +0.230   +1.661/+2.26    +1.633/+3.11
+    1.0     74%  0.875  0.656  +0.219   +1.856/+2.61    +1.821/+3.34
+    2.0     93%  0.880  0.683  +0.197   +1.904/+2.35    +2.137/+3.05
+    5.0    100%  0.883  0.691  +0.192   +1.943/+2.40    +2.282/+3.20   <- shipped
+
+The 0.75-5.0 band carries +0.65 log-growth over the recorded week (reverting)
+against the loss's own -0.07: a cap tight enough to block the loss class gives
+up ~9x what the single loss cost.
+
+Dynamic rules, PAIRED BY DAY against shipped static (reverting model):
+
+    sig x0.5   (81% kept)  -0.036  t-1.04      exp x0.5 (97%)   -0.013 t-1.28
+    sig x1..x2 (93-100%)   ~0.000              exp x1+  (100%)  no-op
+    min(D,sig xk)          no-op for k>=2     trail x0.05..0.3 -0.045..-0.182 (t to -2.65)
+
+**No variant beats static; the ones that bite are negative; trail (tighten in
+calm) is the worst family.** Same verdict as the range gate's dynamic test,
+same reason: 93%+ of triggers sit under 1x sigma, so a vol-scaled depth cap is
+either a no-op or cuts real flow.
+
+Cells: on the live flow no negative cell remains. The storm-x-deep erosion
+(storm half, depth 1-2: win 0.565, edge -0.084, n=23) exists only BEFORE the
+range gate -- that population is what the range gate already refuses, and its
+dynamic variants were already tested and rejected. `--no-range` secondary read
+agrees: 242 triggers, every trail variant negative (t to -3.29).
+
+NOTHING SHIPPED; `cross_max_depth_bps` stays 5.0. The loss entry was a
+normal-depth member of the profitable band -- a whipsaw loss, not a gate
+failure. (For the record: the recovery entry that could have made the round a
+winner was the Down reversal at tau 28s, refused by the reversal guard -- a
+different knob, and its cost is being recorded, not acted on tonight.)
+Limits: 7 days, BTC-5m; a dynamic edge would need regime changes to show, so
+revisit with more data -- same caveat as the range-gate test.
