@@ -4993,3 +4993,36 @@ Now only the PRIMARY is swept inline (page 1, one request). Rolled families are
 refreshed in a background task while the poll keeps serving from the round
 cache. A crash in that task is surfaced via `task.result()` on the next pass
 rather than swallowed.
+
+## CORRECTION: what the range gate actually blocks (2026-09-14)
+
+Stated twice today that gate-blocked triggers "win 0.628 against a break-even
+of ~0.69", i.e. that they lose. **Wrong bar.** 0.69 is the mean ask of the
+triggers the gate KEEPS; the blocked ones are cheaper, so their break-even is
+lower:
+
+    ALL blocked : n=78   win 0.628  ask 0.610  EDGE +0.018
+    ALL kept    : n=162  win 0.883  ask 0.691  EDGE +0.192
+
+Blocked triggers have a slightly POSITIVE edge, not a negative one.
+
+The gate is still correct, for a different reason: +0.018 cannot survive the
+measured +0.088 slippage, while +0.192 clears it with room. Same arithmetic
+that killed the model arm -- edge smaller than slippage -- not "these trades
+lose".
+
+On the volatile half of days, which is the regime that provokes the question:
+
+    blocked, HIGH-volatility days: n=69  win 0.638  ask 0.597  EDGE +0.041
+
+Better than the average blocked trigger, still under half of what execution
+costs.
+
+Per day it is very noisy (+0.316 on 09-10, -0.295 on 09-09, on 6-38 triggers),
+which is why a run of refused winners -- two on 2026-09-14 17:09, both Down on
+rounds that settled Down -- says nothing about the gate.
+
+This is the third time in this file that comparing a win rate to the wrong mean
+ask produced a wrong conclusion. The bar is ALWAYS the mean ask OF THE SAME
+SUBSET, and the test is whether `win - ask` clears ~0.09, not whether it clears
+zero.
