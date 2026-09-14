@@ -2101,3 +2101,67 @@ class TestTheCatchMeter:
         asyncio.run(bot._cross_meter(bot._round, "Up"))    # must not raise
         bot._schedule_cross_meter(bot._round, "Up")        # or schedule anything
         assert not getattr(bot, "_meter_seen", None)
+
+
+class TestTheRefusedProbe:
+    """Flag-off experiment: quote a range-refused crossing at $1 so the venue
+    can answer the fill-honouring question the catch thesis rests on.
+
+    Natural fills cannot answer it: the range gate refuses exactly the
+    jump-sized crossings the question is about, so they never reach the
+    venue. This is the smallest real-money experiment that does.
+    """
+
+    @staticmethod
+    def _wide(store):
+        # ~131 bps of round range (76900 -> 77001), so the 2 bps gate refuses
+        bot = make_bot(store, ticks(76900.0, 76990.0, 77001.0))
+        now = int(time.time() * 1000)
+        bot._ticks = {"BTCUSDT": [(now - 100_000, 76900.0), (now, 77001.0)]}
+        return bot
+
+    def test_off_by_default_leaves_the_range_refusal(self, store, armed,
+                                                     monkeypatch):
+        monkeypatch.setattr(
+            "btcpredict.config.settings.cross_max_round_range_bps", 2.0)
+        bot = self._wide(store)
+        calls = []
+
+        async def ex(*a, **k):
+            calls.append(1)
+
+        bot._cross_execute = ex
+        asyncio.run(bot._cross_tick())
+        assert not calls, "the probe must be off by default"
+        rows = [r[0] for r in bot.store.conn.execute(
+            "select reason from decisions")]
+        assert any("round already moved" in r for r in rows), rows
+
+    def test_probe_quotes_the_refused_crossing_at_the_probe_stake(
+            self, store, armed, monkeypatch):
+        monkeypatch.setattr(
+            "btcpredict.config.settings.cross_max_round_range_bps", 2.0)
+        monkeypatch.setattr("btcpredict.config.settings.cross_probe_enabled",
+                            True)
+        monkeypatch.setattr("btcpredict.config.settings.cross_probe_stake", 1.0)
+        bot = self._wide(store)
+        seen = {}
+
+        async def ex(*a, **k):
+            seen.update(k)
+
+        bot._cross_execute = ex
+        asyncio.run(bot._cross_tick())
+        assert seen, "the probe must order the refused crossing"
+        assert seen["stake"] == pytest.approx(1.0)
+        assert seen["sig"].reason.startswith("cross probe"), seen["sig"].reason
+
+    def test_the_probe_is_capped_per_day(self, store, armed, monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.cross_probe_enabled",
+                            True)
+        monkeypatch.setattr(
+            "btcpredict.config.settings.cross_probe_max_per_day", 1)
+        bot = self._wide(store)
+        r2 = SimpleNamespace(slug="btc-updown-5m-9999000001", symbol="BTCUSDT")
+        assert bot._probe_fires(bot._round) is True
+        assert bot._probe_fires(r2) is False, "cap 1/day must stop the second"

@@ -1500,6 +1500,37 @@ class Bot:
             return None
         return 1e4 * (max(seen) - min(seen)) / r.strike
 
+    def _probe_fires(self, r) -> bool:
+        """Quote a range-REFUSED crossing anyway, at a fixed tiny stake.
+
+        The catch thesis says the venue walks to its post-cross price over ~1s
+        and an early quote pays less -- but its decisive case (a jump-sized
+        move, book running far past the quote) can never produce a natural
+        fill to test that: the range gate refuses those crossings before the
+        venue can answer. So this buys the answer with real orders, once per
+        round, a few times a day, at `cross_probe_stake`. Default OFF: it
+        spends money to measure mechanics, not for edge. Rows are labelled
+        "cross probe" in decisions.reason; everything else -- the guard, the
+        caps, the reserved slot, the exposure checks -- is UNCHANGED.
+        """
+        if not self._ck("probe_enabled", r):
+            return False
+        day = time.strftime("%Y-%m-%d", time.gmtime())
+        st = getattr(self, "_probe_state", None)
+        if not isinstance(st, dict):
+            st = self._probe_state = {"day": "", "n": 0, "slugs": set()}
+        if st["day"] != day:
+            st["day"], st["n"], st["slugs"] = day, 0, set()
+        cap = int(self._ck("probe_max_per_day", r) or 0)
+        if (cap > 0 and st["n"] >= cap) or r.slug in st["slugs"]:
+            return False
+        st["slugs"].add(r.slug)
+        st["n"] += 1
+        log.info("cross probe %s: quoting a range-refused crossing at $%.2f "
+                 "(probe %d/%d today)", r.slug,
+                 float(self._ck("probe_stake", r) or 1.0), st["n"], cap)
+        return True
+
     def _cross_refuse(self, r, side, reason: str, *, tau: float = 0.0,
                       spot=None, stake: float = 0.0, sigma=None) -> None:
         """Record a cross trigger that was DETECTED and then refused.
@@ -1839,16 +1870,20 @@ class Bot:
         # 5-minute round. `self._ticks` is appended once per poll and holds
         # 2400 samples, so it does.
         rng_gate = self._ck("max_round_range_bps", r)
+        probe = False
         if rng_gate > 0:
             rng_bps = self._round_range_bps(r)
             if rng_bps is not None:
                 if rng_bps > rng_gate:
-                    self._cross_refuse(
-                        r, side,
-                        f"round already moved {rng_bps:.1f}bps, gate is "
-                        f"{rng_gate:.1f}",
-                        tau=tau, spot=spot_now, sigma=sigma_now)
-                    return
+                    if self._probe_fires(r):
+                        probe = True        # flag-off experiment; see config
+                    else:
+                        self._cross_refuse(
+                            r, side,
+                            f"round already moved {rng_bps:.1f}bps, gate is "
+                            f"{rng_gate:.1f}",
+                            tau=tau, spot=spot_now, sigma=sigma_now)
+                        return
         # The price that binds is the order's own quote; this is band sanity on
         # the last asks the poll saw. The ceiling is what makes the arm pay --
         # above it the favourite is overpriced and the cell measures negative.
@@ -1937,6 +1972,10 @@ class Bot:
             stake = round(stake * self._ck("stake_mult", r), 2)
             if settings.stake_cap_usdt > 0:      # 0 = no cap, see config
                 stake = min(stake, settings.stake_cap_usdt)
+        if probe:
+            # Fixed and tiny: the probe buys venue-mechanics data, so a
+            # measured stake would confound the thing being measured.
+            stake = round(float(self._ck("probe_stake", r) or 1.0), 2)
         # Size to what is actually resting at the touch. On 2026-09-13 the arm
         # asked for $1.18 and the venue filled $0.90 of it, because nothing
         # checked whether the size existed -- the REST poll carries no depth at
@@ -2152,8 +2191,9 @@ class Bot:
         # `run` goes into the reason so every trigger carries the number the
         # gate decision will be made on, recoverable from the decisions table.
         run_txt = "" if book_run is None else f" run{book_run:+.3f}"
+        kind = "cross probe" if probe else "cross into"
         sig = Signal(side, ask, ask, 0.0, 0.0, 0.0, True,
-                     f"cross into {side} @{ask:.3f} tau{tau:.0f}s{run_txt}")
+                     f"{kind} {side} @{ask:.3f} tau{tau:.0f}s{run_txt}")
         did = self.store.insert("decisions", {
             "slug": r.slug, "ts_ms": now_ms, "tau_s": tau, "side": side,
             "fair": ask, "quote": ask, "edge": 0.0, "hurdle": 0.0,
