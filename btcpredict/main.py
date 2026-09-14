@@ -1508,10 +1508,12 @@ class Bot:
         move, book running far past the quote) can never produce a natural
         fill to test that: the range gate refuses those crossings before the
         venue can answer. So this buys the answer with real orders, once per
-        round, a few times a day, at `cross_probe_stake`. Default OFF: it
-        spends money to measure mechanics, not for edge. Rows are labelled
-        "cross probe" in decisions.reason; everything else -- the guard, the
-        caps, the reserved slot, the exposure checks -- is UNCHANGED.
+        round, a few times a day, at the arm's NORMAL size -- no special
+        stake, because what it measures must be what a gate raise would
+        actually trade. Default OFF: it spends money to measure mechanics,
+        not for edge. Rows are labelled "cross probe" in decisions.reason;
+        everything else -- the guard, the caps, the reserved slot, the
+        exposure checks -- is UNCHANGED.
         """
         if not self._ck("probe_enabled", r):
             return False
@@ -1526,9 +1528,8 @@ class Bot:
             return False
         st["slugs"].add(r.slug)
         st["n"] += 1
-        log.info("cross probe %s: quoting a range-refused crossing at $%.2f "
-                 "(probe %d/%d today)", r.slug,
-                 float(self._ck("probe_stake", r) or 1.0), st["n"], cap)
+        log.info("cross probe %s: quoting a range-refused crossing at the "
+                 "arm's normal size (probe %d/%d today)", r.slug, st["n"], cap)
         return True
 
     def _cross_refuse(self, r, side, reason: str, *, tau: float = 0.0,
@@ -1972,10 +1973,9 @@ class Bot:
             stake = round(stake * self._ck("stake_mult", r), 2)
             if settings.stake_cap_usdt > 0:      # 0 = no cap, see config
                 stake = min(stake, settings.stake_cap_usdt)
-        if probe:
-            # Fixed and tiny: the probe buys venue-mechanics data, so a
-            # measured stake would confound the thing being measured.
-            stake = round(float(self._ck("probe_stake", r) or 1.0), 2)
+        # The probe gets NO special sizing: it is the arm's normal order
+        # (formula, tilt, caps), so what it measures is what a gate raise
+        # would actually trade. Only the daily count is probe-specific.
         # Size to what is actually resting at the touch. On 2026-09-13 the arm
         # asked for $1.18 and the venue filled $0.90 of it, because nothing
         # checked whether the size existed -- the REST poll carries no depth at

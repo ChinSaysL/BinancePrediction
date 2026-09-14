@@ -5973,11 +5973,15 @@ thesis lives on, and natural fills cannot settle it: the range gate refuses
 those crossings before the venue can answer, so they never produce a fill to
 watch. So the question gets a real-money probe instead:
 
-  * `cross_probe_enabled` (default FALSE): quotes RANGE-REFUSED crossings at a
-    fixed `cross_probe_stake` ($1), capped `cross_probe_max_per_day` (6),
-    labelled "cross probe" in decisions.reason. Guard, caps, reserved slot and
-    exposure checks are UNCHANGED. Revert = one config line.
-  * It spends money to buy mechanics data, not edge. Worst case ~-$6/day.
+  * `cross_probe_enabled` (default FALSE): quotes RANGE-REFUSED crossings,
+    sized by the arm's NORMAL rule (no special stake -- what it measures must
+    be what a gate raise would actually trade), capped
+    `cross_probe_max_per_day` (6), labelled "cross probe" in
+    decisions.reason. Guard, caps, reserved slot and exposure checks are
+    UNCHANGED. Revert = one config line.
+  * It spends money to buy mechanics data, not edge, at the normal order
+    size; ~-$20/day worst case at the current formula; the cap (6/day) is
+    the only probe-specific number.
 
 With the meter, this settles both halves: (a) how fast OUR market's book walks,
 and (b) whether the venue fills a quote taken while it walks. Those are the two
@@ -5985,11 +5989,13 @@ numbers the gate decision needs; neither exists yet. GATE STILL 10.
 
 TURNED ON 2026-09-14 23:21 UTC on explicit instruction, with exactly ONE knob
 changed: `CROSS_PROBE_ENABLED=true` in the server `.env` (backup
-`.env.bak-probe-*` beside it). Sizing is untouched -- stake $1.0 and cap 6/day
-are the built defaults, the box's `min_order_usdt` is $1.0 so the order passes,
-and no arm-sizing value was modified. Verified from a fresh interpreter:
-`probe True stake 1.0 cap 6 | min_order 1.0 | streak 12`. (Note the live
-streak halt turned out to be 12, not the 5 the older notes carry.)
+`.env.bak-probe-*` beside it). Probe orders are the arm's NORMAL order -- same
+sizing formula, tilt and caps, NO special stake; the first build had a flat-$1
+override and it was removed at 23:23, before any probe order fired (verified:
+zero `cross probe` lines at the fix). The only probe-specific number is the
+cap (6/day). Verified from a fresh interpreter all the same:
+`probe True | cap 6 | min_order 1.0 | streak 12`. (Note the live streak halt
+turned out to be 12, not the 5 the older notes carry.)
 
 Time-boxed: ~2 days or ~20 probe orders, whichever first, then OFF and read
 `tools/cross_catch_report.py`. Revert = one line + restart. The probe's fills

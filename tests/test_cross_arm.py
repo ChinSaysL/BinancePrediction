@@ -2137,14 +2137,18 @@ class TestTheRefusedProbe:
             "select reason from decisions")]
         assert any("round already moved" in r for r in rows), rows
 
-    def test_probe_quotes_the_refused_crossing_at_the_probe_stake(
+    def test_probe_orders_are_sized_by_the_arm_formula(
             self, store, armed, monkeypatch):
+        """No special sizing: the probe is the arm's normal order, so a
+        monkeypatched formula (0.5 x stake_mult 3.0) must come out as 1.5 --
+        NOT a flat probe stake."""
         monkeypatch.setattr(
             "btcpredict.config.settings.cross_max_round_range_bps", 2.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_probe_enabled",
                             True)
-        monkeypatch.setattr("btcpredict.config.settings.cross_probe_stake", 1.0)
+        monkeypatch.setattr("btcpredict.config.settings.cross_stake_mult", 3.0)
         bot = self._wide(store)
+        bot._stake_for = lambda *a, **k: 0.5
         seen = {}
 
         async def ex(*a, **k):
@@ -2153,7 +2157,8 @@ class TestTheRefusedProbe:
         bot._cross_execute = ex
         asyncio.run(bot._cross_tick())
         assert seen, "the probe must order the refused crossing"
-        assert seen["stake"] == pytest.approx(1.0)
+        assert seen["stake"] == pytest.approx(1.5), (
+            "the probe must ride the normal sizing formula, not a flat stake")
         assert seen["sig"].reason.startswith("cross probe"), seen["sig"].reason
 
     def test_the_probe_is_capped_per_day(self, store, armed, monkeypatch):

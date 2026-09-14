@@ -1494,18 +1494,18 @@ class Settings(BaseSettings):
     #   the reserved slot    one open cross position at a time
     #   max_consecutive_losses
     cross_max_per_day: int = 0
-    # PROBE (default OFF): quote RANGE-REFUSED crossings at a fixed tiny
-    # stake, so the venue can answer the one question the catch thesis
-    # (FINDINGS 2026-09-14 night) rests on: does it honour an early quote
-    # while its book then runs? Nothing else can answer it -- natural fills
-    # cannot, because the range gate refuses exactly the jump-sized
-    # crossings the question is about, so those never reach the venue. This
-    # spends real money (< $1-2/day at the defaults) to buy mechanics data,
-    # not edge; the guard, caps, slot and exposure accounting are unchanged.
-    # Rows are labelled "cross probe" in decisions.reason; revert is one
-    # line (cross_probe_enabled False).
+    # PROBE (default OFF): quote RANGE-REFUSED crossings, sized by the arm's
+    # NORMAL sizing rule -- deliberately no special stake, so what it measures
+    # is what a gate raise would actually trade -- so the venue can answer the
+    # one question the catch thesis (FINDINGS 2026-09-14 night) rests on: does
+    # it honour an early quote while its book then runs? Nothing else can
+    # answer it: natural fills cannot, because the range gate refuses exactly
+    # the jump-sized crossings the question is about, so those never reach
+    # the venue. Spends real money at the normal order size; the only
+    # probe-specific number is the cap. Guard, caps, slot and exposure
+    # accounting are unchanged. Rows are labelled "cross probe" in
+    # decisions.reason; revert is one line (cross_probe_enabled False).
     cross_probe_enabled: bool = False
-    cross_probe_stake: float = 1.0
     cross_probe_max_per_day: int = 6
     # An edge must survive this many consecutive polls before we act: a
     # single-tick edge is usually our own stale data, not a real dislocation.
