@@ -5539,3 +5539,85 @@ gated on. It changes what the record MEANS: past PnL in this ledger is
 optimistic by roughly 0.6-1.5% of stake, which is the correct lens for every
 arm whose measured edge is thin. The cross arm's edge is not thin enough for
 this to reverse it. Nothing else was live.
+
+## Polymarket lists the SAME rounds, on the SAME oracle — and prices them differently
+
+Asked whether to move the cross arm to Polymarket. The answer is no, but the
+question turned up something better: Polymarket is not an alternative venue for
+these markets, it is a SECOND venue for the identical markets.
+
+    slug       btc-updown-5m-<start epoch>   identical on both
+    window     epoch -> epoch+300            identical on both (verified, not assumed)
+    title      "Bitcoin Up or Down - September 14, 4:50PM-4:55PM ET"   identical
+    oracle     Chainlink BTC/USD data stream (data.chain.link/streams/btc-usd)
+
+A winning share pays 1.00 on either venue, so Up on one plus Down on the other
+is a complete pair. Unlike one venue's own Up/Down — which are mirrored into
+each other and can never sum below 1.00 (see the structural-arbitrage section) —
+these are two independent books, free to disagree.
+
+**A correction on method.** The first sweep concluded Polymarket had no
+short-dated markets at all: 800 markets scanned, zero resolving within 48h. That
+was wrong. The gamma `/markets` endpoint silently IGNORES both `slug_contains`
+and `tag_slug`, so the sweep filtered nothing and returned a default page. The
+`/events` endpoint honours `tag_slug`. `tag_slug=5m` returns them immediately.
+Polymarket lists eight assets on 5m rounds (btc, eth, bnb, sol, doge, xrp, zec,
+hype) against this bot's three.
+
+### They disagree on resolution 6.6% of the time, symmetrically
+
+Same oracle, same window, and yet over 561 common settled rounds:
+
+                    PM=Up   PM=Down
+    BN=Up             262        21
+    BN=Down            16       262
+
+6.6% disagreement — the near-ties, where the boundary read differs. This is NOT
+a wash: `BN Up + PM Down` pays 2.00 on (Up,Down) and **0.00** on (Down,Up). So
+the pair is not risk-free, and any writeup calling it that is wrong.
+
+It is, however, unbiased: 21 vs 16 is 0.82 sigma. E[payout] = 1.0089 one way and
+0.9911 the other, s.e. 0.0108. Disagreement buys variance, not drift.
+
+### The pricing gap (tools/xvenue_pair_probe.py, 151 obs, 9 rounds, 3 families)
+
+The two directions sum to a near-constant — median `netA + netB = -0.0471`,
+which is exactly the two spreads plus Binance's measured 169bp fee — so when one
+direction is profitable the other cannot be. The arm evaluates both and takes
+the better, or neither:
+
+    positive in 83.4% of ticks;  median +0.0448/pair, +0.0648 when positive
+
+    family            n    %>0   median best   PM depth at best ask
+    bnb-updown-5m    40    80%       +0.0431         12 shares
+    btc-updown-5m    55    75%       +0.0245        410 shares
+    eth-updown-5m    56    95%       +0.1014         55 shares
+
+Which venue is wrong is visible directly. On one eth round spot was 2558.565
+against a 2558.625 strike — dead at the money, fair ~0.50. Binance quoted
+0.49/0.51. **Polymarket quoted Up 0.39/0.40.** Polymarket's 5m books for eth and
+bnb are 11-40 shares deep and lag; Binance's are tight and correct. The edge is
+picking off a thin, stale book on one venue and hedging it on the tight one.
+
+The depth is the size limit, and at this bankroll it is not binding: 410 shares
+on btc, 55 on eth. A $40 book trades 5-10 shares.
+
+### Why it plausibly persists
+
+Collecting it requires simultaneous capital on BSC and on Polygon, an account
+and signing stack on both, and execution inside the same tick. Capital cannot be
+rebalanced between the chains inside a 5-minute round. That is a real barrier,
+not a free lunch nobody noticed.
+
+### What is NOT yet established
+
+  * Whether Binance's displayed ask is fillable at size. The cross arm's own
+    record is ambiguous: measured patient slippage +0.0037, but real cross fills
+    show median price improvement +0.0209 and the arm still suffers cancelled
+    orders. A 4.5% edge does not survive a missed leg.
+  * Account access, KYC and geo for Polymarket, and USDC on Polygon.
+  * Leg risk. One leg filling alone is a naked directional position. The SELL
+    path on Binance is now confirmed working (MARKET and LIMIT, 50% and 100% of
+    a real 4.91-share position, 2026-09-14), so an unwind exists.
+
+**Nothing shipped. No code path trades Polymarket.**
