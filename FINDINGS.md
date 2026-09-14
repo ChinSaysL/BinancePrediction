@@ -6126,3 +6126,63 @@ winner was the Down reversal at tau 28s, refused by the reversal guard -- a
 different knob, and its cost is being recorded, not acted on tonight.)
 Limits: 7 days, BTC-5m; a dynamic edge would need regime changes to show, so
 revisit with more data -- same caveat as the range-gate test.
+
+## The hedge gate, as stated, measured twice (2026-09-15)
+
+The operator's phrasing: "if a cross trade reverses on us, we execute the
+opposite side of it, to minimize losses." Measured as stated --
+`tools/cross_hedge_on_reversal.py`, recorded book, BTC-5m, 162 entries, the
+reversal = first opposite crossing after entry (best case: hedge leg paid at
+the raw opposite ASK):
+
+    20/162 entries reversed before the round ended
+    P(entry still wins | reversed) = 0.300     (other samples: 0.357, 0.426)
+    pair cost at the reversal: mean 1.302  median 1.295  (<1.0 on 15%)
+    return/$1 on the reversed set: hedge -0.431   vs   hold -0.549
+
+    policy                       book g/t      additive g/t    reverting g/t
+    hold (shipped)            +3.955/+3.12   +1.943/+2.40    +2.282/+3.20
+    hedge at every reversal   +4.134/+3.63   +2.085/+3.33    +2.389/+4.28
+    hedge, +0.088 slip leg    +3.949/+3.50   +1.926/+3.06    +2.236/+4.03
+    hedge only if pair<1      +4.058/+3.23   +2.022/+2.52    +2.333/+3.33
+
+Read: "losses are almost always 0" is false -- the reversal locks the loss at
+~-43% of stake on average (pair 1.302 for a 1.000 payout). The small policy
+gain is a wash the moment the hedge leg pays one tick of the arm's own
+slippage (+0.088: +1.926 additive vs hold +1.943), n=20 flips on 1-2 rounds,
+and **85% of the hedge orders would be refused outright by the shipped
+`max_paired_price = 1.0` guard** (pair > 1.0 -- the typical reversal case).
+
+Why it cannot be more than a wash, three ways, all pre-existing:
+
+  * the algebra (same-round reversal section): with the first leg sunk,
+    EV(take) - EV(decline) = stake_B * [(1-p)/b - 1] -- the entry price
+    CANCELS. Hedging at the reversal is economically the reversal ENTRY
+    itself, which the 249-reversal corpus scores day-t -3.05 and
+    `cross_allow_reversal=False` refuses;
+  * the market: our side wins 0.300 | reversed, and the hedge only pays when
+    the opposite ask is under 1-p. It sits ~on that line -- slightly under
+    on this n=20 slice, slightly over on the powered corpus. A coin flip
+    priced by a spread;
+  * the fill: the hedge leg is a runner (the opposite side just spiked) --
+    the fill-honouring table's worst class (runs >= +0.2: 0/4). The raw ask
+    is a bound, not a fill. And the real-reversal cases (where the hedge
+    would have helped, like tonight's $3.07 loss -> locked ~-$1.33) are
+    exactly the ones where the leg is running hardest.
+
+The OTHER variant -- lock while WINNING when the pair goes cheap
+(`tools/cross_lock_hedge.py`, same rows, fresh run): every threshold destroys
+growth. Hold +3.955/+1.943/+2.282 -> lock<1.00 +1.612/+0.646/+0.492; lock<0.90
++2.440/+0.983/+0.933. The lock caps an 88%-win distribution to buy protection
+from a 12% tail, and pays the fee twice for it.
+
+And the exit comparison stands: stopping/exiting at the bid destroys ~1/3 of
+growth (119 entries, best stop +2.401 vs hold +3.248) -- and by the mirror
+identity (`down_ask == 1 - up_bid`) an exit IS this hedge at the same price.
+The venue's whole spread is the fee; a hedge round-trips it.
+
+KEEP the guards (`cross_allow_reversal=False`, `max_paired_price=1.0`).
+NOTHING SHIPPED. Limits: n=20 reversed (sign flips on 1-2 rounds), BTC-5m,
+7 days -- the powered corpus is the substrate that decides, and it already
+had. Not "very wrong": it is the refused reversal entry in disguise, and its
+net measured effect under realistic fills is zero, not catastrophic.
