@@ -1723,7 +1723,23 @@ class TestReentryGap:
         import inspect
         import btcpredict.main as m
         src = inspect.getsource(m.Bot._cross_tick)
-        assert src.index("lm[r.slug] = now_ms") < src.index("create_task")
+        assert src.index("lm[r.slug] =") < src.index("create_task")
+
+    def test_the_stamp_is_the_CLAIM_time_not_the_tick_start(self):
+        """`now_ms` is read at the top of _cross_tick, before the venue read.
+
+        Stamping it records when the tick STARTED, so a venue read slower than
+        the gap expires the stamp before it is written and the next tick walks
+        through. That is how three rounds took paired entries 36-744ms apart on
+        2026-09-14. See TestConcurrentTicksCannotDoubleEnter for the behaviour;
+        this pins the source so it cannot quietly revert.
+        """
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._cross_tick)
+        assert "lm[r.slug] = now_ms" not in src, (
+            "the re-entry stamp must not be the tick's start time")
+        assert "lm[r.slug] = int(time.time() * 1000)" in src
 
     def test_it_is_per_market(self):
         """One family's entry must not gag another's."""
@@ -1927,3 +1943,93 @@ class TestTheCrossRestsFarShorterThanTheModelArm:
         monkeypatch.setattr("btcpredict.config.settings.limit_wait_s", 20.0)
         w = self._wait_for(store, monkeypatch, ceiling=0.39)
         assert w == pytest.approx(20.0)
+
+
+class TestConcurrentTicksCannotDoubleEnter:
+    """LIVE 2026-09-14: three rounds took paired entries 36-744ms apart.
+
+        eth-updown-5m-1789415100   2 decisions 65ms apart, same quote, same stake
+        bnb-updown-5m-1789414200   2 decisions 60ms apart
+        eth-updown-5m-1789413600   4 decisions inside 300ms (two pairs)
+
+    10 of 48 fills and $29.19 of the day's stake went on duplicates.
+
+    TestReentryGap drives `_cross_tick` SEQUENTIALLY, so each call stamps
+    `_cross_last_ms` before the next one reads it and the gap always holds.
+    That is not how it runs. `_cross_all` is called from two places -- the 1s
+    poll in `tick()` and the websocket loop -- as separate tasks, and
+    `_cross_tick` awaits a venue read between the gap check and the stamp.
+    Two tasks can both be past the gap check before either has stamped.
+
+    `_cross_inflight` is meant to cover exactly that window, so this pins it
+    under concurrency rather than in sequence.
+    """
+
+    def _bot(self, store, monkeypatch, venue_delay=0.03):
+        monkeypatch.setattr("btcpredict.config.settings.cross_reentry_gap_s", 1.0)
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_open_stake_pct", 0.0)
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_round_stake_mult", 0.0)
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0))
+        calls = []
+
+        async def execute(*a, **k):
+            calls.append(1)
+
+        async def unbooked(*a, **k):
+            await asyncio.sleep(venue_delay)     # the real venue read
+            return []
+
+        bot._cross_execute = execute
+        bot._unbooked_round_tokens = unbooked
+        bot.broker.mode = "live"
+        bot.book = object()                      # makes the venue read reachable
+        return bot, calls
+
+    def test_sequential_ticks_take_one_entry(self, store, armed, monkeypatch):
+        bot, calls = self._bot(store, monkeypatch)
+
+        async def go():
+            for _ in range(4):
+                await bot._cross_tick()
+        asyncio.run(go())
+        assert len(calls) == 1
+
+    def test_CONCURRENT_ticks_take_one_entry(self, store, armed, monkeypatch):
+        """The poll and the websocket loop, racing. This is the live case."""
+        bot, calls = self._bot(store, monkeypatch)
+
+        async def go():
+            await asyncio.gather(*[bot._cross_tick() for _ in range(4)])
+        asyncio.run(go())
+        assert len(calls) == 1, (
+            f"{len(calls)} orders from one crossing -- the poll and the websocket "
+            "loop both got past the re-entry gap before either stamped it")
+
+    def test_a_slow_venue_read_must_not_expire_the_gap(self, store, armed,
+                                                       monkeypatch):
+        """The stamp is `now_ms` from the START of the tick, written AFTER the
+        venue read. When that read is slower than the gap, the stamp is stale
+        the moment it lands and the very next tick walks straight through.
+
+        Timeline with a 1.5s read and a 1.0s gap:
+
+            t=0.00  A starts, now_ms=0, gap passes (no stamp), claims inflight
+            t=0.06  B starts, blocked by inflight                     -- correct
+            t=1.50  A stamps _cross_last_ms = 0, releases inflight
+            t=1.55  C starts, now_ms=1550, gap reads last=0
+                    1550 - 0 >= 1000  ->  C PASSES, 50ms after A
+        """
+        bot, calls = self._bot(store, monkeypatch, venue_delay=1.5)
+
+        async def go():
+            first = asyncio.create_task(bot._cross_tick())
+            await asyncio.sleep(0.06)
+            await bot._cross_tick()            # blocked by inflight
+            await first                        # A finishes, stamps a stale time
+            await asyncio.sleep(0.05)
+            await bot._cross_tick()            # C: 50ms after A, must be refused
+        asyncio.run(go())
+        assert len(calls) == 1, (
+            f"{len(calls)} entries {0.05:.2f}s apart -- the re-entry gap was "
+            "stamped with the tick's START time, so a slow venue read expires "
+            "it before it is even written")

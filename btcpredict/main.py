@@ -2042,10 +2042,27 @@ class Bot:
                 rs = self._round_stake = {}
             rs[r.slug] = rs.get(r.slug, 0.0) + stake
             # Stamp the entry time with the claim, for the re-entry gap above.
+            #
+            # NOT `now_ms`. That is read at the TOP of this method, before the
+            # venue round-trip below, so stamping it records when the tick
+            # STARTED rather than when the round was claimed. A venue read
+            # slower than the gap then expires the stamp before it is even
+            # written, and the next tick walks straight through:
+            #
+            #   t=0.00  A starts, now_ms=0, gap passes, claims _cross_inflight
+            #   t=0.06  B starts, blocked by _cross_inflight          (correct)
+            #   t=1.50  A stamps 0, releases _cross_inflight
+            #   t=1.55  C starts, now_ms=1550, reads last=0
+            #           1550 - 0 >= 1000  ->  C PASSES, 50ms after A
+            #
+            # LIVE 2026-09-14, three rounds took paired entries 36-744ms apart
+            # this way -- eth-updown-5m-1789415100 twice 65ms apart at the same
+            # quote and stake, eth-updown-5m-1789413600 four times inside 300ms
+            # -- 10 of 48 fills and $29.19 of the day's stake.
             lm = getattr(self, "_cross_last_ms", None)
             if not isinstance(lm, dict):
                 lm = self._cross_last_ms = {}
-            lm[r.slug] = now_ms
+            lm[r.slug] = int(time.time() * 1000)
             self._cross_last_ms = {k: v for k, v in lm.items() if k in live}
             self._round_stake = {k: v for k, v in rs.items() if k in live}
             # Remember the side, not just the count: the reversal guard reads it.

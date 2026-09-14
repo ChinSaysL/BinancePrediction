@@ -5738,3 +5738,61 @@ day-t is undefined — but a loss of that size is not a sampling artifact, and
 AUC(gap) = 0.51 says the same thing independently.
 
 **Nothing to ship. Polymarket is closed as a venue, as a hedge and as a signal.**
+
+## Duplicate cross entries: the re-entry gap was stamped with the WRONG clock
+
+Reported live: multiple trades executing in quick succession. Confirmed, and it
+had been running all day.
+
+    round                       fills   gaps between them
+    eth-updown-5m-1789413600        4   [0.436, 0.214, 0.612] s
+    eth-updown-5m-1789415100        2   [0.036] s
+    bnb-updown-5m-1789414200        2   [0.744] s
+    btc-updown-5m-1789387500        2   [22.607] s          <- legitimate
+
+10 of 48 real-money fills and **$29.19 of the day's $85.81 stake** went on
+entries the 1.0s `cross_reentry_gap_s` was supposed to refuse. They are separate
+DECISIONS, 60-70ms apart, at identical quote and stake -- not one decision
+placing twice, and not two processes (one startup banner covers the window).
+
+### The mechanism
+
+`_cross_tick` reads `now_ms` once, at the top. The re-entry gap is CHECKED
+against it there, and the same value is STAMPED into `_cross_last_ms` at the
+claim — which is after an `await` on the venue position read. So the stamp
+records when the tick STARTED, not when the round was claimed, and a venue read
+slower than the gap expires the stamp before it is even written:
+
+    t=0.00  A starts, now_ms=0, gap passes (nothing stamped), takes _cross_inflight
+    t=0.06  B starts, blocked by _cross_inflight                        correct
+    t=1.50  A stamps 0, releases _cross_inflight
+    t=1.55  C starts, now_ms=1550, reads last=0
+            1550 - 0 >= 1000  ->  C PASSES, 50ms after A
+
+`_cross_inflight` is not the backstop here: it is discarded in a `finally`
+BEFORE the decision is written and before `create_task(_cross_execute(...))`, so
+it covers only the venue read.
+
+Two guards each looked correct in isolation and the combination was not:
+`TestReentryGap` drives `_cross_tick` sequentially, where each call stamps
+before the next reads, so it could never see this. A concurrency test alone does
+not see it either — with a FAST venue read the in-flight set really does hold.
+It takes both: concurrent ticks AND a venue read slower than the gap.
+
+### The fix
+
+    lm[r.slug] = now_ms                    ->  lm[r.slug] = int(time.time() * 1000)
+
+Stamp the claim with the time of the claim. One line.
+
+Three new tests: sequential ticks take one entry, concurrent ticks take one
+entry, and a slow venue read must not expire the gap (this one fails on the old
+code with "2 entries 0.05s apart"). `test_the_stamp_is_taken_with_the_claim`
+pinned the literal `lm[r.slug] = now_ms`, i.e. it pinned the bug; it now pins
+the ordering, with a companion asserting the start-time stamp cannot return.
+
+**Shipped.** 541 tests pass. Deployed and restarted 2026-09-14 21:36 UTC.
+
+Note the interaction with the same day's `cross_limit_wait_s` change (20s -> 2s):
+a shorter rest frees the arm to re-trigger sooner, so this bug would have grown
+worse, not better, had it been left.
