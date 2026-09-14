@@ -215,6 +215,7 @@ class Bot:
         # Recent (ts_ms, spot) per symbol for the impulse trigger (entry_mode
         # "impulse"). Capped well above the longest impulse window.
         self._ticks: dict[str, list[tuple[int, float]]] = {}
+        self._cross_refused: dict = {}
         self.model = build_model(settings.pricing_model)
         # Opt-in per-side gate: Up is priced by `up_model` when it differs
         # from the default model (prototype: drift-adjusted digital for Up).
@@ -1347,6 +1348,43 @@ class Bot:
         r = getattr(self, "_round", None)
         return cross_knob(market_prefix(getattr(r, "slug", None)), name)
 
+    def _cross_refuse(self, r, side, reason: str, *, tau: float = 0.0,
+                      spot=None, stake: float = 0.0) -> None:
+        """Record a cross trigger that was DETECTED and then refused.
+
+        Two problems this fixes, both found on 2026-09-14 while reconstructing
+        seven rounds that looked like missed crossings:
+
+        * SILENCE. Every refusal after `crossed_side` returns a side used to
+          exit with no decision row -- and most with no log line either. In the
+          database that is indistinguishable from "no crossing happened", so
+          the only way to tell a refusal from a miss was to replay the venue's
+          strike against 1s klines. A detected-then-refused trigger is exactly
+          the thing worth seeing, because it is rare and it is a choice.
+        * SPAM. The one path that did log wrote on every evaluation. Now that
+          the arm runs on the websocket clock (~114/s) that produced 164 lines
+          for 11 rounds. Deduped per (round, reason), so a refusal that persists
+          for a whole round is one line and one row.
+        """
+        # getattr, not attribute access: the fixtures build a Bot with
+        # __new__ and never run __init__, which is the same reason `_ticks`
+        # is looked up that way a few methods down.
+        seen = getattr(self, "_cross_refused", None)
+        if not isinstance(seen, dict) or seen.get("slug") != r.slug:
+            seen = self._cross_refused = {"slug": r.slug, "seen": set()}
+        if reason in seen["seen"]:
+            return
+        seen["seen"].add(reason)
+        log.info("cross %s %s not taken: %s", r.slug, side, reason)
+        with contextlib.suppress(Exception):
+            self.store.insert("decisions", {
+                "slug": r.slug, "ts_ms": int(time.time() * 1000), "tau_s": tau,
+                "side": side, "fair": None, "quote": None, "edge": 0.0,
+                "hurdle": 0.0, "sigma_1m": getattr(self, "_sigma", 0.0),
+                "spot": spot, "oracle": None, "strike": r.strike,
+                "stake": stake, "acted": 0, "reason": f"cross refused: {reason}",
+            })
+
     async def _cross_tick(self) -> None:
         """Buy the side the spot JUST crossed into, while the venue undershoots.
 
@@ -1421,6 +1459,10 @@ class Bot:
         sigma_now = getattr(self, "_sigma", 0.0)
         depth_bps = 1e4 * abs(spot_now - r.strike) / r.strike if r.strike else 1e9
         if depth_bps > self._ck("max_depth_bps"):
+            self._cross_refuse(r, side,
+                               f"{depth_bps:.2f}bps through the strike, gate is "
+                               f"{self._ck('max_depth_bps'):.2f}",
+                               tau=tau, spot=spot_now)
             return
         # The price that binds is the order's own quote; this is band sanity on
         # the last asks the poll saw. The ceiling is what makes the arm pay --
@@ -1459,6 +1501,12 @@ class Bot:
             book_run = None
         if ask is None or not (self._ck("min_price") <= ask
                                <= self._ck("max_price")):
+            self._cross_refuse(
+                r, side,
+                ("no ask on the book" if ask is None else
+                 f"ask {ask:.3f} outside [{self._ck('min_price'):.2f},"
+                 f"{self._ck('max_price'):.2f}]"),
+                tau=tau, spot=spot_now)
             return
         # Size like the main arm unless a flat stake is configured: a flat $1
         # cannot compound, so the arm's contribution shrinks as a share of the
@@ -1570,9 +1618,11 @@ class Bot:
                 reserved, _pool = pool_for_mode(self._fill_mode(fid))
                 if reserved:
                     continue                      # an earlier cross, not the main arm
-                log.info("cross %s %s not taken: the main arm holds the "
-                         "opposite side here (measured EV/$1 -0.107 against "
-                         "+0.356 same-side)", r.slug, side)
+                self._cross_refuse(
+                    r, side,
+                    "the main arm holds the opposite side here (measured "
+                    "EV/$1 -0.107 against +0.356 same-side)",
+                    tau=tau, spot=spot_now)
                 return
         # The RESERVED slot, not the main one. The main arm enters at tau
         # 60-210 and holds to settlement, which covers this arm's whole window,
@@ -1583,7 +1633,7 @@ class Bot:
         allowed, why = self.guard.check_reserved(
             r.slug, max_open=self._ck("max_per_round"))
         if not allowed:
-            log.info("cross %s %s not taken: %s", r.slug, side, why)
+            self._cross_refuse(r, side, why, tau=tau, spot=spot_now)
             return
         # Claim before ordering, so a rejection skips the round rather than
         # risking a second attempt at it.

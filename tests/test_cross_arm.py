@@ -278,7 +278,12 @@ class TestTheArm:
 
         bot._place_order = boom
         asyncio.run(bot._cross_tick())
-        assert bot.store.counts()["decisions"] == 0
+        # A refusal now leaves a row (see _cross_refuse): the invariant
+        # is that no ORDER went out, not that nothing was written.
+        assert [r[0] for r in bot.store.conn.execute(
+            "select reason from decisions")] == [] or all(
+            r[0].startswith("cross refused:") for r in
+            bot.store.conn.execute("select reason from decisions"))
 
     def test_it_refuses_the_side_opposite_the_main_arm(self, store, armed):
         """CHANGED 2026-09-13 (twice). This first asserted a refusal, was
@@ -510,7 +515,12 @@ class TestTheArm:
 
         bot._place_order = boom
         asyncio.run(bot._cross_tick())
-        assert bot.store.counts()["decisions"] == 0
+        # A refusal now leaves a row (see _cross_refuse): the invariant
+        # is that no ORDER went out, not that nothing was written.
+        assert [r[0] for r in bot.store.conn.execute(
+            "select reason from decisions")] == [] or all(
+            r[0].startswith("cross refused:") for r in
+            bot.store.conn.execute("select reason from decisions"))
 
     def test_a_deep_cross_is_refused(self, store, armed):
         """Past the gate the venue has repriced and the edge is gone.
@@ -529,7 +539,12 @@ class TestTheArm:
 
         bot._place_order = boom
         asyncio.run(bot._cross_tick())
-        assert bot.store.counts()["decisions"] == 0
+        # A refusal now leaves a row (see _cross_refuse): the invariant
+        # is that no ORDER went out, not that nothing was written.
+        assert [r[0] for r in bot.store.conn.execute(
+            "select reason from decisions")] == [] or all(
+            r[0].startswith("cross refused:") for r in
+            bot.store.conn.execute("select reason from decisions"))
 
     def test_it_takes_several_crosses_in_one_round_up_to_the_cap(
             self, store, armed, monkeypatch):
@@ -1116,3 +1131,62 @@ class TestDailyCapZeroMeansOff:
         bot = self._armed_bot(store, 4)
         asyncio.run(bot._cross_tick())
         assert bot._cross_fired != {}, "one below the cap must still be allowed"
+
+
+class TestRefusalsAreRecorded:
+    """A DETECTED-then-refused trigger must leave a trace.
+
+    Seven rounds on 2026-09-14 looked like missed crossings and were not: the
+    arm saw them and declined. Nothing in `decisions` said so, because every
+    post-detection refusal returned silently, so the only way to tell a refusal
+    from a miss was to replay the venue strike against 1s klines.
+    """
+
+    def _reasons(self, store):
+        rows = store.conn.execute(
+            "select reason from decisions where reason like 'cross refused:%'"
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def test_a_too_deep_cross_is_recorded(self, store, armed, monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_depth_bps", 0.0001)
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0))
+        bot._place_order = _swallow
+        asyncio.run(bot._cross_tick())
+        got = self._reasons(store)
+        assert got and "through the strike" in got[0], got
+
+    def test_an_out_of_band_ask_is_recorded(self, store, armed, monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_price", 0.05)
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0))
+        bot._place_order = _swallow
+        asyncio.run(bot._cross_tick())
+        got = self._reasons(store)
+        assert got and "outside" in got[0], got
+
+    def test_the_same_reason_is_recorded_once_per_round(self, store, armed,
+                                                        monkeypatch):
+        """At ~114 evaluations/s an undeduped refusal wrote 164 lines for 11
+        rounds. One round, one reason, one row."""
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_depth_bps", 0.0001)
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0))
+        bot._place_order = _swallow
+        for _ in range(25):
+            asyncio.run(bot._cross_tick())
+        assert len(self._reasons(store)) == 1, self._reasons(store)
+
+    def test_a_new_round_records_again(self, store, armed, monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_depth_bps", 0.0001)
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0))
+        bot._place_order = _swallow
+        asyncio.run(bot._cross_tick())
+        bot._round.slug = "btc-updown-5m-1789000300"      # next round
+        asyncio.run(bot._cross_tick())
+        assert len(self._reasons(store)) == 2, self._reasons(store)
+
+    def test_no_crossing_records_nothing(self, store, armed):
+        """Silence must still mean 'nothing happened' when nothing happened."""
+        bot = make_bot(store, ticks(76990.0, 76990.0, 76990.0))
+        bot._place_order = _swallow
+        asyncio.run(bot._cross_tick())
+        assert self._reasons(store) == []

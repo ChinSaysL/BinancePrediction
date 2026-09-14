@@ -3612,3 +3612,49 @@ single reference 2-4s back rather than scanning the interval between them. At
 114 looks/s the arm will normally sample DURING an excursion, so this is now
 mostly academic -- but it is not the same thing as detecting every crossing.
 Backtest the interval-scan variant on the corpus before assuming it helps.
+
+## The seven "missed" crossings were refusals, not misses (2026-09-14)
+
+Replayed all 78 btc-updown-5m rounds from 22:00 UTC against the VENUE's own
+strike (`rounds.strike`) and Binance 1s klines (tools/missed_crossings.py).
+The arm's close-rule fired on 14 rounds; the bot logged 8. All seven gaps are
+now accounted for, and the crossings were real -- verified present in the bot's
+OWN recorded spot feed, not just in klines, with closest approaches of
+0.00-1.82 bps against a 5.0 bps gate.
+
+**Five of seven: refused on purpose.** `cross_skip_opposite_to_main` -- the main
+arm held the opposite side. 164 log lines across 11 distinct rounds. Not a bug:
+that cell measures -0.107/$1 against +0.356 same-side.
+
+**Two of seven** (22:10 and 22:30 UTC) have NO cross log line at all: they
+predate the 22:48 restart that put the arm back on the websocket clock, so it
+never looked while price was on the far side. Same cause as the round the
+operator first spotted.
+
+Both causes are now gone: the feed-clock fix shipped 22:48, and with
+`entry_mode=off` there is no main arm to hold an opposite side (the gate skips
+any fill whose pool is `reserved`, and cross fills are). Last opposite-side
+refusal 03:54 UTC; model arm off at 04:16.
+
+**The gate was suppressing roughly half the arm's opportunities** -- 11 rounds
+refused against 8 taken -- to avoid trading against an arm since measured at
+exactly zero margin (win 0.64971 vs ask 0.64967 over 688 fills).
+
+### The real defect: refusals were invisible
+
+An audit of every exit from `_cross_tick` found 19 return paths, **11 entirely
+silent** and NONE writing a decision row. The damaging ones are the refusals
+that happen AFTER `crossed_side` returns a side -- depth-exceeded and
+ask-out-of-band -- because in the database those are indistinguishable from
+"no crossing happened". That is why separating a refusal from a miss required
+replaying the venue strike against klines.
+
+`_cross_refuse()` now records every post-detection refusal as a
+`cross refused: <reason>` decision row, **deduped per (round, reason)**. The
+dedupe matters for a second reason: the one path that did log wrote on every
+evaluation, and at ~114 evaluations/s that produced 164 lines for 11 rounds.
+One round, one reason, one row.
+
+Three tests asserted `decisions == 0` on refusal -- they encoded the old
+silence as correct, and now assert the invariant that actually matters (no
+ORDER went out) while allowing the refusal row.

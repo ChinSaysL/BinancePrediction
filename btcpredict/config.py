@@ -714,11 +714,31 @@ class Settings(BaseSettings):
     # Raising the PRICE ceiling is the wrong lever for volume -- it buys trades
     # by giving up the edge: <=0.70 is 9.2/day at +10.3 pts, <=0.85 is 15/day
     # at +8.6, against +23.0 at <=0.50.
-    # 10s, not 3s: below ~10s an order cannot reliably land before the bell
-    # (median time to a complete fill is 5.0s), so those triggers mostly become
-    # cancellations. Fill-aware, tau 10-60 books +$10.63 against +$7.11 for the
-    # old 3-60 window on the same days.
-    cross_min_tau_s: float = 10.0
+    # LOWERED 10 -> 5 on 2026-09-14. The edge is strongest closest to the bell,
+    # measured on the largest sample this repo has for the question: 1,718
+    # recorded rounds carrying the venue's REAL Chainlink strike, with the
+    # trigger priced at the REAL venue ask (4,592 triggers):
+    #     tau       n     ask     win   margin     EV/$1
+    #     0-3      73   0.807   0.890   +0.083   +0.502   <- unfillable
+    #     5-10     36   0.701   0.833   +0.132   +0.330
+    #     10-15    38   0.693   0.737   +0.044   +0.262
+    #     45-60   183   0.668   0.760   +0.092   +0.138
+    #     60-90   344   0.621   0.625   +0.004   +0.029   <- edge is gone
+    #    150-300 2863   0.581   0.576   -0.005   -0.008
+    #   grouped: tau 1-10 EV +0.444/$1 (+2.1 SE) | 10-60 +0.243 (+3.2 SE)
+    #
+    # 5, not 3 or 1, is an EXECUTION floor and nothing else. Live decision->fill
+    # is a median 3.7s and a max 4.4s over 10 fills, so a 5s budget is tight but
+    # real while 3s is not: the 0-3 bucket is 73 triggers that can be seen and
+    # never touched.
+    #
+    # CONTRADICTS a recorded fill-aware result, deliberately and with the reason
+    # stated: "tau 10-60 books +$10.63 against +$7.11 for the old 3-60 window on
+    # the same days" (median fill was then 5.0s). That was measured at the 0.5bps
+    # depth gate and BEFORE the arm was put back on the websocket clock, which
+    # is what cut the latency. If the fill rate at tau 5-10 comes in materially
+    # below the 69% seen elsewhere, this goes back to 10.
+    cross_min_tau_s: float = 5.0
     cross_max_tau_s: float = 60.0
     # RAISED 0.50 -> 0.70 on 2026-09-13. Re-measured by price bucket on live
     # data, one entry per round, priced at the trigger ask:
@@ -891,7 +911,38 @@ class Settings(BaseSettings):
     # to be measured for free: the cross-exec telemetry logs fill-% on every
     # order, and full-fill-vs-partial IS P(limit). Revisit at ~20 live fills;
     # below P(limit) ~0.3, 3x becomes justified on evidence.
-    cross_stake_mult: float = 1.5
+    # RAISED 1.5 -> 2.25 on 2026-09-14, with the model arm switched off so this
+    # is the account's only risk. 0.0224 x 2.25 = 5.04% of bankroll per trade.
+    #
+    # Swept on the EMPIRICAL per-trade returns (tools/cross_sizing_sweep.py),
+    # resampled in whole-day blocks so the skew and the within-day correlation
+    # survive -- a mean-EV sweep would be wrong here, because 17% of trades
+    # (ask < 0.30) carry 74% of the profit and win only 28.6% of the time.
+    # 30 days from $50, with the 20% daily stop and the $55 depth cap:
+    #
+    #   frac    all asks (EV +.314)        fillable only (EV +.098)
+    #           median    p10   ruin       median    p10   P(<start)
+    #   2.24%  $ 9,232  $4,474   0%       $   293  $ 149     0.0%
+    #   3.36%  $12,426  $7,618   0%       $   655  $ 236     0.0%
+    #   5.00%  $14,353  $9,506   0%       $ 1,806  $ 423     0.1%   <- ships
+    #  10.00%  $15,299  $9,949   0%       $   329  $  65     6.8%
+    #  15.00%  $13,906  $5,469 1.5%       $    78  $  10    40.9%
+    #  20.00%  $ 8,417  $    0 18.9%
+    #  30.00%  $     0  $    0  100%
+    #
+    # 5% is the only setting at or near the peak under BOTH regimes, and which
+    # regime is true is exactly what is unknown: the headline +0.314 has day-t
+    # 0.59, the fillable +0.098 has day-t 1.91. 10% is the all-asks peak but 5x
+    # WORSE than 5% if the cheap tail is unfillable, which live suggests it may
+    # be (4 of 4 unfilled attempts had decided asks 0.14-0.45).
+    #
+    # Full-Kelly on this distribution is 17-19%, so this is ~1.1x quarter-Kelly.
+    # Past 15% is a cliff rather than a slope -- these are fat-tailed empirical
+    # returns, and 30% wipes out every path. Do not size on the median alone.
+    #
+    # Only 7 priced corpus days exist, so the block bootstrap is lumpy; read the
+    # shape of the table, not single cells.
+    cross_stake_mult: float = 2.25
     cross_limit_buffer: float = 0.10
     # ...but PROPORTIONAL at the cheap end. A flat +0.10 on this arm's most
     # profitable bucket (ask 0.02-0.30, see cross_max_price) is a 33-500%
