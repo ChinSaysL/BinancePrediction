@@ -5898,3 +5898,61 @@ split by strike-crossing count resolves nothing on the priced book (cells of
 is mechanically N-vs-k parity -- won == (N === k mod 2), exact on 1.0000 of 524
 recomputed triggers -- i.e. it measures whether the crossing gets revisited,
 not where it settles. There is no subclass here worth a gate change.
+
+## The catch: the venue WALKS to its price -- measured before shipping (2026-09-14, night)
+
+The refusals keep producing visible winners, and the standing explanation was
+"the venue repriced before we acted" -- assumed, never measured below the 1s
+poll. Two facts and one instrument.
+
+### Infrastructure first: geography is not the constraint, it is 1ms from optimal
+
+From the VPS itself: Tokyo (Contabo Asia), `ping api.binance.com` avg **1.086ms**
+(min 0.985), TCP connect 2.5ms. The venue (same `api.binance.com` host) and the
+spot feed are the same metro; of the measured 89ms venue->us book lag, ~1ms is
+the wire. "Move the server / detect earlier" cannot buy anything there.
+
+### The venue's book after a crossing (Sep 13 recording, sub-second)
+
+`data/ws/book2.jsonl` -- the venue's own book feed, 44 consecutive btc-5m
+markets, ~4.3 frames/s -- matched to the Sep 13 1-second tape and the live DB's
+strikes/settles. The ladder is the Up token (verified: Down-wins collapse it,
+Up-wins run it to 0.99, knife-edges sit mid). For 16 up-crossings with a >=0.08
+move:
+
+    median ask path   0.475 (crossing second) -> 0.555 (+0.25s) -> 0.590
+                      (+0.5s) -> 0.620 (+1s) -> 0.645 (+2s)
+    50% of the move done by  +513ms (q25 +380, q75 +905)
+    90% done by              +1025ms
+    jump-sized movers (>=0.3): the first observable ask sat 0.22-0.39 below the
+    +2s ask (median ~0.33)
+
+The venue does not step to the final price at the cross; it walks there over
+~1s. On a move like tonight's BTC 0.07 -> 0.90, a quote taken in the first
+~250ms sits a quarter to a third of a dollar below one taken a second later.
+
+### And it is the QUOTE that locks the price
+
+34 live `cross exec` lines (decided / limit / fill / elapsed / book-now) show
+fills landing at ~their own limit (median limit - 0.02; 12 at >=97% of the
+intended size) while the NO-FILLS are the runners (limit 0.57 against a book
+that went to 0.92; limit 0.44; limit 0.17). One fill paid decided+0.14 while
+the book sat still. Mixed micro-mechanics, but the part that is stable: what we
+pay tracks what WE saw and committed when we quoted, not the book three seconds
+later. Quoting early is therefore the lever -- and the 2s rest does not cost
+the price.
+
+### Shipped (commit 007a14d, deployed 2026-09-14 23:00 UTC)
+
+  * every refusal now stores the WS ask it saw (`quote` was None -- the one
+    clean read of "the venue had not repriced yet", thrown away);
+  * every trigger meters the book at +0.25/+0.50/+1.00s (`cross meter` log
+    lines). Log-only; cannot touch an order.
+
+PRE-REGISTERED, so this is a test and not a story: over the next day the meter
+must show the +0.25s ask materially below the +1.0s ask on gated refusals (the
+Sep 13 shape), and re-pricing the refused class at the +0.25s ask must clear
+the ~0.06 buffer+fee. If instead the +0.25s ask is already ~equal to +1.0s --
+our market repricing faster than the recorded one -- there is no catch, the
+gate stays at 10, and the "detect/execute earlier" idea closes for good. NO
+GATE CHANGE until that read exists.
