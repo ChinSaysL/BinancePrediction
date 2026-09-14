@@ -265,6 +265,9 @@ class Bot:
         self._sigma = 0.0
         # Cross arm: one claim per round, and its own day-scoped counter.
         self._cross_fired: dict[str, int] = {}
+        # The side already taken in a round, so a later crossing cannot buy the
+        # opposite one. See config.cross_allow_reversal.
+        self._cross_side: dict[str, str] = {}
         self._cross_day = ""
         self._cross_count = 0
         # Rounds this process has already triggered in, so one impulse cannot
@@ -1450,12 +1453,18 @@ class Bot:
         # +$31.37 against +$14.16 for the first alone (see config).
         if not isinstance(self._cross_fired, dict):
             self._cross_fired = {}
+        # getattr, not a bare attribute: fixtures build Bot via __new__, which
+        # skips __init__ (the same trap `_cross_refused` hit on 2026-09-14).
+        if not isinstance(getattr(self, "_cross_side", None), dict):
+            self._cross_side = {}
         if self._cross_fired.get(r.slug, 0) >= self._ck("max_per_round"):
             return
         # Only the live round is worth remembering; the map would otherwise
         # grow all day.
         self._cross_fired = {k: v for k, v in self._cross_fired.items()
                              if k == r.slug}
+        self._cross_side = {k: v for k, v in self._cross_side.items()
+                            if k == r.slug}
         now_ms = int(time.time() * 1000)
         tau = r.tau_s(now_ms)
         if not (self._ck("min_tau_s") <= tau <= self._ck("max_tau_s")):
@@ -1481,6 +1490,29 @@ class Bot:
         side = crossed_side(list(ticks), r.strike, self._ck("look_s"))
         if side is None:
             return
+        # A crossing BACK through the strike is not a hedge on what we already
+        # hold. With the first position sunk the second leg is worth taking iff
+        # it is +EV on its own, and measured it is not: it wins 0.574 against
+        # 0.714 for a first entry (31 days of real strikes, day-t -3.05), and
+        # its growth is negative under every pricing tried. Same-side repeats
+        # are a different animal and stay allowed -- they are most of what the
+        # per-round cap buys and they are profitable. See
+        # config.cross_allow_reversal.
+        #
+        # In-process state, so a restart mid-round forgets the side. Left that
+        # way deliberately: `open_fills` holds a Fill, which carries no `mode`,
+        # so reading the side back would mean re-querying the DB per tick on
+        # the websocket clock, and blocking on any held token is exactly the
+        # arms-independence rule this arm exists outside of. The window is one
+        # round and the observed failure (two entries 22s apart) is in-process.
+        if not self._ck("allow_reversal"):
+            held = self._cross_side.get(r.slug)
+            if held is not None and held != side:
+                self._cross_refuse(
+                    r, side,
+                    f"reversal of the {held} entry already taken this round",
+                    tau=tau, spot=feed.price)
+                return
         # How far through the strike we already are. A cross that is 1-2 bps
         # deep has been seen and repriced (that cell measures -0.19/$1); the
         # edge lives in the nick the venue has not registered yet.
@@ -1686,6 +1718,8 @@ class Bot:
         # Claim before ordering, so a rejection skips the round rather than
         # risking a second attempt at it.
         self._cross_fired[r.slug] = self._cross_fired.get(r.slug, 0) + 1
+        # Remember the side, not just the count: the reversal guard reads it.
+        self._cross_side[r.slug] = side
         self._cross_count += 1
         spot = spot_now
         sigma = sigma_now

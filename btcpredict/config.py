@@ -493,11 +493,32 @@ class Settings(BaseSettings):
     # arm owns calm rounds (+0.661/$1 under 5bps, -0.074 when trending), this
     # one owns moving rounds. Each arm's dead zone is the other's edge.
     #
-    # CAVEAT: day-t 1.80 is under this repo's t=2 bar. It gates an arm that is
-    # otherwise OFF, so the question is where it may trade, not whether to add
-    # risk blindly.
+    # UPPER BOUND CORRECTED 20 -> 12 on 2026-09-14. The window above was built
+    # on 686 LIVE FILLS; replaying the arm's real evaluate() gate over the
+    # recorded history gives 1,159 entries and a different top end:
+    #     range    n    ask    win     EV     day-t  drop-best
+    #     <3      513  0.591  0.635  +0.066   +0.31   -0.021
+    #     3-5     253  0.629  0.652  +0.041   +0.40   -0.018
+    #     5-8     198  0.646  0.737  +0.146   +2.18   +0.085
+    #     8-12    105  0.648  0.762  +0.186   +1.67   +0.078
+    #     12-20    70  0.662  0.700  +0.007   -0.62   -0.221   <- was inside
+    #     >20      20  0.691  0.600  -0.154   +0.33   -0.046
+    #
+    # The raw replay appears to say "drop the window entirely" (ALL: EV +0.078,
+    # day-t +4.95). That is an artifact of pricing at the BOOK ask. Priced at
+    # what we actually fill at, the arm is NEGATIVE everywhere except here:
+    #     window    n   | add +0.088 EV  growth | mean-revert EV  growth
+    #     ALL     1159  |    -0.058     -1.632  |    -0.039      -1.159
+    #     0-12    1069  |    -0.051     -1.345  |    -0.037      -1.000
+    #     5-20     373  |    -0.005     -0.079  |    +0.036      +0.260
+    #     5-12     303  |    +0.018     +0.095  |    +0.053      +0.332  <- ships
+    #
+    # So the lower bound at 5 is what makes this arm viable at all, and 12 is
+    # where it stops paying. Note the arm is only MARGINALLY positive even here
+    # (+0.018/$1 under the harsher slippage model) -- it is a supporting arm,
+    # not a driver.
     model_min_round_range_bps: float = 5.0
-    model_max_round_range_bps: float = 20.0
+    model_max_round_range_bps: float = 12.0
     # --- stale-display maker ------------------------------------------------
     # MEASURED 2026-09-12, lead-lag cross-correlation over 1,372 rounds of the
     # 1 Hz quote tape (corr of the venue's implied-probability change against
@@ -730,7 +751,30 @@ class Settings(BaseSettings):
     # 2s rather than 1s because the replay tape is 1 Hz, so look=1 compares
     # adjacent samples and cannot be validated below that. The live arm reads
     # the websocket at ~33/s, so 2s is measured honestly at both resolutions.
-    cross_look_s: float = 2.0
+    # 2.0 -> 1.0 on 2026-09-14, from a single-methodology audit of EVERY cross
+    # knob (real Chainlink strike, real venue ask, priced at what we FILL at
+    # under both slippage models, scored on compounded growth, day-clustered).
+    # A shorter look-back confirms the crossing against a fresher reference, so
+    # the order goes out before the venue reprices -- the measured ask falls
+    # 0.690 -> 0.644 as the look shortens, and that is the whole margin.
+    cross_look_s: float = 1.0
+
+    # THE AUDIT THESE TWO COME FROM (2026-09-14). Every cross knob, one method:
+    #     config                    n  growth add  growth rev  day-t  drop-best
+    #     shipped (look2, cap3)   136     0.167      0.513     0.38    -0.018
+    #     look 1.0, cap 3         108     1.223      1.302     3.24    +0.196
+    #     look 2.0, cap 8         257     1.407      2.015     2.08    +0.087
+    #     look 1.0, cap 8         170     1.617      1.823     3.54    +0.162
+    #     look 1.0, cap 5         144     1.550      1.731     5.52    +0.230
+    #
+    # Read the first row before trusting anything else in this file: the config
+    # shipped before this audit had day-t 0.38 and a NEGATIVE drop-best-day --
+    # one day carried it. Every other knob (depth, tau bounds, round-range,
+    # price band) sat at that same 0.38/-0.018 point, and its two slippage
+    # models disagreed about which value was best. Those knobs are NOT
+    # established; they are simply not obviously wrong on 7 days of data.
+    # look 1.0 / cap 5 is the only setting that clears day-t 2 with a positive
+    # drop-best-day under BOTH slippage models.
     # The window. RE-MEASURED 2026-09-13 (today excluded), px<=0.50, look 3s:
     #     tau 3-30s   n=20  4.0/day  win 60.0%  edge +23.0 pts  EV/$1 +0.6227
     #     tau 3-45s   n=26  5.2/day  win 65.4%  edge +26.2 pts  EV/$1 +0.6667
@@ -1067,7 +1111,43 @@ class Settings(BaseSettings):
     #     1st cross only, depth<=0.5  n= 66  tot +$14.16  drop1  +8.02
     #     EVERY cross,    depth<=0.5  n=123  tot +$31.37  drop1 +16.37
     # 3 bounds the per-round exposure at $3 against an ~$11 daily cap.
-    cross_max_per_round: int = 3
+    # 3 -> 5. Entries 0-4 in a round all carry positive EV at real fill prices
+    # (+0.263, +0.157, +0.292, +0.168, +0.207 per $1); it decays from 5 on
+    # (-0.054, +0.336, -0.006 on 7-12 samples each).
+    #
+    # "Consecutive crossings alternate sides by construction, so extra entries
+    # in a choppy round hedge rather than double" -- RETRACTED 2026-09-14, on
+    # both halves. It is not true at live tick resolution (51 of 65 non-first
+    # entries on the recorded book repeat the SAME side; alternation only looks
+    # universal on the corpus's coarse 10s grid), and where it does happen it
+    # is not a hedge. See cross_allow_reversal.
+    cross_max_per_round: int = 5
+    # May a cross entry take the side OPPOSITE a position already held in this
+    # round? No. Buying both sides is not a hedge: with the first position sunk,
+    #     EV(take) - EV(decline) = stake_B * [ (1 - p)/b - 1 ]
+    # so the second leg is worth taking iff `1 - p > b`, i.e. iff it is +EV on
+    # its own. The first leg's price cancels; "locked overlap loss" is a red
+    # herring. The only question is whether a reversal beats its own ask, and it
+    # does not:
+    #     substrate                  entry    n    win     ask    edge
+    #     31d Chainlink corpus       first  839  0.714      --      --
+    #                             REVERSAL  249  0.574      --      --   day-t -3.05 / 27d
+    #     5 priced corpus days       first  167  0.749   0.664  +0.084
+    #                             REVERSAL   34  0.559   0.581  -0.022
+    #     7d recorded venue book     first  150  0.880   0.671  +0.209
+    #                             REVERSAL   14  0.643   0.691  -0.048
+    # Compounded growth of the reversals ALONE is negative under every pricing
+    # tried -- book -0.043, additive -0.117, mean-reverting -0.091 (recorded),
+    # and -0.120 / -0.353 (corpus) -- which is the standing two-model bar.
+    # Removing them raises growth on the recorded book under all three pricings
+    # (additive 1.800 -> 1.917, reverting 1.985 -> 2.076) with drop-best-day
+    # still positive.
+    #
+    # This is NOT an argument for a smaller cap. Same-side repeats are the bulk
+    # of what the cap buys and they are clearly good on their own (n=51, growth
+    # +0.451 / +0.143 / +0.404, day-t +3.57 / +1.31 / +2.43). Keep cap 5, refuse
+    # only the reversal. tools/cross_reversal_entries.py, cross_reversal_recorded.py
+    cross_allow_reversal: bool = False
     # Flat dollars, or None to use the MAIN arm's sizing rule (sizing_mode +
     # stake_fraction + tilt + caps). None is the default: a flat $1 does not
     # compound, so the arm's contribution stays constant while the bankroll

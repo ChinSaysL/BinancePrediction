@@ -335,25 +335,24 @@ class TestTheArm:
         asyncio.run(bot._cross_tick())
         assert placed, "the gate must be a switch, not a hard-coded rule"
 
-    def test_a_cross_opposite_an_EARLIER_CROSS_is_still_allowed(self, store,
-                                                                armed):
-        """Only the MAIN arm's side blocks.
+    def test_a_cross_opposite_an_EARLIER_CROSS_is_refused(self, store, armed):
+        """A crossing back through the strike is a new bet, not a hedge.
 
-        Consecutive crosses alternate sides by construction, so a round
-        oscillating around the strike hedges itself -- taking every one
-        measured +$31.37 against +$14.16 for the first alone. Refusing those
-        would delete cross_max_per_round's whole purpose.
+        This asserted the opposite until 2026-09-14, on the reasoning that
+        "consecutive crosses alternate sides by construction, so a round
+        oscillating around the strike hedges itself". Both halves were wrong.
+        Alternation is an artefact of the corpus's 10s grid (at live tick
+        resolution 51 of 65 non-first entries repeat the SAME side), and with
+        the first position sunk the second leg is worth taking iff it is +EV
+        alone -- measured 0.574 against 0.714 for a first entry over 31 days of
+        real strikes, day-t -3.05, with negative growth under every pricing.
+
+        What this does NOT do is shrink the per-round cap: same-side repeats
+        are most of what it buys and they are profitable on their own.
         """
         bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0))
-        fid = store.insert("fills", {
-            "decision_id": None, "slug": bot._round.slug,
-            "ts_ms": int(time.time() * 1000), "mode": "cross", "side": "Down",
-            "requested_px": 0.5, "filled_px": 0.5, "shares": 2.0, "stake": 1.0,
-            "fee_paid": 0.0, "order_id": "o", "raw": "{}", "token_id": "2"})
-        bot.open_fills = {fid: (bot._round.slug,
-                                SimpleNamespace(side="Down", stake=1.0,
-                                                token_id="2"))}
-        bot.guard.on_open(bot._round.slug, reserved=True)
+        # The ticks cross UP through the strike; we already hold Down.
+        bot._cross_side = {bot._round.slug: "Down"}
         placed = []
 
         async def place(*a, **k):
@@ -362,7 +361,45 @@ class TestTheArm:
 
         bot._place_order = place
         asyncio.run(bot._cross_tick())
-        assert placed, "cross-vs-cross opposites are the alternating hedge"
+        assert not placed, "a reversal of our own entry must not be bought"
+        assert any("reversal" in r[0] for r in bot.store.conn.execute(
+            "select reason from decisions")), "the refusal must leave a row"
+
+    def test_a_cross_on_the_SAME_side_as_an_earlier_one_is_allowed(
+            self, store, armed):
+        """The reversal guard must not become a per-round one-shot.
+
+        Same-side repeats are the bulk of what cross_max_per_round buys and
+        they carry positive growth on their own (n=51, +0.451/+0.143/+0.404
+        under the three pricings). Only the opposite side is refused.
+        """
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0))
+        bot._cross_side = {bot._round.slug: "Up"}
+        placed = []
+
+        async def place(*a, **k):
+            placed.append(k)
+            return None
+
+        bot._place_order = place
+        asyncio.run(bot._cross_tick())
+        assert placed, "a repeat of the side we already hold stays allowed"
+
+    def test_the_guard_is_a_switch(self, store, armed, monkeypatch):
+        """cross_allow_reversal restores the old behaviour."""
+        monkeypatch.setattr(
+            "btcpredict.config.settings.cross_allow_reversal", True)
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0))
+        bot._cross_side = {bot._round.slug: "Down"}
+        placed = []
+
+        async def place(*a, **k):
+            placed.append(k)
+            return None
+
+        bot._place_order = place
+        asyncio.run(bot._cross_tick())
+        assert placed, "the gate must be a switch, not a hard-coded rule"
 
     def test_it_also_takes_the_side_the_main_arm_already_holds(
             self, store, armed):
@@ -1307,7 +1344,7 @@ class TestModelRoundRangeWindow:
     def test_the_window_brackets_the_measured_sweet_spot(self):
         from btcpredict.config import settings as s
         assert s.model_min_round_range_bps == 5.0
-        assert s.model_max_round_range_bps == 20.0
+        assert s.model_max_round_range_bps == 12.0
 
     def test_cross_and_model_windows_are_complementary(self):
         """Each arm's dead zone is the other's edge -- that is the whole design."""
