@@ -61,6 +61,14 @@ PROBE_MODE = "probe"
 # stays immediate; this only has to catch what that one missed.
 _CLAIM_SWEEP_S = 180.0
 
+# A MARKET attempt needs the round open only long enough to place and execute
+# (~1-2s); its order/history verdict may land after the bell. `order_min_tau_s`
+# was written for what a RETRY spans with the 9s status budget, which is the
+# wrong requirement for an immediate FOK -- and the venue's book demonstrably
+# processes fills into the close (live fills are booked with 0.0-0.6s of round
+# left). For market orders the retry floor is this instead; see _place_order.
+_MARKET_RETRY_TAU_FLOOR_S = 3.0
+
 # Reasons a decision was declined that must NOT be probed. These are real
 # limits -- existing exposure, a risk halt, or data we could not read -- and
 # probing around them would create exactly the double exposure and the
@@ -2662,11 +2670,21 @@ class Bot:
                 _tau_fn = getattr(r, "tau_s", None)
                 _tau_left = (_tau_fn(int(time.time() * 1000))
                              if _tau_fn else float("inf"))
-                if (settings.order_min_tau_s > 0
-                        and _tau_left < settings.order_min_tau_s):
+                # A MARKET attempt needs the round open only long enough to
+                # place and execute; its verdict may land after the bell, and
+                # the venue executes near the close (4 live fills booked with
+                # under 1s of round left). The 5s floor was calibrated against
+                # the verdict budget, which an immediate FOK does not spend --
+                # and on 07:39:50 it refused the eth retry at 3.3s left, so the
+                # venue never saw a second order. For market orders the floor
+                # is what EXECUTION needs instead.
+                _floor = settings.order_min_tau_s
+                if settings.order_type == "market":
+                    _floor = min(_floor, _MARKET_RETRY_TAU_FLOOR_S)
+                if _floor > 0 and _tau_left < _floor:
                     log.info("not re-attempting %s %s: %.1fs of round left, "
                              "floor is %.1fs", r.slug, sig.side, _tau_left,
-                             settings.order_min_tau_s)
+                             _floor)
                     break
                 # Last line of defence against double exposure. Whatever the
                 # previous attempt reported -- including a status the venue
@@ -2770,22 +2788,13 @@ class Bot:
                              r.slug, sig.side, sec)
                     return
 
-            # MARKET -> LIMIT fallback on a stale-low quote. The venue prices
-            # a MARKET order off its DISPLAYED price, which lags the book both
-            # ways; below the book the FOK simply cannot fill. Measured live at
-            # 05:09:13 on 2026-09-15: sweep_px 0.460, book running to 0.650,
-            # venue quoted 0.370, order FAILED with 7.8s burned. A LIMIT does
-            # not use the quote/bundle path and reaches the real book, so it is
-            # strictly the better instrument for exactly these quotes.
+            # MARKET ONLY for the cross arm (operator directive 2026-09-15:
+            # resting orders here are a dead end). The stale-low fallback to a
+            # LIMIT is removed: a quote the FOK cannot fill costs one failed
+            # attempt and no money, and the retry re-quotes -- resting an order
+            # instead was never the answer for an arm whose edge is seconds
+            # wide.
             use_limit = settings.order_type in ("limit", "limit_take")
-            if (self.broker.mode == "live" and not use_limit
-                    and take_px is not None
-                    and settings.market_stale_quote_tol > 0
-                    and real_px < take_px - settings.market_stale_quote_tol):
-                log.info("market quote %.3f is %.3f below the book ask %.3f for "
-                         "%s %s; a FOK cannot fill that -- using a LIMIT",
-                         real_px, take_px - real_px, take_px, r.slug, sig.side)
-                use_limit = True
             if self.broker.mode == "live" and use_limit:
                 if settings.order_type == "limit":
                     # Maker-first: post one tick below the quote and let it rest.
@@ -2899,6 +2908,16 @@ class Bot:
             # would double the exposure. Brokers that report no reason (paper,
             # whose rejections are deterministic anyway) stop here too.
             reason = getattr(self.broker, "last_failure", None)
+            # Declining a price is not a failed ORDER: nothing reached the
+            # venue, and the next attempt re-quotes into a book that may have
+            # come back inside the ceiling. It used to END the round right
+            # here -- which is why the venue saw one order per failed trigger
+            # while the log said "attempt 1/3; not retrying": the operator's
+            # "retry doesn't work" report, 2026-09-15.
+            if reason == "quote_above_ceiling":
+                log.info("attempt %d/%d declined: quote above the ceiling "
+                         "(price left the band)", attempt + 1, attempts)
+                continue
             if reason not in RETRYABLE_FAILURES:
                 log.error("order failed for %s %s (%s); not retrying",
                           r.slug, sig.side, reason or "outcome unknown")

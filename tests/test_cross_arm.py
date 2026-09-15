@@ -2473,24 +2473,20 @@ def test_the_live_broker_refuses_a_quote_above_max_px():
     assert b.last_failure == "quote_above_ceiling"
 
 
-class TestAStaleLowQuoteFallsBackToALimit:
-    """The venue prices a MARKET order off its DISPLAYED price, which lags the
-    book in BOTH directions.
+class TestTheMarketPathIsTheOnlyPath:
+    """OPERATOR DIRECTIVE 2026-09-15: market orders only -- resting orders on
+    this arm are a dead end.
 
-    Too HIGH is the 2026-09-11 case -- 0.17 on offer, bought at 0.84 -- which
-    `max_px` now refuses. Too LOW is the first live MARKET order after the
-    switch, 2026-09-15 05:09:13 on btc-updown-5m-1789448700: sweep_px 0.460,
-    book running 0.600 -> 0.650, venue quoted 0.370, FAILED with 0 filled and
-    7.8s burned. Nothing is offered at 0.37 when the book is 0.46+, so the FOK
-    was doomed before it was sent.
-
-    A LIMIT does not go through the quote/bundle path and reaches the real
-    book, so it is strictly the better instrument for those quotes.
+    `market_stale_quote_tol` briefly routed a stale-LOW quote to the LIMIT
+    path (the 05:09:13 case: sweep_px 0.460, venue quoted 0.370, book running
+    0.600 -> 0.650; a FOK cannot fill under the book). That fallback is gone:
+    the quote still goes to the FOK, and what a loser costs is one failed
+    attempt and its retry -- not a resting order on an arm whose edge is
+    seconds wide.
     """
 
-    def _run(self, store, monkeypatch, quote_px, ask=0.46, tol=0.03):
+    def _run(self, store, monkeypatch, quote_px, ask=0.46):
         monkeypatch.setattr("btcpredict.config.settings.order_type", "market")
-        monkeypatch.setattr("btcpredict.config.settings.market_stale_quote_tol", tol)
         monkeypatch.setattr("btcpredict.config.settings.cross_max_price", 0.95)
         bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0), asks=(ask, 0.40))
         bot.broker.mode = "live"
@@ -2513,22 +2509,17 @@ class TestAStaleLowQuoteFallsBackToALimit:
         asyncio.run(bot._cross_tick())
         return used
 
-    def test_a_quote_below_the_book_uses_the_limit_path(self, store, armed,
-                                                        monkeypatch):
-        """0.370 against a 0.460 book -- the live failure."""
+    def test_a_stale_low_quote_still_takes_with_a_market_order(self, store,
+                                                               armed, monkeypatch):
+        """0.370 against a 0.460 book -- the quote that used to rest a LIMIT."""
         used = self._run(store, monkeypatch, quote_px=0.370, ask=0.46)
-        assert used["limit"], "a FOK at 0.37 against a 0.46 book cannot fill"
-        assert not used["market"]
+        assert used["market"], "market-only: the FOK gets the order or nothing"
+        assert not used["limit"], "resting orders on this arm are a dead end"
 
-    def test_a_healthy_quote_still_goes_to_MARKET(self, store, armed, monkeypatch):
-        """The fallback must not quietly turn the arm back into a maker."""
+    def test_a_healthy_quote_also_goes_to_MARKET(self, store, armed, monkeypatch):
         used = self._run(store, monkeypatch, quote_px=0.465, ask=0.46)
-        assert used["market"], "a sound quote must still take with a FOK"
+        assert used["market"]
         assert not used["limit"]
-
-    def test_zero_means_off(self, store, armed, monkeypatch):
-        used = self._run(store, monkeypatch, quote_px=0.370, ask=0.46, tol=0.0)
-        assert used["market"], "0 = OFF must honour order_type unconditionally"
 
 
 class TestTheFillPriceIsCapped:
@@ -2571,7 +2562,6 @@ class TestTheFillPriceIsCapped:
         monkeypatch.setattr("btcpredict.config.settings.cross_max_price", 0.95)
         monkeypatch.setattr("btcpredict.config.settings.cross_limit_buffer_inv", 0.30)
         monkeypatch.setattr("btcpredict.config.settings.order_type", "market")
-        monkeypatch.setattr("btcpredict.config.settings.market_stale_quote_tol", 0.0)
         bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0), asks=(0.61, 0.39))
         bot.broker.mode = "live"
         seen = {}
@@ -2624,12 +2614,40 @@ class TestAFailedFOKGetsItsRetries:
         assert "order_status_wait_s" in src
         assert "tries=6, delay=0.6" not in src, "the frozen 3.6s budget is back"
 
+    def test_a_market_retry_is_worth_three_seconds_of_round(self, store, armed,
+                                                            monkeypatch):
+        """The 07:39:50 eth case: the retry was refused at 3.3s left because
+        the 5s floor was calibrated for the 9s verdict budget -- but an
+        immediate FOK needs only enough round to EXECUTE, and the venue's book
+        processes fills into the close (fills booked with under 1s left)."""
+        monkeypatch.setattr("btcpredict.config.settings.order_min_tau_s", 5.0)
+        monkeypatch.setattr("btcpredict.config.settings.order_type", "market")
+        monkeypatch.setattr("btcpredict.config.settings.order_retry_delay_s", 0.0)
+        monkeypatch.setattr("btcpredict.config.settings.order_max_attempts", 3)
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0), asks=(0.30, 0.40))
+        calls = []
+
+        async def buy(**k):
+            calls.append(1)
+            bot.broker.last_failure = "venue_failed"
+            return None
+
+        bot.broker.buy = buy
+        bot.broker.last_failure = None
+        r = types.SimpleNamespace(slug="btc-updown-5m-1", tau_s=lambda _ms: 3.3)
+        sig = types.SimpleNamespace(side="Up", quote=0.30, fair=0.60, edge=0.1)
+        asyncio.run(bot._place_order(r, sig, fair_up=0.40, token="t", stake=1.0,
+                                     skip_pretrade_gates=True, take_px=0.30))
+        assert len(calls) == 3, (
+            f"a market retry at 3.3s left must RUN -- the venue saw one order "
+            f"ever under the old floor; got {len(calls)}")
+
     def test_retries_stop_when_the_round_is_nearly_over(self, store, armed,
                                                         monkeypatch):
-        """Waiting 9s per attempt means three attempts span ~30s, against a
-        trigger that fires with 30-50s left. Attempt 3 must not land in a round
-        that has already settled."""
+        """Below the market floor the attempt is not started: the FOK must
+        still execute before the bell."""
         monkeypatch.setattr("btcpredict.config.settings.order_min_tau_s", 5.0)
+        monkeypatch.setattr("btcpredict.config.settings.order_type", "market")
         monkeypatch.setattr("btcpredict.config.settings.order_retry_delay_s", 0.0)
         monkeypatch.setattr("btcpredict.config.settings.order_max_attempts", 3)
         bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0), asks=(0.30, 0.40))
@@ -2674,6 +2692,49 @@ class TestAFailedFOKGetsItsRetries:
                                      skip_pretrade_gates=True, take_px=0.30))
         assert len(calls) == 3, (
             f"90s of round left must allow all three attempts; got {len(calls)}")
+
+
+class TestADeclinedPriceDoesNotEndTheRound:
+    """The venue never saw a second order on either 2026-09-15 failure, and
+    one reason is a one-line defect: the first `quote_above_ceiling` BROKE the
+    retry loop with "not retrying".
+
+    A decline is not a failure of the order -- it is the ceiling working, and
+    nothing reached the venue, so the next attempt may re-quote into a book
+    that has come back inside the band. Live at 07:59:43 on
+    btc-updown-5m-1789458900: attempt 1 venue_failed, attempt 2's quote 0.750
+    against a 0.630 ceiling, round abandoned -- one failed order at the venue
+    against a log that said "attempt 1/3".
+    """
+
+    def _calls(self, store, armed, monkeypatch, failure):
+        monkeypatch.setattr("btcpredict.config.settings.order_retry_delay_s", 0.0)
+        monkeypatch.setattr("btcpredict.config.settings.order_max_attempts", 3)
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0), asks=(0.30, 0.40))
+        calls = []
+
+        async def buy(**k):
+            calls.append(1)
+            bot.broker.last_failure = failure
+            return None
+
+        bot.broker.buy = buy
+        bot.broker.last_failure = None
+        r = types.SimpleNamespace(slug="btc-updown-5m-1", tau_s=lambda _ms: 90.0)
+        sig = types.SimpleNamespace(side="Up", quote=0.30, fair=0.60, edge=0.1)
+        asyncio.run(bot._place_order(r, sig, fair_up=0.40, token="t", stake=1.0,
+                                     skip_pretrade_gates=True, take_px=0.30))
+        return len(calls)
+
+    def test_an_above_ceiling_quote_re_quotes_instead_of_giving_up(
+            self, store, armed, monkeypatch):
+        assert self._calls(store, armed, monkeypatch, "quote_above_ceiling") == 3, (
+            "every attempt must run; a decline is not an order failure")
+
+    def test_an_unknown_outcome_still_stops_the_loop(self, store, armed,
+                                                     monkeypatch):
+        assert self._calls(store, armed, monkeypatch, "unconfirmed") == 1, (
+            "re-placing on an unknown outcome is how exposure gets doubled")
 
 
 class TestRefusingAPriceIsFree:

@@ -7173,3 +7173,47 @@ to the assistant and the command had run anyway. Restored to `market` both
 times. Worth knowing when reading this file's timestamps.
 
 587 tests pass. Deployed, `order_type=market`, $1 stake.
+
+## "Retry doesn't work": the venue never saw the retries (2026-09-15)
+
+The operator's report, checked against the venue: on BOTH failed triggers of
+the day the venue holds exactly ONE order, and it failed:
+
+    07:39:50  eth-updown-5m-1789457700  order ...29562  FAILED
+    07:59:36  btc-updown-5m-1789458900  order ...67082  FAILED
+
+...while the log says "attempt 1/3 failed" and then stops. Three defects; all
+three fixed:
+
+1. **A declined price ended the round.** Attempt 2's fresh quote landed above
+   the ceiling (btc: 0.750 vs 0.630; the book had run), buy() refused --
+   correctly -- and `quote_above_ceiling` hit the "not retrying" branch,
+   abandoning the round. A decline is not a failed order: nothing reached the
+   venue, and the next attempt re-quotes. The loop now continues (attempt
+   N/M declined) instead of breaking -- see TestADeclinedPriceDoesNotEndTheRound.
+
+2. **The retry floor blocked what the retry did not need.** The ~4.3s safety
+   confirmation after a venue FAILED (position list -- kept: two real double
+   buys, Sep 8) left the eth round at 3.3s to the bell, and the 5s floor
+   refused the retry ("not re-attempting: floor is 5.0s"). That floor was
+   calibrated for the 9s verdict budget, but an immediate FOK needs the round
+   open only long enough to EXECUTE -- and the venue's book processes fills
+   into the close (4 live fills booked with under 1s of round left; 5 under
+   5s). Market orders now use min(order_min_tau_s, 3.0).
+
+3. **The stale-low LIMIT fallback is removed** (operator directive: market
+   only -- resting orders on this arm are a dead end). A FOK that cannot fill
+   a correct-priced quote costs one failed attempt and no money; what can save
+   the trade is a fresh quote, not a resting order.
+
+Honest limit of the fix: in both observed episodes the book had ALREADY left
+the band when the retry ran (eth 0.52-0.56 vs 0.47 ceiling; btc 0.73 vs
+0.63), so a running retry still declines -- by design. What changes is that
+every retry now RUNS, re-quotes and reports; when the book dips back inside
+the band the retry buys it, and the venue shows a second order exactly when
+one was possible.
+
+NOT changed: the 4.3s position confirmation (load-bearing via the Sep 8
+double buys), the ceiling itself, and the 30s cooldown on a genuine venue
+failure. `market_stale_quote_tol` retired from config (env files ignore
+unknown keys). 589 tests pass.

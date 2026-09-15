@@ -255,6 +255,14 @@ class Settings(BaseSettings):
     #
     # 5.0 matches cross_min_tau_s: the arm's own judgement of when a round is
     # too far gone to enter.
+    #
+    # MARKET carve-out (2026-09-15): for `order_type == "market"` the floor is
+    # min(this, 3.0). An immediate FOK needs the round open only long enough to
+    # place and execute (~1-2s) and its verdict may land after the bell, while
+    # this value was calibrated for the 9s verdict budget; and the venue's book
+    # demonstrably processes fills into the close (live fills booked with
+    # 0.0-0.6s of round left). The 07:39:50 eth retry was refused at 3.3s left
+    # by the old floor, and the venue never saw a second order.
     order_min_tau_s: float = 5.0
     order_status_wait_s: float = 9.0
     order_max_attempts: int = 3
@@ -281,27 +289,17 @@ class Settings(BaseSettings):
     # the ask on offer; limit fills -0.014. "limit_take" also cannot pay more
     # than the price we chose, which a slippageBps cap on a market order cannot
     # promise.
+    #
+    # The CROSS arm is MARKET-ONLY (operator directive 2026-09-15). The
+    # per-order fallback that briefly routed stale-low quotes to the LIMIT
+    # path is removed; a FOK that cannot fill is re-quoted by the retry
+    # instead.
     order_type: Literal["market", "limit", "limit_take"] = "market"
-    # A MARKET quote materially BELOW the book is a FOK that cannot fill, and
-    # this routes it to the LIMIT path instead of burning the trigger on it.
-    #
-    # The venue's quote follows its DISPLAYED price, which lags the book in BOTH
-    # directions. Too high is the 2026-09-11 case (0.17 on offer, bought at
-    # 0.84) and `max_px` now refuses it. Too low is the first live MARKET order
-    # after the switch, 2026-09-15 05:09:13 on btc-updown-5m-1789448700:
-    #
-    #     sweep_px 0.460, book running 0.600 -> 0.650
-    #     venue quoted 0.370  ->  MARKET FAILED, 0 filled, 7.8s burned
-    #
-    # Nothing is offered at 0.37 when the book is 0.46+, so the FOK was doomed
-    # before it was sent. A FAILED order costs no money -- only the trade -- but
-    # the trade is the expensive part.
-    #
-    # A LIMIT does not go through the quote/bundle path at all; it reaches the
-    # real book. So when the quote is stale-low, the limit is strictly the
-    # better instrument, and this picks per-order rather than per-config.
-    # 0 = OFF (always honour order_type).
-    market_stale_quote_tol: float = 0.03
+    # REMOVED 2026-09-15: `market_stale_quote_tol` (0.03) used to route a
+    # stale-LOW quote to the LIMIT path. Operator directive the same day:
+    # market orders only for the cross arm -- resting orders there are a dead
+    # end. A quote the FOK cannot fill now costs one failed attempt and its
+    # retry, not a resting order; see Bot._place_order.
     limit_offset: float = 0.01
     limit_wait_s: float = 20.0
     # Kelly sizes against this. Kept explicit rather than derived from the stake,
