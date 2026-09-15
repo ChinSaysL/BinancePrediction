@@ -2748,10 +2748,10 @@ class Bot:
                 # Never rest past the bell: the cross fires 3-60s before it, and
                 # the configured 20s would outlive the round.
                 #
-                # The cross path's wait is `cross_limit_wait_s` (5s since the
+                # The cross path's wait is `cross_limit_wait_s` (6s since the
                 # 2026-09-15 reconciliation: 2s cancels inside the venue's
-                # fill process -- fills complete to ~5.2s -- and the 20s
-                # overreach rode a contested tail; see the config block).
+                # fill process -- fills complete to ~5.2s -- and 5s left no
+                # margin on those reports; see the config block).
                 # `limit_ceiling` is what marks this as the cross path (see
                 # above); the model arm keeps limit_wait_s, and 0 falls back.
                 wait_cap = settings.limit_wait_s

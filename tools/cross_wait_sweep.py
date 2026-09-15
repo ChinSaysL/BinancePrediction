@@ -4,6 +4,8 @@
 adverse-selection argument ("an order fills only when the ask comes back DOWN
 to it, which is the move that makes the side we bought less likely to win") --
 but only TWO values were ever compared (2 vs 20). This sweeps the middle.
+Final value 6.0 (2026-09-15 evening, see config HISTORY): the live fill-latency
+referee killed the 2s thesis and the venue's own fills report up to 5.21s.
 
 Fill model, the same one the buffer tools use: the order lands at t+LAT
 (measured 2.7-5.2s live), then rests for W seconds, and fills if the ask trades
@@ -132,7 +134,7 @@ def main() -> int:
           f"placement latency {LAT}s; shipped wait {S.cross_limit_wait_s}s\n")
     print(f"  {'wait(s)':>8}{'fills':>7}{'fill%':>7}{'win':>7}{'mean px':>9}"
           f"   growth / day-t / drop-best")
-    for w in (0.5, 1.0, 2.0, 2.5, 3.0, 5.0, 10.0, 20.0, 30.0, 45.0):
+    for w in (0.5, 1.0, 2.0, 2.5, 3.0, 5.0, 6.0, 10.0, 20.0, 30.0, 45.0):
         got = [x for x in (run(row, w, a.price) for row in rows) if x is not None]
         if len(got) < 10:
             print(f"  {w:>8.1f}{len(got):>7}  (too few)")

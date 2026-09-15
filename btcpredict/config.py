@@ -1156,20 +1156,26 @@ class Settings(BaseSettings):
     # band has also produced zero fills in ~39 orders -- unobserved either way.)
     #
     # But 2.0 is provably inside the venue's own fill process: fills complete
-    # up to ~5.2s after the decision (four observed, incl. 00:24 UTC 09-15:
-    # 92% at 0.5976, +0.67/$1), and a 2s cancel kills them by construction.
-    # The corrected sweep (tools/cross_wait_sweep.py -- re-entry gap and tick
-    # floor aligned to the calibrated tool, both fill-price conventions, LAT
-    # 2/3/4) puts 5s above 2s under EVERY convention (+0.39 vs +0.27 at
-    # pay-the-limit; +1.20 vs +0.83 at touch). The 5-20s extension is
-    # UNOBSERVED live (zero fills there in ~39 orders) and the two models
-    # disagree on it, so it is not ridden tonight.
+    # up to ~5.2s after the decision (four observed at 5.12-5.21s reported,
+    # incl. 00:24 UTC 09-15: 92% at 0.5976, +0.67/$1), and a 2s cancel kills
+    # them by construction. The corrected sweep (tools/cross_wait_sweep.py --
+    # re-entry gap and tick floor aligned to the calibrated tool, both
+    # fill-price conventions, LAT 2/3/4) puts longer waits above 2s under
+    # EVERY convention (+0.27 -> +0.39 at pay-the-limit; +0.83 -> +1.20 at
+    # touch). Anything past the demonstrated ~5.2s is UNOBSERVED live (zero
+    # fills there in 45 exec attempts to date) and the two models disagree on
+    # the extension, so the rest stops just past what the venue has shown.
     #
-    # 5.0 = captures every fill the live record has demonstrated, declines
-    # the unverified tail. CHECKPOINT: keep scoring live fills by latency --
-    # if the >3s class turns negative over ~20 more fills, tighten toward 2;
-    # if fills start appearing in the 5-20s band and win, extend.
-    cross_limit_wait_s: float = 5.0
+    # 6.0 = every fill the venue has produced, with ~0.8s of margin. 5.0 was
+    # shipped briefly, then moved +1 the same evening: the long fills report
+    # at 5.12-5.21s (four, 2W/2L) and that report includes the fill-confirm
+    # lag, so a 5.0 cancel raced exactly the tail the record says works
+    # (>=3.4s: 9W/12). The 6.0 sweep row is IDENTICAL to 5.0's (68 fills,
+    # +0.389/1.28/0.198 -- the extra second adds no modelled fill), so the
+    # margin is free. CHECKPOINT: keep scoring live fills by latency -- if
+    # the >3s class turns negative over ~20 more fills, tighten toward 2; if
+    # fills start appearing in the 6-20s band and win, extend toward 10-20.
+    cross_limit_wait_s: float = 6.0
     cross_skip_opposite_to_main: bool = True
     # RAISED 0.5 -> 2.0 on 2026-09-13. The old 0.5 was picked by a fill-aware
     # sweep that called it a "clear peak", but that sweep could not have seen

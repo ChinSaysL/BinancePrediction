@@ -1885,15 +1885,17 @@ class TestTheInFlightGuard:
 
 
 class TestTheCrossWaitIsTheLiveObservedFillWindow:
-    """The cross limit rests 5s: long enough for the venue's fill process.
+    """The cross limit rests 6s: long enough for the venue's fill process.
 
     The 2s rest (2026-09-14) had a documented reason (cross_buffer_vs_fill:
     hold-2 rode the CI-clearing combo), but the live record refutes it:
     settled fills by completion latency are >3.4s: 9W/12 (0.75),
     2.5-3.4s: 7W/10, <=2.5s: 2W/5 -- slow fills are the BEST class, and a
-    2s cancel kills them by construction. The 5-20s tail has zero live fills
-    in ~39 orders, so 5.0 captures the demonstrated window and declines the
-    unobserved one; checkpoint is live slow-fill scoring (see config).
+    2s cancel kills them by construction. The venue's long fills report at
+    5.12-5.21s (four) and the report includes confirm lag, so 6.0 clears
+    every demonstrated fill with ~0.8s of margin (the sweep row is identical
+    to 5.0's -- the extra second adds no modelled fill); 5.5-20s has zero
+    live fills in 45 exec attempts. Checkpoint is live slow-fill scoring.
 
     `limit_ceiling is not None` is what distinguishes the cross path from the
     model arm inside the shared placement block, so that is what must select
@@ -1927,11 +1929,11 @@ class TestTheCrossWaitIsTheLiveObservedFillWindow:
         return seen.get("wait_s")
 
     def test_the_cross_path_uses_the_shipped_wait(self, store, armed, monkeypatch):
-        monkeypatch.setattr("btcpredict.config.settings.cross_limit_wait_s", 5.0)
+        monkeypatch.setattr("btcpredict.config.settings.cross_limit_wait_s", 6.0)
         monkeypatch.setattr("btcpredict.config.settings.limit_wait_s", 20.0)
         w = self._wait_for(store, monkeypatch, ceiling=0.39)
-        assert w == pytest.approx(5.0), (
-            "the shipped cross wait is 5s (2026-09-15 reconciliation)")
+        assert w == pytest.approx(6.0), (
+            "the shipped cross wait is 6s (2026-09-15 reconciliation)")
 
     def test_a_custom_cross_wait_still_overrides(self, store, armed, monkeypatch):
         monkeypatch.setattr("btcpredict.config.settings.cross_limit_wait_s", 8.0)

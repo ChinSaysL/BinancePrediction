@@ -6209,7 +6209,7 @@ zero-fill bucket, the buffer sweep, and the adverse-selection table
 stays 10; no knobs changed anywhere. Revert path: `CROSS_PROBE_ENABLED=true`
 + restart. The day's order count is back to the normal arm alone.
 
-## The cross cancel wait: 2s had a reason; the live fills say it was wrong; 5s ships (2026-09-15)
+## The cross cancel wait: 2s had a reason; the live fills say it was wrong; 6s ships (2026-09-15)
 
 Re-asked after the interim change to 20s, because the 2s had a documented
 rationale. It did -- and working it through moved the answer twice.
@@ -6233,6 +6233,7 @@ tick floor, both fill-price conventions, LAT 2/3/4). At the live convention
     wait    fills  fill%   win    growth  day-t  drop-best
      2.0       58   48.7  0.810   +0.265  +1.23   +0.098    <- was shipped
      5.0       68   57.1  0.824   +0.389  +1.28   +0.198
+     6.0       68   57.1  0.824   +0.389  +1.28   +0.198    <- ships (+margin)
     10.0       72   60.5  0.819   +0.392  +1.24   +0.201
     20.0       79   66.4  0.835   +0.573  +1.72   +0.347
 
@@ -6253,10 +6254,15 @@ orders of the 20s-wait era, so 5-20 remains unobserved both ways.
 
 ### Shipped
 
-`cross_limit_wait_s` -> 5.0 (from the interim 20.0): captures every fill the
-live record has demonstrated, declines the unobserved tail. CHECKPOINT: keep
+`cross_limit_wait_s` -> 6.0 (from the interim 20.0; 5.0 briefly, then +1 for
+margin). Why not 5: every long fill the venue has produced reports at
+5.12-5.21s (four, 2W/2L), and that report includes the fill-confirm lag --
+a 5.0 cancel raced exactly the tail class the live record says works
+(>=3.4s: 9W/12). 6.0 clears every demonstrated fill with ~0.8s to spare, and
+its sweep row is IDENTICAL to 5.0's (68 fills, +0.389/1.28/0.198) -- the
+extra second adds no modelled fill, so the margin is free. CHECKPOINT: keep
 scoring live fills by latency -- if the >3s class turns negative over ~20
-more fills, tighten toward 2; if fills start appearing in the 5-20s band and
+more fills, tighten toward 2; if fills start appearing in the 6-20s band and
 win, extend toward 10-20. Same-day: the guard audit restored
 `daily_loss_cap_pct` 0.0 -> 0.20 in `.env` (left off since the 09-11
 no-guards experiment -- the only guard that was off).
