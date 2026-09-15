@@ -6298,3 +6298,67 @@ Fix: `sweep_claims()` -- a wallet-wide `redeem()` every `_CLAIM_SWEEP_S`
 the venue lists nothing claimable (steady-state cost: one read per cooldown),
 and the clock starts at 0 on boot, so a restart adopts stranded claims. The
 on-win redeem stays as the fast path. Tests: tests/test_claim_sweep.py.
+
+## The 15m families are inert and cannot be calibrated: their book is stale
+
+Asked why bnb-updown-15m bought Down on a round that settled Up while
+bnb-updown-5m bought Up on the same move. Not a bug -- two guards firing
+asymmetrically -- but the investigation says something worse about 15m.
+
+### What happened, from the tape (2026-09-15 00:59)
+
+    strike 15m 719.255      strike 5m 719.185      (7 cents apart)
+
+    00:59:21.356  15m  Up   REFUSED: only 2 tick(s) through the strike, floor is 5
+    00:59:21.643  5m   Up   TAKEN    spot 719.27 vs strike 719.18, tau 38s
+    00:59:22      spot 719.175 -> 719.275   crosses UP through both strikes
+    00:59:25      spot 719.275 -> 719.165   crosses DOWN through both strikes
+    00:59:25.056  5m   Down REFUSED: reversal of the Up entry already taken
+    00:59:25.130  15m  Down TAKEN    spot 719.16 vs strike 719.25, tau 35s
+    00:59:39      spot 719.345               both rounds settle Up
+
+The 15m arm was offered the CORRECT side four seconds earlier and refused it on
+the depth floor: spot was 2 ticks past its strike, against a floor of 5. The 5m
+arm passed the same floor on the same move only because its strike sat 7c lower,
+putting spot 9 ticks clear. On the reverse leg the roles swapped -- and the 5m
+was protected by the reversal guard while the 15m, holding nothing, was not.
+
+Both entries are correct per `crossed_side`. The depth floor is measured from
+each round's OWN strike, so inside a 32-cent chop with strikes 7 cents apart,
+which family gets to trade is decided by noise.
+
+A cross-family contradiction guard is the obvious idea and is NOT justified:
+across all 36 cross fills ever, this has happened ONCE.
+
+### Why it cannot be settled with data
+
+`tools/cross_15m_calibrate.py` replays the 15m families off the live DB
+(567 settled rounds, 247,566 quote rows). Almost nothing survives:
+
+    family            in tau 5-60s  crossed  through ALL gates  HAS AN ASK
+    btc-updown-15m           7,948       34                 34           6
+    eth-updown-15m           7,948       38                 25           0
+    bnb-updown-15m           1,961        5                  2           2
+
+The gates are not the constraint -- btc-15m loses none of its 34 crossings to
+them. **The ask is.** And this is not a recorder bug: the websocket override in
+`_record` deliberately carries no `trade` gate so recorded families get a real
+ask. It writes None because `wsb.best(market_id, ws_book_max_age_s)` returns
+None -- the 15m book is genuinely STALE about 78% of the time. Which also means
+`_cross_one` refuses these families live for the same reason.
+
+### What they have produced
+
+    family              n  won   staked      pnl    ev/$1
+    btc-updown-15m      1    1     3.00    +1.93   +0.643
+    bnb-updown-15m      1    0     3.48    -3.48   -1.000
+    ---- 5m families   34   23    87.56    -1.97   -0.022
+
+**Two fills in five days.** They add no frequency, carry no measurable edge, and
+cannot be validated from recorded data because the book they price off is stale
+most of the time. Both fills are also n=1 per family, so neither number means
+anything.
+
+No config change made: the six-market widening was an explicit operator
+decision. Recorded so the choice is informed -- the case for dropping 15m from
+`CROSS_TRADED` is that it is unmeasurable, not that it is proven bad.
