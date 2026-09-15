@@ -10796,3 +10796,50 @@ is real, not an entry-moment artefact.
   scattered -- and that the bottom 5 are all negative.
 * n=39 at X=15 is thin; the arm's own note says a live arm at ~12 fires/day takes
   weeks to reach 50.
+
+## EXPOSURE / CONCURRENCY SWEEP -- nothing to ship, and that IS the result
+## (2026-09-15, tools/train_sweep.py PORTFOLIO section)
+
+Shipped signal config (X=15, no ceiling), n=39 entrants, priced at ask+1.5c,
+$1 a leg, positions held to settlement on the real clock.
+
+    max_open 2..10 / max_same_dir 2..3 / max_per_symbol 2   ALL identical to off
+        n=39  px 0.817  hit 94.9%  net +0.123  day-t +4.04  6/6+  peak 2 open
+    every cap that BINDS (max_open=1, max_same_dir=1, max_per_symbol=1, gap 120s)
+        drops THE SAME SINGLE ENTRY:  n=38  net +0.119  day-t +4.07
+    global_gap=600s   n=33  net +0.131  day-t +4.36  but days+ falls 6 -> 5
+    max_per_day=5     n=27  net +0.091  day-t +3.17   (worse); 10+ no-op
+
+**PEAK CONCURRENCY IS 2, AND BOTH LEGS ARE ONE WAY.** Across the whole sample the
+worst exposure this trigger has produced is two $1 legs on the same view.
+`cross_max_open_positions=10` is five times the observed peak, so `max_open` is
+NOT a live constraint at all.
+
+**THE X=15 CHANGE ALREADY REMOVED THE BURST.** The six-leg pile-on that prompted
+the stop was an X=10 artefact: a higher threshold is cleared by fewer families in
+the same instant. That is also why the 120s cooldown the operator disabled was
+only ever deleting ONE ENTRY of 39 -- under the current signal it was never a
+burst-blocker, and turning it off cost essentially nothing.
+
+**NOTHING SHIPPED from this sweep.** The single cell that "improves" (gap 600s)
+does so by deleting 6 of 39 entries on a 6-day sample while LOSING a positive day.
+Selecting it would be fitting, not edge. The valuable output is the negative
+result plus the corrected picture of the risk.
+
+### TOOL BUG FOUND AND FIXED -- a slot must be RELEASED on settlement
+The first cut incremented a per-symbol counter and NEVER decremented it, so
+`max_per_symbol=1` was a LIFETIME cap: it printed n=3, net +0.118, **day-t +5.00**
+-- a number that looks like an excellent filter and measured nothing at all. `op`
+now holds (settle_ms, symbol, side) and is pruned on settlement; the corrected
+cell is n=38, i.e. the same one entry every other binding cap drops.
+**Any concurrency knob that does not free its slot is not a concurrency knob.**
+
+### CANNOT be swept with this tool, and why (out of scope, not neglected)
+`cross_skip_opposite_to_main`, `cross_allow_reversal`, `flip_block_s`,
+`cross_look_s`, `cross_min_depth_ticks`, `cross_max_depth_bps` all act on the
+CROSS arm's crossing/depth STATE, which the train entry set does not carry -- the
+train trigger bypasses depth and range entirely. Sweeping them needs a different
+simulation (the crossing path), not a different grid.
+Sizing (`stake_usdt`, `stake_cap_usdt`, `cross_max_open_stake_pct`) is
+scale-invariant for per-share EV, so a DB sweep cannot show an edge difference --
+it needs a compounding/drawdown simulation, which is a separate tool.

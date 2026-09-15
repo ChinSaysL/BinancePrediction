@@ -120,7 +120,7 @@ def simulate(series, ranges, cfg, pay_up, fee, side_mode="cont"):
             rr = round_range_bps(slug, T, K, ts)
             if rr is None or rr > cfg["max_range_bps"]:
                 continue
-        out.append((ts, ask, winner == side, slug))
+        out.append((ts, ask, winner == side, slug, side))
     return out
 
 
@@ -190,63 +190,79 @@ def portfolio_sweep(series, ranges, cfg, pay_up, fee):
     column is the true high-water mark of concurrent positions.
     """
     ents = []
-    for ts, ask, hit, slug in simulate(series, ranges, cfg, pay_up, fee):
+    for ts, ask, hit, slug, side in simulate(series, ranges, cfg, pay_up, fee):
         p = slug.split("-")
         dur = DUR.get(p[2] if len(p) > 2 else "", 0)
         try:
             start = int(p[3]) * 1000
         except (ValueError, IndexError):
             continue
-        ents.append((ts, ask, hit, slug, p[0], start + dur * 1000))
+        ents.append((ts, ask, hit, slug, p[0], start + dur * 1000, side))
     ents.sort(key=lambda e: e[0])
     print(f"\n  entrants under the SHIPPED signal config: {len(ents)}")
 
-    def sim(max_open, max_day, max_sym, gap_s):
-        op, taken, per_day, per_sym = [], [], collections.Counter(), {}
-        peak, last = 0, None
-        for ts, ask, hit, slug, sym, settle in ents:
-            op = [s for s in op if s > ts]           # settle first
+    def sim(max_open, max_day, max_sym, gap_s, max_same=0):
+        """op holds (settle_ms, symbol, side) and is RELEASED on settlement.
+
+        The first cut kept a per-symbol COUNTER and never decremented it, so
+        `max_per_symbol=1` was a lifetime cap of one entry per symbol and
+        reported t +5.00 on n=3 -- a number that looked like a great filter and
+        measured nothing. A slot must free when the position it belongs to
+        settles, or the knob is not a concurrency limit at all.
+        """
+        op, taken, per_day = [], [], collections.Counter()
+        peak, peak_same, last = 0, 0, None
+        for ts, ask, hit, slug, sym, settle, side in ents:
+            op = [x for x in op if x[0] > ts]                 # settle first
             if max_open and len(op) >= max_open:
+                continue
+            if max_same and sum(1 for x in op if x[2] == side) >= max_same:
                 continue
             d = dt.datetime.fromtimestamp(ts / 1000, dt.timezone.utc).date()
             if max_day and per_day[d] >= max_day:
                 continue
-            if max_sym and per_sym.get(sym, 0) >= max_sym:
+            if max_sym and sum(1 for x in op if x[1] == sym) >= max_sym:
                 continue
             if gap_s and last is not None and ts - last < gap_s * 1000:
                 continue
             taken.append((ts, ask, hit, slug))
-            op.append(settle)
+            op.append((settle, sym, side))
             peak = max(peak, len(op))
+            for sd in ("Up", "Down"):
+                peak_same = max(peak_same,
+                                sum(1 for x in op if x[2] == sd))
             per_day[d] += 1
-            per_sym[sym] = per_sym.get(sym, 0) + 1
             last = ts
-        return taken, peak
+        return taken, peak, peak_same
 
-    def line(name, taken, peak):
+    def line(name, taken, peak, peak_same):
         if not taken:
             print(f"  {name:34s} -- nothing taken")
             return
         money = sum((1.0 if r[2] else 0.0) - (r[1] + pay_up)
                     - fee * (r[1] + pay_up) for r in taken)
         got = report(name, taken, fee, pay_up, 1)
-        print(f"{got[5]}  peak {peak:2d} open  ${money:+6.2f} total")
+        print(f"{got[5]}  peak {peak:2d} open ({peak_same:2d} one way)  "
+              f"${money:+6.2f}")
 
     for mo in (0, 1, 2, 3, 5, 10):
-        t, pk = sim(mo, 0, 0, 0)
-        line(f"max_open={mo or 'off'}", t, pk)
-    for md in (0, 5, 10, 20, 50):
-        t, pk = sim(0, md, 0, 0)
-        line(f"max_per_day={md or 'off'}", t, pk)
+        t, pk, ps = sim(mo, 0, 0, 0)
+        line(f"max_open={mo or 'off'}", t, pk, ps)
+    # THE BURST KNOB: a burst is N bets on ONE view, so cap the direction, not
+    # the count. This is the knob the disabled global cooldown was a blunt
+    # proxy for, and it drops legs by CORRELATION rather than by age.
+    for ms in (0, 1, 2, 3):
+        t, pk, ps = sim(0, 0, 0, 0, ms)
+        line(f"max_same_dir={ms or 'off'}", t, pk, ps)
     for ms in (0, 1, 2):
-        t, pk = sim(0, 0, ms, 0)
-        line(f"max_per_symbol={ms or 'off'}", t, pk)
-    for g in (0, 30, 60, 120, 300):
-        t, pk = sim(0, 0, 0, g)
-        line(f"global_gap={g}s", t, pk)
-    for mo, ms in ((2, 1), (3, 1), (1, 1)):
-        t, pk = sim(mo, 0, ms, 0)
-        line(f"max_open={mo}+per_symbol={ms}", t, pk)
+        t, pk, ps = sim(0, 0, ms, 0)
+        line(f"max_per_symbol={ms or 'off'}", t, pk, ps)
+    for g in (0, 120, 300, 600):
+        t, pk, ps = sim(0, 0, 0, g)
+        line(f"global_gap={g}s", t, pk, ps)
+    for md in (0, 5, 10):
+        t, pk, ps = sim(0, md, 0, 0)
+        line(f"max_per_day={md or 'off'}", t, pk, ps)
 
 
 def main():
