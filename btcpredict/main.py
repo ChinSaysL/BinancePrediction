@@ -2022,17 +2022,23 @@ class Bot:
                 cd = self._ck("train_cooldown_s", r)
                 last_ms = getattr(self, "_train_last_ms", 0)
                 if cd > 0 and last_ms and (now_ms - last_ms) < cd * 1000.0:
+                    # NO `return` here. This guard suppresses the TRAIN entry,
+                    # not the family's whole tick: returning would also swallow
+                    # a genuine CROSS in the same family inside the 5-60s
+                    # window, i.e. a second signal killed by the first one's
+                    # burst guard. Falling through lets the ordinary window gate
+                    # and the crossing path decide.
                     self._cross_refuse(
                         r, "Up" if dist_bps > 0 else "Down",
                         f"train cooldown {cd:.0f}s: one entry per burst",
                         tau=tau, spot=feed.price)
-                    return
-                # Stamped on the SIGNAL, before any later gate, so a refused
-                # order cannot let the same move be re-attempted family by
-                # family -- the next one is what would rebuild the burst.
-                self._train_last_ms = now_ms
-                side = "Up" if dist_bps > 0 else "Down"
-                train = True
+                else:
+                    # Stamped on the SIGNAL, before any later gate, so a refused
+                    # order cannot let the same move be re-attempted family by
+                    # family -- the next one is what would rebuild the burst.
+                    self._train_last_ms = now_ms
+                    side = "Up" if dist_bps > 0 else "Down"
+                    train = True
         if not train and not (self._ck("min_tau_s", r) <= tau
                               <= self._ck("max_tau_s", r)):
             return
