@@ -6725,3 +6725,76 @@ the next piece of work, and it is engineering rather than a constant.
 
 n=34 (19 fills at the shipped cell) is thin. It is also the only substrate that
 can see the effect at all.
+
+## The cross arm is a MAKER by construction, and its fills are adversely selected
+
+Told that latency and execution are already optimised. Verified, and it is true
+on our side:
+
+    decision -> order ON THE VENUE   n=50  median 0.208s  p90 0.233s  max 0.270s
+    order created -> FILLED          n=26  median 1.187s  p90 4.004s  max 5.064s
+
+208ms is ours; the remaining ~1.2s is venue-side matching. There is nothing to
+win there. But that makes the cancellations incoherent -- until you read the
+order path.
+
+### There is no marketable limit on this venue
+
+    live.py:440  "LIMIT must be GTC; FOK belongs to MARKET (schema, verified live)."
+    live.py:558  "FOK is the only accepted value -- IOC and GTC are both rejected with -1102"
+
+`buy_limit`'s own docstring: *"Post a resting LIMIT, wait `wait_s`, and cancel
+whatever is left."* LIMIT is GTC-only. The arm has been resting, not taking.
+
+### What that costs, measured on live orders
+
+Pairing 100 venue orders against the arm's own `cross meter` lines (the book at
++0.25s after each trigger):
+
+    matched orders with a +0.25s ask: 32
+      limit AT/ABOVE the ask (should cross) and FILLED     :  5
+      limit AT/ABOVE the ask (should cross) and NOT filled :  8
+      limit BELOW the ask (genuinely not crossable)        : 19
+
+Eight of thirteen marketable limits never took. And the split by outcome is the
+whole story:
+
+    marketable AND filled (the GTC limit happened to take)
+      n=5  won 2/5  mean price 0.638  EV/$1 -0.2330  TOTAL -1.165
+    marketable but NOT filled (a FOK would have taken)
+      n=8  won 7/8  mean price 0.539  EV/$1 +0.6895  TOTAL +5.516
+
+**When the resting limit gets hit it is picking losers; when it does not get hit
+those are the winners.** A maker gets filled by someone who wants to sell to
+them, and does not get filled when the price is about to run their way. Same
+shape as the earlier FILLED/MISSED cut over all 34 triggers (-0.0572 vs +0.2466).
+
+### Why `order_type = "limit_take"` was chosen, and what that reasoning missed
+
+Recorded in config:
+
+> MARKET prices off the venue's DISPLAYED price -- which lags its own book by up
+> to 0.40 and left the quote above the ask in 5-7% of live samples. Market fills
+> averaged +0.16 above the ask on offer; limit fills -0.014.
+
+Both numbers are presumably right. The comparison is not: it judges the two
+paths on fill PRICE and never asks what each is filling. **+0.16 above the ask
+is almost exactly the reprice measured tonight (+0.149 median at +1.00s)** -- it
+is the price of actually getting the trade that is running your way. The limit's
+cheap -0.014 fills are the adversely-selected ones that win 2 of 5.
+
+This is the same error as the depth-floor win-rate table and the buffer sweep:
+**comparing an outcome across subsets without asking what selected them.** Third
+instance in two days.
+
+### Not shipped
+
+Switching the cross arm to MARKET FOK is the obvious candidate and it is NOT
+made here. n=8 on the decisive cell, it reverses a documented decision made on
+real fills, and the operator's standing view is that execution is already tuned.
+What is recorded is the defect: the limit path is a maker, its fills are
+adversely selected, and the prior comparison that chose it could not have seen
+that.
+
+If it is tried, `order_type=market` in the VPS `.env` is the whole change, with
+`slippage_bps=300` already bounding the take, and it is one line to revert.
