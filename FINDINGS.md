@@ -7253,6 +7253,8 @@ edge question with its own evidence bar.
 
 CHECKPOINT: after ~20 fires, compare the venue order's `createTime` minus the
 CROSS decision log against the 169-186ms baseline -- a warm hit should print
-~120-135ms. 595 tests pass (6 new: warm hit skips the fetch; stale and
-stake-mismatch fall back; imminent side chosen; one-shot consumption;
-throttled refresh).
+~120-135ms. The log marks the hits (`warm quote used for <slug> <side>`), and
+an unmarked fire that is slow means the fallback ran (window edge, stake
+sized down, or no websocket book). 595 tests pass (6 new: warm hit skips the
+fetch; stale and stake-mismatch fall back; imminent side chosen; one-shot
+consumption; throttled refresh).

@@ -2850,6 +2850,12 @@ class Bot:
                 # faster, never a different trade.
                 if attempt == 0:
                     quote = self._take_prefetched_quote(token, stake)
+                    if quote is not None:
+                        # Marks the warm hits so the decision -> venue delta
+                        # (order createTime minus the CROSS line) can be
+                        # scored against the 169-186ms cold baseline; see
+                        # FINDINGS "Can we execute faster".
+                        log.info("warm quote used for %s %s", r.slug, sig.side)
                 if quote is None:
                     quote = await self.broker.get_quote(token, stake)
                 if not quote:
