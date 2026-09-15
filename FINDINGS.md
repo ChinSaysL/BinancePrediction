@@ -7217,3 +7217,42 @@ NOT changed: the 4.3s position confirmation (load-bearing via the Sep 8
 double buys), the ceiling itself, and the 30s cooldown on a genuine venue
 failure. `market_stale_quote_tol` retired from config (env files ignore
 unknown keys). 589 tests pass.
+
+## Can we execute faster and catch that trade? (2026-09-15)
+
+Measured, pairing the decision log with the venue's own order records:
+
+    episode         decision -> venue accepted   venue verdict   outcome
+    09:09 eth       186ms                         675ms           FOK failed
+    09:09 btc       169ms                         755ms           FOK failed
+    07:59 btc       179ms                         364ms           FOK failed
+    07:39 eth       178ms                         324ms           FOK failed
+    08:39 eth fill  ~220ms                        1558ms          FILLED 0.54
+
+169-186ms breaks down as: the quote round-trip (40-65ms) + the order POST and
+the venue's own intake (~120-130ms). Detection is already tick-resolution
+(`_idle` runs `_cross_all` on every spot tick, ~114/s), and the venue's
+intake is theirs. That left ONE shaveable leg: the signed quote fetched
+between the decision and the order, while the book is jumping (eth 0.46 ->
+0.63, btc 0.30 -> 0.66 by +250ms).
+
+Shipped: the cross arm keeps a quote WARM for the side the NEXT crossing
+would buy -- below the strike Up, above it Down -- refreshed at most 1/s while
+the family sits in its tradeable window, consumed once by the first attempt
+when younger than 2.5s and carrying the fire's exact stake (flat-or-cap
+sizing makes that knowable: $1.00 today). Any doubt -- stale, stake mismatch,
+fetch failure -- falls back to the synchronous fetch; retries always fetch
+fresh, because their question is whether the book CAME BACK.
+
+Honest expectation: 07:59 btc missed by ~20ms and 09:09 eth by ~45ms, inside
+this saving -- those flip to toss-ups at best. The violent jumps stay lost:
+09:09 btc's book crossed the 0.39 ceiling within ~100ms of the cross, faster
+than any ~130ms pipeline can react from Tokyo. The remaining lever is not
+latency: it is what the arm will PAY for a fast mover (the band), which is an
+edge question with its own evidence bar.
+
+CHECKPOINT: after ~20 fires, compare the venue order's `createTime` minus the
+CROSS decision log against the 169-186ms baseline -- a warm hit should print
+~120-135ms. 595 tests pass (6 new: warm hit skips the fetch; stale and
+stake-mismatch fall back; imminent side chosen; one-shot consumption;
+throttled refresh).

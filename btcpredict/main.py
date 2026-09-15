@@ -69,6 +69,13 @@ _CLAIM_SWEEP_S = 180.0
 # left). For market orders the retry floor is this instead; see _place_order.
 _MARKET_RETRY_TAU_FLOOR_S = 3.0
 
+# Quote warm-up for the cross arm (see Bot._prefetch_cross_quote): refresh at
+# most this often while a family is in its tradeable window, and consume the
+# warm quote only if younger than the max age. The venue's quote TTL is ~5s,
+# so 2.5s keeps a wide margin.
+_QUOTE_PREFETCH_REFRESH_S = 1.0
+_QUOTE_PREFETCH_MAX_AGE_S = 2.5
+
 # Reasons a decision was declined that must NOT be probed. These are real
 # limits -- existing exposure, a risk halt, or data we could not read -- and
 # probing around them would create exactly the double exposure and the
@@ -285,6 +292,11 @@ class Bot:
         # The side already taken in a round, so a later crossing cannot buy the
         # opposite one. See config.cross_allow_reversal.
         self._cross_side: dict[str, str] = {}
+        # Warm quotes for the cross arm's NEXT crossing (see
+        # _prefetch_cross_quote): token -> (monotonic_ts, stake, quote).
+        self._quote_pre: dict[str, tuple[float, float, dict]] = {}
+        self._quote_pre_busy: set[str] = set()
+        self._quote_pre_tasks: set = set()
         # Rounds with a cross decision IN FLIGHT. `_cross_fired` and
         # `_cross_last_ms` are not written until after the venue read in
         # _cross_tick, so on the websocket clock (~114/s) every tick that
@@ -1726,6 +1738,114 @@ class Bot:
         """
         return float(getattr(self, "_pending_stake", 0.0) or 0.0)
 
+    async def _prefetch_cross_quote(self, r, up, down, feed, tau, ctx):
+        """Keep a quote WARM for the side the next crossing would buy.
+
+        The fire path pays a quote round-trip (measured 40-65ms) between the
+        decision and the order, inside a race the venue settles in ~250ms:
+        measured 2026-09-15 against the venue's own order records, decision ->
+        venue-accepted is 169-186ms, and the book is already past the ceiling
+        at +250ms (eth 0.46 -> 0.63, btc 0.30 -> 0.66). Two of that morning's
+        four failures missed by less than this round-trip (07:59 btc by
+        ~20ms, 09:09 eth by ~45ms).
+
+        The side is knowable BEFORE the crossing -- below the strike the next
+        cross is Up, above it Down -- so the quote is fetched here, while the
+        family sits in its tradeable window, and consumed ONCE by the first
+        attempt (`_take_prefetched_quote`, used in _place_order). Any doubt
+        (stale, stake mismatch, fetch failure) falls back to the synchronous
+        fetch: this can only ever be faster, never a different trade.
+
+        The stake mirrors the fire's sizing so the quote's amountIn matches
+        the order's; if the two ever drift apart the mismatch is caught at
+        use time rather than trading a size the arm did not choose.
+        """
+        broker = getattr(self, "broker", None)
+        if broker is None or getattr(broker, "mode", None) != "live":
+            return None
+        get_quote = getattr(broker, "get_quote", None)
+        spot, strike = getattr(feed, "price", None), getattr(r, "strike", None)
+        if get_quote is None or not spot or not strike or spot == strike:
+            return None
+        side = "Up" if spot < strike else "Down"
+        token = up.token_id if side == "Up" else down.token_id
+        if not token:
+            return None
+        wsb = getattr(self, "ws_book", None)
+        top = (wsb.best(r.market_id, settings.ws_book_max_age_s)
+               if wsb is not None else None)
+        ask = top.ask(side) if top is not None else None
+        if ask is None or ask <= 0:
+            return None
+        stake = self._ck("stake_usdt", r)
+        if stake is None:
+            sigma = (ctx.get("sigma") if ctx else None) \
+                or getattr(self, "_sigma", 0.0) or 0.0
+            mz = (abs(math.log(spot / strike))
+                  / (sigma * math.sqrt(tau / 60.0))
+                  if tau > 0 and sigma > 0 else 0.0)
+            stake = self._stake_for(
+                Signal(side, ask, ask, 0.0, 0.0, 0.0, True, "cross"), mz)
+            stake = round(stake * self._ck("stake_mult", r), 2)
+            if settings.stake_cap_usdt > 0:
+                stake = min(stake, settings.stake_cap_usdt)
+        stake = float(stake)
+        if stake < settings.min_order_usdt:
+            return None
+        cache = getattr(self, "_quote_pre", None)
+        if not isinstance(cache, dict):
+            cache = self._quote_pre = {}
+        busy = getattr(self, "_quote_pre_busy", None)
+        if not isinstance(busy, set):
+            busy = self._quote_pre_busy = set()
+        now = time.monotonic()
+        for old, entry in list(cache.items()):
+            if now - entry[0] > 60.0:
+                cache.pop(old, None)
+        entry = cache.get(token)
+        if entry is not None and now - entry[0] < _QUOTE_PREFETCH_REFRESH_S:
+            return None
+        if token in busy:
+            return None
+        busy.add(token)
+
+        async def _warm() -> None:
+            try:
+                q = await get_quote(token, stake)
+                if q:
+                    cache[token] = (time.monotonic(), stake, q)
+            except Exception as e:                      # noqa: BLE001
+                log.debug("quote warm-up failed for %s: %s", r.slug, e)
+            finally:
+                busy.discard(token)
+
+        task = asyncio.create_task(_warm())
+        tasks = getattr(self, "_quote_pre_tasks", None)
+        if not isinstance(tasks, set):
+            tasks = self._quote_pre_tasks = set()
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+        return task
+
+    def _take_prefetched_quote(self, token: str, stake: float) -> dict | None:
+        """Pop the warm quote for this token when it is fresh and exact.
+
+        One shot: the attempt that consumes it has spent it, so a later
+        attempt can never trade on a price the first one already used.
+        """
+        cache = getattr(self, "_quote_pre", None)
+        if not isinstance(cache, dict):
+            return None
+        entry = cache.pop(token, None)
+        if entry is None:
+            return None
+        ts, q_stake, q = entry
+        if time.monotonic() - ts > _QUOTE_PREFETCH_MAX_AGE_S:
+            return None
+        if round(float(q_stake), 2) != round(float(stake), 2):
+            return None
+        return q
+
     async def _cross_all(self) -> None:
         """Run the cross arm over every family in CROSS_TRADED.
 
@@ -1847,6 +1967,11 @@ class Bot:
             return
         side = crossed_side(list(ticks), r.strike, self._ck("look_s", r))
         if side is None:
+            # No crossing this tick: keep a quote WARM for the side the next
+            # crossing would buy (see _prefetch_cross_quote). This is the
+            # only point that is in the tradeable window, live, fresh and not
+            # already spent -- a fire from here is plausible.
+            await self._prefetch_cross_quote(r, up, down, feed, tau, ctx)
             return
         # WHIPSAW. Stamped on the CROSSING, before any gate, because that is the
         # hole `cross_allow_reversal` leaves: it arms on the ENTRY, so a crossing
@@ -2714,7 +2839,19 @@ class Bot:
             # order itself so placing it costs no extra latency (quote TTL is ~5s).
             quote = None
             if self.broker.mode == "live":
-                quote = await self.broker.get_quote(token, stake)
+                # A WARM quote on the FIRST attempt only: the cross fetches it
+                # before the crossing, and consuming it removes the 40-65ms
+                # quote round-trip from the decision -> venue race (measured
+                # 169-186ms against the venue's own records; the venue's
+                # reprice settles inside ~250ms). Retries fetch fresh -- their
+                # question is whether the book CAME BACK, which only a fresh
+                # quote can answer. Any doubt (stale, stake mismatch) falls
+                # through to the synchronous fetch, so this can only ever be
+                # faster, never a different trade.
+                if attempt == 0:
+                    quote = self._take_prefetched_quote(token, stake)
+                if quote is None:
+                    quote = await self.broker.get_quote(token, stake)
                 if not quote:
                     log.warning("no pre-trade quote for %s (attempt %d/%d)",
                                 r.slug, attempt + 1, attempts)

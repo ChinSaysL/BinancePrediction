@@ -2737,6 +2737,149 @@ class TestADeclinedPriceDoesNotEndTheRound:
             "re-placing on an unknown outcome is how exposure gets doubled")
 
 
+class TestTheCrossKeepsAQuoteWarm:
+    """The fire path pays a quote round-trip (40-65ms) inside the decision ->
+    venue race (~170-190ms), while the venue settles its reprice inside ~250ms
+    (measured 2026-09-15 against the venue's own order records: 07:59 btc
+    missed by ~20ms, 09:09 eth by ~45ms -- both inside this saving).
+
+    The side the NEXT crossing buys is known before it happens -- below the
+    strike that is Up, above it Down -- so the quote is fetched while the
+    family waits, and consumed once by the first attempt. Any doubt -- stale
+    quote, stake mismatch, fetch failure -- falls back to the synchronous
+    fetch: this can only ever be faster, never a different trade.
+    """
+
+    def _bot(self, store, monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.order_type", "market")
+        monkeypatch.setattr("btcpredict.config.settings.order_max_attempts", 1)
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0), asks=(0.30, 0.40))
+        bot.broker.mode = "live"
+        calls = {"get_quote": 0, "buy": []}
+
+        async def get_quote(*a, **k):
+            calls["get_quote"] += 1
+            return {"quoteId": "fresh", "averagePrice": 0.30, "expireAt": 0}
+
+        async def buy(**k):
+            calls["buy"].append(k)
+            bot.broker.last_failure = "venue_failed"
+            return None
+
+        bot.broker.get_quote = get_quote
+        bot.broker.buy = buy
+        return bot, calls
+
+    def _order(self, bot):
+        r = types.SimpleNamespace(slug="btc-updown-5m-1", tau_s=lambda _ms: 90.0)
+        sig = types.SimpleNamespace(side="Up", quote=0.30, fair=0.60, edge=0.1)
+        asyncio.run(bot._place_order(r, sig, fair_up=0.40, token="t", stake=1.0,
+                                     skip_pretrade_gates=True, take_px=0.30))
+
+    def test_a_warm_quote_skips_the_fetch_on_the_first_attempt(self, store, armed,
+                                                               monkeypatch):
+        bot, calls = self._bot(store, monkeypatch)
+        bot._quote_pre = {"t": (time.monotonic(), 1.0,
+                                {"quoteId": "warm", "averagePrice": 0.30,
+                                 "expireAt": 0})}
+        self._order(bot)
+        assert calls["get_quote"] == 0, (
+            "the warm quote must remove the round-trip from the fire path")
+        assert calls["buy"] and calls["buy"][0]["quote"]["quoteId"] == "warm"
+
+    def test_a_stale_quote_falls_back_to_a_fetch(self, store, armed, monkeypatch):
+        bot, calls = self._bot(store, monkeypatch)
+        bot._quote_pre = {"t": (time.monotonic() - 10.0, 1.0,
+                                {"quoteId": "warm", "averagePrice": 0.30,
+                                 "expireAt": 0})}
+        self._order(bot)
+        assert calls["get_quote"] == 1
+        assert calls["buy"][0]["quote"]["quoteId"] == "fresh"
+
+    def test_a_stake_mismatch_falls_back_to_a_fetch(self, store, armed, monkeypatch):
+        bot, calls = self._bot(store, monkeypatch)
+        bot._quote_pre = {"t": (time.monotonic(), 2.5,
+                                {"quoteId": "warm", "averagePrice": 0.30,
+                                 "expireAt": 0})}
+        self._order(bot)
+        assert calls["get_quote"] == 1, (
+            "a quote for $2.50 must never commit a $1.00 order")
+
+    def test_the_warm_quote_is_consumed_once(self, store, armed, monkeypatch):
+        bot, _ = self._bot(store, monkeypatch)
+        bot._quote_pre = {"t": (time.monotonic(), 1.0,
+                                {"quoteId": "warm", "averagePrice": 0.30,
+                                 "expireAt": 0})}
+        assert bot._take_prefetched_quote("t", 1.0) is not None
+        assert bot._take_prefetched_quote("t", 1.0) is None, (
+            "one shot: a second attempt must not trade the same quote")
+
+    def _prefetch_bot(self, store, monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.stake_cap_usdt", 1.0)
+        monkeypatch.setattr("btcpredict.config.settings.min_order_usdt", 0.5)
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0), asks=(0.30, 0.40))
+        bot.broker.mode = "live"
+        bot._stake_for = lambda *a, **k: 10.0    # formula -> mult -> cap $1.00
+
+        class _Top:
+            def ask(self, side):
+                return 0.40
+
+        class _WSB:
+            def best(self, market_id, max_age):
+                return _Top()
+
+        bot.ws_book = _WSB()
+        return bot
+
+    def test_the_prefetch_warms_the_side_the_next_crossing_buys(self, store, armed,
+                                                                 monkeypatch):
+        bot = self._prefetch_bot(store, monkeypatch)
+        fetched = []
+
+        async def get_quote(token, stake):
+            fetched.append((token, stake))
+            return {"quoteId": "warm", "averagePrice": 0.30, "expireAt": 0}
+
+        bot.broker.get_quote = get_quote
+        up = types.SimpleNamespace(token_id="TOKUP")
+        down = types.SimpleNamespace(token_id="TOKDN")
+        r = types.SimpleNamespace(slug="r1", strike=100.0, market_id=1)
+
+        async def go(price):
+            t = await bot._prefetch_cross_quote(
+                r, up, down, types.SimpleNamespace(price=price), 30.0, None)
+            if t is not None:
+                await t
+        asyncio.run(go(99.0))            # below the strike -> the next cross is Up
+        assert fetched and fetched[0][0] == "TOKUP"
+        assert fetched[0][1] == pytest.approx(1.0), (
+            "the warm quote must carry the stake the fire would use")
+
+    def test_the_prefetch_is_throttled(self, store, armed, monkeypatch):
+        bot = self._prefetch_bot(store, monkeypatch)
+        fetched = []
+
+        async def get_quote(token, stake):
+            fetched.append(token)
+            return {"quoteId": "warm", "averagePrice": 0.30, "expireAt": 0}
+
+        bot.broker.get_quote = get_quote
+        up = types.SimpleNamespace(token_id="TOKUP")
+        down = types.SimpleNamespace(token_id="TOKDN")
+        r = types.SimpleNamespace(slug="r1", strike=100.0, market_id=1)
+        feed = types.SimpleNamespace(price=99.0)
+
+        async def go():
+            for _ in range(3):
+                t = await bot._prefetch_cross_quote(r, up, down, feed, 30.0, None)
+                if t is not None:
+                    await t
+        asyncio.run(go())
+        assert fetched == ["TOKUP"], (
+            "three ticks inside one refresh interval must fetch once")
+
+
 class TestRefusingAPriceIsFree:
     """The order cooldown is SHARED across every arm and family. It exists for
     a venue that is rejecting orders -- retrying at 1 Hz would just hammer it.
