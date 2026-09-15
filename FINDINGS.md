@@ -8813,3 +8813,133 @@ battered side is underpriced; measured, it is overpriced, and buying it at the a
 loses -0.0125 to -0.0200 per share with day-t -1.52 to -3.16. Changing the gate
 from a price threshold to a spot-displacement threshold changes which entries are
 selected, not whether the battered side is cheap.
+
+## The gamma diagnosis, the four re-geometries, and where the money actually
+## goes (2026-09-15)
+
+New tools: `tools/cross_geometry.py` (four re-geometries, one entry per round,
+priced at the DISPLAYED ask with zero slippage granted), `tools/cross_gap_by_tau.py`
+(signed ask move after every trigger, bucketed by tau). Tape: the live DB pulled
+from the VPS, 3,189 settled rounds / 1.23M quotes / 2026-09-08..15.
+
+### First, the observation behind the diagnosis is CORRECT and I could not see it
+
+Every cross entry in the live DB sits in the final minute:
+
+    tau at fire   n=115   min 10s   p10 26s   p25 35s   p50 44s   p90 59s   max 60s
+
+That is not a market fact, it is a hard config gate: `cross_max_tau_s = 60.0`
+(and `cross_min_tau_s = 5.0`). So my earlier result -- "15m contracts gap just as
+hard as 5m at the moments we trade" -- was measuring two contracts both being
+entered at tau 13-60s. The proposed explanation for that result is right.
+
+### IDEA 1, EARLY-TAU GATE: mechanism CONFIRMED, conclusion REFUTED
+
+Granted in full and measured. Signed ask move after the trigger (positive = price
+ran away from us), by tau:
+
+    bucket                  n   ask@trig   d+250ms   p50     p90     %up   win    edge/sh
+    A tau   5-60 (current) 760    0.647    +0.040  +0.010  +0.170   52%  72.8%   +0.080
+    B tau  60-120         1059    0.594    +0.029  +0.000  +0.120   47%  59.0%   -0.004
+    C tau 120-200         1593    0.571    +0.023  +0.000  +0.100   46%  58.4%   +0.013
+    D tau 200-300 (idea1) 2983    0.564    +0.018  +0.000  +0.070   47%  57.3%   +0.009
+    E tau 400-700 (15m)    491    0.540    +0.014  +0.000  +0.050   40%  53.4%   -0.006
+
+So the diagnosis of the *slippage* is right and it is monotone: the mean gap falls
+4.0c -> 1.8c -> 1.4c and the p90 falls 17c -> 7c -> 5c as tau rises. The "28-cent
+shortfalls" really are a small-tau artifact, exactly as argued, and the gamma
+arithmetic behind it (phi(0)=0.399, dP/dS = phi(d)/(S*sigma*sqrt(tau))) checks out.
+
+**But the edge falls faster than the gap, and the ratio is what pays.**
+
+    gap / edge at tau   5-60  : 0.040 / 0.080 = 0.5x
+    gap / edge at tau 200-300 : 0.018 / 0.009 = 2.0x
+
+At tau 200-300 you would be crossing a 1.8c gap to collect a 0.9c edge -- and the
+fee on an ask of 0.564 is about 1.0c/share, which by itself exceeds the entire
+edge. So the proposal is flat-to-negative even when granted a perfect fill at the
+displayed ask with zero slippage, which is the best case it can possibly have.
+15m does not rescue it (tau 400-700 is -0.006).
+
+This also matches what the arm had already recorded internally: the config comment
+for `cross_max_tau_s` carries a tau sweep whose 150-300 bucket is ask 0.581 / win
+0.576 / edge -0.005, annotated "edge is gone" above tau 90, n=2863.
+
+End to end on the tape, one entry per round:
+
+    V0 baseline (tau 5-60, as configured)  n= 386 fire=12.1%  ask 0.629  win 75.6%
+                                           gross +0.128/sh  net +0.115/sh  day-t +5.43 (8d)
+    V1a early-tau 5m tau 220-300           n=1061 fire=36.3%  ask 0.564  win 58.9%
+                                           gross +0.025/sh  net +0.014/sh  day-t +0.49 (8d)
+    V1c tau 60-300 any contract            n=1658 fire=52.0%  gross +0.017  net +0.006  day-t +0.74
+
+The current window is 8x the net edge per share and takes 4x fewer trades. Moving
+to early tau does not add rounds, it enters worse ones.
+
+### IDEA 2, DEPTH-OF-ORIGIN (spot >=6bps from K within 45s): too rare, and harmful
+
+    V2 thrust-origin +-6bps/45s   n=39  fire=1.2%  ask 0.558  win 59.0%
+                                  gross +0.031/sh  net +0.020/sh  day-t +1.59 (6d)
+
+39 rounds out of 3,189. And it is not just rare, it is *worse than not filtering*:
+the unfiltered population at that same price band (ask 0.50-0.60) earns **+0.162/sh**
+(see the table below). Conditioning on a thrust origin drops the edge at that price
+from +0.162 to +0.031. The filter destroys edge rather than selecting it.
+
+### IDEA 3, CROSS-ROUND SPILLOVER: n=6
+
+    V3 spillover -> next round open  n=6  fire=0.2%  ask 0.535  win 66.7%  day-t +1.03
+
+Six trades in 3,189 rounds is not a strategy. The premise it rests on -- that the
+next round opens under-repriced and the lag is capturable -- was already falsified
+live in the previous batch: pooled -0.0325/share, -0.0254 with |d|>=0.25, 6 of 8
+days negative.
+
+### IDEA 4, PROBABILITY CROSS AT P=0.70: negative as specified
+
+    V4 prob-cross 0.70 depth>=4bps  n=54  fire=1.7%  ask 0.778  win 75.9%
+                                    gross -0.019/sh  net -0.034/sh  day-t +2.10 (8d)
+
+The delta-flattening argument is the same monotone fact as idea 1 and it is right.
+But you are re-anchoring the purchase to a *higher* price: 0.778 paid for a 75.9%
+proposition. The cross population in the 0.70-0.80 band earns +0.047/sh; this
+trigger earns -0.019 at a higher ask. The 0.85-0.99 band, where the delta argument
+is strongest of all, was already measured at -0.0364/$1.
+
+### WHERE THE MONEY ACTUALLY GOES -- this is the finding that matters
+
+The tape says the cross signal is worth a lot at the price we trade, and the fills
+say we capture none of it. Decomposed at the price point we actually get filled in:
+
+    edge by ask paid, first cross per round, tau 5-60 (n=386)
+      ask band        n    mean ask    win     edge/sh
+      0.10-0.30       9      0.207    66.7%    +0.460
+      0.30-0.40      20      0.350    60.0%    +0.250
+      0.40-0.50      30      0.462    63.3%    +0.172
+      0.50-0.60      89      0.557    71.9%    +0.162   <- our price point
+      0.60-0.70     107      0.644    73.8%    +0.094
+      0.70-0.80      71      0.742    78.9%    +0.047
+      0.80-0.98      56      0.868    92.9%    +0.060
+
+    the 44 rounds we were ACTUALLY filled in:
+      tape ask at trigger   0.571
+      price we PAID         0.623   (+0.055/share; 84% of fills above the tape ask,
+                                     median +0.069)
+      win rate              59.1%   (population at this price wins 71.9%)
+
+    population edge at 0.571            +0.162/sh
+    adverse selection on the fills     -0.142/sh   (71.9% -> 59.1% at the same price)
+    slippage vs the trigger ask        -0.055/sh
+    fee                                -0.010/sh
+    --------------------------------------------
+    net                                -0.045/sh   (measured: -0.037)
+
+So the trigger geometry is NOT the binding constraint. The signal is worth
++0.162/share where we trade it and execution removes 0.207/share of that. Ideas 1-4
+all move the trigger to a place with less edge, and the fill problem shrinks in
+absolute terms but the edge shrinks further.
+
+An earlier live measurement of the same window agrees: 59% of 44 fills, net -0.088/$1.
+
+**The trap was never the gamma. It is that we pay above the displayed ask 84% of the
+time, and we only get filled on the crossings that are already failing.**
