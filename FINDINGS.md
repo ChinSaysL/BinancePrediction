@@ -10471,3 +10471,82 @@ evidence honest:
     doubling exposure to one bet is not diversification.
 
 Nothing shipped. No code path added. Live config and the +2c canary untouched.
+
+## SHIPPED LIVE: the TRAIN entry trigger (2026-09-15, operator decision)
+
+Built and deployed after the operator accepted the override explicitly: *"this is
+money i can afford to lose"*. It is **not** an execution tweak -- it is a new
+entry SIGNAL on the cross arm, firing on DISTANCE from the strike instead of a
+crossing, and therefore living OUTSIDE the arm's 5-60s tau window.
+
+### What it does
+
+    trigger   |spot - strike| / strike >= cross_train_bps (10.0), tau >= 60s
+    gate      coherent ask <= cross_train_max_ask (0.890), else refused
+    bound     flat ask + cross_train_bound (0.015), capped at 0.90
+    delay     D = 0 -- the first evaluation at/after the breakout
+
+### What it deliberately overrides, and what it does not
+
+It replaces THREE gates, because a >=10bps entry is deep, implies a >=10bps round
+travel, and prices near 0.80:
+
+    max_depth_bps          5.0   -> bypassed for this trigger
+    max_round_range_bps   10.0   -> bypassed for this trigger
+    cross_max_fill_px     0.65   -> cross_train_max_fill_px = 0.90
+
+That third one is a genuine correctness requirement, not a preference: at a
+~0.80 ask the shipped 0.65 cap would put the entry permanently out of reach. It
+is threaded as an explicit `fill_cap` through `_cross_execute` and `_place_order`
+so the CROSS arm's cap is untouched -- `_place_order` now resolves
+`settings.cross_max_fill_px if fill_cap is None else fill_cap`, and the two
+source-text guard tests that pinned `cross_max_fill_px > 0` were updated to pin
+the new idiom rather than the old string.
+
+Everything that bounds RISK is SHARED with the cross arm, as instructed: the
+guard, the reserved slot, `cross_max_open_positions`, `cross_max_open_stake_pct`,
+the daily cap, the re-entry gap, the order cooldown and the reversal rule. It is
+an entry trigger on one book, not a parallel book.
+
+### Ships OFF, then enabled
+
+    cross_train_enabled: bool = False   <- the default in code
+    .env: cross_train_enabled=1         <- enabled per deployment
+
+Deployed in two steps so a code error could not reach live money: the code went
+out with the knob OFF and was restarted and verified healthy, then the knob was
+flipped and restarted again. Stake is bounded by the existing
+`stake_cap_usdt = 1.0`.
+
+    backups   btcpredict/config.py.bak-20260915-204835
+              btcpredict/main.py.bak-20260915-204835
+              .env.bak-<ts>-pretrain
+    revert    cross_train_enabled=0 in .env + systemctl restart btcpredict
+              (and restore the .bak pair if the CODE is to go too)
+
+### First minutes live
+
+    0 ERROR / Traceback lines in the 400 lines after the restart; poll alive
+    stats: rounds=5843 quotes=1356675 decisions=281126 fills=804
+
+and the trigger immediately demonstrated both halves of its behaviour on
+bnb-updown-15m-1789505100:
+
+    cross bnb-updown-15m-1789505100 Up not taken: train ask 0.93 above the gate 0.890
+    cross bnb-updown-15m-1789505100 Up not taken: train ask 0.98 above the gate 0.890
+    cross bnb-updown-15m-1789505100 Up not taken: train ask 0.95 above the gate 0.890
+    cross bnb-updown-15m-1789505100 Up not taken: train ask 0.94 above the gate 0.890
+    cross bnb-updown-15m-1789505100 Up not taken: train ask 0.90 above the gate 0.890
+
+**FIRST LIVE OBSERVATION, and it matters: on a 15m round that has broken out the
+ask sits at 0.90-0.98, not the ~0.80 the measurement assumed.** The measured cell
+was conditioned on `ask <= 0.890`, so the >0.89 breakouts were excluded from it by
+construction -- which means the live trigger will refuse most of what it sees, and
+the realised fire rate will be far below the 12/day the backtest implied. That is
+the gate doing its job, but it is the first thing to watch: if almost everything
+is refused, the arm is being tested on a population it rarely reaches.
+
+Still open and NOT resolved by shipping it: the n=321 coherent-favourite
+contradiction (-0.0221 at the ask), and the fact that 76% of the measured fires
+sit on rounds the range gate refuses. The live record now accumulates against
+both.

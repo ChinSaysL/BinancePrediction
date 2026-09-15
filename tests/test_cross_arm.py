@@ -1753,6 +1753,57 @@ class TestReentryGap:
         assert "_cross_last_ms" in src and ".get(r.slug)" in src
 
 
+class TestTheTrainTrigger:
+    """The Train entry: DISTANCE from the strike, not a crossing.
+
+    It fires OUTSIDE the arm's 5-60s tau window and deliberately bypasses three
+    gates -- max_depth_bps (5.0), max_round_range_bps (10.0) and
+    cross_max_fill_px (0.65) -- because a >=10bps entry is deep, implies a
+    >=10bps round travel, and prices near 0.80 where a 0.65 cap puts it out of
+    reach. That override is an operator risk decision (2026-09-15); see
+    config.cross_train_*. Everything that bounds RISK is shared with the cross
+    arm: the guard, the reserved slot, the exposure caps, the daily cap, the
+    reentry gap and the cooldown.
+    """
+
+    def test_a_deep_breakout_at_high_tau_fires(self, store, armed, monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.cross_train_enabled", True)
+        # 77080 is ~10.4bps past a 77000 strike, on a round with tau = 120s.
+        bot = make_bot(store, ticks(77000.0, 77040.0, 77080.0))
+        bot._round = make_round(tau_s=120.0)
+        seen = {}
+
+        async def ex(*a, **k):
+            seen.update(k)
+
+        bot._cross_execute = ex
+        asyncio.run(bot._cross_tick())
+        assert seen, "a >=10bps breakout at tau>=60s must fire"
+        assert seen["side"] == "Up"
+        assert seen["ceil_side"] <= 0.900 + 1e-9, (
+            "the train bound is a flat +1.5c, capped by train_max_fill_px")
+        assert seen["fill_cap"] == 0.90, (
+            "the shipped 0.65 fill cap would put a ~0.80 entry out of reach")
+
+    def test_it_does_not_fire_below_the_distance(self, store, armed, monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.cross_train_enabled", True)
+        bot = make_bot(store, ticks(77000.0, 77004.0, 77006.0))   # ~0.8bps
+        bot._round = make_round(tau_s=120.0)
+        calls = []
+
+        async def ex(*a, **k):
+            calls.append(k)
+
+        bot._cross_execute = ex
+        asyncio.run(bot._cross_tick())
+        assert not calls, "a sub-bps move is not a Train breakout"
+
+    def test_the_arm_is_quiet_when_off(self, store, armed):
+        from btcpredict.config import settings
+        assert settings.cross_train_enabled is False, (
+            "ships OFF; it is enabled per deployment via .env")
+
+
 class TestTickDepthFloor:
     """bps is the wrong unit for a depth FLOOR. All three symbols quote in
     $0.01, but that cent is 0.0013 bps on BTC and 0.1377 on BNB -- so BNB's
@@ -1792,7 +1843,7 @@ class TestTickDepthFloor:
         import inspect
         import btcpredict.main as m
         src = inspect.getsource(m.Bot._cross_tick)
-        assert "if min_ticks > 0:" in src
+        assert "if not train and min_ticks > 0:" in src
 
     def test_the_floor_is_in_ticks_not_bps(self):
         """The whole point: a bps floor cannot scale across symbols."""
@@ -2584,10 +2635,22 @@ class TestTheFillPriceIsCapped:
             f"the market path may not pay above the cap; got {seen['max_px']}")
 
     def test_zero_means_off(self):
+        """0 = OFF must SURVIVE the Train override.
+
+        `_place_order` now resolves its fill cap from an optional per-call
+        `fill_cap` (the Train path needs 0.90 where the arm ships 0.65), so the
+        literal `cross_max_fill_px > 0` is gone. The convention it guarded is
+        not: with no override the cap still comes from settings, and 0 still
+        disables it.
+        """
         import inspect
         import btcpredict.main as m
         src = inspect.getsource(m.Bot._place_order)
-        assert "cross_max_fill_px > 0" in src, "0 = OFF, the repo convention"
+        assert "settings.cross_max_fill_px if fill_cap is None" in src, (
+            "the cap must still resolve from settings with no override")
+        assert ") > 0:" in src, "0 = OFF, the repo convention"
+        assert "cap = min(cap, _fcap)" in src, (
+            "the MARKET path must use the resolved cap, not settings directly")
 
 
 class TestAFailedFOKGetsItsRetries:

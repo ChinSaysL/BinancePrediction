@@ -1371,6 +1371,30 @@ class Settings(BaseSettings):
     # it matters. Applied to BOTH paths: it caps the LIMIT ceiling and the
     # MARKET `max_px`, so neither instrument can buy outside the band.
     cross_max_fill_px: float = 0.65
+    # ---- TRAIN entry trigger: DISTANCE from the strike, not a crossing ----
+    # Explicitly an OVERRIDE of three of the arm's gates, taken as a risk
+    # decision by the operator on 2026-09-15. The strike IS the round's open, so
+    # spot >=10bps from it means the round has travelled >=10bps and the entry
+    # is deep -- which is exactly what max_round_range_bps (10.0) and
+    # max_depth_bps (5.0) refuse, and what cross_max_fill_px (0.65) puts out of
+    # reach. Those three are therefore replaced for this trigger only.
+    #
+    # Measured on the live book (tools/momentum_continuation.py, coherent asks,
+    # 5,776 rounds, fee 0.0117, one entry per round, day-clustered t), REPORTED
+    # AT ask+1.5c because 69% of live fills land exactly on the limit:
+    #     X>=10 D=0  n= 75  px 0.799  hit 89.3%  +0.085/sh  day-t +2.94
+    #     X>=15 D=0  n= 39  px 0.817  hit 94.9%  +0.123/sh  day-t +4.04
+    #     opposite side, same entries  n=68  hit 11.8%  -0.128/sh  t -3.83
+    # DELAY: D=0 only. D=2/5/10 collapse the day-t to -0.33/+0.52/+0.32, because
+    # the continuation premium is spent in the first seconds.
+    # NOT reconciled with the n=321 coherent-favourite result (-0.0221 at the
+    # ask), and 76% of these fires sit on rounds the range gate refuses.
+    cross_train_enabled: bool = False
+    cross_train_min_tau_s: float = 60.0
+    cross_train_bps: float = 10.0
+    cross_train_max_ask: float = 0.890
+    cross_train_bound: float = 0.015
+    cross_train_max_fill_px: float = 0.90
     cross_skip_opposite_to_main: bool = True
     # RAISED 0.5 -> 2.0 on 2026-09-13. The old 0.5 was picked by a fill-aware
     # sweep that called it a "clear peak", but that sweep could not have seen

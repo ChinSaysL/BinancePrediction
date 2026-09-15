@@ -1959,7 +1959,27 @@ class Bot:
         self._cross_side = {k: v for k, v in self._cross_side.items() if k in live}
         now_ms = int(time.time() * 1000)
         tau = r.tau_s(now_ms)
-        if not (self._ck("min_tau_s", r) <= tau <= self._ck("max_tau_s", r)):
+        # ---- TRAIN TRIGGER (config.cross_train_*) --------------------------
+        # Fires on DISTANCE from the strike instead of a crossing, so it lives
+        # OUTSIDE this arm's tau window (which is 5-60s) rather than inside it.
+        # It is an explicit override of three gates -- max_depth_bps,
+        # max_round_range_bps and cross_max_fill_px -- because a >=10bps entry
+        # is deep, implies a >=10bps round travel, and prices near 0.80. Open
+        # by operator decision 2026-09-15; see config for the measurement.
+        # Everything that bounds RISK is untouched and shared with the cross
+        # arm: the guard, the reserved slot, the exposure caps, the daily cap,
+        # the reentry gap, the cooldown and the reversal rule.
+        train = False
+        side = None
+        if self._ck("train_enabled", r) and r.strike \
+                and tau >= self._ck("train_min_tau_s", r) \
+                and feed.is_fresh(settings.max_spot_age_s):
+            dist_bps = 1e4 * (feed.price - r.strike) / r.strike
+            if abs(dist_bps) >= self._ck("train_bps", r):
+                side = "Up" if dist_bps > 0 else "Down"
+                train = True
+        if not train and not (self._ck("min_tau_s", r) <= tau
+                              <= self._ck("max_tau_s", r)):
             return
         # RE-ENTRY GAP. Without it the websocket clock (~114/s) takes the same
         # crossing dozens of times; the substrate this arm's multi-entry EV was
@@ -1989,7 +2009,8 @@ class Bot:
         cap_per_day = self._ck("max_per_day", r)
         if cap_per_day > 0 and self._cross_count >= cap_per_day:
             return
-        side = crossed_side(list(ticks), r.strike, self._ck("look_s", r))
+        if not train:
+            side = crossed_side(list(ticks), r.strike, self._ck("look_s", r))
         if side is None:
             # No crossing this tick: keep a quote WARM for the side the next
             # crossing would buy (see _prefetch_cross_quote). This is the
@@ -2080,7 +2101,7 @@ class Bot:
         # $0.01 is 0.0013 bps on BTC and 0.1377 on BNB, so BNB's median trigger
         # was ONE tick -- the last decimal flipping. See config.
         min_ticks = self._ck("min_depth_ticks", r)
-        if min_ticks > 0:
+        if not train and min_ticks > 0:
             tick = self._ck("tick_size", r) or 0.01
             if abs(spot_now - r.strike) < min_ticks * tick - 1e-12:
                 self._cross_refuse(
@@ -2089,7 +2110,7 @@ class Bot:
                     f"the strike, floor is {min_ticks:.0f}",
                     tau=tau, spot=spot_now, sigma=sigma_now)
                 return
-        if depth_bps > self._ck("max_depth_bps", r):
+        if not train and depth_bps > self._ck("max_depth_bps", r):
             self._cross_refuse(r, side,
                                f"{depth_bps:.2f}bps through the strike, gate is "
                                f"{self._ck('max_depth_bps'):.2f}",
@@ -2105,7 +2126,7 @@ class Bot:
         # 2400 samples, so it does.
         rng_gate = self._ck("max_round_range_bps", r)
         probe = False
-        if rng_gate > 0:
+        if not train and rng_gate > 0:
             rng_bps = self._round_range_bps(r)
             if rng_bps is not None:
                 if rng_bps > rng_gate:
@@ -2132,6 +2153,18 @@ class Bot:
         if top is not None:
             ask = top.ask(side)
             depth_usd = top.ask_dollars(side)
+            # TRAIN price gate. The measured cell is coherent asks <=0.890
+            # (tools/momentum_continuation.py --max-ask 0.890, n=75, +0.085/sh
+            # paying the limit, day-t +2.94). Above it the entry is not the one
+            # that was measured, so it is refused rather than extrapolated.
+            if train:
+                tmax = self._ck("train_max_ask", r)
+                if tmax > 0 and (not ask or ask > tmax):
+                    self._cross_refuse(
+                        r, side,
+                        f"train ask {ask} above the gate {tmax:.3f}",
+                        tau=tau, spot=spot_now, sigma=sigma_now)
+                    return
             # How far the book has ALREADY moved since the last poll saw it.
             # MEASURED 2026-09-13 on 163 fill-aware triggers, split by this:
             #     run <= 0.00   n=29  win 0.931  EV/$ +0.5436  day-t 4.63
@@ -2469,9 +2502,18 @@ class Bot:
         #
         # `cross_limit_buffer` stays the absolute cap; see config for the
         # limit-pinning sweep that chose 0.25 over the more aggressive 0.35/0.50.
-        buf = max(0.01, min(self._ck("limit_buffer", r),
-                            self._ck("limit_buffer_inv", r) * (1.0 - ask)))
-        ceil_side = min(self._ck("max_price", r), round(ask + buf, 2))
+        if train:
+            # TRAIN: a flat bound. The proportional buffer below is tuned for a
+            # crossing's ~0.50-0.60 ask and collapses as the ask rises; this
+            # entry prices near 0.80, where the measured bound is a flat +1.5c.
+            # cross_max_fill_px (0.65) cannot be allowed to clamp it -- it
+            # would put the entry out of reach entirely -- hence fill_cap.
+            ceil_side = min(self._ck("train_max_fill_px", r),
+                            round(ask + self._ck("train_bound", r), 2))
+        else:
+            buf = max(0.01, min(self._ck("limit_buffer", r),
+                                self._ck("limit_buffer_inv", r) * (1.0 - ask)))
+            ceil_side = min(self._ck("max_price", r), round(ask + buf, 2))
         # INSTRUMENTATION. Three explanations for the gate->fill gap have now
         # been wrong: a stale gate (the websocket made it fresh and the gap
         # stayed), order latency (get_quote round-trips measure 43ms), and
@@ -2503,7 +2545,8 @@ class Bot:
         task = asyncio.create_task(self._cross_execute(
             r=r, sig=sig, side=side, token=token, stake=stake, ask=ask,
             ceil_side=ceil_side, did=did, up=up, spot=spot, sigma=sigma,
-            tau=tau, wsb=wsb))
+            tau=tau, wsb=wsb,
+            fill_cap=(self._ck("train_max_fill_px", r) if train else None)))
         tasks = getattr(self, "_order_tasks", None)
         if tasks is None:
             tasks = self._order_tasks = set()
@@ -2511,7 +2554,8 @@ class Bot:
         task.add_done_callback(tasks.discard)
 
     async def _cross_execute(self, *, r, sig, side, token, stake, ask,
-                             ceil_side, did, up, spot, sigma, tau, wsb) -> None:
+                             ceil_side, did, up, spot, sigma, tau, wsb,
+                             fill_cap: float | None = None) -> None:
         """Place one cross order and book it, OFF the poll loop.
 
         Same code that used to run inline in `_cross_tick`; what changed is
@@ -2533,7 +2577,7 @@ class Bot:
                 token=token, stake=stake, skip_pretrade_gates=True, take_px=ask,
                 # Bid up to the ceiling, not to the stale quote plus a tick. See
                 # limit_ceiling in _place_order for the round this cost us.
-                limit_ceiling=ceil_side)
+                limit_ceiling=ceil_side, fill_cap=fill_cap)
             elapsed = time.monotonic() - t_send
             top_now = (wsb.best(r.market_id, settings.ws_book_max_age_s)
                        if wsb is not None else None)
@@ -2815,7 +2859,8 @@ class Bot:
                            skip_pretrade_gates: bool = False,
                            take_px: float | None = None,
                            impulse_order: bool = False,
-                           limit_ceiling: float | None = None) -> Fill | None:
+                           limit_ceiling: float | None = None,
+                           fill_cap: float | None = None) -> Fill | None:
         """Place one order, retrying a confirmed rejection a bounded number of times.
 
         Returns the fill, or None when the order could not be placed -- having
@@ -3072,9 +3117,13 @@ class Bot:
                     # Hard cap on the price PAID. Every other knob bounds the
                     # ask; this bounds the fill. See config.cross_max_fill_px:
                     # the arm is only profitable on fills of 0.55-0.65.
-                    if limit_ceiling is not None and settings.cross_max_fill_px > 0:
-                        limit_ceiling = min(limit_ceiling,
-                                            settings.cross_max_fill_px)
+                    if limit_ceiling is not None and \
+                            (settings.cross_max_fill_px if fill_cap is None
+                             else fill_cap) > 0:
+                        limit_ceiling = min(
+                            limit_ceiling,
+                            settings.cross_max_fill_px if fill_cap is None
+                            else fill_cap)
                     if limit_ceiling is not None:
                         # `take_limit_px` clamps to quote + tick LAST, which
                         # overrides everything else. That clamp is right for the
@@ -3125,8 +3174,10 @@ class Bot:
             # cannot sell us a 0.17 ask at 0.84 (2026-09-11, +47% EV -> -70%).
             if limit_ceiling is not None:
                 cap = min(round(limit_ceiling, 2), 0.99)
-                if settings.cross_max_fill_px > 0:
-                    cap = min(cap, settings.cross_max_fill_px)
+                _fcap = (settings.cross_max_fill_px if fill_cap is None
+                         else fill_cap)
+                if _fcap > 0:
+                    cap = min(cap, _fcap)
                 kw["max_px"] = cap
             fill = await self.broker.buy(slug=r.slug, side=sig.side, token_id=token,
                                          price=sig.quote, stake=stake, **kw)
