@@ -626,10 +626,21 @@ class LiveBroker:
         # overpay -- deriving it is neither.
         #
         # Without a ceiling the caller gets the configured default unchanged.
+        #
+        # The range's top is the VENUE's maximum, not ours: the official
+        # OpenAPI schema (slippagebps/ in the repo) types `slippageBps` on
+        # BOTH trade/get-quote and trade/place-order-bundle as an integer,
+        # "Range 1-10000". 10_000 is therefore the most any client can ask
+        # for; under the quote x (1 + slip) bound that tops out an authorised
+        # fill at 2x the quote, for everyone. The 2026-09-15 drought windows
+        # needed 25_454-203_333bps (3.5x-21x the quote) -- beyond the venue's
+        # own maximum, unfillable at any latency by any participant. Within
+        # the range the venue enforces OUR ceiling exactly, which is the
+        # property this arm wants.
         slip = self.slippage_bps
         if max_px is not None and avg_px > 0:
             room = int((max_px / avg_px - 1.0) * 10_000)
-            slip = max(self.slippage_bps, min(room, 9_000))
+            slip = max(self.slippage_bps, min(room, 10_000))
         resp = await self._request("POST", PLACE_ORDER, {
             "walletAddress": self.wallet_address,
             "walletId": self.wallet_id,

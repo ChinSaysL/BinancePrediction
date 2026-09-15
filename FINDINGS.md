@@ -7151,7 +7151,9 @@ The venue now enforces OUR ceiling: the FOK fills anywhere below it and fails
 above. Too tight and a gapping book is unreachable; too loose and we overpay.
 Deriving it is neither, and it cannot drift out of step with the ceiling the way
 a second constant would. Floored at the configured value so ordinary jitter is
-still covered, and clamped at 9000.
+still covered, and clamped at 9000 (raised to the venue-documented maximum of
+10_000 on 2026-09-15 -- see the fill-drought section below for why the venue's
+own schema, not a probe, settled the number).
 
 ### What this does and does not fix
 
@@ -7261,3 +7263,55 @@ and an unmarked fire that is slow means the fallback ran (window edge, stake
 sized down, or no websocket book). 595 tests pass (6 new: warm hit skips the
 fetch; stale and stake-mismatch fall back; imminent side chosen; one-shot
 consumption; throttled refresh).
+
+## The fill drought classified: venue-side timing, plus a slip cap below the venue's maximum (2026-09-15)
+
+After the warm-quote deploy the client side is fast: 8 fires at 09:34/09:44,
+decision -> venue-accepted 116-152ms. The drought continued anyway, and the
+09:29-09:44 fires say why -- the binding constraint is now VENUE-side:
+
+    09:44 eth15m  venue quote 0.11, ceiling 0.39. The venue's OWN book was
+                  still 0.09-0.11 at +250ms (it had not jumped for this
+                  family), our order was at the venue at +137ms -- and the
+                  FOK still FAILED: the venue answered at +564ms, AFTER its
+                  own book jumped 0.09 -> 0.90 (the +0.25/+0.50s meter).
+                  Even the clamped bound (0.11 x 1.9 = 0.209) was satisfied
+                  while we were there; the venue's own execution latency is
+                  what lost it.
+    09:44 bnb     quote 0.10, book 0.66 by +250ms. Doomed at ANY latency.
+    08:39 eth     the counter-example -- the fill. Book stayed put; the
+                  venue executed at 0.5405 (~its ceiling) 1.5s later.
+
+So today's crossings reprice inside ~250-500ms while the venue's own FOK
+pipeline answers ~300-600ms after intake: the undershoot window is shorter
+than the venue's own execution lag. Client-side speed is no longer the
+bottleneck -- 0ms would not flip the fast cases.
+
+BUT the audit also caught a REAL machinery limiter: the derived-slip CLAMP
+(9_000bps). For extreme undershoots -- the arm's best cases -- the venue's
+quote is far below our ceiling, and slip = clamp(room, 9000) bounds the
+authorized fill at quote x 1.9, NOT at the ceiling:
+
+    09:44 eth5m  quote 0.03, ceiling 0.64 -> authorized <= 0.057 (not 0.64)
+    09:44 btc    quote 0.07, ceiling 0.31 -> authorized <= 0.133 (not 0.31)
+
+RESOLVED the same day, from the venue's own schema: the docs pages serve an
+OpenAPI spec (saved as slippagebps/ in the repo), and it types
+`slippageBps` on BOTH trade/get-quote and trade/place-order-bundle as an
+integer, "Range 1-10000". 10_000 is the most ANY client can ask for -- no
+probe could have lifted that, and a static scan of 12 live tokens had
+already found no safe window anyway (at rest the venue's quote sits AT its
+book). Under the quote x (1 + slip) bound the authorised fill tops out at
+2x the quote, which re-reads the table above: eth5m needed ~203_333bps,
+eth15m 25_454, btc 34_285 -- all BEYOND the venue's own maximum. Those
+fills were unreachable for every participant at any latency; the
+self-inflicted part was only ever the 9_000-10_000 slice (authorising less
+than the venue permits). Fix shipped: the derived cap moves 9_000 ->
+10_000, the documented maximum -- small, correct, and honest about being
+small. The venue-side timing conclusion above stands.
+
+Minor, same audit: bnb15m fired at sweep 0.79 on 09:29 (cap
+expected 0.82) but the market path caps at cross_max_fill_px=0.65, so all
+three attempts were declined client-side. A fire whose ask is already above
+the cap can never place; the exec summary's "limit 0.82" hides that.
+Consider gating the fire on ask <= cross_max_fill_px (or at least logging).

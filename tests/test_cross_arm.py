@@ -2978,9 +2978,14 @@ class TestTheFOKToleranceTracksTheCeiling:
         s = self._sent(avg_px=0.60, max_px=0.601, default=300)
         assert s.get("slippageBps") == 300
 
-    def test_it_is_clamped_at_the_top(self):
-        s = self._sent(avg_px=0.02, max_px=0.65)
-        assert s.get("slippageBps") <= 9000
+    def test_it_is_clamped_at_the_venues_own_maximum(self):
+        """10_000 is the venue's documented maximum, not a house number:
+        the OpenAPI schema types `slippageBps` on both trade/get-quote and
+        trade/place-order-bundle as an integer, "Range 1-10000". Asking for
+        more leaves the documented range -- and the old 9_000 gave away
+        1000bps of headroom the venue permits."""
+        s = self._sent(avg_px=0.02, max_px=0.65)      # room = 315_000bps
+        assert s.get("slippageBps") == 10_000
 
     def test_no_ceiling_means_the_configured_default(self):
         import btcpredict.execution.live as live
