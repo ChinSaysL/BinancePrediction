@@ -64,12 +64,22 @@ def win_sum(ts, pre, lo: int, hi: int) -> float:
     return pre[j] - pre[i]
 
 
-def load_rounds(conn, sym_filter: set[str]):
+def slug_day(slug: str) -> str:
+    """The day of a round, from the start seconds embedded in its slug."""
+    try:
+        return time.strftime("%m-%d", time.gmtime(int(slug.rsplit("-", 1)[1])))
+    except (ValueError, IndexError):
+        return "?"
+
+
+def load_rounds(conn, sym_filter: set[str], day_filter: set[str] = set()):
     out = []
     q = ("SELECT slug, symbol, start_ms, end_ms, strike, winner, fee_rate_bps "
          "FROM rounds WHERE winner IN ('Up','Down')")
     for r in conn.execute(q):
         if r["symbol"] not in sym_filter:
+            continue
+        if day_filter and slug_day(r["slug"]) not in day_filter:
             continue
         out.append(dict(r))
     out.sort(key=lambda r: r["start_ms"])
@@ -118,12 +128,20 @@ def main() -> int:
                     help="quote age before we could actually fill (0 = same tick)")
     ap.add_argument("--mom-bps", type=float, default=0.0,
                     help="minimum 1s momentum for MOM_ONLY / PRE_MOM")
+    ap.add_argument("--days", default="",
+                    help="comma-separated MM-DD filter (empty = every day in "
+                         "the DB that has quotes)")
+    ap.add_argument("--db", default=f"{DATA}/btcpredict.db",
+                    help="venue DB; use data/btcpredict_vps.db for the live "
+                         "snapshot (8 days, ~5.5k rounds) instead of the "
+                         "stale 3-day local copy")
     args = ap.parse_args()
 
     syms = {s.strip() for s in args.symbols.split(",")}
-    conn = sqlite3.connect(f"file:{DATA}/btcpredict.db?mode=ro", uri=True)
+    days = {d.strip() for d in args.days.split(",") if d.strip()}
+    conn = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
-    rounds = load_rounds(conn, syms)
+    rounds = load_rounds(conn, syms, days)
     print(f"rounds with a winner: {len(rounds)}")
 
     cache: dict[tuple[str, str], tuple] = {}
@@ -275,18 +293,12 @@ def main() -> int:
                 parts.append(f"{sym[:3]} {ev:+.3f}({len(sub)})")
         print(f"   {k:9} " + "  ".join(parts))
     print("\nby day (EV/$1, n) -- stability:")
+    days_seen = sorted({slug_day(x[0]) for x in (res.get("CROSS") or [])})
     for k in ("CROSS", "PRE", "PRE_MOM", "PRE_INV", "MOM_ONLY"):
         v = res.get(k) or []
         parts = []
-        for d in ("09-08", "09-09", "09-10"):
-            sub = []
-            for x in v:
-                try:                                  # slug ends in start secs
-                    rstart = int(x[0].rsplit("-", 1)[1])
-                except (ValueError, IndexError):
-                    continue
-                if time.strftime("%m-%d", time.gmtime(rstart)) == d:
-                    sub.append(x)
+        for d in days_seen:
+            sub = [x for x in v if slug_day(x[0]) == d]
             if sub:
                 ev = sum(((1 - p) / p if w == s else -1.0)
                          for _, s, p, w, _, _ in sub) / len(sub)

@@ -7530,3 +7530,71 @@ qi-triggered entry can be tested on the signal that actually replicated
 (88-93% next-tick direction, 2.4-2.7x drift lift) instead of on aggTrade flow
 alone. That recording is cheap, local, and now the only thing standing between
 the tick-level result and a money answer.
+
+### Addendum: I ran it against the WRONG DB, and the real one kills it (2026-09-15)
+
+Asked "would there be any difference if you test on the vps?" -- the answer is
+yes, and it is decisive. The run above used `data/btcpredict.db`, a Sep-13
+snapshot that is both STALE and FILTERED. Census of the two:
+
+  local snapshot   964 rounds with a winner, days 09-08..09-10, 85,708 quotes
+  VPS live DB    5,556 rounds with a winner, days 09-08..09-15, 1,232,941 quotes
+
+So the money test above saw 17% of the rounds that exist, and only 3 of 8 days.
+Worse, the local copy is not merely old -- within the SAME days it holds fewer
+rounds than the venue recorded (09-08: 236 of 708; 09-10: 161 of 479; 09-09 is
+the only day that matches at 567). That subset was itself a favourable slice.
+
+Method note: run it locally anyway, with the live DB pulled down
+(`sqlite3 .backup` on the VPS -> rsync -> `--db data/btcpredict_vps.db`). The
+aggTrades archive only exists on this box, and it stops at 09-12, so the flow
+rules cannot reach 09-13..09-15 (52% of the rounds) wherever they are run.
+Added `--db` and `--days` to the tool; the by-day breakdown is no longer
+hardcoded to three days.
+
+SAME THREE DAYS, on the venue's full record (1,754 rounds vs 964):
+
+  rule        n    mean_px   win    EV_net
+  CROSS     907     0.580   0.552   -0.059
+  PRE_MOM   320     0.432   0.431   -0.003   <- was +0.007 on the 964-round slice
+  PRE_INV   320     0.581   0.569   -0.031   <- opposite side, same entries
+
+So even inside 09-08..09-10 the extra rounds take the +0.007 to -0.003. The
+sign was a slice artefact, not a day artefact.
+
+ALL FIVE DAYS WITH aggTrades (09-08..09-12, 2,606 rounds):
+
+  rule         n    mean_px   win    EV_net
+  CROSS     3279     0.571   0.583   +0.125
+  PRE_MOM    447     0.415   0.383   -0.026
+  PRE_INV    447     0.596   0.617   +0.037
+  MOM_ONLY 12347     0.419   0.423   +0.148
+  PRE_COIN  1675     0.503   0.473   -0.069
+
+  PRE_MOM minus OPPOSITE-SIDE: -0.0625/$1   se 0.1089   t -0.57   (n=447)
+
+The control now BEATS the signal, and the paired difference is negative. The
+t-statistic did not shrink toward zero on 2x the data -- it changed sign.
+
+The by-day table is the honest picture, and it is not a signal:
+
+  PRE_MOM  -0.041(58)  +0.100(135)  -0.046(127)  -0.489(66)  +0.400(61)
+  PRE_INV  +0.024(58)  -0.112(135)  +0.080(127)  +0.393(66)  +0.050(61)
+
+On 09-11 the signal loses 0.489/$1 while the opposite side of the same entries
+makes 0.393 ($0.88 swing); on 09-12 they reverse (+0.400 / +0.050). The control
+wins on 3 of 5 days. Day-level dispersion of +/-0.4-$0.5 per $1 on n~60 swamps
+anything the rule produces -- which is exactly the condition under which a
+3-day subset can read either sign.
+
+(For the record, the CROSS aggregates here are inflated by one day: 09-12 reads
++0.318 on n=364, and BNB reads +0.819 on n=70. The unfiltered crossing rule is
+still not the shipped arm; the gated arm remains the right yardstick.)
+
+VERDICT UNCHANGED AND NOW STRONGER: DO NOT SHIP. The pre-cross entry is a
+negative-expectancy rule whose opposite side is positive on more days than it
+is, and the earlier positive reading was an artefact of testing on a stale,
+filtered 3-day local copy. The lesson is about method, not about the signal:
+CHECK THE COVERAGE OF THE DB BEFORE RUNNING A MONEY TEST -- a local snapshot is
+a biased sample unless proven otherwise. A 17% slice produced a +0.007 that the
+full record turns into -0.026.
