@@ -920,6 +920,25 @@ class Settings(BaseSettings):
     # strictly worse than the poll it replaces. 2s is ~8x the median update
     # gap, so a healthy feed never trips it.
     ws_book_max_age_s: float = 2.0
+    # RECORDING ONLY. The gate above is right for trading -- a stale book must
+    # never price an order -- but it also silently decides what the tape
+    # contains, and off-primary that is most of it. Ask coverage in the recorded
+    # quotes: btc-5m ~100% (it is the primary and gets the REST book every
+    # poll), eth-5m 31%, bnb-5m 17%, the 15m families ~22%.
+    #
+    # The cost is not theoretical. Asked on 2026-09-15 whether each symbol
+    # should have its own tuned values -- the right instinct -- the answer was
+    # that it cannot be settled, because at the shipped gates bnb-5m has FOUR
+    # priceable crossings and every 15m family has fewer than seven. btc has 302.
+    # Every per-symbol question is blocked on this one number.
+    #
+    # So the recorder takes a wider window and STAMPS THE AGE (`book_age_ms`),
+    # which is strictly more information: a replay can filter to whatever
+    # freshness it wants, and one that ignores the column is no worse off than
+    # today. It never feeds an order -- the trading paths keep
+    # ws_book_max_age_s, and the recorded value only fills in where the fresh
+    # lookup returned nothing. 0 = fall back to the trading gate.
+    ws_book_record_max_age_s: float = 30.0
     # How far ABOVE the observed ask the cross arm's limit may sit.
     #
     # This replaces pinning the limit at cross_max_price (0.90), which was

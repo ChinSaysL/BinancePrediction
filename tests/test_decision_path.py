@@ -502,3 +502,81 @@ def test_no_stdlib_module_is_used_without_being_imported():
             offenders += undefined_module_usages(
                 str(path.relative_to(root)), path.read_text())
     assert not offenders, "missing imports:\n  " + "\n  ".join(sorted(set(offenders)))
+
+
+class TestTheRecorderKeepsAWiderBookWindowThanTrading:
+    """Ask coverage in the recorded tape decided what could be tuned.
+
+    `ws_book_max_age_s` (2s) is right for trading -- a stale book must never
+    price an order -- but it also gates the RECORDER, and off-primary that is
+    most of the tape: btc-5m ~100% (it is the primary and gets the REST book
+    every poll) against eth-5m 31% and bnb-5m 17%.
+
+    The cost showed up on 2026-09-15 when asked whether each symbol should have
+    its own tuned knobs. It could not be answered: at the shipped gates bnb-5m
+    had FOUR priceable crossings and btc-5m had 302.
+
+    So the recorder falls back to a wider window and stamps `book_age_ms`. That
+    is strictly more information -- a replay filters to whatever freshness it
+    wants -- and it must never reach an order.
+    """
+
+    class _Book:
+        """A ws book that is FRESH for nobody and stale-but-present for all."""
+        def __init__(self, age_s):
+            self._age = age_s
+            self.messages = 0
+
+        def best(self, market_id, max_age_s):
+            if self._age > max_age_s:
+                return None
+            return SimpleNamespace(up_bid=0.40, up_ask=0.42,
+                                   down_bid=0.58, down_ask=0.60,
+                                   age_s=lambda: self._age)
+
+    def _row(self, store, monkeypatch, *, age_s, record_window):
+        monkeypatch.setattr("btcpredict.config.settings.ws_book_max_age_s", 2.0)
+        monkeypatch.setattr(
+            "btcpredict.config.settings.ws_book_record_max_age_s", record_window)
+        bot = make_bot(store)
+        bot.book = None                      # no REST book: off-primary
+        bot.ws_book = self._Book(age_s)
+        asyncio.run(bot._record(make_round(), "BTCUSDT", trade=False,
+                                primary=False))
+        rows = bot.store.query("SELECT * FROM quotes")
+        assert rows, "the recorder must still write a row"
+        return rows[-1]
+
+    def test_a_stale_book_is_recorded_with_its_age(self, store, monkeypatch,
+                                                   no_gates):
+        r = self._row(store, monkeypatch, age_s=9.0, record_window=30.0)
+        assert r["up_ask"] == pytest.approx(0.42), (
+            "a 9s-old book is useless for an order and still worth recording")
+        assert r["book_age_ms"] == pytest.approx(9000, abs=50), (
+            "and the age must be stamped, or the replay cannot filter it")
+
+    def test_a_fresh_book_records_a_small_age(self, store, monkeypatch, no_gates):
+        r = self._row(store, monkeypatch, age_s=0.5, record_window=30.0)
+        assert r["up_ask"] == pytest.approx(0.42)
+        assert r["book_age_ms"] == pytest.approx(500, abs=50)
+
+    def test_beyond_the_record_window_nothing_is_written(self, store, monkeypatch,
+                                                         no_gates):
+        r = self._row(store, monkeypatch, age_s=99.0, record_window=30.0)
+        assert r["up_ask"] is None
+        assert r["book_age_ms"] is None
+
+    def test_zero_means_off(self, store, monkeypatch, no_gates):
+        """0 = OFF falls back to the trading gate, so a 9s book is dropped."""
+        r = self._row(store, monkeypatch, age_s=9.0, record_window=0.0)
+        assert r["up_ask"] is None, "0 must behave exactly as before this change"
+
+    def test_the_trading_paths_do_not_use_the_record_window(self):
+        """The whole safety argument. _cross_tick and the execute path must
+        keep asking for ws_book_max_age_s; only _record may widen it."""
+        import inspect
+        import btcpredict.main as m
+        for fn in (m.Bot._cross_tick, m.Bot._cross_execute):
+            src = inspect.getsource(fn)
+            assert "ws_book_record_max_age_s" not in src, (
+                f"{fn.__name__} must never price off the recorder's window")

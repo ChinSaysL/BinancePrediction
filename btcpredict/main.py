@@ -769,6 +769,7 @@ class Bot:
         # Buy prices come from the real book (the ask), not the displayed
         # last-trade price, which was observed 2-3 cents away from the mid.
         up_bid = up_ask = down_bid = down_ask = None
+        book_age_ms = None
         if self.book and r.market_id and primary:
             # Only the PRIMARY, not every traded family: the REST book costs
             # SAPI quota and we have been rate limited, so six families would
@@ -816,6 +817,25 @@ class Bot:
                                  self._ws_gap_n, wsb.messages)
                 up_bid, up_ask = top.up_bid, top.up_ask
                 down_bid, down_ask = top.down_bid, top.down_ask
+                book_age_ms = int(top.age_s() * 1000)
+        # RECORD-ONLY fallback. The gate above is right for trading, and it also
+        # decides what the tape contains -- off-primary that is most of it. Ask
+        # coverage was btc-5m ~100% (the primary, which gets the REST book every
+        # poll) against eth-5m 31% and bnb-5m 17%, which is why bnb had FOUR
+        # priceable crossings to tune on and btc had 302. Every per-symbol
+        # question was blocked on that.
+        #
+        # This fills the recorded prices in ONLY where the fresh lookup returned
+        # nothing, and stamps `book_age_ms` so a replay can filter to whatever
+        # freshness it wants. It cannot reach an order: the trading paths do
+        # their own `wsb.best(..., ws_book_max_age_s)` lookups.
+        if (wsb is not None and r.market_id and up_ask is None
+                and settings.ws_book_record_max_age_s > 0):
+            stale = wsb.best(r.market_id, settings.ws_book_record_max_age_s)
+            if stale is not None:
+                up_bid, up_ask = stale.up_bid, stale.up_ask
+                down_bid, down_ask = stale.down_bid, stale.down_ask
+                book_age_ms = int(stale.age_s() * 1000)
         buy_up = up_ask if up_ask is not None else up.price
         buy_down = down_ask if down_ask is not None else down.price
         # No spread guess when the ask is the actual executable price.
@@ -829,6 +849,7 @@ class Bot:
             "spot": spot, "spot_ts_ms": feed.ts_ms,
             "oracle": None, "oracle_ts_ms": None,
             "strike": r.strike,
+            "book_age_ms": book_age_ms,
             "up_bid": up_bid, "up_ask": up_ask,
             "down_bid": down_bid, "down_ask": down_ask,
             "fee_rate_bps": r.fee_rate_bps,

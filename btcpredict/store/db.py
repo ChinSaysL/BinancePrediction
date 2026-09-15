@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS quotes (
     down_bid      REAL,
     down_ask      REAL,
     fee_rate_bps  INTEGER,   -- as quoted live; the market metadata overstates it
+    book_age_ms   INTEGER,   -- age of the ws book behind the four prices above
     spot          REAL,      -- Binance spot mid at poll time
     spot_ts_ms    INTEGER,
     oracle        REAL,      -- Chainlink feed price at poll time
@@ -147,7 +148,14 @@ class Store:
         have = {r["name"] for r in self.conn.execute("PRAGMA table_info(quotes)")}
         for col, typ in (("up_bid", "REAL"), ("up_ask", "REAL"),
                          ("down_bid", "REAL"), ("down_ask", "REAL"),
-                         ("fee_rate_bps", "INTEGER")):
+                         ("fee_rate_bps", "INTEGER"),
+                         # Age of the websocket book behind up_bid/up_ask/etc,
+                         # in ms. NULL means the REST poll supplied them (the
+                         # primary) or nothing did. See
+                         # config.ws_book_record_max_age_s: the recorder keeps a
+                         # wider staleness window than the trading paths, and
+                         # this column is what makes that safe to replay.
+                         ("book_age_ms", "INTEGER")):
             if col not in have:
                 self.conn.execute(f"ALTER TABLE quotes ADD COLUMN {col} {typ}")
         shave = {r["name"] for r in self.conn.execute("PRAGMA table_info(settlements)")}

@@ -6522,3 +6522,68 @@ $720. The tick unit was chosen to scale across symbols and does the opposite.
 Two tests pin the SHIPPED value against the live case (a 2-tick crossing must
 trade; spot exactly on the strike must not). `TestTickDepthFloor` monkeypatches
 5.0 and still covers the mechanism.
+
+## Per-symbol tuning was blocked by the RECORDER, not by the knobs
+
+Asked whether each symbol has its own optimised values. It does not, and only
+one knob ever did:
+
+    knob                  bnb15m  bnb5m  btc15m  btc5m  eth15m  eth5m
+    min_tau_s / max_tau_s    5-60   5-60    5-60   5-60    5-60   5-60
+    min_depth_ticks           1.0    1.0     1.0    1.0     1.0    1.0
+    max_depth_bps             5.0    5.0     5.0    5.0     5.0    5.0
+    max_round_range_bps      21.1    7.8    13.6   10.0    21.0   12.9   <- the only one
+    max_per_round / stake       5      5       5      5       5      5
+
+Two of those are now answered rather than merely shared:
+
+  * **`max_depth_bps` is INERT.** On btc, 5 / 8 / 15 / OFF all return the same
+    83 trades and +0.711 growth -- the ceiling never binds. Nothing to tune.
+  * **The tau window agrees across symbols.** Widening is decisively bad on
+    both families with data (btc +0.711 -> -0.530 at 5-120s; eth +0.192 ->
+    -0.177). The apparent split -- btc likes 10-60s (+0.755), eth likes 5-60s --
+    is three trades' worth of difference.
+  * And the depth floor, at 1 tick, is no longer symbol-dependent at all. At 5
+    it was ($0.05 = 0.006 bps on BTC, 0.69 bps on BNB); at 1 it means "strictly
+    past the strike", which is the same condition everywhere.
+
+### The real obstacle
+
+    family              rounds  days  crossings  PRICEABLE
+    btc-updown-5m         1656     7        302        302
+    eth-updown-5m         1268     7        249         98
+    bnb-updown-5m          677     4        159         32
+    btc-updown-15m         227     5         34          6
+    eth-updown-15m         227     5         38          2
+    bnb-updown-15m         110     4          5          4
+
+btc has 302 priceable crossings; bnb-5m has 32, and FOUR survive the shipped
+gates. Every per-symbol question is blocked on that one number, and the cause is
+not the market -- it is that `ws_book_max_age_s` (2s) gates the RECORDER as well
+as trading. Ask coverage was btc-5m ~100% (it is the primary and gets the REST
+book every poll) against eth-5m 31% and bnb-5m 17%.
+
+### The fix
+
+`ws_book_record_max_age_s = 30.0` (0 = OFF, falls back to the trading gate). The
+recorder fills the four book columns from a wider window ONLY where the fresh
+lookup returned nothing, and stamps `book_age_ms` alongside. Strictly more
+information: a replay filters to whatever freshness it wants, and one that
+ignores the column is no worse off than before.
+
+It cannot reach an order. `_cross_tick` and `_cross_execute` do their own
+`wsb.best(..., ws_book_max_age_s)` lookups, and a test asserts the new setting
+name appears in neither.
+
+Measured four minutes after deploy:
+
+    family            before   after   mean book age
+    bnb-updown-5m       17%     51%          1110ms
+    eth-updown-5m       31%     73%           604ms
+    eth-updown-15m      22%     96%           225ms
+    btc-updown-15m      22%     67%           177ms
+    bnb-updown-15m      22%     41%           989ms
+
+**Nothing about trading changed.** This buys the data that per-symbol tuning
+needs; the tuning itself waits until bnb and the 15m families have enough
+priceable crossings to answer with, rather than being fitted to 4.
