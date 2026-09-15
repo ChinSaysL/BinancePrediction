@@ -10843,3 +10843,44 @@ simulation (the crossing path), not a different grid.
 Sizing (`stake_usdt`, `stake_cap_usdt`, `cross_max_open_stake_pct`) is
 scale-invariant for per-share EV, so a DB sweep cannot show an edge difference --
 it needs a compounding/drawdown simulation, which is a separate tool.
+
+## FOCUSED `max_ask` CHECK AT X=15 -- the LIVE 0.89 IS THE OPTIMUM. Nothing shipped.
+## (2026-09-15)
+
+I was about to ship `max_ask 0.89 -> 0.92` on the strength of the joint search's
+`X=15 t>=180 ask<=0.92  n=47 net +0.110 day-t +4.51` cell. The focused table --
+with the control re-run PER CAP, because a higher cap ADMITS dearer entries and
+so the control is a different population at every row -- refutes it:
+
+    ask<=0.85  n= 26  px 0.778  net +0.137  day-t +2.55  5d 5/5+  $ +3.55
+    ask<=0.89  n= 39  px 0.817  net +0.123  day-t +4.04  6d 6/6+  $ +4.79  <- LIVE
+    ask<=0.90  n= 43  px 0.826  net +0.072  day-t +1.83  6d 5/6+  $ +3.09
+    ask<=0.92  n= 52  px 0.844  net +0.069  day-t +2.11  6d 5/6+  $ +3.60
+    ask<=0.95  n=100  px 0.899  net +0.041  day-t +1.74  6d 4/6+  $ +4.10
+    opposite, same entries      n=143  net -0.098  day-t -3.28  6d 0/6+
+
+**net per share is MONOTONE DECREASING in the cap** (+0.137 -> +0.041), so the
+OFAT's "max_ask is insensitive" was WRONG -- it is monotone; only the t was flat.
+And 0.89 is not on a plateau: it is simultaneously the best cell on total $, on
+day-t AND on day-consistency (the only 6/6). Tightening to 0.85 buys per-share net
+but gives up 13 entries and a whole positive day.
+
+**THE SAME ERROR SHAPE, TWICE IN ONE HOUR.** The joint table's winning label was
+`t>=180 ask<=0.92` -- MIN_TAU 180 plus a wider cap. I attributed the improvement to
+`max_ask` when it was the `min_tau`. At min_tau=60 that same cap is n=52,
+net +0.069, day-t +2.11: WORSE than live. The first time it was reading `t>=180`
+as a tau CEILING; this time as evidence for the cap beside it. What caught both was
+a FOCUSED, single-knob table run with its own control -- not the joint search.
+
+**DECISION: SHIP NOTHING.** The best configuration of every knob swept is the one
+already live. `cross_train_max_ask = 0.890` stays; nothing changes.
+
+## SIZING: fixed at $1, by operator decision (2026-09-15)
+`stake_cap_usdt = 1.0` stays. Operator: "keep sizing at 1$". No compounding or
+drawdown simulation was built, and it is recorded as an open gap rather than a
+finding. Why it is a handbrake and not a neutral choice: per-share EV is
+scale-INVARIANT, so sizing cannot change the edge -- only the $ and the path. On a
+~$31 bankroll, $1 is 3.2% of the book. If the bankroll grows and the stake does
+not, the arm's contribution shrinks toward nothing, which the config already
+warns about ("a flat $1 cannot compound, so the arm's contribution shrinks as a
+share of the book"). That is a decision with a known shelf life.

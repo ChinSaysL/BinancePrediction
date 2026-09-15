@@ -270,7 +270,12 @@ def main():
     ap.add_argument("--db", default="data/btcpredict.db")
     ap.add_argument("--pay-up", type=float, default=0.015)
     ap.add_argument("--min-n", type=int, default=25)
+    ap.add_argument("--X", type=float, default=None,
+                    help="override the baseline distance threshold")
     args = ap.parse_args()
+    if args.X:
+        BASE["X"] = args.X
+        SHIPPED["X"] = args.X
 
     c = sqlite3.connect(args.db)
     fee = 0.0117
@@ -357,6 +362,27 @@ def main():
     print("  A cap drops the most CORRELATED legs first, so it selects; it is not")
     print("  a random subsample. `$` is the total on these entries at $1 a leg.")
     portfolio_sweep(series, ranges, SHIPPED, args.pay_up, fee)
+
+    # ---- FOCUSED: the price cap, WITH its own control ---------------------
+    # `max_ask` reads as "insensitive" in the OFAT and is the only knob that
+    # added entries AND held day-t -- at BOTH X=10 (n 76->102, t +1.99->+2.17)
+    # and X=15 (n 39->47, t +4.04->+4.51). A cell that replicates at two
+    # independent settings earns a focused table, and the CONTROL has to be
+    # re-run per cap: a higher cap ADMITS dearer entries, so the control is a
+    # DIFFERENT population at every row.
+    print("\n" + "=" * 78)
+    print(f"FOCUSED: max_ask at X={BASE['X']:.1f}, with the OPPOSITE-side control")
+    print("  $ is the total on those entries at $1 a leg, at ask+%.3f." % args.pay_up)
+    for ma in (0.85, 0.89, 0.90, 0.92, 0.95):
+        cfg = dict(BASE, max_ask=ma)
+        rows = simulate(series, ranges, cfg, args.pay_up, fee)
+        money = sum((1.0 if r[2] else 0.0) - (r[1] + args.pay_up)
+                    - fee * (r[1] + args.pay_up) for r in rows)
+        got = report(f"ask<={ma}", rows, fee, args.pay_up, 1)
+        print(f"{got[5]}  ${money:+6.2f}" if got else f"  ask<={ma} too few")
+        ctrl = simulate(series, ranges, cfg, args.pay_up, fee, "opp")
+        cg = report("   opposite (must stay NEGATIVE)", ctrl, fee, args.pay_up, 1)
+        print(cg[5] if cg else "   opposite: too few")
 
 
 if __name__ == "__main__":
