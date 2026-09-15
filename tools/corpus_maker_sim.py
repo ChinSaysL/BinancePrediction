@@ -74,6 +74,12 @@ def main() -> int:
     ap.add_argument("--place-tau", type=float, default=180.0)
     ap.add_argument("--cancel-bps", type=float, default=2.0,
                     help="0 disables the defensive cancel")
+    ap.add_argument("--cancel-mode", choices=("cum", "tick"), default="cum",
+                    help="cum = cancel when the spot has moved cancel-bps against "
+                         "the PLACEMENT spot (a level rule, correct for a "
+                         "resting order); tick = a cancel-bps move within one "
+                         "second (a velocity rule, which the travel-time "
+                         "distribution says almost never fires)")
     ap.add_argument("--fill-buffer", type=float, default=0.0,
                     help="fill needs ask <= limit - buffer")
     ap.add_argument("--side", choices=("fav", "up", "dn"), default="fav")
@@ -96,6 +102,9 @@ def main() -> int:
         byw[pd_["window_id"][i]].append({c: pd_[c][i] for c in pcols})
 
     res = []
+    n_placed = 0
+    n_canc = 0
+    n_fill = 0
     for w, rs in byw.items():
         y = lab.get(ep(w))
         if y is None:
@@ -128,11 +137,14 @@ def main() -> int:
             continue
         tape = load_tape(w) if args.cancel_bps else {}
         base = ep(w)
+        # the spot when we place -- the reference for a level-based cancel
+        spot0 = tape.get(base + place["sec"]) if tape else None
 
         for side in sides:
             L = ub if side == "Up" else db
             filled = False
             cancelled = False
+            n_placed += 1
             for r in after:
                 b = r["tau_s"]
                 if b is None or b < 0:
@@ -141,28 +153,45 @@ def main() -> int:
                     # tape keys are ABSOLUTE epoch seconds = round start + sec
                     idx = base + r["sec"]
                     p_now = tape.get(idx)
-                    p_prev = tape.get(idx - 1)
-                    if p_now and p_prev:
-                        move = (p_now - p_prev) / p_prev * 1e4
-                        against = -move if side == "Up" else move
-                        if against >= args.cancel_bps:
-                            cancelled = True
-                            break
+                    if args.cancel_mode == "cum":
+                        # LEVEL rule: how far has the spot travelled against us
+                        # since we placed? Correct for a resting order.
+                        if spot0 and p_now:
+                            move = (p_now - spot0) / spot0 * 1e4
+                            against = -move if side == "Up" else move
+                            if against >= args.cancel_bps:
+                                cancelled = True
+                                break
+                    else:
+                        # VELOCITY rule: a move inside one second
+                        p_prev = tape.get(idx - 1)
+                        if p_now and p_prev:
+                            move = (p_now - p_prev) / p_prev * 1e4
+                            against = -move if side == "Up" else move
+                            if against >= args.cancel_bps:
+                                cancelled = True
+                                break
                 a = r["up_sell_px"] if side == "Up" else r["dn_sell_px"]
                 if a and a <= L - args.fill_buffer - 1e-9:
                     filled = True
                     break
+            if cancelled:
+                n_canc += 1
+                continue
             if not filled:
                 continue
             won = (y == 1) if side == "Up" else (y == 0)
             res.append({"day": str(w).split("/")[0], "side": side, "L": L,
                         "won": 1.0 if won else 0.0,
                         "edge": (1.0 if won else 0.0) - L - (place["fees"] or 0)})
+            n_fill += 1
     n_windows = len(byw)
-    nplaced = sum(1 for r in res if True)
     print(f"windows: {n_windows:,}   place at tau<={args.place_tau:.0f}s  "
-          f"cancel {args.cancel_bps}bps  fill buffer {args.fill_buffer}  "
-          f"side={args.side}  fills={len(res)}")
+          f"cancel {args.cancel_bps}bps ({args.cancel_mode})  "
+          f"fill buffer {args.fill_buffer}  side={args.side}")
+    print(f"orders placed={n_placed}  cancelled={n_canc} "
+          f"({100*n_canc/max(n_placed,1):.1f}%)  unfilled={n_placed-n_canc-n_fill}  "
+          f"fills={n_fill}")
     for side in ("Up", "Down"):
         g = [r for r in res if r["side"] == side]
         if not g:
@@ -173,12 +202,15 @@ def main() -> int:
         days = [st.mean(v) for v in dm.values()]
         sd = st.stdev(days) if len(days) > 1 else 0.0
         t = st.mean(days) / (sd / len(days) ** 0.5) if sd else 0.0
-        print(f"\n  {side}: fills {len(g)}  ({100*len(g)/n_windows:.1f}% of windows)"
+        print(f"\n  {side}: fills {len(g)}  ({100*len(g)/n_placed:.1f}% of orders)"
               f"  mean limit {st.mean([r['L'] for r in g]):.4f}"
               f"  realized {st.mean([r['won'] for r in g]):.4f}"
               f"  edge/share {st.mean([r['edge'] for r in g]):+.4f}"
               f"  ROI {st.mean([r['edge'] for r in g])/st.mean([r['L'] for r in g])*100:+.2f}%"
               f"  day-t {t:+.2f}  ({sum(1 for d in days if d>0)}/{len(days)} days +)")
+        for d in sorted(dm):
+            v = dm[d]
+            print(f"      {d}  n={len(v):4d}  edge/share {st.mean(v):+.4f}")
     if not res:
         print("\n  no fills at all under this rule")
     return 0

@@ -8212,3 +8212,103 @@ Depth at that resolution was never published for 2026 (and the free futures
 `bookDepth` archive is 20bps bands at 30s), and the liquidation tape is behind
 a private endpoint. Recording starts the clock; in about a week there will be
 more days than five.
+
+## THE REMAINING GAP, CLOSED: the sub-second defensive cancel (2026-09-15)
+
+This was the last unexcluded version of the maker idea. It was excluded on the
+theory that it could only be tested live, because the corpus's venue prices are
+1 s granularity and a sub-second cancel is by definition a sub-second question.
+That reasoning was wrong twice over, and the way it was wrong is the finding.
+
+### Part 1 -- the physics: the spot is SLOW, so there is nothing sub-second to race
+
+`data/bookticker/BTCUSDT-2026-09-01.csv.gz`, Tardis top-of-book, **9,847,706
+events over 24.00 h = 114/s**, microsecond stamps. mid = (bid+ask)/2. From
+30,000 random instants, time until the mid falls N bps:
+
+| adverse | reaches in 30 s | p10 | p25 | median | p75 | <250 ms | <500 ms | <1 s |
+|---|---|---|---|---|---|---|---|---|
+| 0.25 bp | 64.4% | 39 ms | 490 ms | 3,438 ms | 10,954 ms | 20.4% | 25.1% | 31.2% |
+| 0.5 bp | 59.9% | 113 ms | 964 ms | 4,465 ms | 12,122 ms | 14.6% | 19.0% | 25.4% |
+| 1 bp | 52.4% | 488 ms | 2,047 ms | 6,640 ms | 14,712 ms | 6.6% | 10.1% | 16.1% |
+| 2 bp | 37.6% | 1,626 ms | 4,396 ms | 9,816 ms | 17,861 ms | 1.7% | 3.1% | 6.2% |
+| 5 bp | 13.2% | 4,477 ms | 8,688 ms | 15,567 ms | 23,309 ms | 0.2% | 0.5% | 1.1% |
+
+The spot needs a **median ~10 s to travel 2 bps**. Only **1.7%** of 2 bp moves
+complete inside 250 ms. So the premise of the whole sub-second exercise was
+false: there is no millisecond race to win. A defensive cancel that reacts on a
+**1-second** grid is not "too slow" -- it has **seconds** of warning (median
+3,438 ms even at the hypersensitive 0.25 bp threshold). For the venue's cancel
+round-trip to be the binding constraint it would have to exceed ~3 s; measured
+venue order round-trips are 260-1,237 ms. **Latency was never the bottleneck**,
+so the live cancel-RTT measurement is no longer needed to decide this.
+
+### Part 2 -- my own cancel rule was mis-specified, and the physics is what exposed it
+
+`tools/corpus_maker_sim.py` tested: *"cancel if the tape moves `--cancel-bps`
+against the order within one second"* -- a **velocity** rule. The table above
+explains its failure exactly: a 2 bp move *inside one second* happens on only
+6.2% of 2 bp paths, so the rule fired on 100 of 1,595 orders and was dead on
+arrival. The correct defensive rule for a *resting* order is a **level** rule:
+*cancel if the spot has moved `--cancel-bps` against the **placement** spot*.
+Added as `--cancel-mode {cum,tick}` (default `cum`), and it fires properly:
+**24.8%-47.8% of orders cancelled** instead of 6%. The 1 s grid is *adequate* for
+a level rule precisely because the trigger travels over ~10 s, not ~100 ms.
+
+### Part 3 -- the corrected cancel, tested 8 ways: still negative everywhere
+
+`--place-tau 180 --side fav`, 8 days, one order per round, edge **per share**
+(cross-check: `mean(edge) = mean(won) - mean(limit)`, so fees here are ≈1 bp and
+cannot be blamed):
+
+| cancel | mode | side | fills | lim | realised | edge/share | day-t | days + |
+|---|---|---|---|---|---|---|---|---|
+| off | - | Up | 800 (39.2%) | 0.7035 | 0.6500 | **-0.0539** | -4.93 | 0/8 |
+| off | - | Down | 795 (39.0%) | 0.6950 | 0.6465 | **-0.0486** | -2.83 | 1/8 |
+| 3 bp | cum | Up | 707 (34.7%) | 0.6961 | 0.6492 | **-0.0473** | -3.40 | 1/8 |
+| 3 bp | cum | Down | 701 (34.4%) | 0.6862 | 0.6491 | **-0.0373** | -2.01 | 2/8 |
+| 2 bp | cum | Up | 628 (30.8%) | 0.6900 | 0.6433 | **-0.0471** | -3.26 | 1/8 |
+| 2 bp | cum | Down | 650 (31.9%) | 0.6816 | 0.6492 | **-0.0325** | -1.53 | 2/8 |
+| 1 bp | cum | Up | 510 (25.0%) | 0.6879 | 0.6510 | **-0.0375** | -2.70 | 2/8 |
+| 1 bp | cum | Down | 505 (24.8%) | 0.6802 | 0.6515 | **-0.0288** | -1.32 | 3/8 |
+| 0.5 bp | cum | Up | 433 (21.2%) | 0.6788 | 0.6351 | **-0.0443** | -2.35 | 2/8 |
+| 0.5 bp | cum | Down | 421 (20.6%) | 0.6764 | 0.6532 | **-0.0233** | -0.89 | 3/8 |
+| 0.25 bp | cum | Up | 388 (19.0%) | 0.6793 | 0.6443 | **-0.0357** | -1.69 | 3/8 |
+| 0.25 bp | cum | Down | 381 (18.7%) | 0.6788 | 0.6614 | **-0.0176** | -0.85 | 3/8 |
+| 1 bp | cum | Up (both) | 1,209 (59.2%) | 0.4522 | 0.4194 | **-0.0332** | -3.44 | 1/8 |
+| 1 bp | cum, buffer 0.01 (strict) | Up | 448 (22.0%) | 0.6794 | 0.6317 | **-0.0479** | -2.34 | 2/8 |
+| 1 bp | cum, buffer 0.01 (strict) | Down | 441 (21.6%) | 0.6727 | 0.6281 | **-0.0447** | -1.94 | 1/8 |
+
+**Best cell of the whole matrix: -0.0176/share, day-t -0.85, 3/8 days.** Still
+negative, still not significant. The cancel is monotonically *not* monotone --
+0.25 bp beats 1 bp beats 0.5 bp -- which says the threshold is selecting on
+noise, not on toxicity.
+
+### Why the gap is closed now, and why the earlier "can only be tested live" was wrong
+
+The defensive cancel **works as designed**. It fires on 19-48% of orders instead
+of 6%. It gets seconds of warning, far beyond any plausible cancel round-trip --
+so a *zero*-latency cancel is already covered by these results, and no live
+venue-latency experiment can rescue the idea. And it still loses, at **every**
+threshold, in both directions, under both fill buffers.
+
+The arithmetic that closes it: cancelling recovers **~1.5-2 pp** of a **~5 pp**
+hole and stops. The fills you *keep* after the cancel are still adversely
+selected by **1.8-4.8 pp per share** -- and the realised-minus-limit gap on the
+best cell (0.6614 realised vs 0.6788 limit) is essentially the spread. The
+defensive cancel removes the orders, not the *selection*: the trades that still
+reach you are the ones where the market came to you because it knew something.
+**This is the same wall every other experiment hit this session**, now confirmed
+at the one parameterisation that had been left untested.
+
+Method caveat, stated plainly: the corpus's *venue* prices are 1 s, so genuine
+sub-second **venue-price** dynamics remain unobservable. That no longer matters,
+because the *trigger* (the spot level) travels over ~10 s -- 1 s sampling of a
+10 s process is fine -- and because the binding constraint turned out to be
+selection, not speed. What remains genuinely unmeasured is the venue's cancel
+round-trip; it is no longer decisive, and it is recorded here as unmeasured
+rather than as measured.
+
+**VERDICT: the maker idea is now excluded in every testable form -- passive
+rest, passive rest with a velocity cancel, and passive rest with a correctly
+specified level cancel at five thresholds. There is no remaining variant.**
