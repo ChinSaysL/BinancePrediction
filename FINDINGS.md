@@ -7725,6 +7725,132 @@ backtest on five days -- it is to start recording `depth20@100ms` and
 `!forceOrder@arr` on the VPS now, and re-ask in a week with more days than five.
 Five days is the binding constraint, not the choice of feature.
 
+## The five "macro / structural" ideas, measured (2026-09-15)
+
+The pitch: since a 1s execution delay destroys sub-second alpha, trade horizons
+that make the delay irrelevant -- TWAP-oracle last-mile, fading the
+lottery-ticket bias, a volatility regime gate, becoming a maker, macro
+releases. Every one of these is speed-independent, so unlike the microstructure
+list these can be settled on data we already hold. Tool:
+`tools/venue_late_odds.py` (read-only, committed). Four of the five are now
+answered.
+
+### 1. "Deterministic TWAP oracle lock" -- DEAD. Settlement is a POINT SNAPSHOT.
+
+The whole idea requires that the venue average a window, so the winner is
+locked before the bell. It does not. Joining 3,622 rounds' `end_price` to
+Binance 1s bars:
+
+    |end_price - Binance CLOSE at end|   median  0.02 bps   (mean 0.30)
+    |end_price - 30s MEAN of Binance|    median  0.44 bps
+    |end_price - 60s MEAN of Binance|    median  0.85 bps
+    signed (Binance close - end_price):  median +0.00 bps
+
+The instantaneous close fits to 0.02 bps -- two cents on a 77,000 print -- and
+the signed lag is exactly zero. A 30s or 60s average fits *worse*. So the
+settle is a point value read at the bell, `rounds.feed_provider` is recorded as
+CHAINLINK (three feed ids, one per symbol) but the value it stores tracks
+Binance's instantaneous price. There is no averaging window, therefore nothing
+becomes "mathematically locked" 8-12s early, therefore there is no stale
+0.88-0.94 winner to buy. The 15-bps-above-strike example in the pitch describes
+a market this venue does not run.
+
+### 2. "Fade the lottery-ticket bias" -- DEAD on the fee, and DEAD on the price.
+
+Two halves, two different answers. First the fee half, which is checkable
+against money we actually paid (801 fills):
+
+    realized fee = 95.9 bps MEAN / 88.4 bps MEDIAN of stake
+    aggregate: $18.378 fee on $1,850.63 staked = 0.993%
+
+The claim that fees drop near zero at 0.90+ (Polymarket's p(1-p) schedule) is
+FALSE here: `fills.fee_paid/stake` is flat across the price range. The 200 bps
+in `quotes.fee_rate_bps` is a pre-trade ESTIMATE the arm uses, not what is
+charged. Any idea must clear ~96 bps, not 200, and not ~0.
+
+Second half, measured on one row per round (the last quote with tau 5-15s,
+n=4,997 -- 88% of them sit in tau 5-10s, so this really is the last-mile
+window):
+
+    buy the side priced >= 0.85:  n=3714  mean_px 0.969  realized 0.9620  EV -0.0077
+    buy the side priced >= 0.90:  n=3398  mean_px 0.977  realized 0.9788  EV +0.0015
+    buy the side priced >= 0.95:  n=3015  mean_px 0.984  realized 0.9847  EV +0.0008
+
+The late favourite is priced to within 0.2pp of its realized frequency. Gross
+EV is +0.15% at >=0.90 and, after the real 96 bps fee, it is **-0.81%**. There
+is no lottery-ticket bias to fade at this venue -- the bias the idea describes
+is real on Polymarket and absent here.
+
+### The trap I walked into, and the check that caught it
+
+Section 3 of the tool bins the SAME late quotes by `|spot - strike|` instead of
+by price -- an independent variable, since it does not use the venue's odds.
+It reproduces the sane monotone relation (realized P(favourite wins) 0.708 at
+|dist|<0.5bps rising to 0.998 past 5 bps) and then reports:
+
+    spot-strike   n     realized  priced   gap     EV_fav
+    -99..-5    1203      0.998    0.848   +0.150   +1.194   <- 119% per $1
+
+A +119%/$1 "edge" on 1,203 trades is not a discovery, it is a pricing error, and
+it is the one this file already documents at the top: **`up_price` is the stale
+displayed value, not an ask -- "beating a price you cannot trade at is not
+evidence."** The venue's own recorded book settles it. For |dist| >= 2 bps with
+a recorded bid AND ask (680 of 3,463 rows), the favourite side reads:
+
+    mean DISPLAYED price 0.8007   mean bid 0.9143   mean ask 0.9708
+
+The bid is ABOVE the displayed price -- the "price" column is not inside its own
+book on average, and only 47.2% of those rows are coherent (bid <= price <= ask).
+In that coherent subset the trade the idea describes is:
+
+    n=321   priced 0.9526   ASK 0.9738   realized 0.9564
+      EV/$1 at the DISPLAYED price: +0.0030   after fee: -0.0066
+      EV/$1 at the ASK            : -0.0221   after fee: -0.0317
+
+Realized 0.956 vs an ask of 0.974. The 8-15pp "gap" in section 3 was the display
+column understating the favourite by ~11 cents. Note this is the SAME artefact
+that made VEL_INV's mirror read +0.028 at day-t +6.79 and that flipped every
+early rule's mirror positive -- it is one bug, not four findings.
+
+### 3. Regime gate -- the mechanism is real (it is the day factor), the edge is not.
+
+The proposal to only trade when the market is trending describes exactly what
+was measured earlier today: six unrelated rules with median pairwise daily-EV
+correlation +0.73, 6/6 positive on 09-12, 0/6 on 09-08 and 09-11. A gate can
+stop trading the chop; it cannot manufacture an edge in a market whose
+executable price is calibrated. Worth noting the arm ALREADY has the lever,
+pointing the other way: `cross_max_move_bps` (7.8-21 bps) makes it REFUSE when
+the round has already moved, and the pitch's gate ("only trade if spot has
+displaced >= 4 bps by minute 2") is the opposite instruction. Consistent with
+the depth-gate measurement: our money is in the venues' quote lag at the
+crossing, not in the size of the move.
+
+### 4. Maker rather than taker -- the one genuinely open item, already partly tested.
+
+The venue does support GTC LIMIT (verified live; MARKET is FOK, IOC is rejected
+-1102), and there IS a spread to capture: on the same late rows the
+favourite-side spread is median 2.0 cents (p05 1.0c, p95 23c). That is a real
+2% gross, which is more than any signal measured today. But as a maker the leg
+that fills is the leg moving against you, and the repo has already built and
+scored this: `stale_maker` is recorded flat (n=24, +1.4 pts, 0.1 SE) and the
+2018-era note "the maker arm ... all flat" stands. What has NOT been done is a
+maker sweep on the current 8-day record with maker/taker fills separated. That
+is a real, bounded experiment and it is the only item on this list I would
+spend time on.
+
+### 5. Macro releases -- not testable, and not a new mechanism.
+
+Eight days of data covers roughly one CPI and no FOMC; there is no calendar on
+disk and no pre-event tape. Mechanically it is idea 3 with an exogenous trigger,
+so it inherits idea 3's verdict: it can only change WHEN we trade, and the
+executable price is what decides whether that pays.
+
+SUMMARY: 1 dead (no TWAP window), 2 dead (fee flat at ~96bps; late favourite
+priced to 0.2pp), 3 real-but-edge-free, 5 untestable on this sample. 4 is open
+and bounded. And the recurring lesson, restated for the third time today:
+`up_price` is a displayed value that is not inside its own book on average --
+never score a strategy against it.
+
 ## The synthetic-sweep idea, tested -- and the recorder that now exists
 (2026-09-15)
 
