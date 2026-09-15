@@ -9353,3 +9353,72 @@ implies the market priced them at 0.479 and they won 66.7%, a 19-point edge, whi
 is not credible and is the signature of the recorded `quote` on a refusal row not
 being the executable ask. Same trap as the warm-quote question: a recorded price
 is not a price you can trade. Left open, flagged.
+
+## Does the ceiling need to cover the drift? NO -- measured, and the widening hurts
+## (2026-09-15) -- tools/cap_drift_sweep.py
+
+The hypothesis: the ceiling is derived from the TRIGGER ask, but the venue's quote
+arrives ~250ms later and is higher, so `room == 0` and the order has no tolerance
+left. Fix: `trigger_ask + cap + drift`.
+
+First, a structural note that kills the story as a story: on the tape,
+"fill iff ask <= A + cap + drift" IS "fill iff ask <= A + (cap+drift)". The tape
+cannot distinguish compensating for drift from simply widening the cap. What it
+CANNOT do either is model the 250ms arrival -- its cadence is ~1s. That is what
+the recorded 50ms `cross fine` paths are for. So both were run.
+
+### LOG, arrival = ask(+250ms), n=106 triggers. THE RIGHT HORIZON (ack p50 = 249ms)
+
+    cap      fills  rate    paid    win     net/sh   net/$1
+    no cap     106 100.0%  0.582  59.4%   +0.005   +0.074
+    +8.0c       64  60.4%  0.550  62.5%   +0.069   +0.221
+    +6.0c       57  53.8%  0.544  61.4%   +0.064   +0.229
+    +5.0c       54  50.9%  0.546  61.1%   +0.059   +0.219
+    +4.0c       51  48.1%  0.545  62.7%   +0.076   +0.249
+    +3.0c       47  44.3%  0.540  63.8%   +0.092   +0.281
+    +2.0c       39  36.8%  0.539  69.2%   +0.147   +0.399   <- SHIPPED
+    +1.5c       36  34.0%  0.537  66.7%   +0.124   +0.370
+    +0.5c       31  29.2%  0.540  74.2%   +0.195   +0.529
+    +0.0c       31  29.2%  0.540  74.2%   +0.195   +0.529
+
+Widening to cover the drift makes things WORSE, monotonically: net/sh falls
++0.195 -> +0.147 -> +0.092 -> +0.069 -> +0.005 as the cap goes 0.5c -> 2c -> 3c ->
+8c -> off. **And the win rate falls with it: 74.2% -> 69.2% -> 63.8% -> 62.5% ->
+59.4%.** That is not a price effect, it is SELECTION: the fills that need a wider
+band are the ones whose price already ran, and those are the losers. The
+hypothesis is refuted, and the mechanism it was meant to exploit runs the other
+way.
+
+### The horizon dominates everything
+
+    arrival     best net/sh        verdict
+    250ms       +0.195 at 0.5c     profitable at every cap
+    500ms       -0.022 at 8c       NEGATIVE at every cap
+    1000ms      +0.062 at 6c       mostly negative
+
+Our measured ack p50 is 249ms, so the 250ms table is the operative one -- and it
+says the arm is 250ms from being unprofitable. That is the single most important
+number in this batch: not the cap, the latency.
+
+### The two tables disagree, and I am not going to average them
+
+    TAPE (n=386, arrival ~1s)   win FLAT at 74.8-77.0% across all caps; optimum +2..+4c
+    LOG  (n=106, arrival 250ms) win FALLS 74.2% -> 59.4%; optimum at the tightest cap
+
+The log has the right horizon and a small sample; the tape has 4x the sample and
+the wrong horizon. On the tape the next quote is ~1s out, by which time a spike
+has partly reverted, so the spike that carries the adverse signal at 250ms is
+smoothed away -- which is exactly why its win rate is flat.
+
+**DECISION: change nothing.** The hypothesis under test is dead, so it ships
+nothing. The suggestion that the live 2c is too LOOSE rests on 31-39 fills at the
+correct horizon and is contradicted by the tape's 386. If anything the direction of
+travel is tighter, not looser -- but not on this sample, and not while the canary
+is mid-read.
+
+### Method note for this repo
+
+`tools/cross_geometry.py` is NOT on the VPS (it was only ever local), and
+`cap_drift_sweep.py` first failed there on the import. It now inlines
+`crossed_side`, so it runs standalone. Any tool meant to run on the box must be
+self-contained.
