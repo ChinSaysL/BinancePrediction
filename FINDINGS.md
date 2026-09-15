@@ -8036,6 +8036,93 @@ no favourite-side edge". What the corpus DID produce is worth more than the
 answer: three measured traps, of which the bid/ask inversion is the one that
 just cost this session a 6.65% false positive.
 
+### CORRECTION to the table above: pooled vs day-mean edge
+
+The first version of that table printed the mean of the DAILY means in the
+edge column while printing pooled means for `hit` and `side_px`. With unequal
+n per day those are different statistics and they differ in sign on the
+near-zero cells. `tools/corpus_paired_rules.py` now prints both:
+
+    rule                 n   side_px    hit  edge_pool  edge_day   day-t  days+
+    FAV (priced side) 1840    0.9126 0.9207   -0.0071   -0.0067   -1.29   2/8
+    DIST>=2bp          722    0.6272 0.6343   -0.0096   -0.0063   -0.56   2/8
+    DIST>=5bp          158    0.6340 0.6456   -0.0016   +0.0009   +0.06   4/8
+    DIST>=10bp          23    0.7246 0.7826   +0.0531   +0.0289   +1.15   5/7
+    MOM_30>=4bp        247    0.6696 0.6802   -0.0122   -0.0094   -0.64   5/8
+    MOM_120>=4bp       680    0.5749 0.5794   -0.0122   -0.0110   -1.25   3/8
+    VOLSURGE>=2.5       71    0.6514 0.6761   -0.0060   -0.0237   -0.54   4/8
+    CVD>=0.6          1742    0.5166 0.5098   -0.0227   -0.0226   -2.84   1/8
+    ZTAU>=1.0          818    0.5609 0.5452   -0.0289   -0.0251   -2.84   0/8
+
+The two columns differ in sign only on DIST>=5 and DIST>=10, both of which were
+already inside the noise. FAV is negative both ways, so every verdict above
+stands; the bug would only have mattered if a cell had been near-zero and
+claimed as an edge.
+
+## The maker: rest at the bid and collect the spread? Measured -- NO. (2026-09-15)
+
+Raised as the natural conclusion: our takers lose about the size of the spread,
+so stop paying it and start collecting it -- rest a BUY at `up_buy_px` at
+tau 180-120s, cancel defensively if the tape goes against it, and harvest the
+1-2 cents the market makers must be taking. `tools/corpus_maker_sim.py`.
+
+The premise that has to be tested rather than assumed: a resting buy at the bid
+does not fill because we want it to. It fills when somebody SELLS into us, which
+is when the price is coming down. That is adverse selection and it is measurable.
+
+Simulation: at `place_tau`, rest a buy at that side's bid; walk forward second by
+second; CANCEL if the underlying tape (ticks_dense, 1s closes) moves
+`cancel_bps` against within one second; FILL if that side's ASK trades down to
+the limit. The fill rule is OPTIMISTIC -- front of queue, fills on touch -- so
+the real result can only be worse.
+
+  place_tau  buffer  fills  limit   realized   edge/sh    ROI    day-t  days+
+    240        0.00   847   0.6425   0.6009   -0.0418   -6.50%  -4.28   0/8
+    240        0.01   811   0.6416   0.5906   -0.0512   -7.98%  -5.52   0/8
+    180        0.00   748   0.6996   0.6430   -0.0570   -8.14%  -5.11   0/8
+    180        0.01   707   0.6949   0.6266   -0.0685   -9.86%  -6.03   0/8
+    120        0.00   671   0.7390   0.7079   -0.0315   -4.26%  -3.10   1/8
+    120        0.01   621   0.7307   0.6860   -0.0452   -6.19%  -4.20   1/8
+     60        0.00   499   0.7708   0.7014   -0.0747   -9.70%  -3.77   0/8
+     60        0.01   462   0.7644   0.6775   -0.0927  -12.12%  -4.92   0/8
+
+(all with the 2bps defensive cancel). Every configuration loses, on 0-1 of 8
+days, at day-t -3.1 to -6.0. The stricter fill rule is worse in all four
+comparisons, as it must be: the fills it removes are the benign ones and the
+ones it keeps are the most adversely selected.
+
+THE MECHANISM, measured: realized win rate is 3-9 percentage points BELOW the
+limit paid, in every single configuration. That is the adverse selection, and it
+is 3-7x the ~1.2pp spread the idea is trying to collect. **The spread is not
+free money; it is the compensation for being filled exactly when you are wrong,
+and at this venue it does not cover the damage.**
+
+The defensive cancel does not rescue it either. At 2bps it cancels ~100 of 1,595
+fills and moves the Up side from -7.67% to -8.14% (i.e. nothing, or slightly
+worse); 5bps cancels 14 fills, 10bps cancels 1. Cancelling on a 1-second adverse
+tick is simply too slow and too local to avoid the fills that matter -- by the
+time the tape has ticked 2bps against you, the order is already the best bid in
+a falling market.
+
+### And the 6.65% was never the spread
+
+The proposal's arithmetic assumed the +6.65% measured at the bid WAS the
+market-making spread, making MMs the harvesters. It was mostly not. That number
+came from the per-$ estimator (mean of `(1-p)/p`), which is leverage-dominated;
+per share, the same bid-side cell is **-0.43%**, and the bid-ask gap itself is
+~1.2pp (median spread 0.0100 on a ~0.85 price). So the spread being fought over
+is ~1.2pp -- and the maker sim shows it costs 3-9pp of adverse selection to
+collect it. The inference "MMs are harvesting 6.65%" overstates the prize by
+roughly 5x, and the direction of the trade is wrong.
+
+FINAL ANSWER ON THE MAKER: no. Not "unproven" -- significantly negative in 8 of
+8 configurations with an optimistic fill model, on 8 days, and worse than simply
+taking at the ask (-0.71%). The one honest caveat is that this models a single
+side with no inventory management and no queue position; an MM that also quotes
+the other side and skews with flow is a different object. But the adverse
+selection is measured directly at 3-9pp, so any such strategy has to overcome
+that first, and nothing measured today comes close.
+
 ## The synthetic-sweep idea, tested -- and the recorder that now exists
 (2026-09-15)
 

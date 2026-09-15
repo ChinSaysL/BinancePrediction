@@ -106,8 +106,8 @@ def main() -> int:
           f"{len(rounds):,} over {len({r['day'] for r in rounds})} days "
           f"(paying the {args.pay.upper()})")
 
-    print(f"\n{'rule':18} {'n':>5} {'side_px':>8} {'hit':>7} {'edge/sh':>8} "
-          f"{'ROI':>7} {'se':>7} {'day-t':>7} {'pos/day':>7}")
+    print(f"\n{'rule':18} {'n':>5} {'side_px':>8} {'hit':>7} {'edge_pool':>9} "
+          f"{'edge_day':>9} {'ROI':>7} {'se':>7} {'day-t':>7} {'pos/day':>7}")
     for name, feat, thr, dirn in RULES:
         byday: dict[str, list[float]] = collections.defaultdict(list)
         pick_px, pick_won = [], []
@@ -133,14 +133,15 @@ def main() -> int:
         dm = [st.mean(v) for v in byday.values()]
         sd = st.stdev(dm) if len(dm) > 1 else 0.0
         t = st.mean(dm) / (sd / len(dm) ** 0.5) if sd else 0.0
+        pooled = st.mean([x for v in byday.values() for x in v])
         mpx = st.mean(pick_px)
         print(f"{name:18} {len(pick_px):>5} {mpx:8.4f} "
-              f"{st.mean(pick_won):7.4f} {st.mean(dm):+8.4f} "
-              f"{st.mean(dm)/mpx*100:+6.2f}% {sd/len(dm)**0.5:7.4f} {t:+7.2f} "
+              f"{st.mean(pick_won):7.4f} {pooled:+9.4f} {st.mean(dm):+9.4f} "
+              f"{pooled/mpx*100:+6.2f}% {sd/len(dm)**0.5:7.4f} {t:+7.2f} "
               f"{sum(1 for x in dm if x>0):>3}/{len(dm):<3}")
-    print("\n  edge/share = P(win) - price paid - fee. Positive with |day-t| > 2 wins.")
-    print("  A near-constant small positive across unrelated rules is a pricing")
-    print("  OFFSET (the recorded ask is not the ask you get), not N discoveries.")
+    print("\n  edge_pool = mean over all entries (the money). edge_day = mean of the")
+    print("  daily means; they can differ in SIGN when days have unequal n, which")
+    print("  is why both are shown. day-t is clustered on edge_day.")
     return 0
 
 
