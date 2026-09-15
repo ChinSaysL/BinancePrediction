@@ -1552,6 +1552,37 @@ class Bot:
             return None
         return 1e4 * (max(seen) - min(seen)) / r.strike
 
+    def _train_is_fresh(self, r, thr_bps: float) -> bool:
+        """Did the spot cross `thr_bps` from the strike JUST NOW?
+
+        THE BUG THIS FIXES, live 2026-09-15 20:49:54. The train condition is a
+        LEVEL -- |spot - strike| >= 10bps -- and a level has no anchor. On the
+        first tick after a restart it fired on all three families at once, on a
+        15m round whose strike was TEN MINUTES old with the spot already
+        16-25bps out (btc +18.17, eth +16.33, bnb +25.18). It bought a stale,
+        fully-repriced level at asks of 0.77-0.89, not a breakout. The
+        measurement it was built from anchored at the FIRST quote to cross the
+        threshold; the shipped code anchored at nothing.
+
+        True only when a sample INSIDE the last `train_fresh_s` seconds was
+        still BELOW the threshold -- the crossing is then provably recent.
+        Fails CLOSED when there is not enough history to prove it, which is
+        exactly the restart case that misfired.
+        """
+        if not r.strike or thr_bps <= 0:
+            return False
+        win_ms = int(self._ck("train_fresh_s", r) * 1000)
+        if win_ms <= 0:
+            return False
+        buf = (getattr(self, "_ticks", None) or {}).get(
+            getattr(r, "symbol", "")) or []
+        now = int(time.time() * 1000)
+        recent = [(t, px) for t, px in buf if t >= now - win_ms and px > 0]
+        if not recent:
+            return False
+        oldest = min(recent, key=lambda s: s[0])[1]
+        return abs(1e4 * (oldest - r.strike) / r.strike) < thr_bps
+
     def _probe_fires(self, r) -> bool:
         """Quote a range-REFUSED crossing anyway, at a fixed tiny stake.
 
@@ -1975,7 +2006,8 @@ class Bot:
                 and tau >= self._ck("train_min_tau_s", r) \
                 and feed.is_fresh(settings.max_spot_age_s):
             dist_bps = 1e4 * (feed.price - r.strike) / r.strike
-            if abs(dist_bps) >= self._ck("train_bps", r):
+            thr = self._ck("train_bps", r)
+            if abs(dist_bps) >= thr and self._train_is_fresh(r, thr):
                 side = "Up" if dist_bps > 0 else "Down"
                 train = True
         if not train and not (self._ck("min_tau_s", r) <= tau
@@ -2046,7 +2078,7 @@ class Bot:
         # eth -0.047 vs +0.076). A flipped crossing has no edge at all, never
         # mind enough to clear the limit buffer. It is 6.6% of crossings.
         fb = self._ck("flip_block_s", r)
-        if fb > 0:
+        if not train and fb > 0:
             fl = getattr(self, "_cross_flip", None)
             if not isinstance(fl, dict):
                 fl = self._cross_flip = {}
@@ -2153,18 +2185,6 @@ class Bot:
         if top is not None:
             ask = top.ask(side)
             depth_usd = top.ask_dollars(side)
-            # TRAIN price gate. The measured cell is coherent asks <=0.890
-            # (tools/momentum_continuation.py --max-ask 0.890, n=75, +0.085/sh
-            # paying the limit, day-t +2.94). Above it the entry is not the one
-            # that was measured, so it is refused rather than extrapolated.
-            if train:
-                tmax = self._ck("train_max_ask", r)
-                if tmax > 0 and (not ask or ask > tmax):
-                    self._cross_refuse(
-                        r, side,
-                        f"train ask {ask} above the gate {tmax:.3f}",
-                        tau=tau, spot=spot_now, sigma=sigma_now)
-                    return
             # How far the book has ALREADY moved since the last poll saw it.
             # MEASURED 2026-09-13 on 163 fill-aware triggers, split by this:
             #     run <= 0.00   n=29  win 0.931  EV/$ +0.5436  day-t 4.63
@@ -2208,6 +2228,20 @@ class Bot:
                  f"{self._ck('max_price'):.2f}]"),
                 tau=tau, spot=spot_now)
             return
+        # TRAIN price gate. Placed HERE, after `ask` is FINAL, not on the
+        # websocket branch: inside `if top is not None` it was skipped entirely
+        # whenever the ws book was stale and the primary fell back to `asks`,
+        # which is exactly when a gate is most needed. The reason is CONSTANT so
+        # `_cross_refuse`'s per-(round, reason) dedupe collapses it to one row --
+        # with the ask in the text every distinct cent made a new row (7 rows for
+        # one round on 2026-09-15, the per-tick-refusal trap this file records).
+        if train:
+            tmax = self._ck("train_max_ask", r)
+            if tmax > 0 and ask > tmax:
+                self._cross_refuse(
+                    r, side, f"train ask above the gate {tmax:.3f}",
+                    tau=tau, spot=spot_now, sigma=sigma_now)
+                return
         # Size like the main arm unless a flat stake is configured: a flat $1
         # cannot compound, so the arm's contribution shrinks as a share of the
         # book while the bankroll grows.
@@ -2457,7 +2491,8 @@ class Bot:
         # `run` goes into the reason so every trigger carries the number the
         # gate decision will be made on, recoverable from the decisions table.
         run_txt = "" if book_run is None else f" run{book_run:+.3f}"
-        kind = "cross probe" if probe else "cross into"
+        kind = ("train into" if train
+                else ("cross probe" if probe else "cross into"))
         sig = Signal(side, ask, ask, 0.0, 0.0, 0.0, True,
                      f"{kind} {side} @{ask:.3f} tau{tau:.0f}s{run_txt}")
         did = self.store.insert("decisions", {

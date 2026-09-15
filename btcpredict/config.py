@@ -1395,6 +1395,16 @@ class Settings(BaseSettings):
     cross_train_max_ask: float = 0.890
     cross_train_bound: float = 0.015
     cross_train_max_fill_px: float = 0.90
+    # EVENT ANCHOR. The train condition is a LEVEL (|spot-strike| >= 10bps);
+    # without this it fires on any tick where the spot is merely far away, which
+    # on 2026-09-15 20:49:54 meant three fills on ONE 15m round whose strike was
+    # ten minutes old and whose spot was already 16-25bps out -- bought on the
+    # first tick after a restart, at asks of 0.77-0.89. Requires a sample inside
+    # the last `train_fresh_s` seconds to have been BELOW the threshold, i.e. the
+    # crossing is provably recent. Fails CLOSED without enough history (the
+    # restart case). Do not set this to 0 -- 0 means "cannot prove freshness"
+    # and the trigger goes inert.
+    cross_train_fresh_s: float = 5.0
     cross_skip_opposite_to_main: bool = True
     # RAISED 0.5 -> 2.0 on 2026-09-13. The old 0.5 was picked by a fill-aware
     # sweep that called it a "clear peak", but that sweep could not have seen

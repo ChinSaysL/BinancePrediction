@@ -1760,17 +1760,27 @@ class TestTheTrainTrigger:
     gates -- max_depth_bps (5.0), max_round_range_bps (10.0) and
     cross_max_fill_px (0.65) -- because a >=10bps entry is deep, implies a
     >=10bps round travel, and prices near 0.80 where a 0.65 cap puts it out of
-    reach. That override is an operator risk decision (2026-09-15); see
-    config.cross_train_*. Everything that bounds RISK is shared with the cross
-    arm: the guard, the reserved slot, the exposure caps, the daily cap, the
-    reentry gap and the cooldown.
+    reach. That override is an operator risk decision (2026-09-15); everything
+    that bounds RISK is shared with the cross arm.
+
+    AND IT MUST BE A FRESH CROSSING, NOT A LEVEL. Shipped without that anchor on
+    2026-09-15 it bought three 15m rounds at once on the first tick after a
+    restart -- strike ten minutes old, spot already 16-25bps out, asks 0.77-0.89.
     """
 
-    def test_a_deep_breakout_at_high_tau_fires(self, store, armed, monkeypatch):
+    @staticmethod
+    def _history(bot, prices, step_ms=1000, symbol="BTCUSDT"):
+        now = int(time.time() * 1000)
+        n = len(prices)
+        bot._ticks = {symbol: [(now - (n - 1 - i) * step_ms, p)
+                               for i, p in enumerate(prices)]}
+        return bot
+
+    def test_a_FRESH_breakout_fires(self, store, armed, monkeypatch):
         monkeypatch.setattr("btcpredict.config.settings.cross_train_enabled", True)
-        # 77080 is ~10.4bps past a 77000 strike, on a round with tau = 120s.
         bot = make_bot(store, ticks(77000.0, 77040.0, 77080.0))
         bot._round = make_round(tau_s=120.0)
+        self._history(bot, [77000.0, 77040.0, 77080.0])   # 2s ago: at the strike
         seen = {}
 
         async def ex(*a, **k):
@@ -1778,17 +1788,18 @@ class TestTheTrainTrigger:
 
         bot._cross_execute = ex
         asyncio.run(bot._cross_tick())
-        assert seen, "a >=10bps breakout at tau>=60s must fire"
+        assert seen, "a fresh >=10bps breakout at tau>=60s must fire"
         assert seen["side"] == "Up"
-        assert seen["ceil_side"] <= 0.900 + 1e-9, (
-            "the train bound is a flat +1.5c, capped by train_max_fill_px")
         assert seen["fill_cap"] == 0.90, (
             "the shipped 0.65 fill cap would put a ~0.80 entry out of reach")
 
-    def test_it_does_not_fire_below_the_distance(self, store, armed, monkeypatch):
+    def test_a_STALE_level_does_not_fire(self, store, armed, monkeypatch):
+        """THE BUG, reproduced: every sample in the freshness window is already
+        past the threshold, so this is an old move, not a breakout."""
         monkeypatch.setattr("btcpredict.config.settings.cross_train_enabled", True)
-        bot = make_bot(store, ticks(77000.0, 77004.0, 77006.0))   # ~0.8bps
-        bot._round = make_round(tau_s=120.0)
+        bot = make_bot(store, ticks(77080.0, 77082.0, 77084.0))
+        bot._round = make_round(tau_s=600.0)
+        self._history(bot, [77080.0, 77082.0, 77084.0])
         calls = []
 
         async def ex(*a, **k):
@@ -1796,7 +1807,41 @@ class TestTheTrainTrigger:
 
         bot._cross_execute = ex
         asyncio.run(bot._cross_tick())
-        assert not calls, "a sub-bps move is not a Train breakout"
+        assert not calls, "an OLD level must not be traded as a breakout"
+
+    def test_no_history_fails_CLOSED(self, store, armed, monkeypatch):
+        """At startup the tick buffer is empty -- which is exactly when the live
+        misfire happened. No history must mean no trade, not a trade."""
+        monkeypatch.setattr("btcpredict.config.settings.cross_train_enabled", True)
+        bot = make_bot(store, ticks(77040.0, 77060.0, 77080.0))
+        bot._round = make_round(tau_s=600.0)
+        bot._ticks = {}
+        calls = []
+
+        async def ex(*a, **k):
+            calls.append(k)
+
+        bot._cross_execute = ex
+        asyncio.run(bot._cross_tick())
+        assert not calls, "no history must fail closed"
+
+    def test_the_ledger_labels_it_apart_from_a_cross(self, store, armed,
+                                                     monkeypatch):
+        """A train fill must be separable from a cross fill, or the live record
+        cannot grade it."""
+        monkeypatch.setattr("btcpredict.config.settings.cross_train_enabled", True)
+        bot = make_bot(store, ticks(77000.0, 77040.0, 77080.0))
+        bot._round = make_round(tau_s=120.0)
+        self._history(bot, [77000.0, 77040.0, 77080.0])
+
+        async def ex(*a, **k):
+            pass
+
+        bot._cross_execute = ex
+        asyncio.run(bot._cross_tick())
+        rows = [r[0] for r in
+                bot.store.conn.execute("select reason from decisions")]
+        assert any(r.startswith("train into") for r in rows), rows
 
     def test_the_arm_is_quiet_when_off(self, store, armed):
         from btcpredict.config import settings
