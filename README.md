@@ -139,7 +139,9 @@ by probing the live venue — see FINDINGS.md before changing any of them:
 - `accountType` must be **SPOT** (CeDeFi → -3026)
 
 Winnings do not auto-credit; `batch-redeem` must be called with a comma-separated
-`tokenIds`. The bot does this automatically after a win.
+`tokenIds`. The bot does this automatically after a win, and a claim sweep runs
+every three minutes (`sweep_claims`), so a claim the venue rejects as not-yet-
+final is retried on that clock instead of waiting for the next win.
 
 Note that `apiRestrictions` does **not** report prediction permissions — a key
 showing every trading flag `false` can still trade prediction markets. Use

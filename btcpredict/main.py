@@ -56,6 +56,11 @@ _BANKROLL_DRIFT_READS = 5
 
 PROBE_MODE = "probe"
 
+# How often the winnings-claim sweep runs (see Bot.sweep_claims): the retry
+# clock for claims the venue rejected as not-yet-final. The on-win redeem
+# stays immediate; this only has to catch what that one missed.
+_CLAIM_SWEEP_S = 180.0
+
 # Reasons a decision was declined that must NOT be probed. These are real
 # limits -- existing exposure, a risk halt, or data we could not read -- and
 # probing around them would create exactly the double exposure and the
@@ -253,6 +258,10 @@ class Bot:
         # settlement row was ever written for it, so the ledger silently
         # understated the loss.
         self.open_fills: dict[int, tuple[str, Fill]] = {}   # fill_id -> (slug, Fill)
+        # Wall-clock stamp of the last winnings-claim sweep (see
+        # sweep_claims). 0.0, so the first tick after a restart picks up any
+        # claim a crash or a venue rejection left stranded.
+        self._last_claim_sweep = 0.0
         self.bankroll = settings.bankroll_usdt
         # -- fast impulse path (see _impulse_tick) --------------------------
         # The current round and the last executable asks seen for it, refreshed
@@ -2983,7 +2992,9 @@ class Bot:
             self.bankroll += s.pnl
             del self.open_fills[fid]
             # Live winnings sit as a claimable position until redeemed; they do
-            # not credit the wallet on their own.
+            # not credit the wallet on their own. This is the FAST path -- the
+            # venue sometimes rejects a not-yet-final position here, and
+            # sweep_claims() is the retry clock for whatever it drops.
             if s.won and self.broker.mode == "live":
                 claimed = await self.broker.redeem()
                 log.info("redeem -> %s", str(claimed)[:200])
@@ -2993,6 +3004,36 @@ class Bot:
             # A position closed, so the wallet balance is readable as equity
             # and the next stake should track it (see _refresh_bankroll).
             await self._refresh_bankroll()
+
+    async def sweep_claims(self) -> None:
+        """Retry winnings claims on a clock, not only on a win.
+
+        `settle_due` redeems the moment a WON fill settles -- but that is the
+        only trigger, so a claim that FAILS there is not retried until the
+        next win. Both failure modes are on the record (2026-09-14): the
+        venue rejects a position that is not yet final (`-9000 SYSTEM_ERROR`
+        -- the claim call that fired 6 seconds after the first 15m round
+        ended returned `failed_tokens: 1`, exactly this trap), and it rejects
+        a claim already in flight ("already have a pending claim", 3x at
+        19:25). Whatever the cause, the winnings sat claimable until
+        something WON again: hours on a losing stretch, overnight when idle.
+
+        The sweep is wallet-wide by construction: `redeem()` asks the venue
+        what is CLAIMABLE (every family, every cause -- it also picks up
+        claims a restart stranded) and returns without POSTing when the
+        answer is empty, so the steady-state cost is one read per cooldown.
+        The on-win redeem stays: it is the fast path when the venue accepts.
+        """
+        broker = getattr(self, "broker", None)
+        if broker is None or broker.mode != "live":
+            return
+        now = time.time()
+        if now - getattr(self, "_last_claim_sweep", 0.0) < _CLAIM_SWEEP_S:
+            return
+        self._last_claim_sweep = now
+        claimed = await broker.redeem()
+        if claimed:
+            log.info("claim sweep -> %s", str(claimed)[:160])
 
     # -- run ----------------------------------------------------------------
     async def run(self) -> None:
@@ -3009,6 +3050,9 @@ class Bot:
                     await self.backfill_settlements()
                 if self.mode != "record":
                     await self.settle_due()
+                    # Claims the venue rejected at settlement are retried on
+                    # this clock, not on the next win (see sweep_claims).
+                    await self.sweep_claims()
             except Exception as e:
                 log.exception("tick failed: %s: %s", type(e).__name__, e)
             n += 1

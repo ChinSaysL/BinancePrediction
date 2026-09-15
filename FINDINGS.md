@@ -6267,3 +6267,34 @@ more fills, tighten toward 2; if fills start appearing in the 6-20s band and
 win, extend toward 10-20. Same-day: the guard audit restored
 `daily_loss_cap_pct` 0.0 -> 0.20 in `.env` (left off since the 09-11
 no-guards experiment -- the only guard that was off).
+
+## Winnings claims: no 15m bug, but no retry clock either (2026-09-15)
+
+Asked whether 15m winnings get redeemed. The path is family-agnostic --
+`redeem()` asks the venue what is CLAIMABLE for the WALLET -- and the claim
+call that fired when the first (and only) 15m win settled
+(`btc-updown-15m-1789427700`, +$1.93) came 6 seconds after its round ended.
+The venue's own summary, read back today: `totalClaimableAmount: 0`,
+`pendingClaimCount: 0`, `positions: []` -- nothing unredeemed in any family.
+
+What the audit DID expose is why a payout can look stuck. `redeem()` fired
+only when a WIN settled, and its failures were never retried until the NEXT
+win. Both failure modes are in the log:
+
+    -9000 SYSTEM_ERROR         23:30 09-14  a token failed in the claim call
+                                            that fired 6s after the 15m round
+                                            ended -- the venue rejects a
+                                            position that is not yet final
+    "already have a pending    19:25 09-14  repeated re-POSTs of a claim the
+     claim ... please wait"                 venue already had in flight
+
+On a losing stretch, or idle overnight, winnings could sit claimable for
+hours. None did -- the next win came first -- but the trap is worst exactly
+where the question pointed: a claim fired seconds after a round ends is the
+one most likely to be rejected as not-yet-final.
+
+Fix: `sweep_claims()` -- a wallet-wide `redeem()` every `_CLAIM_SWEEP_S`
+(180s) from the run loop, independent of settlements. `redeem()` no-ops when
+the venue lists nothing claimable (steady-state cost: one read per cooldown),
+and the clock starts at 0 on boot, so a restart adopts stranded claims. The
+on-win redeem stays as the fast path. Tests: tests/test_claim_sweep.py.
