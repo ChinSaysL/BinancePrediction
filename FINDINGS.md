@@ -7230,7 +7230,10 @@ Measured, pairing the decision log with the venue's own order records:
     08:39 eth fill  ~220ms                        1558ms          FILLED 0.54
 
 169-186ms breaks down as: the quote round-trip (40-65ms) + the order POST and
-the venue's own intake (~120-130ms). Detection is already tick-resolution
+the venue's own intake (~120-130ms). Two more cold fires at 09:19 (still the
+pre-warm build; the restart to it was 09:22:33) read 190ms and 220ms total --
+the venue's intake runs 120-175ms, so EXPECT the warm total around
+125-150ms, not a fixed number. Detection is already tick-resolution
 (`_idle` runs `_cross_all` on every spot tick, ~114/s), and the venue's
 intake is theirs. That left ONE shaveable leg: the signed quote fetched
 between the decision and the order, while the book is jumping (eth 0.46 ->
@@ -7252,9 +7255,9 @@ latency: it is what the arm will PAY for a fast mover (the band), which is an
 edge question with its own evidence bar.
 
 CHECKPOINT: after ~20 fires, compare the venue order's `createTime` minus the
-CROSS decision log against the 169-186ms baseline -- a warm hit should print
-~120-135ms. The log marks the hits (`warm quote used for <slug> <side>`), and
-an unmarked fire that is slow means the fallback ran (window edge, stake
+CROSS decision log against the 169-220ms cold baseline -- a warm hit should
+print ~125-150ms. The log marks the hits (`warm quote used for <slug> <side>`),
+and an unmarked fire that is slow means the fallback ran (window edge, stake
 sized down, or no websocket book). 595 tests pass (6 new: warm hit skips the
 fetch; stale and stake-mismatch fall back; imminent side chosen; one-shot
 consumption; throttled refresh).
