@@ -204,11 +204,49 @@ class LiveBroker:
                 min(float(a["price"]) for a in asks))
 
     async def balance(self) -> float:
+        """Cash sitting in the wallet. NOT equity -- see `equity()`."""
         resp = await self._request("GET", POSITION_LIST,
                                    {"walletAddress": self.wallet_address})
         if not resp:
             return 0.0
         return float((resp.get("summary") or {}).get("walletBalance") or 0.0)
+
+    async def equity(self) -> float:
+        """Total account value: cash + open positions + unredeemed winnings.
+
+        `walletBalance` alone is what sizing used to read, and it is the source
+        of the lag `Bot._reconcile_bankroll` was written to defend against: a
+        stake leaves the wallet the instant an order fills, while the payout
+        only reappears after redemption settles on-chain. In between, the
+        wallet under-states the account by the whole position.
+
+        The venue publishes the missing pieces. Verified live 2026-09-15:
+
+            totalValue 42.12746449
+              = walletBalance 42.12746449
+              + positionValue 0
+              + totalClaimableAmount 0
+
+        so `totalValue` is exactly the sum, and reading it removes the lag
+        rather than waiting it out. The sum is recomputed as a fallback in case
+        `totalValue` is ever absent, and `walletBalance` remains the last
+        resort so this can never return 0 on a partial response.
+        """
+        resp = await self._request("GET", POSITION_LIST,
+                                   {"walletAddress": self.wallet_address})
+        if not resp:
+            return 0.0
+        s = resp.get("summary") or {}
+
+        def num(key: str) -> float:
+            try:
+                return float(s.get(key) or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        total = num("totalValue")
+        parts = num("walletBalance") + num("positionValue") + num("totalClaimableAmount")
+        return total or parts or num("walletBalance")
 
     async def positions(self) -> list[dict]:
         resp = await self._request("GET", POSITION_LIST,

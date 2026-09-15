@@ -6798,3 +6798,59 @@ that.
 
 If it is tried, `order_type=market` in the VPS `.env` is the whole change, with
 `slippage_bps=300` already bounding the take, and it is one line to revert.
+
+## Sizing read wallet CASH, not equity, and the ledger drifted high for hours
+
+Asked to un-hardcode the balance. First a correction: it was not hardcoded.
+`setup` reads the venue and assigns `self.bankroll = bal`, and
+`_refresh_bankroll` re-reads after every settlement, so `bankroll_usdt = 40.0`
+in config is only a pre-connection placeholder. An earlier claim in this session
+that "sizing is running ~5% conservative" was made by reading the config instead
+of the runtime value, and was wrong.
+
+The instruction was right anyway, for a different reason.
+
+### What the logs showed
+
+    00:25  bankroll read $45.50 is below the ledger $50.53 (1/5 reads)
+    00:35  bankroll read $47.13 is below the ledger $52.78 (1/5 reads)
+    00:45  bankroll read $45.86 is below the ledger $49.96 (1/5 reads)
+    00:55  bankroll read $46.60 is below the ledger $53.18 (2/5 reads)
+    01:00  bankroll read $46.30 is below the ledger $50.24 (3/5 reads)
+    03:45  bankroll read $35.12 is below the ledger $44.66 (1/5 reads)
+
+The ledger ran $4-10 ABOVE the venue for hours and never adopted the lower
+figure: `_reconcile_bankroll` requires five consecutive low reads, and the
+counter kept resetting. **The bot was sizing off inflated equity** -- the
+opposite of conservative.
+
+### The cause, and the fix
+
+`LiveBroker.balance()` returned `walletBalance` -- cash only. That is the source
+of the very lag `_reconcile_bankroll` was written to survive: a stake leaves the
+wallet the moment an order fills, while the payout only returns after redemption
+settles on-chain, so mid-flight the wallet under-states the account by the whole
+position.
+
+The venue publishes the missing pieces. Verified live 2026-09-15:
+
+    totalValue 42.12746449
+      = walletBalance 42.12746449 + positionValue 0 + totalClaimableAmount 0
+
+`totalValue` is exactly that sum. New `LiveBroker.equity()` returns it, falling
+back to the recomputed sum and then to `walletBalance` so a partial response can
+never yield 0. Both bankroll call sites now use it.
+
+That also retires a guard: `_refresh_bankroll` used to skip entirely while a
+position was open, because cash alone would have under-stated the account. With
+equity an open position is counted at its VALUE rather than looking like a hole,
+so the refresh runs whenever a round settles. `_reconcile_bankroll`'s drift
+machinery stays as a safety net -- but with the artefact gone, a persistent gap
+is now far more likely to be real, which is the point.
+
+The test that pinned the old guard (`test_refresh_is_skipped_while_a_position_is_open`)
+asserted the bug. It is replaced by one asserting the new invariant, with the
+fake returning DIFFERENT numbers from `balance()` (20.0) and `equity()` (76.0)
+so that reading the wrong one fails loudly instead of passing plausibly.
+
+567 tests pass. Deployed; startup read $42.1275.

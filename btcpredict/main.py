@@ -368,7 +368,9 @@ class Bot:
                     "prediction access and that a Prediction Account exists."
                 )
             self.broker = self.book
-            bal = await self.broker.balance()
+            # equity(), not balance(): cash alone under-states the account by
+            # any open position and by winnings not yet redeemed.
+            bal = await self.broker.equity()
             log.info("LIVE mode. wallet %s balance $%.4f",
                      self.broker.wallet_address, bal)
             if bal > 0:
@@ -2927,19 +2929,21 @@ class Bot:
         what was left, which is the exact failure mode fraction sizing exists
         to prevent.
 
-        Only ever called when a round of ours has just settled and nothing is
-        open, because `walletBalance` excludes cash locked in an open position:
-        reading it mid-round would UNDERSTATE equity and shrink the next stake.
+        Used to be gated on `not self.open_fills`, because `walletBalance`
+        excludes cash locked in an open position and reading it mid-round would
+        UNDERSTATE equity and shrink the next stake. That gate is gone with the
+        move to `equity()`, which adds `positionValue` and
+        `totalClaimableAmount` back -- an open position is now counted at its
+        value rather than looking like a hole in the account.
 
-        The read is a RECONCILIATION, not the answer -- see _reconcile_bankroll
-        for why the venue's number lags a settlement rather than tracking it.
+        The read is still a RECONCILIATION, not the answer -- see
+        _reconcile_bankroll -- but the artefact it defends against is now much
+        rarer, so a persistent gap is far more likely to be real.
         """
         if self.mode != "live" or getattr(self, "book", None) is None:
             return
-        if self.open_fills:
-            return                      # still invested; equity is not readable
         try:
-            bal = await self.book.balance()
+            bal = await self.book.equity()
         except Exception as e:          # never let a read failure stop trading
             log.warning("bankroll refresh failed: %s: %s", type(e).__name__, e)
             return

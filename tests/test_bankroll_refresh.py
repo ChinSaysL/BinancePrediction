@@ -17,10 +17,12 @@ class FakeLiveBook:
 
     mode = "live"
 
-    def __init__(self, balance=76.0, *, fail=False):
+    def __init__(self, balance=76.0, *, fail=False, position_value=0.0):
         self._balance = balance
+        self._position_value = position_value
         self.fail = fail
         self.balance_calls = 0
+        self.equity_calls = 0
         self.redeemed = 0
 
     async def balance(self):
@@ -28,6 +30,20 @@ class FakeLiveBook:
         if self.fail:
             raise RuntimeError("venue hiccup")
         return self._balance
+
+    async def equity(self):
+        """Total account value: cash + open positions + unredeemed winnings.
+
+        Deliberately DIFFERENT from balance() here, so a test cannot pass by
+        reading the wrong one. On the real venue `walletBalance` under-states
+        the account by any open position; `equity()` is `totalValue`, which the
+        venue publishes as exactly
+        walletBalance + positionValue + totalClaimableAmount.
+        """
+        self.equity_calls += 1
+        if self.fail:
+            raise RuntimeError("venue hiccup")
+        return self._balance + self._position_value
 
     async def settle(self, fill, winner):
         won = fill.side == winner
@@ -76,14 +92,26 @@ def test_refresh_moves_the_bankroll_to_the_live_balance(store):
     assert bot.bankroll == pytest.approx(91.25)
 
 
-def test_refresh_is_skipped_while_a_position_is_open(store):
-    """walletBalance excludes locked cash, so reading it while invested would
-    understate equity and shrink the next stake below the intended fraction."""
-    book = FakeLiveBook(20.0)                   # free cash only, rest is invested
+def test_an_open_position_is_counted_at_its_VALUE_not_as_a_hole(store):
+    """Sizing must read equity, never wallet cash.
+
+    This used to assert the refresh was SKIPPED while invested, because
+    `walletBalance` excludes cash locked in a position and reading it mid-round
+    would understate the account and shrink the next stake. `equity()` removes
+    the reason for that gate: the venue publishes `totalValue` as
+    walletBalance + positionValue + totalClaimableAmount, so a position is
+    counted at its value instead of looking like a hole.
+
+    The fake returns 20.0 from balance() and 20.0 + 56.0 from equity(), so
+    reading the wrong one is visible rather than silently plausible.
+    """
+    book = FakeLiveBook(20.0, position_value=56.0)
     bot = make_bot(store, book, open_fills={1: ("r1", make_fill())})
     asyncio.run(bot._refresh_bankroll())
-    assert bot.bankroll == pytest.approx(76.0)
-    assert book.balance_calls == 0
+    assert bot.bankroll == pytest.approx(76.0), (
+        "equity is cash plus the open position, not cash alone")
+    assert book.equity_calls == 1, "sizing must go through equity()"
+    assert book.balance_calls == 0, "and must not read wallet cash for sizing"
 
 
 def test_refresh_is_a_noop_outside_live_mode(store):
@@ -194,5 +222,5 @@ def test_a_win_raises_the_ledger_even_when_the_read_lags(store):
 
     # pnl = payout 2.207 - stake 1.53 - fee 0.05
     assert bot.bankroll == pytest.approx(76.5027 + 0.627)
-    assert book.balance_calls == 1              # the read still happened, and
+    assert book.equity_calls == 1               # the read still happened, and
     assert bot._bankroll_drift == 1             # was recorded as a disagreement
