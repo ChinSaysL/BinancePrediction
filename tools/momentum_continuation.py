@@ -80,6 +80,11 @@ def main():
                     help="tau at the BREAKOUT must be >= this (Train spec: 60)")
     ap.add_argument("--max-ask", type=float, default=0.98,
                     help="fire only if the coherent ask is <= this")
+    ap.add_argument("--max-range-bps", type=float, default=0.0,
+                    help="skip entries where the round has ALREADY travelled more "
+                         "than this, open->entry. 0 = off. The cross arm ships "
+                         "cross_max_round_range_bps=10.0, so this asks whether the "
+                         "Train edge lives in the population that gate refuses.")
     ap.add_argument("--pay-up", type=float, default=0.0,
                     help="also report EV at ask+this, i.e. paying the LIMIT. "
                          "The arm pays about the limit: 69%% of live fills land "
@@ -143,6 +148,29 @@ def main():
                 return None
         return ask
 
+    def round_range_bps(slug, upto_ms):
+        """How far the round has travelled, open -> upto_ms, in bps.
+
+        The slug IS the round's start in unix seconds and the family names its
+        length, so this needs no extra table. Cross arm ships this as
+        cross_max_round_range_bps = 10.0.
+        """
+        parts = slug.split("-")
+        dur = {"5m": 300, "15m": 900, "1h": 3600, "1d": 86400}.get(
+            parts[2] if len(parts) > 2 else "", None)
+        if dur is None:
+            return None
+        try:
+            start = int(parts[3]) * 1000
+        except (ValueError, IndexError):
+            return None
+        K = rounds[slug][0]
+        seen = [row[2] for row in series[slug]
+                if start <= row[0] <= upto_ms and row[2] > 0]
+        if len(seen) < 2 or K <= 0:
+            return None
+        return 1e4 * (max(seen) - min(seen)) / K
+
     # ---------------- STATIC: calibration by distance --------------------
     # one entry per round: the LAST quote inside the tau window (the same
     # convention the prior DIST table used, so the numbers are comparable).
@@ -199,6 +227,10 @@ def main():
                 row = T[j]
                 ts, spot = row[0], row[2]
                 side = "Up" if spot >= K else "Down"
+                if args.max_range_bps > 0:
+                    rr = round_range_bps(slug, ts)
+                    if rr is None or rr > args.max_range_bps:
+                        continue
                 ask = pick(side, row)
                 oask = pick("Down" if side == "Up" else "Up", row)
                 if ask is None:

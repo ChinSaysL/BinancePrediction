@@ -10400,3 +10400,74 @@ the breakout, ~1s later at this cadence -- not instantly.
 RECOMMENDATION: build it at **D=0** with the tau>=60 and ask<=0.890 gates, as an
 additional ENTRY TRIGGER on the existing arm (or sharing its exposure cap) rather
 than a separate book. Do not build D=3-5.
+
+## BLOCKER before building the Train arm: the trigger is structurally
+## incompatible with the arm's own validated range gate (2026-09-15)
+
+Asked to implement and ship the Train entry trigger live. One check first, and it
+stops the build.
+
+### The trigger cannot coexist with `cross_max_round_range_bps = 10.0`
+
+The strike IS the round's opening price. So if the spot is 10bps from the strike,
+the round has BY CONSTRUCTION travelled at least 10bps open->now. The Train
+trigger requires exactly that; the range gate refuses exactly that. **They are the
+same condition**, and it means Train is not "an additional entry trigger on the
+existing arm" -- it is an OVERRIDE of a validated risk control.
+
+Measured, adding the shipped gate as a filter to the Train cells:
+
+    X>=10 D=0   NO range gate   n= 75  px 0.799  hit 89.3%  +0.085  day-t +2.94
+                RANGE GATE 10   n= 18  px 0.802  hit 88.9%  +0.087  day-t +0.19
+    X>=15 D=0   NO range gate   n= 39  px 0.817  hit 94.9%  +0.123  day-t +4.04
+                RANGE GATE 10   n=  5  -- too few to test at all
+
+**76% of the Train fires (57 of 75) sit on rounds the range gate refuses.** The
+18 that survive are almost certainly quote-sparsity artefacts -- rounds whose
+recorded spot series never printed a full 10bps range -- not genuine members of
+the gate's population. Restricted to what the gate actually admits, the day-t
+falls from +2.94 to **+0.19**: no evidence at all.
+
+### Why this is not a formality
+
+`cross_max_round_range_bps = 10.0` was not chosen by reasoning. It was re-tested
+and VALIDATED on 2026-09-15 (commit ffa6aa5): win rate falls monotonically
+84.9% -> 78.0% -> 62.3% -> 63.9% -> 56.2% as range/gate rises, and **every bucket
+above ratio 1.0 is NEGATIVE net of the +0.055 slippage** (-0.049, -0.027, -0.105).
+The refused region is measured to lose money.
+
+So shipping Train as specified means trading a population this file has
+independently measured as loser-dense, on the strength of a CALIBRATION result
+with n=75 that is (a) contradicted in sign by the n=321 coherent-favourite
+measurement, and (b) unreconciled.
+
+### And there is no configuration that avoids the conflict
+
+    X >= 5bps  (shallow, so a smaller range)   n=244  paying the limit  -0.000  day-t +0.02
+    X >=10bps  (works, but breaks the gate)    n= 75  paying the limit  +0.085  day-t +2.94
+    X >=20bps  (deeper)                        n= 23  paying the limit  -0.019  day-t -0.38
+
+Shallow enough to respect the gate -> no edge. Deep enough to have an edge ->
+breaks the gate. There is no middle: the edges only at X>=10..15, and the gate is
+at 10.
+
+### NOT BUILT. The decision that is actually being asked for.
+
+Building this is not an engineering task, it is a RISK decision, and it is the
+operator's: **override a gate that was validated on 8 days in order to trade a
+signal measured on 75 fires over 6, on one substrate, contradicted by another
+result in this same file.** I am not shipping that on my own initiative with real
+money, and the honest form of "ship it" would have to be stated as "override the
+range gate for this trigger", which is a different instruction.
+
+If it is pursued, the version that at least keeps the risk bounded and the
+evidence honest:
+
+  * record-only first (log the trigger and the ask it would have paid, no orders)
+    until ~50 fires accumulate live, which at 12/day is under a week;
+  * then reconcile the n=321 contradiction BEFORE the first real order;
+  * and if it ships, it must SHARE the cross arm's exposure cap rather than add a
+    parallel book -- the six families are already 94.5% same-side correlated, and
+    doubling exposure to one bet is not diversification.
+
+Nothing shipped. No code path added. Live config and the +2c canary untouched.
