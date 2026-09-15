@@ -145,6 +145,25 @@ def perp_move_bps(ts, px, t_us: int, win_ms: float) -> float | None:
     return (now - then) / then * 1e4 if then else None
 
 
+def move_ratio(ts, px, t_us: int, win_ms: float, base_n: int = 10) -> float | None:
+    """Volatility expansion: recent |move| / mean of the prior |moves|.
+
+    The 'squeeze breakout' claim: when the last window's displacement is a
+    multiple of its own trailing baseline, the drift continues for 15-45s.
+    """
+    recent = perp_move_bps(ts, px, t_us, win_ms)
+    if recent is None:
+        return None
+    step = int(win_ms * 1000)
+    base = [perp_move_bps(ts, px, t_us - k * step, win_ms)
+            for k in range(1, base_n + 1)]
+    base = [abs(b) for b in base if b is not None]
+    if len(base) < 5:
+        return None
+    m = sum(base) / len(base)
+    return abs(recent) / m if m > 0 else None
+
+
 def win_sum(ts, pre, lo: int, hi: int) -> float:
     i = bisect.bisect_left(ts, lo)
     j = bisect.bisect_left(ts, hi)
@@ -222,6 +241,10 @@ def main() -> int:
                     help="window for the perp displacement")
     ap.add_argument("--vel-x", type=float, default=3.0,
                     help="trade-arrival multiple over the 10s baseline")
+    ap.add_argument("--break-x", type=float, default=2.0,
+                    help="BREAK: recent 30s perp move vs its 5min baseline")
+    ap.add_argument("--break-bps", type=float, default=3.0,
+                    help="BREAK: minimum recent 30s perp displacement (bps)")
     ap.add_argument("--sweep-ms", type=float, default=200.0,
                     help="burst window for the forced-sweep footprint")
     ap.add_argument("--sweep-usd", type=float, default=300_000.0,
@@ -277,6 +300,7 @@ def main() -> int:
         perp_done = False
         vel_done = False
         sweep_done = False
+        break_done = False
         rows_pre = {}
         for i, q in enumerate(qs):
             spot = q.get("spot")
@@ -425,10 +449,38 @@ def main() -> int:
                                 ev(side, p, r["winner"])
                                 - ev(oside, pi, r["winner"]))
 
+            # ---- BREAK: volatility expansion (squeeze breakout) in the tape
+            if (not break_done and perp_ts
+                    and args.min_tau <= tau <= args.max_tau
+                    and 0 < abs(dist_bps) <= args.gap_bps):
+                side = "Up" if dist_bps < 0 else "Down"
+                t_us = q["ts_ms"] * 1000
+                mv = perp_move_bps(perp_ts, perp_px, t_us, 30_000)
+                ratio = move_ratio(perp_ts, perp_px, t_us, 30_000)
+                sgn = 1.0 if side == "Up" else -1.0
+                if (mv is not None and ratio is not None and sgn * mv >= args.break_bps
+                        and ratio >= args.break_x):
+                    break_done = True
+                    p = entry_price(qs, i, side, args.entry_lag_ms)
+                    oside = "Down" if side == "Up" else "Up"
+                    pi = entry_price(qs, i, oside, args.entry_lag_ms)
+                    if p:
+                        res.setdefault("BREAK", []).append(
+                            (r["slug"], side, p, r["winner"],
+                             r["fee_rate_bps"], tau))
+                        if pi:
+                            res.setdefault("BREAK_INV", []).append(
+                                (r["slug"], oside, pi, r["winner"],
+                                 r["fee_rate_bps"], tau))
+                            pairs.setdefault("BREAK", []).append(
+                                ev(side, p, r["winner"])
+                                - ev(oside, pi, r["winner"]))
+
     print(f"\n{'rule':9} {'n':>5} {'mean_px':>8} {'win':>6} {'EV/$1':>8} "
           f"{'EV_net':>8} {'med_tau':>8} {'day-t':>7}")
     for k in ("CROSS", "PRE", "PRE_MOM", "PRE_INV", "PERP", "PERP_INV",
-              "VEL", "VEL_INV", "SWEEP", "SWEEP_INV", "MOM_ONLY", "PRE_COIN"):
+              "VEL", "VEL_INV", "SWEEP", "SWEEP_INV", "BREAK", "BREAK_INV",
+              "MOM_ONLY", "PRE_COIN"):
         v = res.get(k) or []
         if not v:
             print(f"{k:9} {0:5}")
@@ -484,7 +536,7 @@ def main() -> int:
                   f"{m/2:+.4f}/$1")
 
     print("\nby symbol (EV/$1, n):")
-    for k in ("CROSS", "PRE", "PRE_MOM", "PERP", "VEL", "SWEEP", "MOM_ONLY"):
+    for k in ("CROSS", "PRE", "PRE_MOM", "PERP", "VEL", "SWEEP", "BREAK", "MOM_ONLY"):
         v = res.get(k) or []
         parts = []
         for sym in sorted(syms):
@@ -497,7 +549,7 @@ def main() -> int:
         print(f"   {k:9} " + "  ".join(parts))
     print("\nby day (EV/$1, n) -- stability:")
     days_seen = sorted({slug_day(x[0]) for x in (res.get("CROSS") or [])})
-    for k in ("CROSS", "PRE", "PRE_MOM", "PERP", "VEL", "SWEEP", "MOM_ONLY"):
+    for k in ("CROSS", "PRE", "PRE_MOM", "PERP", "VEL", "SWEEP", "BREAK", "MOM_ONLY"):
         v = res.get(k) or []
         parts = []
         for d in days_seen:

@@ -7851,6 +7851,96 @@ and bounded. And the recurring lesson, restated for the third time today:
 `up_price` is a displayed value that is not inside its own book on average --
 never score a strategy against it.
 
+## The "you cannot trade 1s impulses" batch: two halves measured, one already built (2026-09-15)
+
+The pitch: (1) extend the horizon to 5-30s so the 1s fill lands mid-move
+(ATR/range breakouts, 1m CVD divergence over 10-20s); (2) become a maker with
+GTC resting limits and cancel into adverse moves; (3) pay up -- `best_ask + 2-3
+ticks` -- to stop FOK failures.
+
+Every window tested earlier today was 0.5-2s, so (1)'s horizon claim was
+genuinely untested. It is tested now. (2) and (3) are already in this file.
+
+### 1a. Horizon: extending 1s -> 30s does NOT help. The skill goes NEGATIVE.
+
+`tools/precursor_entry.py --perp-win-ms`, same 2,606 rounds, same honest
++1000ms entry pricing, each paired against the opposite side at its own entries:
+
+  window    n     EV_net   paired vs opposite side
+  1s       953    +0.067   +0.0317  se 0.0815  t +0.39
+  5s      1360    -0.008   -0.0370  se 0.0614  t -0.60
+  10s     1410    -0.007   -0.0415  se 0.0610  t -0.68
+  20s     1432    -0.011   -0.0568  se 0.0606  t -0.94
+  30s     1429    +0.002   -0.0398  se 0.0622  t -0.64
+
+The trade count triples (953 -> 1,432) and the EV goes to zero, while the paired
+difference -- the statistic that isolates DIRECTION -- is negative at every
+horizon beyond 1s. Elongating the window does not buy runway for our 1s fill;
+it buys more trades with no signal in them.
+
+### 1b. Volatility expansion (squeeze breakout): the only non-flat cell all day, and it is 09-12.
+
+New rule BREAK: 30s perp displacement >= `--break-bps` AND >= `--break-x` times
+the mean |30s displacement| of the prior 5 minutes, taking the direction of that
+displacement. Four configs:
+
+  x1.5 / 2bps   n= 872   EV_net -0.008   paired -0.0672  t -0.84
+  x2.0 / 3bps   n= 513   EV_net +0.093   paired +0.0744  t +0.68
+  x3.0 / 3bps   n= 230   EV_net +0.371   paired +0.3259  t +1.41   <- best of the day
+  x2.0 / 6bps   n= 199   EV_net +0.139   paired +0.0769  t +0.34
+
+EV rising monotonically with strictness is the signature of a FITTED parameter,
+and the best cell is the smallest sample in its own sweep. The decisive read:
+
+  BREAK  n=230  mean_px 0.417  win 0.409  EV_net +0.351  med_tau 127  day-t +0.92
+  by day: 09-08 -0.292(29)  09-09 +0.041(58)  09-10 +0.235(57)
+          09-11 -0.024(27)  09-12 +1.333(59)
+
+Negative on 2 of 5 days; day-clustered t +0.92; and the entire +0.371 is 09-12
+(+1.333 on n=59). Strip that one day and the other four average **+0.039** on
+n=171. It is the day factor again, selected by threshold -- the same 09-12 that
+makes every other rule positive. And its median tau is 127s: mid-round, not a
+late-window rule at all.
+
+### 2. Maker: BUILT AND MEASURED ALREADY -- and the edge was a price artifact
+
+This is not untested work; it is recorded above. `stale_maker` (09-12/13) is the
+literal rest-before-the-move design, and its decomposition is the whole story:
+**"the measured edge is ENTIRELY in the fill price: at the ask +0.0175/$1, at
+the mid +0.3449."** Resting at the mid looks like +34%/$1; at the ask it is
++1.75% gross. Live it ran n=24, flat (+1.4 pts, 0.1 SE). That is the same
+displayed-vs-executable collapse measured again in the section above, and it is
+why the standing rule is do-not-widen-buffers.
+
+New numbers from the 801 live fills, for whoever re-runs it:
+
+  fee_paid/stake: mean 95.9 bps, median 88.4, p10 0.0, p90 203.8
+  **24.8% of fills pay ZERO fee** (the mean is a minority of expensive fills)
+  fee_paid is NOT marketProviderFee + networkFee (they disagree on 548/771 rows)
+  the venue DOES attribute maker/taker: all 472 fills carrying the field are
+  maker-side (makerShareQty > 0, taker 0) at 86.5 bps mean / 63.6 median
+  fillPercentage: mean 0.607 -- **566/771 fills are PARTIAL**
+  favourite-side spread late in the round: median 2.0 cents
+
+So the prize (2 cents = 200 bps) is real and larger than the fee, but the one
+decomposition that exists says it does not survive contact with the ask. The
+honest gap is n=24, not the design. A longer live maker run at fixed size is a
+legitimate experiment; a fresh backtest is not, because the backtest has been
+done and it says the edge is the mid.
+
+### 3. Paying up (best_ask + 2-3 ticks): already tested, and the failures are not 1-2 ticks
+
+Two prior results settle it. (a) "The cancelled orders: adverse selection, and
+why NOT to widen the buffer" -- 7 missed fills, **+7.17/$1 at our bids vs -0.73
+at the real ask**; the fills we get are the ones where the book stayed put, and
+the ones we miss are the ones that ran, i.e. exactly when we were right. (b) The
+drought windows needed **25,454-203,333 bps** of slippage -- past the venue's own
+documented maximum of 10,000 bps, which we already raised the clamp to (commit
+428c0fc). No ceiling can fill those.
+Today's fills show we already pay up: executed price vs requested is median
++16 bps (mean +13.3, p95 +373). The complaint that we lose 1-2 ticks to venue
+latency describes a different failure than the one we have.
+
 ## The synthetic-sweep idea, tested -- and the recorder that now exists
 (2026-09-15)
 
