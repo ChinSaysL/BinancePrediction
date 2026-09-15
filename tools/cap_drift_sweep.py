@@ -89,11 +89,13 @@ def show(title, by_cap, n_total, fee_frac, note=""):
            f"{'net/sh':>8s} {'net/$1':>8s} {'day-t':>7s}")
     print(hdr)
     print("-" * len(hdr))
+    out = {}
     for cap in CAPS:
         rs = by_cap.get(cap) or []
         label = "no cap" if cap == float("inf") else f"+{cap*100:.1f}c"
         if not rs:
             print(f"{label:>8s} {0:6d}")
+            out[cap] = None
             continue
         paid = statistics.fmean(r[1] for r in rs)
         win = statistics.fmean(1.0 if r[2] else 0.0 for r in rs)
@@ -103,6 +105,8 @@ def show(title, by_cap, n_total, fee_frac, note=""):
         t = day_t([(r[0], (1.0 if r[2] else 0.0) - r[1]) for r in rs])
         print(f"{label:>8s} {len(rs):6d} {len(rs)/n_total:7.1%} {paid:7.3f} {win:7.1%} "
               f"{net:+8.3f} {per1:+8.3f} {t:+7.2f}")
+        out[cap] = (len(rs), net, win, paid)
+    return out
 
 
 def main():
@@ -113,6 +117,8 @@ def main():
     ap.add_argument("--tau-hi", type=float, default=60.0)
     ap.add_argument("--fee-frac", type=float, default=None,
                     help="fee as a fraction of price; default = measured from fills")
+    ap.add_argument("--max-hop", type=int, default=4,
+                    help="how many venue quotes after the trigger to sweep")
     args = ap.parse_args()
 
     c = sqlite3.connect(args.db)
@@ -129,12 +135,22 @@ def main():
         "select slug, strike, winner from rounds "
         "where winner in ('Up','Down') and strike > 0")}
 
-    # ---------------- TAPE: arrival = next quote (~1s) ----------------
+    # ------------- TAPE: arrival = the Nth venue quote after the trigger -----
+    # Why sweep HOPS, not milliseconds. The venue's own order records show an
+    # order is WORKED, not matched once: createTime -> terminalTime is p50
+    # 1430ms for FILLED (n=3, min 1120) but p50 416ms for FAILED (n=17), and
+    # our own elapsed on a fill is p50 2.82s (max 15.9s). So the arrival that
+    # decides the cap is ~1-2 venue quotes out, not 250ms.
+    #
+    # And this substrate CANNOT resolve 250ms: the venue quote series is ~1s
+    # apart, so lag 250 and lag 500 return the SAME next quote 99.8% of the
+    # time (see "QUOTE RESOLUTION"). Hopping quotes is the honest horizon
+    # sweep this data supports, and the live +2c cap was chosen on the 250ms
+    # model that this data cannot even express.
     sql = ("select slug, ts_ms, tau_s, spot, up_ask, down_ask from quotes "
            "where up_ask is not null and down_ask is not null and spot > 0 "
            "order by slug, ts_ms")
-    tape = collections.defaultdict(list)
-    n_tape = 0
+    trigs = []
     for slug, grp in itertools.groupby(c.execute(sql), key=lambda r: r[0]):
         if slug not in rounds:
             continue
@@ -157,20 +173,40 @@ def main():
             ask = ua if side == "Up" else da
             if not ask or ask <= 0.02 or ask >= 0.98:
                 continue
-            if i + 1 >= len(T):
+            col = 3 if side == "Up" else 4
+            fwd = [T[i + k][col] if i + k < len(T) else None
+                   for k in range(1, args.max_hop + 1)]
+            if fwd[0] is None:
                 break
-            arrived = T[i + 1][3] if side == "Up" else T[i + 1][4]
-            if not arrived:
-                break
-            n_tape += 1
-            won = winner == side
+            trigs.append((ts, ask, fwd, winner == side))
+            break                                  # first trigger per round
+
+    print(f"\nTAPE horizon sweep: {len(trigs)} first-triggers at "
+          f"tau {args.tau_lo:.0f}-{args.tau_hi:.0f}s")
+    for hop in range(1, args.max_hop + 1):
+        by_cap = collections.defaultdict(list)
+        n = 0
+        for ts, ask, fwd, won in trigs:
+            arr = fwd[hop - 1]
+            if arr is None or arr <= 0.02 or arr >= 0.98:
+                continue
+            n += 1
             for cap in CAPS:
                 lim = ask + (cap if cap != float("inf") else 1.0)
-                if arrived <= lim + 1e-9:
-                    tape[cap].append((ts, arrived, won))
-            break                                  # first trigger per round
-    show("TAPE  arrival = next quote (~1s)", tape, n_tape, fee_frac,
-         "overstates the drift vs the real 250ms, so the fill rates here are a FLOOR")
+                if arr <= lim + 1e-9:
+                    by_cap[cap].append((ts, arr, won))
+        s = show(f"TAPE arrival = trigger + {hop} quote(s) (~{hop}s)", by_cap,
+                 max(1, n), fee_frac, f"{n} rounds carrying a usable arrival")
+        usable = {k: v for k, v in s.items() if v and v[0] >= 20}
+        if not usable:
+            continue
+        best = max(usable.items(), key=lambda kv: kv[1][1])
+        lab = "no cap" if best[0] == float("inf") else f"+{best[0]*100:.1f}c"
+        live = s.get(0.02)
+        livestr = f"{live[1]:+.3f}" if live else "n/a"
+        print(f"  >>> HOP {hop}: best cap {lab} at {best[1][1]:+.3f}/sh, "
+              f"win {best[1][2]:.1%}, fill {best[1][0]/max(1,n):.1%}"
+              f"   |  the live +2c gives {livestr}/sh")
 
     # ---------------- LOG: arrival at the real 250/500/1000ms ----------------
     txt = open(args.log, errors="ignore").read()

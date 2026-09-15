@@ -9906,3 +9906,91 @@ Idea 2 is not refuted, it is priced out: the mechanism shows no lead on the pair
 that can be measured, the transport to the venues named costs ~41ms one-way from
 Tokyo before any lead is banked, and the analogous trigger already failed its
 own opposite-side control when traded (t = +0.39).
+
+## The +2c cap re-tested at the horizon the venue actually uses (2026-09-15, night)
+
+The reason to look: the venue's own order records show an order is WORKED, not
+matched once. `createTime -> terminalTime` is **p50 1430ms for FILLED** (n=3, min
+1120, max 1683) against **p50 416ms for FAILED** (n=17, min 260, max 962), and
+our own elapsed on a fill is p50 2.82s (max 15.89s). The live +2c cap was chosen
+on a **250ms** arrival model. If the venue works for ~1.4s, the cap was tuned at
+a horizon that does not exist.
+
+So the cap was swept against the horizon. Two constraints on the method, both
+already recorded and both binding:
+
+  * this DB **cannot express 250ms**: the venue quote series is ~1s apart, so lag
+    250 and lag 500 return the SAME next quote 99.8% of the time;
+  * therefore the sweep is over QUOTES, not milliseconds -- arrival = the Nth
+    quote after the trigger. `tools/cap_drift_sweep.py --max-hop N`.
+
+433 first-triggers, tau 5-60s, fee 0.0117 of price, one entry per round:
+
+    HOP 1 (~1s)   n=431
+       +0.5c  180  41.8%  0.642  72.8%  +0.078  day-t +2.43
+       +1.0c  212  49.2%  0.648  73.6%  +0.081  day-t +3.05
+       +2.0c  231  53.6%  0.647  74.0%  **+0.086**  day-t +3.03   <- LIVE
+       +3.0c  241  55.9%  0.650  74.7%  **+0.089**  day-t +3.27   <- BEST
+       +4.0c  259  60.1%  0.654  74.5%  +0.083  day-t +3.37
+       +6.0c  290  67.3%  0.657  73.8%  +0.073  day-t +3.84
+       +8.0c  310  71.9%  0.662  73.9%  +0.069  day-t +3.92
+      no cap  431 100.0%  0.685  73.3%  +0.040  day-t +3.06
+
+    HOP 2 (~2s)   n=430
+       +1.0c  192  44.7%  0.625  70.8%  +0.076  day-t +3.36
+       +2.0c  209  48.6%  0.633  71.8%  **+0.077**  day-t +3.43   <- LIVE
+       +3.0c  230  53.5%  0.639  73.5%  **+0.088**  day-t +3.70   <- BEST
+       +4.0c  237  55.1%  0.641  73.0%  +0.082  day-t +4.18
+       +6.0c  260  60.5%  0.647  71.9%  +0.065  day-t +3.77
+      no cap  430 100.0%  0.694  73.3%  +0.031  day-t +2.81
+
+    HOP 3 (~3s)   n=424
+       +2.0c  190  44.8%  0.618  69.5%  **+0.069**  day-t +2.50   <- LIVE
+       +3.0c  203  47.9%  0.623  70.0%  +0.069  day-t +2.65   (tie on net, more fills)
+      no cap  424 100.0%  0.698  72.9%  +0.023  day-t +2.64
+
+    HOP 4 (~4s): best +0.5c +0.053 | live +2c +0.045
+    HOP 5 (~5s): best +6.0c +0.060 | live +2c +0.042
+
+### MY OWN HYPOTHESIS IS REFUTED
+
+I expected the optimum to move OUTWARD with the horizon, and it does not. **It sits
+at +3c at hops 1, 2 and 3, and the live +2c is within 0.003 / 0.011 / 0.000 per
+share of it.** The cap plateau is broad and flat: from +1c to +8c the net edge
+spans 0.081-0.089 at hop 1 and 0.065-0.088 at hop 2. What the sweep does rule out
+is *no cap at all*, which is 3-6c worse at every hop (+0.040/+0.031/+0.023) --
+the cap is load-bearing as a bound, and its exact width barely matters.
+
+And the four-fold horizon extension buys nothing: at +2c the edge decays only from
++0.086 (1s) to +0.042 (5s), and stays **positive at every horizon**. Whatever the
+cap is doing, it is not what is starving the fills.
+
+### The number that actually explains the drought
+
+    TAPE fill rate at the LIVE +2c:   53.6% (1s)  48.6% (2s)  44.8% (3s)
+    REAL fill rate in the log:        34.5%  (48 fills / 139 fires)
+
+The tape says +2c should fill 54% of first triggers. The venue fills 34.5%. The
+tape assumes "price inside the cap => filled", and the venue has to actually match
+it inside its ~1.4s working window. It over-predicts fills by ~20pp **at every cap**
+-- at +8c it claims 71.9%. So the cap is not the binding constraint, and this
+substrate cannot say whether +2c is too tight in the real world, because its
+cap->fill mapping is not the venue's.
+
+### Recommendation
+
++3c dominates +2c on net/sh at hops 1, 2 and 3 AND fills more at each (241 vs 231,
+230 vs 209, 203 vs 190), with day-t >= 2.5 in every cell. The margin is small
+(0.003-0.011/sh) and it is a single substrate, but it is directionally consistent
+across three horizons and it moves the cap back toward the pre-change +3.75..+6.25c
+without reopening it.
+
+Counter-consideration, recorded: the LOG/250ms path -- the only substrate that
+measures a real arrival -- preferred +2c (+0.147) over +3c (+0.092). The two
+substrates disagree, and the venue's actual working time (~1.4s) sits between the
+LOG's 250ms and the tape's 1-2s. That is why this stays a recommendation with the
+margin stated, not a finding.
+
+Also flagged: `cross_max_fill_px = 0.65` declines a fire whose ask is already
+above it, so any ceiling above 0.65 is unreachable client-side regardless of cap.
+At +3c that bites for asks > ~0.62.
