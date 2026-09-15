@@ -8451,3 +8451,110 @@ corpus says the leader costs 0.5310 while the live venue charges 0.5739 -- and
 that 4-6c is the entire difference between a +0.0445 (day-t +4.77) mirage and a
 -0.0325 reality. Any future round-start or early-round claim must be re-priced on
 `quotes.up_ask/down_ask` from the live DB before it is believed.
+
+## CORRECTION: there is no 1,000 ms venue delay, and the "Last Look" theory is unsupported (2026-09-15)
+
+### The latency number was never ours
+
+"1000 ms" arrived with the third-party text ("the venue takes 800ms to 1,500ms").
+It was never measured here, and `grep` finds no hardcoded 1000 ms in the
+execution path. What we actually have in `data/live.log`:
+
+**`venue ack`** -- and the code defines it exactly: `t_ack = time.monotonic()`
+sits immediately before `self._request("POST", PLACE_ORDER, ...)`, with the log
+comment *"the ack ms is the decision->venue share of the race."*
+  n=32:  min 185ms | p25 210 | **median 249** | p75 486 | p90 640 | **max 823**
+  78.1% <= 500ms, **100% <= 1000ms**. The call that creates the order never took
+  a second; the median is a quarter of one.
+
+**`cross exec` duration** (decision -> our terminal state): n=135, min 1.75s,
+p25 2.97s, **median 6.87s**, max 21.53s -- but this is OUR OWN machinery: quote ->
+POST -> poll `order/history` (budget `order_status_wait_s`, raised 3.6s -> 9.0s)
+-> position patience -> up to 3 attempts -> NO_FILL timeout. It says nothing
+about venue latency, and repeating the 1 s figure as if it were measured was a
+mistake on my part.
+
+The real headline was in the same table all along: of 135 cross decisions,
+**87 = NO FILL and only 8 filled -- a 5.9% fill rate.**
+
+### Testing Last Look honestly: it is not needed, and we have no evidence of it
+
+The ack cannot see a dealer hold by construction -- the code says so: *"The venue
+returns HTTP 200 + {orderId} even when the order FAILS to fill. Never trust it:
+look the order up in order/history."* So a 500-1500 ms internal hold is invisible
+to it. The discriminating measurement is whether a *failure* happens when the
+price is **inside** the range we authorised: if it does, our own published cap
+cannot explain it.
+
+The bound is logged only on the MARKET path, so the sample is tiny: **32
+`venue ack` lines across the whole log**, 26 of which pair with a forward path.
+Classified against `--slip`-derived bound (quote x (1+slip)) and the 50ms..1s path:
+
+  price LEFT the authorised range (our own cap explains the FOK failure) : 20 / 26
+  price stayed INSIDE the range                                          :  6 / 26
+     of those 6: 3 FILLED (so not counterexamples at all), 3 unresolved in the log
+
+**Zero clear counterexamples.** The dominant cause of our FOK failures is
+arithmetic, not a discretionary veto. And the mechanism is symmetric and
+published: `slippageBps` on a MARKET/FOK bounds the fill at quote x (1 + slip),
+capped at 10_000 = 2x the quote **for every participant**. Our own comment already
+recorded the consequence: the 2026-09-15 drought windows needed 25_454-203_333 bps
+(3.5x-21x the quote), beyond the venue's maximum, unfillable at any latency by
+anyone.
+
+VERDICT: **Last Look is neither confirmed nor needed.** It is unfalsified only
+because our instrument for it (the bound, logged on one path) is too thin --
+recorded here as *unmeasured*, not as refuted. Note also that the theory's
+conclusion (you cannot snipe 1-2s moves) was already right for a different
+reason, so the theory changes no decision.
+
+### The four "exploit the dealer" ideas, finished
+
+1. **Stale volatility parameter** -- FALSIFIED earlier this session. The venue
+   is not using a slow rolling vol: implied sigma (inverted out of the contract
+   price) median **0.474** bps/sqrt(s) vs realised **0.464**, median ratio
+   **0.99** (p10 0.51, p90 1.82). It tracks trailing realised vol to ~1%. There is
+   no sigma gap to harvest, and the favourite-at-the-ask edge by vol-ratio bin is
+   insignificant in all five bins.
+
+2. **Cross-contract lag (BTC break -> ETH/BNB contract)** -- FALSIFIED, and this
+   was the last untested idea in the batch. `tools/cross_asset_lag.py`, live DB,
+   one entry per round, 3x3 signal x traded matrix, priced at the ask, fee 96 bps
+   of stake, day-clustered t:
+
+     signal traded  lag   n    ask   realized  edge/sh  day-t  days+
+     btc    btc       0  859  0.6370  0.6519  +0.0088  +0.25   5/8   (own)
+     btc    eth       0  325  0.6210  0.6092  **-0.0177**  -0.22   2/5   (cross)
+     btc    bnb       0  155  0.5727  0.5226  **-0.0556**  -2.81   0/2   (cross)
+     eth    btc       0  447  0.6150  0.5839  -0.0370  -3.37   1/7   (cross)
+     eth    eth       0  472  0.6100  0.5911  -0.0248  -0.37   2/5   (own)
+     bnb    btc       0  238  0.6143  0.5714  -0.0488  -1.67   1/4   (cross)
+     bnb    eth       0  144  0.5949  0.5486  -0.0520  -4.50   0/2   (cross)
+     bnb    bnb       0  149  0.5770  0.5705  -0.0120  -0.53   1/2   (own)
+
+   The claim is specifically that the CROSS signal carries information the
+   contract's own spot has not yet imparted, so the test had to be cross vs own
+   at identical entries. It fails in 8 of 9 cells:
+
+     own vs cross: btc lag0 own +0.0088 vs cross -0.0411  NOT better
+                   eth lag0 own -0.0248 vs cross -0.0283  NOT better
+                   bnb lag0 own -0.0120 vs cross -0.0249  NOT better
+                   (and at 1s/2s every cell is worse; the single "BETTER" is the
+                    bnb/2s cell on 2 days of data, i.e. noise)
+
+   The cross signal is systematically WORSE than the own signal -- it adds no
+   information, it only dilutes with a less correlated asset. And paying our real
+   latency kills even the diagonal: btc->btc goes +0.0088 (0ms) -> -0.0281 (1s)
+   -> -0.0212 (2s). BNB cells rest on 2 days and their day-t values are
+   meaningless; the ETH cells on 5 days are solidly negative.
+
+3. **Pullback entry (wait for the retrace, then fire)** -- FALSIFIED earlier:
+   -0.0150/share, day-t +0.00, 1/8 days positive.
+
+4. **Bundle execution as an atomic multi-leg spread** -- NOT AVAILABLE.
+   `trade/place-order-bundle` takes a single `quoteId`; there is no array of legs
+   and no cross-round atomicity to exploit. The official schema also confirms
+   MARKET must be FOK with no price limit, so `slippageBps` (integer, range
+   1-10000) is the only price bound that exists.
+
+New tool: `tools/cross_asset_lag.py` (read-only).
