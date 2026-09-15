@@ -76,11 +76,22 @@ def derived_slip_bps(default_bps: int, max_px: float | None,
     when the quote has drifted within default_bps/10000 of it. Measured live
     2026-09-15: quote 0.5800 against ceiling 0.58 authorised 0.5974 -- 3.74c
     above a trigger ask of 0.56 when the ceiling said 2c. Clamp to the ceiling.
+
+    The result is always within the venue's documented range (1 to 10000).
     """
     if max_px is None or avg_px <= 0:
         return default_bps
     room = int((max_px / avg_px - 1.0) * 10_000)
-    return max(0, min(room, 10_000))
+    # FLOOR OF 1, NOT 0. The venue's own schema types `slippageBps` as
+    # "Slippage tolerance in basis points. Range 1–10000"
+    # (slippagebps/schema(1).yaml:1405 for place-order-bundle, :1675 for
+    # get-quote). A quote at or above the ceiling yields room <= 0, and sending
+    # 0 is OUT OF RANGE -- measured live 2026-09-15 19:14, two attempts with
+    # slip 0 came back in 19ms and 18ms as last_failure "rejected", while every
+    # in-range attempt on the same arm took 200-250ms and failed as
+    # "venue_failed". The 1bp costs 0.006c on a 0.60 quote and is the smallest
+    # value the schema permits here.
+    return max(1, min(room, 10_000))
 
 
 def amount_usdt(x: str | int | float | None) -> float:

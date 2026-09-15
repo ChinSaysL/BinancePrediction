@@ -9230,3 +9230,57 @@ per TICK, not per round. `2026-09-15` holds 124 rows over **7 slugs**. Always
 collapse to one row per slug (first occurrence = the moment the arm would
 otherwise have fired) before computing a rate or an EV. I did not, and mis-stated
 the refusal rate by more than 10x.
+
+## BUG I SHIPPED, CAUGHT AND FIXED WITHIN 20 MINUTES: slippageBps = 0
+## (2026-09-15 19:14 -> 19:2x)
+
+The ceiling clamp (dc15293) returned `max(0, min(room, 10_000))`. When the
+venue's quote sits at or above the ceiling, `room <= 0` and the helper sent
+**`slippageBps = 0`**.
+
+The venue's own schema forbids it:
+
+    slippageBps:
+      type: integer
+      description: Slippage tolerance in basis points. Range 1-10000
+    slippagebps/schema(1).yaml:1405 (place-order-bundle), :1675 (get-quote)
+
+So 0 is not a "tighter cap", it is an INVALID ORDER. Measured live in the four
+minutes after the deploy:
+
+    venue ack eth...:  19ms, quote 0.5100 slip    0 -> bound 0.5100  FAILED (rejected)
+    venue ack btc...:  18ms, quote 0.5400 slip    0 -> bound 0.5400  FAILED (rejected)
+    venue ack btc...: 217ms, quote 0.4500 slip 1999 -> bound 0.5400  FAILED (venue_failed)
+    venue ack eth...: 216ms, quote 0.4908 slip  391 -> bound 0.5100  FAILED (venue_failed)
+    venue ack bnb...: 201ms, quote 0.4808 slip 1855 -> bound 0.5700  FAILED (venue_failed)
+
+Two signatures, and they are distinguishable by LATENCY: `slip 0` comes back in
+**18-19ms** classified `rejected` (a parameter rejection, before matching);
+every in-range attempt takes **200-250ms** and fails as `venue_failed` (a genuine
+FOK non-fill). `rejected` is a NEW failure class on this arm -- every historical
+failure was `venue_failed`.
+
+The floor I removed was doing TWO jobs, and I only saw one of them. It was raising
+the bound above the ceiling (the bug I was fixing) AND guaranteeing a legal value
+>= 300. Removing it fixed the first and broke the second.
+
+**Fix: `max(1, min(room, 10_000))`.** The 1bp costs 0.006c on a 0.60 quote and is
+the smallest value the schema permits. Tests updated, and a new one added that
+would have caught this in the first place:
+
+    test_always_within_the_venues_documented_range -- asserts 1 <= v <= 10_000
+    for every (default, ceiling, quote) combination.
+
+Lesson, and it is the same one as the depth gate: I validated the value I CARED
+about (bound <= ceiling) and never validated the value I was SENDING against the
+endpoint's contract. A clamp needs both bounds checked.
+
+### The other half: is the +2c cap costing fills?
+
+Separately from the bug, all three attempts failed with `bound == ceiling`. That is
+the cap working, but note the geometry: the ceiling is derived from the TRIGGER
+ask, while the venue's quote arrives ~250ms later and is `quote x (1+slip)`. When
+the quote has already drifted onto the ceiling, `room` is 0 and the order has no
+tolerance left at all. Whether that costs fills we wanted is NOT yet measured --
+the first four clean attempts are all NO FILL, and n=4 settles nothing. The canary
+criteria (paid <= 0.585, win >= 60%) still need ~50 fills.

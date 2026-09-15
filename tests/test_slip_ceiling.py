@@ -33,25 +33,46 @@ CASES = [(0.50, 0.52), (0.56, 0.58), (0.58, 0.60), (0.62, 0.64), (0.70, 0.72)]
 
 
 @pytest.mark.parametrize("ask,ceil", CASES)
-def test_bound_never_exceeds_the_ceiling(ask, ceil):
-    """For any quote between the ask and the ceiling, bound <= ceiling."""
+def test_bound_never_exceeds_the_ceiling_beyond_the_schema_minimum(ask, ceil):
+    """The bound may exceed the ceiling only by the 1bp the schema forces.
+
+    `slippageBps` is typed "Range 1-10000", so a quote sitting exactly on the
+    ceiling cannot be authorised at 0 -- the venue rejects that outright. The
+    permitted excess is therefore quote * 1bp (0.006c on a 0.60 quote).
+    """
     for quote in (ask, ask + 0.005, ceil - 0.01, ceil - 0.001, ceil):
         if quote <= 0:
             continue
         slip = derived_slip_bps(300, ceil, quote)
         bound = quote * (1 + slip / 10_000)
-        assert bound <= ceil + 1e-9, (
+        allowed = max(ceil, quote * 1.0001) + 1e-9
+        assert bound <= allowed, (
             f"ask={ask} ceil={ceil} quote={quote} slip={slip} bound={bound}")
+
+
+@pytest.mark.parametrize("quote", [0.02, 0.10, 0.50, 0.58, 0.599, 0.60, 0.90, 1.20])
+def test_always_within_the_venues_documented_range(quote):
+    """The venue schema (slippagebps/schema(1).yaml:1405) says "Range 1-10000".
+
+    A 0 here is not a tighter cap, it is an INVALID ORDER: measured live
+    2026-09-15 19:14, slip 0 returned in 19ms/18ms as "rejected" while every
+    in-range attempt took 200-250ms. This is the test that would have caught it.
+    """
+    for ceil in (0.10, 0.52, 0.58, 0.60, 0.90):
+        for default in (0, 1, 200, 300, 10_000):
+            v = derived_slip_bps(default, ceil, quote)
+            assert 1 <= v <= 10_000, (default, ceil, quote, v)
 
 
 def test_the_live_regression_is_fixed():
     """The exact live line: quote 0.58 against ceiling 0.58.
 
-    Old expression gave slip=300 -> bound 0.5974, which is ABOVE the ceiling.
+    The old expression gave slip=300 -> bound 0.5974, which is ABOVE the ceiling.
+    The fix gives 1 -- the schema floor, because 0 would be rejected outright.
     """
     slip = derived_slip_bps(300, 0.58, 0.58)
-    assert slip == 0
-    assert 0.58 * (1 + slip / 10_000) <= 0.58 + 1e-9
+    assert slip == 1
+    assert 0.58 * (1 + slip / 10_000) <= 0.58 * 1.0001 + 1e-9
 
 
 def test_a_quote_close_to_the_ceiling_gets_only_the_room_left():
@@ -68,10 +89,11 @@ def test_no_ceiling_keeps_the_configured_default():
     assert derived_slip_bps(300, 0.58, 0.0) == 300      # no usable quote
 
 
-def test_quote_at_or_above_the_ceiling_authorises_nothing():
-    """The caller refuses this case first; the helper must not invent room."""
-    assert derived_slip_bps(300, 0.58, 0.58) == 0
-    assert derived_slip_bps(300, 0.58, 0.60) == 0
+def test_a_quote_at_or_above_the_ceiling_still_sends_the_schema_minimum():
+    """The caller refuses this case first, but if it ever reaches here the value
+    must still be in range -- 0 is REJECTED by the venue."""
+    assert derived_slip_bps(300, 0.58, 0.58) == 1
+    assert derived_slip_bps(300, 0.58, 0.60) == 1
 
 
 def test_the_venue_maximum_is_respected():
