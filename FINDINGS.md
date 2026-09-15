@@ -7377,3 +7377,67 @@ age+px; a SHADOW fresh quote fetched concurrently with each cross order
 (answers "would a current reference have been accepted?" without touching
 the order); and one `venue ack` line per attempt with quote, slip, bound,
 ceiling and ms.
+
+## Precursor signals, redone at tick level (2026-09-15)
+
+The earlier "1s tape / 1s momentum" falsifications could not have seen a
+precursor to a 250-600ms race: they fed the model 1-second klines and
+labelled 5-minute settlements. Redone from scratch on the µs feeds already
+on disk (`data/bookticker/*.csv.gz` = Tardis top-of-book; `data/aggTrades/*`
+= trades with taker side), tool `tools/precursor_ticks.py`, day 2026-09-01
+(the one day with both feeds), 8h per symbol, 100ms grid, features strictly
+causal (sampled BEFORE the event that crosses the grid), two targets (quote
+mid and LAST TRADE price), and -- the decisive design -- a NON-OVERLAPPING
+event test: one label per mid tick, with the book state 100/300/800ms before
+it.
+
+WHAT REPLICATES (BTC / ETH / BNB):
+
+  * the next mid TICK is highly predictable from top-of-book imbalance:
+    baseline P(up) 50.3 / 53.5 / 49.4%;
+        qi > +0.65 ->  88.8 / 92.6 / 90.3%  (at 100ms lookback)
+                       85.2 / 88.8 / 88.6%  (300ms)
+                       82.3 / 84.3 / 86.0%  (800ms)
+        qi < -0.65 ->   9.0 /  8.9 /  9.9%  (mirror, 100ms)
+    Three symbols, stable across halves -- this is the real queue-imbalance
+    effect, and it is far stronger than anything measured before at 1s.
+
+  * the DRIFT accumulates: P(mid moves >= +0.5bps within 1s) goes from
+    3.4 / 5.1 / 3.2% (base) to 8.3 / 13.7 / 8.5% when qi > +0.65, and the
+    same lift appears on the TRADE-price target (8.3 / 13.7 / 8.5%).
+    Composite (qi>+0.65 AND CVD>0 AND dCVD>0): 10.8 / 19.6 / 11.2%.
+    Split-half stable. IC(qi -> forward return) +0.22..+0.30.
+
+WHAT DOES NOT (the part that matters for our fills):
+
+  * BIG single-tick moves -- the >=0.5bps jumps that actually cross strikes
+    -- are a COIN FLIP in direction: P(up) 55.1 / 44.4 / 49.5%, n=574/1899/
+    1197. Imbalance predicts the mechanical next tick, not the jump.
+  * the flow features are weak on their own: cvd500 IC +0.07/+0.05/+0.03,
+    absorption +0.014/+0.032/+0.038, and the composite adds little over qi
+    alone. tn500 (trade count) is noise.
+  * TWO of Gemini's ideas collapse before testing: (a) at top-of-book the
+    micro-price deviation is an IDENTITY -- micro-mid = -(spread/2)*qi, so
+    (micro-mid)/spread == -qi/2 exactly; it is one signal, not two (5-level
+    depth would separate them; this archive is top-1 only). (b) the venue
+    accepts FOK for MARKET and GTC for LIMIT ONLY -- IOC is rejected -1102
+    (verified live), so "switch to IOC + buffer" is inapplicable; the
+    cushion already exists as our ceiling/slippage derivation.
+
+VERDICT: the precursor exists but it is the WRONG CLASS. It front-runs
+1-tick queue mechanics (88-93% direction) and a slow drift (2.4-2.7x lift on
+>=0.5bps over 1-5s, visible in prints), while the violent jump that kills our
+FOKs (0.09 -> 0.90 inside 250-500ms) stays a coin flip -- and its size is
+past any slippage the venue accepts anyway (see the fill-drought section).
+Gemini's lead-lag idea is untestable here (no free Binance FUTURES archive;
+spot bookTicker stopped 2024-03 per the tape section) and is second-order
+next to this.
+
+DATA GAP for the money test. The strong signal needs bookTicker, which the
+archive has only for 2026-08-01 and 2026-09-01; the venue's own books (live
+DB) span 09-12..09-15; the Polymarket up/down recordings (data/hf/*.parquet,
+captured 08-21..08-24) overlap only aggTrades. No join is possible today.
+The fix is cheap and local: record Binance bookTicker + aggTrade for BTC/ETH/
+BNB on the VPS (the bot already holds the spot ws) and join against the
+venue's own recorded quotes -- that is what would settle whether a qi-triggered
+EARLY entry beats waiting for the crossing.
