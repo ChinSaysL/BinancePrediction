@@ -224,6 +224,39 @@ class Settings(BaseSettings):
     # an order round trip (~2s), so 3 is what fits inside a 10s candle-open
     # window. Retries only ever follow a failure the venue confirmed, never an
     # order whose outcome is unknown (see execution/live.RETRYABLE_FAILURES).
+    # How long buy() waits for order/history to return a TERMINAL status before
+    # falling back to the position list. Seconds; 0 keeps the old 3.6s budget.
+    #
+    # A FOK that fails is retryable ("venue_failed"), but only if we hear the
+    # venue SAY so. Measured 2026-09-15 05:09:13: the order was placed, the
+    # status poll ran 6 x 0.6s = 3.6s and gave up, the position list was empty,
+    # and buy() returned "unconfirmed" -- which is deliberately NOT retryable,
+    # because an empty position list lags a fill and re-placing on it could
+    # double exposure. The venue's own terminalTime for that order was ~8.2s
+    # after createTime, and its verdict was FAILED.
+    #
+    # So the order died after ONE attempt for want of ~5 more seconds of
+    # patience, while the bnb order at 05:34:29 -- whose status did arrive in
+    # time -- was retried at 05:34:36 and FILLED. Five of six MARKET orders
+    # since the switch failed; this is the difference between one shot and the
+    # three `order_max_attempts` already allows.
+    #
+    # Waiting costs nothing when the order filled (the poll returns early on any
+    # terminal status) and costs only time when it did not -- and a failed FOK
+    # costs no money, just the trade.
+    # Do not START another attempt with less than this much of the round left.
+    # 0 = OFF.
+    #
+    # Retries were unbounded in tau. That was harmless while a failed attempt
+    # was cheap and quick, but `order_status_wait_s` now spends up to 9s hearing
+    # the venue's verdict, so three attempts can span ~30s -- and the cross arm
+    # triggers with only 30-50s of round left. Without this, attempt 3 could be
+    # placed into a round that has already settled.
+    #
+    # 5.0 matches cross_min_tau_s: the arm's own judgement of when a round is
+    # too far gone to enter.
+    order_min_tau_s: float = 5.0
+    order_status_wait_s: float = 9.0
     order_max_attempts: int = 3
     # Small pause between attempts: re-quoting into the same instant that just
     # failed tends to fail the same way.

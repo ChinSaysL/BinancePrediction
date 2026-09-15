@@ -7023,3 +7023,56 @@ The arm is marginal on its whole live record -- 26/43 at 0.605 -- and today cost
 22.5% of the account. It is halted until the next UTC day by the loss cap. It
 should stay halted until the 0.55-0.65 band is confirmed on fills taken UNDER
 the new cap, rather than resumed because the clock rolled over.
+
+## Fixing MARKET rather than abandoning it: the FOK never got its retries
+
+Five of six MARKET orders failed after the 2026-09-15 switch. The reflex is to
+revert; the record says the path was never actually given its three attempts.
+
+    05:09:13  MARKET FAILED  btc  quote 0.370   "after 1 attempt(s)"
+    05:34:22  MARKET FAILED  btc  quote 0.530
+    05:34:25  MARKET FAILED  eth  quote 0.491
+    05:34:29  MARKET FAILED  bnb  quote 0.702
+    05:34:36  MARKET FILLED  bnb  quote 0.712   <- the RETRY of the line above
+    06:19:15  MARKET FAILED  btc  quote 0.370
+    06:34:11  LIMIT  FILLED  btc  quote 0.690   <- the stale-quote fallback
+
+The one MARKET fill is a retry. A FOK that fails is retryable
+(`venue_failed` is in RETRYABLE_FAILURES) -- but only once the venue SAYS it
+failed.
+
+### Why the retry never happened
+
+`buy()` polled `order/history` for a terminal status with `tries=6, delay=0.6`
+= 3.6s, gave up, checked the position list, found it empty, and returned
+`"unconfirmed"` -- which is deliberately NOT retryable, because an empty
+position list lags a fill and re-placing on it could double exposure. That
+reasoning is right and stays.
+
+The problem is the clock. Order `...549423`'s own `terminalTime` was **~8.2s
+after createTime**, and its verdict was `FAILED`. We stopped asking 4.6 seconds
+before the venue answered. The order died after one attempt for want of
+patience, while its bnb sibling -- whose status did arrive in time -- was
+retried and filled.
+
+**Shipped** `order_status_wait_s = 9.0`. Waiting costs nothing when the order
+filled (the poll returns early on any terminal status) and costs only time when
+it did not -- and a failed FOK costs no money, just the trade.
+
+### The consequence that had to be handled
+
+Three attempts at up to 9s each spans ~30s, and the cross arm triggers with only
+30-50s of round left. Unbounded-in-tau retries were harmless when an attempt was
+quick; they are not now. **Shipped** `order_min_tau_s = 5.0` (0 = OFF, matching
+`cross_min_tau_s`): no attempt starts into a round that is nearly over.
+
+Four tests, including one asserting a healthy round still gets all three
+attempts -- so the tau guard cannot quietly become a one-shot rule. They also
+pin that only a CONFIRMED venue failure is retried; an unknown outcome never is.
+
+### A note on the state this was found in
+
+`order_type` was reading `limit_take` when this was checked. A revert command
+that the operator rejected had nonetheless executed -- `.env.bak.1789455821`
+(07:03:41) holds `order_type=market`, and a restart is logged at 07:03:42.
+Restored to `market`. Worth knowing that a rejected command here still ran.

@@ -2654,6 +2654,20 @@ class Bot:
         for attempt in range(attempts):
             if attempt:
                 await asyncio.sleep(settings.order_retry_delay_s)
+                # Never start an attempt into a round that is nearly over.
+                # Retries used to be cheap and quick; `order_status_wait_s` now
+                # spends up to 9s hearing the venue's verdict, so three attempts
+                # can span ~30s against a trigger with 30-50s of round left.
+                # See config.order_min_tau_s.
+                _tau_fn = getattr(r, "tau_s", None)
+                _tau_left = (_tau_fn(int(time.time() * 1000))
+                             if _tau_fn else float("inf"))
+                if (settings.order_min_tau_s > 0
+                        and _tau_left < settings.order_min_tau_s):
+                    log.info("not re-attempting %s %s: %.1fs of round left, "
+                             "floor is %.1fs", r.slug, sig.side, _tau_left,
+                             settings.order_min_tau_s)
+                    break
                 # Last line of defence against double exposure. Whatever the
                 # previous attempt reported -- including a status the venue
                 # called FAILED -- ask the venue what it actually holds before

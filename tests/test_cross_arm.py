@@ -2595,3 +2595,82 @@ class TestTheFillPriceIsCapped:
         import btcpredict.main as m
         src = inspect.getsource(m.Bot._place_order)
         assert "cross_max_fill_px > 0" in src, "0 = OFF, the repo convention"
+
+
+class TestAFailedFOKGetsItsRetries:
+    """Five of six MARKET orders failed after the 2026-09-15 switch, and one of
+    them never got a second attempt at all.
+
+        05:09:13  MARKET FAILED  btc  ... "after 1 attempt(s)"
+        05:34:29  MARKET FAILED  bnb  quote 0.702
+        05:34:36  MARKET FILLED  bnb  quote 0.712   <- the retry
+
+    A FOK that fails is retryable ("venue_failed"), but only once the venue SAYS
+    it failed. buy() polled order/history for 3.6s, gave up, found an empty
+    position list, and returned the deliberately NON-retryable "unconfirmed" --
+    while that order's terminalTime was ~8.2s after createTime.
+    """
+
+    def test_the_status_budget_covers_the_venue_verdict(self):
+        """~8.2s was observed; the budget must exceed it."""
+        from btcpredict.config import settings as S
+        assert S.order_status_wait_s >= 8.5, (
+            "3.6s gave up before the venue answered, which cost the retry")
+
+    def test_the_budget_is_actually_used_by_buy(self):
+        import inspect
+        import btcpredict.execution.live as live
+        src = inspect.getsource(live.LiveBroker.buy)
+        assert "order_status_wait_s" in src
+        assert "tries=6, delay=0.6" not in src, "the frozen 3.6s budget is back"
+
+    def test_retries_stop_when_the_round_is_nearly_over(self, store, armed,
+                                                        monkeypatch):
+        """Waiting 9s per attempt means three attempts span ~30s, against a
+        trigger that fires with 30-50s left. Attempt 3 must not land in a round
+        that has already settled."""
+        monkeypatch.setattr("btcpredict.config.settings.order_min_tau_s", 5.0)
+        monkeypatch.setattr("btcpredict.config.settings.order_retry_delay_s", 0.0)
+        monkeypatch.setattr("btcpredict.config.settings.order_max_attempts", 3)
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0), asks=(0.30, 0.40))
+        calls = []
+
+        async def buy(**k):
+            calls.append(1)
+            bot.broker.last_failure = "venue_failed"   # confirmed, so retryable
+            return None
+
+        bot.broker.buy = buy
+        bot.broker.last_failure = None
+        r = types.SimpleNamespace(slug="btc-updown-5m-1", tau_s=lambda _ms: 2.0)
+        sig = types.SimpleNamespace(side="Up", quote=0.30, fair=0.60, edge=0.1)
+        asyncio.run(bot._place_order(r, sig, fair_up=0.40, token="t", stake=1.0,
+                                     skip_pretrade_gates=True, take_px=0.30))
+        assert len(calls) == 1, (
+            f"with 2.0s of round left only the first attempt may run; "
+            f"got {len(calls)}")
+
+    def test_a_healthy_round_still_gets_its_retries(self, store, armed,
+                                                    monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.order_min_tau_s", 5.0)
+        monkeypatch.setattr("btcpredict.config.settings.order_retry_delay_s", 0.0)
+        monkeypatch.setattr("btcpredict.config.settings.order_max_attempts", 3)
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0), asks=(0.30, 0.40))
+        calls = []
+
+        async def buy(**k):
+            calls.append(1)
+            # A FOK the venue CONFIRMED it could not fill. Only a confirmed
+            # rejection is retryable -- an unknown outcome never is, because
+            # re-placing on doubt is how exposure gets doubled.
+            bot.broker.last_failure = "venue_failed"
+            return None
+
+        bot.broker.buy = buy
+        bot.broker.last_failure = None
+        r = types.SimpleNamespace(slug="btc-updown-5m-1", tau_s=lambda _ms: 90.0)
+        sig = types.SimpleNamespace(side="Up", quote=0.30, fair=0.60, edge=0.1)
+        asyncio.run(bot._place_order(r, sig, fair_up=0.40, token="t", stake=1.0,
+                                     skip_pretrade_gates=True, take_px=0.30))
+        assert len(calls) == 3, (
+            f"90s of round left must allow all three attempts; got {len(calls)}")

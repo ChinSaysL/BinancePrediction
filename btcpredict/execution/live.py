@@ -644,7 +644,20 @@ class LiveBroker:
         # 0.5s), so the old budget reported "unreadable" for an order that had
         # already executed, and the position list was still empty 3.5s later.
         # ~3.6s here plus the position patience below covers that latency.
-        status = await self._order_status(order_id, tries=6, delay=0.6)
+        #
+        # RAISED 2026-09-15 via settings.order_status_wait_s. 3.6s was short of
+        # the venue's own verdict: order ...549423 on 05:09:13 had a terminalTime
+        # ~8.2s after createTime, so the poll gave up, the position list was
+        # (correctly) empty, and buy() returned the NON-retryable "unconfirmed".
+        # The order died after one attempt for want of a few more seconds, while
+        # a sibling whose status did arrive was retried and FILLED. Hearing
+        # "FAILED" is what makes a FOK retryable, and a failed FOK costs no
+        # money -- only the trade.
+        from btcpredict.config import settings as _s
+        _budget = getattr(_s, "order_status_wait_s", 0.0) or 3.6
+        status = await self._order_status(order_id,
+                                          tries=max(6, int(_budget / 0.6)),
+                                          delay=0.6)
         if status is None:
             # The history endpoint did not answer in time. It lags the
             # place-order call by a second or two, so this is the COMMON case
