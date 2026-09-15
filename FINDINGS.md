@@ -9594,3 +9594,190 @@ earlier n=50 never exceeded 270ms. The multi-family widening is the obvious
 suspect and the timestamps are consistent with it, but the two measurements come
 from different periods and could be different regimes. Do not act on the
 difference until both are measured the same way.
+
+## The five "get more fills without paying up" ideas, measured (2026-09-15, night)
+
+The brief: raise the fill rate without reopening the door to the +7c slippage.
+Four of the five are already answered in this file; the two that were not are
+measured here. Nothing shipped.
+
+### IDEA 1 -- pre-cached quote IDs to skip the 47ms `get-quote`: ALREADY SHIPPED,
+### AND THE CHECKPOINT PASSES
+
+This is not a proposal, it is a description of the code that has been running
+since 2026-09-15 morning: the cross arm keeps a quote WARM for the side the next
+crossing would buy, refreshed at most 1/s, consumed by the first attempt when
+younger than 2.5s. The premise as stated -- "if your bot calls get-quote after
+detecting the crossing" -- stopped being true that morning.
+
+FINDINGS left an explicit CHECKPOINT for it and it was never read out: *"after
+~20 fires, compare the venue order's createTime minus the CROSS decision log
+against the 169-220ms cold baseline -- a warm hit should print ~125-150ms."*
+46 warm hits existed. `tools/warm_quote_checkpoint.py` pulls the venue's own
+`order/history` records (the log carries createTime 0 times) and joins them to
+the CROSS decision by slug:
+
+    tau   decision -> venue createTime   warm   status
+     10                135ms             WARM   FAILED
+     13                113ms             WARM   FAILED
+     21                129ms             WARM   FAILED
+     27                125ms             WARM   FAILED
+     34                 98ms             WARM   FAILED
+     37                124ms             WARM   FAILED
+     39                119ms             WARM   FAILED
+     40                126ms             WARM   FAILED
+     42                122ms             WARM   FAILED
+     43                129ms             WARM   FAILED
+     52                130ms             WARM   FAILED
+     55                119ms             WARM   FAILED
+     59                108ms             WARM   FAILED
+     60                129ms             WARM   FAILED
+     60                227ms             cold   FILLED
+
+    WARM n=15  p50 125ms  min 98  max 978 (the 978 is a retry, which fetches fresh)
+
+**The checkpoint PASSES: 125ms, against a 169-220ms cold baseline.** The
+mechanism works exactly as designed and the fetch leg is gone.
+
+**And it changed nothing about fills.** 15 of 15 warm fires FAILED. The reason is
+the next paragraph, not the client.
+
+METHOD NOTE, because I got this wrong first: `venue ack` (p50 238ms across the
+same fires) is NOT the same endpoint as createTime. The ack is when the venue
+RESPONDS; createTime is when it STAMPS the order, before the match. Reading the
+ack made it look like the warm quote had failed. Always check which end of the
+chain a latency is measured at.
+
+Why it cannot be the lever, in one line: create at +125ms, and the venue's own
+FOK match takes 260-1237ms (failures clustering ~425ms), while the bound is left
+behind by ~250ms on a fast cross. **125 + 425 = 550ms against a ~250ms door.**
+Even createTime at 0ms would need another 175ms of lead.
+
+### IDEA 2 -- IOC to harvest partial depth: NOT AVAILABLE, and the premise is
+### false anyway
+
+`timeInForce` accepts FOK for MARKET and GTC for LIMIT ONLY. IOC returns -1102
+(verified live, recorded at live.py:558 and in three places in this file).
+
+The premise is separately wrong: "an FOK order rejects completely ($0 fill)"
+is not what this venue does. Of 135 `cross exec` lines, 87 were NO FILL and
+**40 got a PARTIAL fill** (and 8 filled in full). Partials are 29.6% of fires.
+FOK here is not the all-or-nothing it is assumed to be, so there is no depth to
+"harvest" that is not already being harvested.
+
+### IDEA 3 -- predictive pre-firing: MEASURED NEGATIVE, and now falsified at the
+### physics level too
+
+The economic half was already settled: PRE (|spot-K| within gap bps + flow) at
+250ms lag is **-0.061/share**, PRE_MOM -0.014, and the same-entry opposite-side
+control gives t = +0.54 -- no directional skill. On the venue's full record
+PRE_MOM goes to **-0.003** from a +0.007 slice artefact.
+
+What was never tested is whether the trigger can even SEE a cross 360ms ahead.
+That number is forced by the venue, not chosen: the order must be created ~175ms
+before the cross (match ~425ms vs a ~250ms door), and with a 125-185ms pipeline
+the trigger must fire at ~-300 to -360ms. `tools/prefire_physics.py`, BTCUSDT
+bookticker 2026-09-01, 9,847,706 ticks at 114/s, 5m rounds, K = the round's
+opening mid (matching the venue's own definition of the strike), 500ms
+momentum, strictly causal:
+
+    PROXIMITY 0.4-0.8bps (as proposed)     n=483,421   P(cross in 360ms) =  6.5%
+      ... and NOT moving toward K          n=444,426   P(cross in 360ms) =  5.2%
+      ... AND momentum >1.5bps/s           n= 38,995   P(cross in 360ms) = 21.2%
+    MOMENTUM >1.5bps/s alone               n=847,202   P(cross in 360ms) =  4.1%
+    ALL ticks (base rate)                  n=9.8M      P(cross in 360ms) =  1.3%
+
+So the momentum clause IS informative -- it lifts 6.5% to 21.2%, more than 3x the
+proximity-only control. **And it is still wrong four times out of five.**
+
+Does any lead time rescue it?
+
+    lead     BTC P(cross|trigger)   BTC proximity only   ETH trigger
+    100ms          10.7%                 3.4%               --
+    250ms          18.5%                 5.5%             24.9%
+    500ms          24.0%                 7.6%             32.3%
+   1000ms          31.8%                10.1%             40.0%
+   2000ms          46.7%                15.1%             48.2%
+   5000ms          59.3%                24.0%             64.7%
+
+Even at a FIVE SECOND lead the trigger is right 59-65% -- barely a coin flip. The
+mechanism is that 500ms micro-momentum does not persist: the approach stalls or
+reverses. The trigger fires 135 times per 5m round on average.
+
+The economics of a 21% trigger are not borderline, they are inverted. The current
+rule fires ON the cross, which is 100% precise by construction; its problem is the
+execution window, not the detection. Pre-firing trades a certain signal for a 21%
+one to buy 360ms, and each of the 79% wrong fires buys a position ahead of a move
+that did not come -- the PRE population, priced at -0.061/share.
+
+### IDEA 4 -- tau-elastic buffers: no support at any tau, on either substrate
+
+Not previously tested as an interaction, so it was tested. `tools/cap_drift_sweep.py`
+already carried `--tau-lo/--tau-hi`, and **that filter was silently inert for the
+LOG path**: `cross fine` does not carry tau, so a three-band run printed three
+IDENTICAL LOG blocks, each looking like a tau result. Fixed -- tau is derivable,
+since the slug IS the round's start in unix seconds and the family names its
+length. Trap recorded: a filter that applies to one of two substrates will
+produce a confident table about neither.
+
+TAPE, arrival = next quote (~1s) -- the only substrate with usable n:
+
+    tau 45-60  n=185   +2c +0.035  +3c +0.036  +4c +0.043  +8c +0.021  nocap +0.012
+    tau 25-45  n=208   +2c +0.058  +3c +0.065  +4c +0.045  +8c +0.029  nocap +0.003
+    tau  5-25  n=138   +2c +0.066  +1c +0.073  +4c +0.057  +8c +0.072  nocap +0.058
+
+LOG, arrival = the real ask(+250ms):
+
+    tau 45-60  n=52    +0.5c +0.062  +2c +0.040  +3c -0.007  +4c -0.034  nocap -0.041
+    tau 25-45  n=44    +0.5c +0.325  +2c +0.327  +3c +0.271  +4c +0.279  nocap +0.018
+    tau  5-25  n=17    +0.5c +0.388  +2c +0.076  +4c +0.098  +8c +0.098  nocap +0.132
+
+The claim was that at tau 45-60 gamma is lower and +2.5-3.0c "remains highly
+profitable". Measured **on the substrate that matters (the 250ms arrival), +3c at
+tau 45-60 is -0.007 net/sh against +2c at +0.040 and +0.5c at +0.062** -- tighter
+is better, in every band. On the tape the same band shows +0.035/+0.036/+0.043 for
++2/+3/+4c, a spread of 0.008 with no sign, and the optima across the three bands
+land on +4c, +3c and +1c respectively: a sign-flipping optimum is what fitting
+looks like, not what a mechanism looks like.
+
+n is 17-52 per band on the LOG path with day-t = nan (one day of `cross fine`
+paths). **This substrate cannot carry the claim either way, and what it does show
+points the other way.** Consistent with this file's two prior answers to "should
+this gate be dynamic?" -- the range gate (premise right, fix does not pay) and the
+depth gate (no).
+
+### IDEA 5 -- transport pre-warming / heartbeats: real, and ~10ms
+
+`tools/transport_probe.py`, read-only.
+
+    PART A, production, 38 acks by the idle gap before them:
+      gap <30s     n=21  ack p50 217ms  max 823ms
+      30s-10min    n= 7  ack p50 332ms  max 651ms
+      >10min       n=10  ack p50 275ms  max 492ms
+      -> non-monotone; no clean cold-socket signature.
+
+    PART B, probe, same POST three ways:
+      COLD first request on a brand-new session    55.4ms
+      WARM steady state (n=6)                      46.7ms  [44-50]
+      AFTER 35s IDLE, same session                 57.4ms
+
+So a fresh connection costs ~9ms and a connection idle for 35s costs ~11ms (n=1
+for that cell -- suggestive, not established). **The claim is real and it is
+about 10ms.** Against a pipeline that needs ~360ms of lead and whose binding leg
+is the venue's own ~425ms match, 10ms is 3% of the requirement. A heartbeat is
+not worth code that runs forever to save it.
+
+### Verdict: nothing to ship
+
+IDEA 1 already shipped and passes its own checkpoint while changing no fills;
+IDEA 2 is not available and its premise is false; IDEA 3 is negative
+economically and now falsified mechanically (21% at the required lead, and the
+momentum clause is the only part that works); IDEA 4 has no support and the
+substrate is too thin to claim one; IDEA 5 is real at ~10ms.
+
+The thread running through all five is the same one already recorded: **the fills
+we are missing are not missing because we are late.** They are missing because
+the venue's own match (~425ms) is slower than the window (~250ms) in which the
+price is still inside our bound. Nothing on the client can fix that, which is why
+every client-side saving measured so far (47ms fetch, 9ms TLS, 2ms colocation,
+125ms decision-to-create) has moved the fill rate by zero.

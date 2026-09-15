@@ -174,11 +174,39 @@ def main():
 
     # ---------------- LOG: arrival at the real 250/500/1000ms ----------------
     txt = open(args.log, errors="ignore").read()
-    pat = re.compile(r"cross fine (\S+) (Up|Down) (?:fire|refuse|trigger): (.*)")
+    pat = re.compile(
+        r"^(\S+ \S+),(\d+) .*?cross fine (\S+) (Up|Down) "
+        r"(?:fire|refuse|trigger): (.*)", re.M)
+
+    def line_tau(slug: str, stamp: str, msec: str) -> float | None:
+        """`cross fine` does NOT carry tau, so the --tau-lo/--tau-hi filter was
+        silently filtering only the TAPE path: a three-band run printed three
+        IDENTICAL LOG blocks and each one looked like a tau result. tau is
+        derivable instead -- the slug IS the round's start in unix seconds and
+        the family names its length."""
+        parts = slug.split("-")
+        if len(parts) < 4:
+            return None
+        dur = {"5m": 300, "15m": 900, "1h": 3600, "1d": 86400}.get(parts[2])
+        if dur is None:
+            return None
+        try:
+            start = int(parts[3])
+        except ValueError:
+            return None
+        t = dt.datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=dt.timezone.utc).timestamp() + int(msec) / 1000.0
+        return start + dur - t
+
     parsed = []
+    skipped_tau = 0
     for m in pat.finditer(txt):
-        slug, side, rest = m.group(1), m.group(2), m.group(3)
+        stamp, msec, slug, side, rest = m.groups()
         if slug not in rounds:
+            continue
+        tau = line_tau(slug, stamp, msec)
+        if tau is None or not (args.tau_lo <= tau <= args.tau_hi):
+            skipped_tau += 1
             continue
         pts = []
         for tok in rest.split():
@@ -203,6 +231,10 @@ def main():
         if trig is None:
             continue
         parsed.append((slug, side, pts, trig, rounds[slug][1] == side))
+
+    if skipped_tau:
+        print(f"  [tau filter dropped {skipped_tau} of the log's cross fine "
+              f"paths, tau {args.tau_lo:.0f}-{args.tau_hi:.0f}s]")
 
     for horizon_pc, hname in ((25, "250ms"), (50, "500ms"), (100, "1000ms")):
         by_cap = collections.defaultdict(list)
