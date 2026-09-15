@@ -2722,3 +2722,80 @@ class TestRefusingAPriceIsFree:
         is what the cooldown is for."""
         assert self._run(store, monkeypatch, "venue_failed") > 0.0, (
             "a genuine venue failure must still trigger the cooldown")
+
+
+class TestTheFOKToleranceTracksTheCeiling:
+    """`slippageBps` is the venue's tolerance for the book moving between the
+    quote and the execution, and at a frozen 300 (3%) it made this arm's orders
+    unfillable by construction.
+
+    The cross arm triggers precisely when the book is about to gap. Live
+    2026-09-15 07:39:50 on eth-updown-5m-1789457700: sweep_px 0.394, book at
+    +0.25s 0.720. A FOK authorised to 0.405 could never fill. 7 of 8 MARKET
+    orders failed that way.
+
+    `max_px` already states how far we will go, so the tolerance is computed
+    from it. The venue then enforces our own ceiling: the order fills anywhere
+    below it and fails above -- which is the correct outcome, because a fill at
+    0.72 on a 0.39 decision is in the losing band anyway.
+    """
+
+    def _sent(self, *, avg_px, max_px, default=300):
+        import btcpredict.execution.live as live
+
+        b = live.LiveBroker(None, "k", "s", wallet_address="w", wallet_id="1",
+                            slippage_bps=default)
+        sent = {}
+
+        async def quote(*a, **kw):
+            return {"quoteId": "q1", "averagePrice": avg_px, "expireAt": 0,
+                    "amountOut": str(10 * 10**18), "feeAmount": "0"}
+
+        async def request(method, path, params=None):
+            if path.endswith("place-order-bundle"):
+                sent.update(params or {})
+            return None                      # stop after the POST
+
+        b.get_quote = quote
+        b._request = request
+        asyncio.run(b.buy(slug="s", side="Down", token_id="t",
+                          price=avg_px, stake=1.0, max_px=max_px))
+        return sent
+
+    def test_the_tolerance_is_the_room_up_to_the_ceiling(self):
+        s = self._sent(avg_px=0.394, max_px=0.47)
+        # (0.47 / 0.394 - 1) = 19.3%
+        assert s.get("slippageBps") == pytest.approx(1928, abs=5), (
+            f"the FOK must be allowed to reach the ceiling; got {s.get('slippageBps')}")
+
+    def test_it_never_goes_below_the_configured_default(self):
+        """A ceiling tighter than the default must not shrink the tolerance
+        below what the venue already needs for ordinary jitter."""
+        s = self._sent(avg_px=0.60, max_px=0.601, default=300)
+        assert s.get("slippageBps") == 300
+
+    def test_it_is_clamped_at_the_top(self):
+        s = self._sent(avg_px=0.02, max_px=0.65)
+        assert s.get("slippageBps") <= 9000
+
+    def test_no_ceiling_means_the_configured_default(self):
+        import btcpredict.execution.live as live
+
+        b = live.LiveBroker(None, "k", "s", wallet_address="w", wallet_id="1",
+                            slippage_bps=300)
+        sent = {}
+
+        async def quote(*a, **kw):
+            return {"quoteId": "q1", "averagePrice": 0.40, "expireAt": 0,
+                    "amountOut": str(10 * 10**18), "feeAmount": "0"}
+
+        async def request(method, path, params=None):
+            if path.endswith("place-order-bundle"):
+                sent.update(params or {})
+            return None
+
+        b.get_quote = quote
+        b._request = request
+        asyncio.run(b.buy(slug="s", side="Down", token_id="t",
+                          price=0.40, stake=1.0))
+        assert sent.get("slippageBps") == 300

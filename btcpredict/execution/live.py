@@ -609,6 +609,27 @@ class LiveBroker:
                         avg_px, slug, side, max_px)
             return None
 
+        # SLIPPAGE DERIVED FROM THE CEILING, not frozen at a constant.
+        #
+        # `slippageBps` is the venue's tolerance for the book moving between the
+        # quote and the execution. At the default 300 (3%) a quote of 0.3936
+        # authorises a fill up to 0.405 -- and this arm triggers precisely when
+        # the book is about to gap. Measured live 2026-09-15 07:39:50 on
+        # eth-updown-5m-1789457700: sweep_px 0.394, the book at +0.25s was
+        # 0.720. The FOK was dead on arrival, and 7 of 8 MARKET orders failed
+        # the same way.
+        #
+        # The fix is not a bigger constant. `max_px` already says exactly how
+        # far we are willing to go, so the tolerance is computed from it: the
+        # venue then enforces our own ceiling, and the order fills anywhere in
+        # between. Too tight and a gapping book is unreachable; too loose and we
+        # overpay -- deriving it is neither.
+        #
+        # Without a ceiling the caller gets the configured default unchanged.
+        slip = self.slippage_bps
+        if max_px is not None and avg_px > 0:
+            room = int((max_px / avg_px - 1.0) * 10_000)
+            slip = max(self.slippage_bps, min(room, 9_000))
         resp = await self._request("POST", PLACE_ORDER, {
             "walletAddress": self.wallet_address,
             "walletId": self.wallet_id,
@@ -619,7 +640,7 @@ class LiveBroker:
             "timeInForce": "FOK",
             "accountType": self.account_type,
             "orderType": "MARKET",
-            "slippageBps": self.slippage_bps,
+            "slippageBps": slip,
         })
         if not resp:
             # A 4xx carries a venue error code (-1102, -3026, ...): the order

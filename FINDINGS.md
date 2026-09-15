@@ -7116,3 +7116,60 @@ Three tests, including one asserting a genuine `venue_failed` STILL pauses, so
 the exemption cannot widen into "never cool down".
 
 580 tests pass. Deployed.
+
+## The FOK was unfillable by construction: `slippageBps` was a constant, not a bound
+
+7 of 8 MARKET orders failed after the switch. The reflex reading is "market
+orders do not work on this venue". The mechanism says otherwise.
+
+`slippageBps` is the venue's tolerance for the book moving between the QUOTE and
+the EXECUTION. It was frozen at the configured 300 (3%). This arm triggers
+precisely when the book is about to gap:
+
+    07:39:50  eth-updown-5m-1789457700  sweep_px 0.394
+              cross meter: +0.25s=0.720  +0.50s=0.710  +1.00s=0.560
+              MARKET FAILED
+
+A quote of 0.3936 with 300bps authorises a fill up to **0.405**, against a book
+that was at 0.720 a quarter-second later. The order was dead before it was sent.
+Same shape at 07:29 (0.53 decided, book 0.67) and at 05:09 (0.37 quoted, book
+0.46).
+
+### The fix is not a bigger constant
+
+`max_px` already states exactly how far this arm will go -- it is the same
+`ask + buffer` ceiling the LIMIT path uses, capped by `cross_max_fill_px`. So
+the tolerance is now DERIVED from it:
+
+    slip = clamp(slippage_bps, (max_px / avg_px - 1) * 10_000, 9_000)
+
+    quote 0.394, ceiling 0.47  ->  1928 bps   (was 300)
+    quote 0.530, ceiling 0.59  ->  1132 bps   (was 300)
+    quote 0.600, ceiling 0.65  ->   833 bps   (was 300)
+
+The venue now enforces OUR ceiling: the FOK fills anywhere below it and fails
+above. Too tight and a gapping book is unreachable; too loose and we overpay.
+Deriving it is neither, and it cannot drift out of step with the ceiling the way
+a second constant would. Floored at the configured value so ordinary jitter is
+still covered, and clamped at 9000.
+
+### What this does and does not fix
+
+It converts every failure where the gap landed INSIDE the ceiling into a fill.
+It does not rescue 07:39:50: that book went 0.394 -> 0.720, far past the 0.47
+ceiling, so the FOK still fails -- correctly, because paying 0.72 on a 0.39
+decision is the losing band. The arm should decline that, and now it declines it
+by not filling rather than by an accident of a 3% constant.
+
+Four tests: the tolerance equals the room to the ceiling, never drops below the
+configured floor, is clamped at the top, and falls back to the plain default
+when no ceiling is given.
+
+### Operational note, second occurrence
+
+`order_type` was found on `limit_take` twice while checking this, after revert
+commands that the operator had REJECTED. Both times the rejection was reported
+to the assistant and the command had run anyway. Restored to `market` both
+times. Worth knowing when reading this file's timestamps.
+
+587 tests pass. Deployed, `order_type=market`, $1 stake.
