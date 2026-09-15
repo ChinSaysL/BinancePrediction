@@ -9422,3 +9422,58 @@ is mid-read.
 `cap_drift_sweep.py` first failed there on the import. It now inlines
 `crossed_side`, so it runs standalone. Any tool meant to run on the box must be
 self-contained.
+
+## Latency anatomy: a hard HOLD floor at ~185ms, and CONCURRENCY doubles it
+## (2026-09-15) -- tools/latency_anatomy.py
+
+The cap sweep established that the horizon dominates everything else: modelled at
+250ms the arm is profitable at every cap, at 500ms negative at every cap, and
+`venue ack` p50 sits on 249ms. So the next thing to measure is the latency itself.
+We already know it is not the network (RTT 2.05ms, warm HTTPS round trip 6.2ms).
+
+     POST trade/get-quote            n= 31  min  36  p25  43  p50  46  p75  51  max  56
+     POST trade/place-order-bundle   n= 39  min  18  p25 209  p50 223  p75 384  max 823
+
+### H1 CONFIRMED: the venue holds order submissions
+
+    +  0- 25ms    2   <- the two slippageBps=0 parameter rejections (no matching)
+    + 25- 50ms    0
+    + 50- 75ms    0
+    + 75-100ms    0
+    +100-125ms    0
+    +125-150ms    0
+    +150-175ms    2
+    +175-200ms   12
+
+**A 125ms DEAD ZONE with zero samples, then 12 of 39 bunched at 175-200ms.** A
+processing-time distribution is continuous; a void followed by mass is a deliberate
+hold. get-quote has no such floor (continuous 36-56ms). So the venue holds an
+order ~185ms before answering, and ~185ms is a floor no client change can beat.
+
+The good news: alone, our p50 is 223ms -- only ~38ms above that floor. Near-optimal.
+
+### H3 ALSO CONFIRMED, and it is where the whole gap is
+
+    other orders in flight   n    min    p50    max
+    0                       30     18    220    640
+    1                        6    315    602    823
+    2                        3     19    216    217
+
+**Median 220ms alone against 602ms with one other order in flight** -- 2.7x. And
+with a peer in flight the minimum never drops below 315ms.
+
+The arm fires CONCURRENTLY across markets. At 19:14:00 three markets crossed inside
+the same second and three orders went out together. So we are self-inflicting
+500-800ms latencies at exactly the moment the price is moving. Against the measured
+250ms-profitable / 500ms-negative cliff, that is the difference between a working
+arm and a losing one.
+
+CAVEAT: n=6 and n=3 for the concurrent cells, and "in flight" is a proxy (other
+acks within 1.5s). Thin. This needs more data before it is acted on -- but it is
+the only lever found this session that sits on the right side of the cliff.
+
+### Why this outranks everything else measured today
+
+Every other finding this session moved EV per share by 0.01-0.05 on a base that is
+one latency doubling from negative. This one moves the arm between the 250ms column
+and the 500ms column.
