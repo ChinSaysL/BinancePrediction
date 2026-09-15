@@ -1778,9 +1778,10 @@ class TestTheTrainTrigger:
 
     def test_a_FRESH_breakout_fires(self, store, armed, monkeypatch):
         monkeypatch.setattr("btcpredict.config.settings.cross_train_enabled", True)
-        bot = make_bot(store, ticks(77000.0, 77040.0, 77080.0))
+        # +26bps on the last sample: must clear the swept 15bps threshold
+        bot = make_bot(store, ticks(77000.0, 77100.0, 77200.0))
         bot._round = make_round(tau_s=120.0)
-        self._history(bot, [77000.0, 77040.0, 77080.0])   # 2s ago: at the strike
+        self._history(bot, [77000.0, 77100.0, 77200.0])   # 2s ago: at the strike
         seen = {}
 
         async def ex(*a, **k):
@@ -1797,10 +1798,10 @@ class TestTheTrainTrigger:
         """THE BUG, reproduced: every sample in the freshness window is already
         past the threshold, so this is an old move, not a breakout."""
         monkeypatch.setattr("btcpredict.config.settings.cross_train_enabled", True)
-        bot = make_bot(store, ticks(77080.0, 77082.0, 77084.0))
-        bot._round = make_round(tau_s=600.0)
-        self._history(bot, [77080.0, 77082.0, 77084.0])
-        calls = []
+        bot = make_bot(store, ticks(77140.0, 77150.0, 77160.0))
+        bot._round = make_round(tau_s=150.0)   # INSIDE the window on purpose:
+        self._history(bot, [77140.0, 77150.0, 77160.0])   # only staleness can
+        calls = []                                        # explain no fire
 
         async def ex(*a, **k):
             calls.append(k)
@@ -1813,8 +1814,8 @@ class TestTheTrainTrigger:
         """At startup the tick buffer is empty -- which is exactly when the live
         misfire happened. No history must mean no trade, not a trade."""
         monkeypatch.setattr("btcpredict.config.settings.cross_train_enabled", True)
-        bot = make_bot(store, ticks(77040.0, 77060.0, 77080.0))
-        bot._round = make_round(tau_s=600.0)
+        bot = make_bot(store, ticks(77120.0, 77160.0, 77200.0))
+        bot._round = make_round(tau_s=150.0)
         bot._ticks = {}
         calls = []
 
@@ -1830,9 +1831,9 @@ class TestTheTrainTrigger:
         """A train fill must be separable from a cross fill, or the live record
         cannot grade it."""
         monkeypatch.setattr("btcpredict.config.settings.cross_train_enabled", True)
-        bot = make_bot(store, ticks(77000.0, 77040.0, 77080.0))
+        bot = make_bot(store, ticks(77000.0, 77100.0, 77200.0))
         bot._round = make_round(tau_s=120.0)
-        self._history(bot, [77000.0, 77040.0, 77080.0])
+        self._history(bot, [77000.0, 77100.0, 77200.0])
 
         async def ex(*a, **k):
             pass
@@ -1852,9 +1853,14 @@ class TestTheTrainTrigger:
         same bet. Live: eight entries in 241s, all Down, one view six ways.
         """
         monkeypatch.setattr("btcpredict.config.settings.cross_train_enabled", True)
-        bot = make_bot(store, ticks(77000.0, 77040.0, 77080.0))
+        # The guard is DISABLED by default (.env cooldown=0, 2026-09-15), so the
+        # mechanism must be asserted with the knob set explicitly -- otherwise
+        # this test would pass by measuring the disabled default.
+        monkeypatch.setattr("btcpredict.config.settings.cross_train_cooldown_s",
+                            120.0)
+        bot = make_bot(store, ticks(77000.0, 77100.0, 77200.0))
         bot._round = make_round(tau_s=120.0)
-        self._history(bot, [77000.0, 77040.0, 77080.0])
+        self._history(bot, [77000.0, 77100.0, 77200.0])
         bot._train_last_ms = int(time.time() * 1000) - 1_000     # 1s ago
         calls = []
 
@@ -1874,9 +1880,11 @@ class TestTheTrainTrigger:
         """It must be a cooldown, not a latch: a genuinely new move later on is
         still tradeable."""
         monkeypatch.setattr("btcpredict.config.settings.cross_train_enabled", True)
-        bot = make_bot(store, ticks(77000.0, 77040.0, 77080.0))
+        monkeypatch.setattr("btcpredict.config.settings.cross_train_cooldown_s",
+                            120.0)
+        bot = make_bot(store, ticks(77000.0, 77100.0, 77200.0))
         bot._round = make_round(tau_s=120.0)
-        self._history(bot, [77000.0, 77040.0, 77080.0])
+        self._history(bot, [77000.0, 77100.0, 77200.0])
         bot._train_last_ms = int(time.time() * 1000) - 200_000   # 200s ago
         seen = {}
 
@@ -1892,9 +1900,11 @@ class TestTheTrainTrigger:
         it on the FILL would let a refused order be re-attempted family by
         family, which is exactly what rebuilds the burst."""
         monkeypatch.setattr("btcpredict.config.settings.cross_train_enabled", True)
-        bot = make_bot(store, ticks(77000.0, 77040.0, 77080.0))
+        monkeypatch.setattr("btcpredict.config.settings.cross_train_cooldown_s",
+                            120.0)
+        bot = make_bot(store, ticks(77000.0, 77100.0, 77200.0))
         bot._round = make_round(tau_s=120.0)
-        self._history(bot, [77000.0, 77040.0, 77080.0])
+        self._history(bot, [77000.0, 77100.0, 77200.0])
         bot._train_last_ms = 0
 
         async def ex(*a, **k):
@@ -1933,9 +1943,9 @@ class TestTheTrainTrigger:
         monkeypatch.setattr("btcpredict.config.settings.cross_train_enabled", True)
         monkeypatch.setattr("btcpredict.config.settings.cross_train_max_tau_s",
                             180.0)
-        bot = make_bot(store, ticks(77000.0, 77040.0, 77080.0))
+        bot = make_bot(store, ticks(77000.0, 77100.0, 77200.0))
         bot._round = make_round(tau_s=400.0)      # outside the 180s ceiling
-        self._history(bot, [77000.0, 77040.0, 77080.0])
+        self._history(bot, [77000.0, 77100.0, 77200.0])
         calls = []
 
         async def ex(*a, **k):
