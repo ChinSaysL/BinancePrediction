@@ -8710,3 +8710,106 @@ is nothing here to protect: the best of nine cells is +0.0040 at day-t +0.34.
 Both sides lose at the ask (mirror -0.0046 to -0.0264, and
 edge_unloved + edge_fav = 1 - ask_sum - fees ~= -0.025), which is the same
 ask-sum-exceeds-one-plus-fee wall every other variant hits.
+
+## Four cross-arm redesigns (2026-09-15) -- and a correction to my own fill-rate claim
+
+### CORRECTION FIRST: the "5.9% fill rate" I reported was wrong
+
+I have been quoting "87 NO FILL, only 8 filled = 5.9%". That counted only the
+execs carrying `committed $1.0000`. The honest breakdown from the log's 135
+`cross exec` lines:
+
+    87  NO FILL                                    (64.4%)
+    48  got a fill price, of which
+        8  committed the full $1.00                (5.9%)
+       40  committed less -- PARTIAL fills         (29.6%)
+
+So ~36% of cross decisions get at least a partial fill, not 5.9%. That is a
+material overstatement on my part and it changes the framing: the arm is not
+being rejected 94% of the time, it is being *partially* filled a third of the
+time. Corrected here and in the memory notes.
+
+### #1 Pre-cross bracketing (buy UP at K-1.5bps <= S < K)
+
+Two problems, one fatal.
+
+**The risk gate is not implementable.** The design says "if spot fails to cross K
+within 3s, dump the contract at 0.44-0.46". `grep -i sell btcpredict/execution/live.py`
+returns nothing -- there is no exit path in the client at all. The official schema
+does carry SELL (21 occurrences), so it is buildable, but it would be new code,
+and it would sell at the BID, not at a price of our choosing.
+
+**And the entry is already measured negative.** This is the PRE rule:
+`precursor_entry.py` at lag 250ms gives PRE **-0.061**, PRE_MOM -0.014, at 1000ms
+PRE -0.064. The claim is that the ask sits at 0.45-0.49 in the compression zone
+and liquidity is deep; measured, the PRE entries averaged an ask of **0.408** --
+cheaper than the claim assumes, and still -6c per share. A cheap entry is not an
+edge if the side wins less often than its price.
+
+### #2 Migrate to 15m -- the premise is HALF right, and the conclusion is wrong
+
+This is the first claim in a while that is partly supported, so it deserves the
+detail. Two separate questions:
+
+**(a) Is the 15m contract calmer? YES, on average.** From the DB, consecutive 1s
+quotes, `|price change|`:
+
+    5m   n=733,938   p90  2.00c  p99 12.00c   frac>5c  4.1%   frac>15c  0.6%
+    15m  n=374,063   p90  0.00c  p99  5.00c   frac>5c  0.9%   frac>15c  0.2%
+
+4.6x fewer >5c moves on the 15m. The mechanism is real: dP/dS = phi(d)/(S*sigma*sqrt(tau)),
+and with more time left sigma*sqrt(tau) is larger, so sensitivity at a given
+displacement is lower. Directionally the claim is right.
+
+**(b) But at the moments we actually trade, it gaps just as hard.** The log's 50ms
+`cross fine` paths, same forward windows:
+
+    kind   n    window      p50     p75     p90    max   frac>5c   frac>15c
+    5m    72   50-300ms    10.00   18.50   36.90  73.00    65.3%     33.3%
+    15m    9   50-300ms     7.00   23.00   49.60  52.00    55.6%     33.3%
+    5m    72   100ms-1s    11.50   23.25   43.70  72.00    77.8%     43.1%
+    15m    9   100ms-1s    13.00   25.00   42.00  50.00    66.7%     44.4%
+
+The worst 15m excursions: 50.0c (bnb-15m Down, 0.260 -> 0.760), 40.0c, 25.0c,
+16.0c. **Seven of nine moved more than 4c and three moved >= 25c** -- against a
+claim of "2 to 4 cents". n=9 is small, but the direction is unambiguous, and it is
+what the formula predicts: at S=K the sensitivity is at its MAXIMUM (phi(0)=0.399),
+and sigma*sqrt(tau) is only ~1.7x wider for 15m, so a crossing moves it ~1.8x
+less, not 6x. "2-4c" would require the crossing to be ~1.5 bps; if it is 5 bps,
+the 15m moves ~10c. The claim conflates the calm AVERAGE with the CROSSING, and
+the crossing is exactly where the sensitivity peaks.
+
+**(c) And the fill rate does not improve at all.**
+
+    5m : filled 42  no-fill 75  -> fill rate 35.9%  (n=117)
+    15m: filled  6  no-fill 12  -> fill rate 33.3%  (n=18)
+
+33.3% vs 35.9% -- statistically indistinguishable, and the wrong direction. The
+predicted lift to "70%+" does not appear. A softer average price series does not
+help if the specific moments we fire at are the violent ones.
+
+### #3 Retest limit bid at 0.52-0.54 after the gap
+
+This is a resting maker order, and that family is already falsified exhaustively:
+`tools/corpus_maker_sim.py` gives 8 of 8 configurations negative (day-t -3.1 to
+-6.0, 0-1 of 8 days positive) with adverse selection of 3-9 pp against a 1.2 pp
+spread, and the corrected level-based defensive cancel is negative at all 16
+configurations. Structurally this variant is the same trade: a bid 14c below the
+market fills only on the paths where the cross failed and price came back -- which
+is the definition of the adverse selection those tests measured. #2's data above
+adds the entry condition: the contract moves a **median 10c in the first 250ms**
+after the signal, so a bid at 0.53 against a 0.68 print is asking for a 15c
+reversal to be filled. It fills when it reverses. Not re-run; the family is closed.
+
+### #4 Strike-rejection fade (buy DOWN at 0.30-0.35)
+
+Same mechanism as the post-spike exhaustion fade falsified in the previous
+section, gated differently (spot displacement <2bps instead of a contract price
+threshold). That test already answered the mechanism question directly: in the
+fav>=0.75/0.80/0.85 bands the unloved side's realised win rate is BELOW its ask
+(0.1928<0.2034, 0.1586<0.1714, 0.1208<0.1395), i.e. **the battered side is RICH
+here, not cheap.** "Exploit the overreaction of other cross-chasers" assumes the
+battered side is underpriced; measured, it is overpriced, and buying it at the ask
+loses -0.0125 to -0.0200 per share with day-t -1.52 to -3.16. Changing the gate
+from a price threshold to a spot-displacement threshold changes which entries are
+selected, not whether the battered side is cheap.
