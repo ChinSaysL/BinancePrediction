@@ -2008,6 +2008,29 @@ class Bot:
             dist_bps = 1e4 * (feed.price - r.strike) / r.strike
             thr = self._ck("train_bps", r)
             if abs(dist_bps) >= thr and self._train_is_fresh(r, thr):
+                # BURST GUARD, 2026-09-15 21:01. See cross_train_cooldown_s.
+                #
+                # The trigger is a LEVEL (`|spot-strike| >= thr`), so the
+                # moment btc/eth/bnb move together it goes true for EVERY
+                # family -- and because a 5m round and its 15m sibling share a
+                # strike, those two are the SAME bet. Measured: eight entries
+                # in 241s, all Down, as eth-5m+eth-15m (one tick), then
+                # bnb-5m+bnb-15m (+20s), then btc-5m+btc-15m (+34s) -- one view
+                # expressed six ways. A CROSSING cannot cluster like this; a
+                # distance condition always will. The exposure caps do not
+                # catch it: they count positions and stake, not correlation.
+                cd = self._ck("train_cooldown_s", r)
+                last_ms = getattr(self, "_train_last_ms", 0)
+                if cd > 0 and last_ms and (now_ms - last_ms) < cd * 1000.0:
+                    self._cross_refuse(
+                        r, "Up" if dist_bps > 0 else "Down",
+                        f"train cooldown {cd:.0f}s: one entry per burst",
+                        tau=tau, spot=feed.price)
+                    return
+                # Stamped on the SIGNAL, before any later gate, so a refused
+                # order cannot let the same move be re-attempted family by
+                # family -- the next one is what would rebuild the burst.
+                self._train_last_ms = now_ms
                 side = "Up" if dist_bps > 0 else "Down"
                 train = True
         if not train and not (self._ck("min_tau_s", r) <= tau
@@ -2485,8 +2508,12 @@ class Bot:
         # get. The old label said "stale_ask" and quoted the touch, which made
         # a normal sweep read as a 14-cent execution failure.
         src = "sweep" if top is not None else "poll"
-        log.info("CROSS %s %s %s_px=%.3f (spot %.2f vs strike %.2f, tau %.0fs) "
-                 "stake=$%.2f -> %d today", r.slug, side, src, ask, spot,
+        # The label has to carry the TRIGGER. A train fire logged as "CROSS"
+        # reads as the cross arm violating its own 5-60s tau gate -- it did at
+        # tau 820s on 2026-09-15 21:01, and that is exactly how it was misread.
+        log.info("%s %s %s %s_px=%.3f (spot %.2f vs strike %.2f, tau %.0fs) "
+                 "stake=$%.2f -> %d today",
+                 "TRAIN" if train else "CROSS", r.slug, side, src, ask, spot,
                  r.strike, tau, stake, self._cross_count)
         # `run` goes into the reason so every trigger carries the number the
         # gate decision will be made on, recoverable from the decisions table.

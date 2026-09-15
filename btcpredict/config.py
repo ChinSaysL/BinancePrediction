@@ -1405,6 +1405,21 @@ class Settings(BaseSettings):
     # restart case). Do not set this to 0 -- 0 means "cannot prove freshness"
     # and the trigger goes inert.
     cross_train_fresh_s: float = 5.0
+    # BURST GUARD (2026-09-15 21:01). `|spot-strike| >= 10bps` is a LEVEL, so
+    # when btc/eth/bnb move together it goes true for EVERY family at once --
+    # and a 5m and its 15m sibling SHARE a strike, so those two are literally
+    # the same bet. Measured live: EIGHT entries in 241 seconds, every one of
+    # them Down, arriving as
+    #     eth-5m + eth-15m  (same tick)   bnb-5m + bnb-15m  (+20s)
+    #     btc-5m + btc-15m  (+34s)
+    # -- one view expressed six ways, at $1 a leg, and the 15m legs fired 46-80
+    # seconds into a 900-second round, a regime the measurement never sampled.
+    # The cross arm cannot do this (a CROSSING happens at unrelated times per
+    # family); a DISTANCE condition always can. Nothing that bounds RISK
+    # catches it either: the caps count positions and stake, not correlation.
+    # So: ONE train entry per burst, globally, not per family. 0 disables the
+    # guard, which is the behaviour that took the eight.
+    cross_train_cooldown_s: float = 120.0
     cross_skip_opposite_to_main: bool = True
     # RAISED 0.5 -> 2.0 on 2026-09-13. The old 0.5 was picked by a fill-aware
     # sweep that called it a "clear peak", but that sweep could not have seen

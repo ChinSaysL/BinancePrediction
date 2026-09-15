@@ -1843,6 +1843,67 @@ class TestTheTrainTrigger:
                 bot.store.conn.execute("select reason from decisions")]
         assert any(r.startswith("train into") for r in rows), rows
 
+    def test_a_SECOND_family_in_the_same_burst_is_refused(self, store, armed,
+                                                          monkeypatch):
+        """THE 21:01 BURST, reproduced.
+
+        `|spot-strike| >= 10bps` is a LEVEL, so btc/eth/bnb cross it together --
+        and a 5m round and its 15m sibling SHARE a strike, so those two are the
+        same bet. Live: eight entries in 241s, all Down, one view six ways.
+        """
+        monkeypatch.setattr("btcpredict.config.settings.cross_train_enabled", True)
+        bot = make_bot(store, ticks(77000.0, 77040.0, 77080.0))
+        bot._round = make_round(tau_s=120.0)
+        self._history(bot, [77000.0, 77040.0, 77080.0])
+        bot._train_last_ms = int(time.time() * 1000) - 1_000     # 1s ago
+        calls = []
+
+        async def ex(*a, **k):
+            calls.append(k)
+
+        bot._cross_execute = ex
+        asyncio.run(bot._cross_tick())
+        assert not calls, (
+            "a fresh breakout 1s after another train entry is the BURST, not a "
+            "second signal -- it must be refused")
+        rows = [r[0] for r in
+                bot.store.conn.execute("select reason from decisions")]
+        assert any("train cooldown" in r for r in rows), rows
+
+    def test_the_burst_guard_EXPIRES(self, store, armed, monkeypatch):
+        """It must be a cooldown, not a latch: a genuinely new move later on is
+        still tradeable."""
+        monkeypatch.setattr("btcpredict.config.settings.cross_train_enabled", True)
+        bot = make_bot(store, ticks(77000.0, 77040.0, 77080.0))
+        bot._round = make_round(tau_s=120.0)
+        self._history(bot, [77000.0, 77040.0, 77080.0])
+        bot._train_last_ms = int(time.time() * 1000) - 200_000   # 200s ago
+        seen = {}
+
+        async def ex(*a, **k):
+            seen.update(k)
+
+        bot._cross_execute = ex
+        asyncio.run(bot._cross_tick())
+        assert seen, "past the cooldown a new burst must fire again"
+
+    def test_firing_STAMPS_the_burst_clock(self, store, armed, monkeypatch):
+        """The stamp must land on the SIGNAL, before any later gate -- stamping
+        it on the FILL would let a refused order be re-attempted family by
+        family, which is exactly what rebuilds the burst."""
+        monkeypatch.setattr("btcpredict.config.settings.cross_train_enabled", True)
+        bot = make_bot(store, ticks(77000.0, 77040.0, 77080.0))
+        bot._round = make_round(tau_s=120.0)
+        self._history(bot, [77000.0, 77040.0, 77080.0])
+        bot._train_last_ms = 0
+
+        async def ex(*a, **k):
+            pass
+
+        bot._cross_execute = ex
+        asyncio.run(bot._cross_tick())
+        assert bot._train_last_ms > 0, "the signal must stamp the burst clock"
+
     def test_the_arm_is_quiet_when_off(self, store, armed):
         from btcpredict.config import settings
         assert settings.cross_train_enabled is False, (
