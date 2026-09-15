@@ -8312,3 +8312,142 @@ rather than as measured.
 **VERDICT: the maker idea is now excluded in every testable form -- passive
 rest, passive rest with a velocity cancel, and passive rest with a correctly
 specified level cancel at five thresholds. There is no remaining variant.**
+
+## The five-idea batch: four falsified, one not applicable (2026-09-15)
+
+Tools: `tools/corpus_roundstart.py` (corpus half), `tools/roundstart_live.py`
+(live half -- the one that decides). Both read-only.
+
+### IDEA 1 -- "strike-pegging / initialization lag": premise TRUE, edge FALSE
+
+The premise checks out, and that is worth recording: at sec 0-7 of a round the
+corpus quotes a flat **up_buy median exactly 0.5000**, and at sec=0 the spot IS
+the strike, so 0.50 is correct there and only becomes stale as the spot walks
+away. The venue really does open every contract at ~0.50.
+
+The corpus then appears to show a large edge. `tools/corpus_roundstart.py`,
+2,240 windows, strike = tape at sec 0, buy the side the spot moved toward at its
+ask, one row per (round, sec):
+  sec>=1 pooled  n=1384  ask 0.5164  realized 0.5621  edge +0.0445  **day-t +4.77 (8/8 days)**
+  by sec: 1 +0.0193(42) | 2 +0.0697(122) | 3 +0.0959(236) | 4 +0.0705(299) | 5 +0.0072(302) | 6 +0.0166(383)
+and by distance, the calibration gap opens exactly where |dist|>0 and is ZERO
+where it is not:
+  |d| 0.00-0.25  n 669  ask 0.5044  realized 0.5052  **+0.0008**
+  |d| 0.25-0.50  n 103  ask 0.5045  realized 0.5922  +0.0878
+  |d| 0.50-1.00  n 205  ask 0.5229  realized 0.5707  +0.0478
+  |d| 1.00-2.00  n 243  ask 0.5310  realized 0.6214  +0.0904
+  |d| 2.00-5.00  n 148  ask 0.5413  realized 0.6824  +0.1412
+
+**First check -- not my strike, not my alignment.** My dist was validated against
+the corpus's OWN `delta_bps` at elapsed=31 over 4,000 rows: mean diff **+0.002
+bps**, median 0.000, correlation **+0.9618**, and `strike_tape` is byte-identical
+to `open_tape` on 100.0% of rows. So the strike and the tape indexing are right.
+
+**Second check -- is the "win rate" momentum? NO.** Pure tape, all 15,240 rounds,
+forward move from sec s to the close, split by the sign of the move so far:
+  s     n     E[fwd|d>0]  E[fwd|d<0]   diff     win%|d>0  win%|d<0
+  1  15240     +0.078      -0.471     +0.549     51.65%    45.78%
+  3  15240     +0.381      -0.536     +0.917     54.34%    44.18%
+  10 15240     +0.139      -0.326     +0.464     56.83%    42.52%
+  31 15240     -0.037      -0.085     +0.048     60.53%    38.37%
+  60 15240     -0.108      -0.045     -0.063     64.78%    34.33%
+The forward move is essentially INDEPENDENT of the signal (+0.92 bps at s=3
+against a remaining sigma of ~9.6 bps, and NEGATIVE by s=60). The rising win rate
+is purely mechanical -- being ahead now makes finishing ahead more likely -- and
+it matches the closed form: leader win% = Phi(|d| / sigma*sqrt(300-s)) with
+sigma~0.298 predicts 55.0/60.9% at |d| 0.5-1/1-2 versus 55.40/58.11% measured.
+**This is the delta-selection mirage (NINTH/TENTH face), not a signal.**
+
+**Third check -- is the sample biased? NO.** The venue subsample's leader win
+rates track the full-tape ones bin by bin (0.5052/0.5922/0.5707/0.6214/0.6824 vs
+50.18/54.39/55.40/58.11/62.28%). So the corpus's own rows are representative.
+
+**Fourth check -- is it round-start-specific? In the corpus, YES.** Using the
+corpus's own `delta_bps` and `y_up` at elapsed 31/61/91/121 s the calibration
+gap is +-0.03 (well calibrated) -- so the apparent mispricing really is confined
+to the first seconds, which is what the claim predicts.
+
+**THE DECIDER -- the live venue contradicts the corpus.** `tools/roundstart_live.py`,
+live DB, September 2026, btc-updown-5m, tau 294-300 s, **one row per round**,
+868 rounds, fee 96 bps of stake:
+  |d| 0.00-0.25  n 487  ask 0.5055  realized 0.4723  **-0.0381**
+  |d| 0.25-0.50  n  67  ask 0.5300  realized 0.4776  **-0.0575**
+  |d| 0.50-1.00  n  94  ask 0.5572  realized 0.5213  **-0.0413**
+  |d| 1.00-2.00  n 110  ask 0.5739  realized 0.5636  **-0.0158**
+  |d| 2.00-5.00  n  88  ask 0.6030  realized 0.6250  **+0.0163**
+  6 of the 8 live days are negative.
+  pooled LEADER -0.0325 (day-t +0.48) | |d|>=0.25 **-0.0254 (day-t -2.22)** |
+  |d|>=0.5 -0.0185 (-2.21) | |d|>=1 -0.0088 (-1.89)
+
+**And here is why, in one number: the live ask is not the corpus ask.**
+  |d| 1.00-2.00:  corpus ask **0.5310**  vs  live ask **0.5739**
+  |d| 2.00-5.00:  corpus ask **0.5413**  vs  live ask **0.6030**
+The live market already prices 4-6 cents of the early move, which is exactly the
+"edge" the corpus was showing. The April corpus's round-start `*_sell_px`
+under-reacts relative to the venue that exists today. Live governs, because live
+is what we could have paid.
+
+VERDICT: **falsified on live data.** The structural premise (flat 0.50 open, a
+book that takes seconds to differentiate) is real and now documented; the
+tradeable edge in it is not.
+
+### IDEA 2 -- "fade the retail overreaction / buy the battered side": NEGATIVE where it applies
+
+For a binary pair edge_A + edge_B = 1 - ask_A - ask_B - fees, so the fade is the
+leader's mirror, and the leader (idea 1) is already negative. Live, per share,
+both sides at their own ask:
+  |d| floor   n    LEADER            FADE (buy the laggard)
+  >=0.00     868   -0.0325 (t +0.48)  +0.0109 (day-t -0.83)
+  >=0.25     381   -0.0254 (t -2.22)  +0.0036 (day-t +1.32)
+  >=0.50     314   -0.0185 (-2.21)    -0.0034 (day-t +0.85)
+  >=1.00     220   -0.0088 (-1.89)    -0.0132 (day-t +0.85)
+  >=2.00     110   -0.0018 (-0.97)    -0.0199 (day-t +0.78)
+The fade is break-even at best, its day-t never exceeds +1.4 in any cut, and it
+turns **negative precisely in the regime the claim targets** (odds pushed far
+from fair: -0.0132 at >=1 bp, -0.0199 at >=2 bp). Aggregating the two sides'
+prices is not the fix either: the ask sum is 1.0119, so the pair is -1.2c before
+fees by construction. VERDICT: **no edge.**
+
+### IDEA 3 -- "pin-risk double-fill: rest 0.35 on UP and 0.35 on DOWN": arithmetically impossible here
+
+The claim's arithmetic needs the two BIDS to sum to 0.70 (0.35 + 0.35) so that a
+double fill pays 1.00 for 0.70 = +0.30. Measured on 412,502 live two-sided quotes:
+  **BID sum: min 0.1200, p01 0.9400, median 0.9900**; <0.95 on 1.2%, <0.80 on 0.18%
+  ASK sum: min 0.1500, p01 1.0100, median 1.0100
+The two quotes are two prices for the two sides of the SAME 300-second bet. One
+cannot be cheap without the other being rich, so they cannot both rest at 0.35 --
+the sum is pinned near 1.00. A double fill at the bids is therefore worth about
+**+1.0c per pair**, not +30c, and it is paid for by the single fills, which are
+the adverse ones. The both-sides maker sim already measured this directly:
+**-0.0332/share, day-t -3.44** (previous section). VERDICT: **no edge.**
+
+### IDEA 4 -- "CTF mint/merge + liquidity mining": not available on this venue, and the arb does not exist
+
+The venue (`/sapi/v1/w3w/wallet/prediction/`) is a CLOB with
+`trade/place-order-bundle` and `order/history`. There is no mint/merge primitive:
+you cannot deposit $1 and receive YES+NO, so the CTF construction has no analogue
+here. The derived trade -- buy BOTH sides for under $1.00 -- was checked directly:
+  round start: ask sum < 1.0000 on **0 of 868** rounds (min exactly 1.0000)
+  all taus:    ask sum < 1.0000 on 407 of 412,502 (0.10%), median 1.0100
+and even those 0.10% do not clear the ~96 bps fee (1 - 0.99 - 0.0096 < 0). The
+"bid sum 0.99" that looks like free money is the BID; buying happens at the ASK,
+where the sum is 1.01. Polymarket's liquidity-reward distributions have no
+counterpart on this venue. VERDICT: **not applicable.**
+
+### IDEA 5 -- "oracle heartbeat frontrunning": already measured and dead
+
+Settlement is a POINT SNAPSHOT, not a window: `rounds.end_price` vs Binance 1 s
+bars gives |end - close at end| median **0.02 bps**, versus 0.44 bps against the
+30 s mean and 0.85 bps against the 60 s mean. There is no 10-30 s heartbeat to
+get ahead of, because the settle tracks the instantaneous spot. VERDICT:
+**already falsified** (see the settlement section above).
+
+### What the batch did produce
+
+One genuinely new, reusable fact, and it is a data-reliability warning not a
+strategy: **the April-May corpus's round-start quotes are not the live venue's
+round-start quotes.** Same rule, same distance bin (1-2 bps off the strike), the
+corpus says the leader costs 0.5310 while the live venue charges 0.5739 -- and
+that 4-6c is the entire difference between a +0.0445 (day-t +4.77) mirage and a
+-0.0325 reality. Any future round-start or early-round claim must be re-priced on
+`quotes.up_ask/down_ask` from the live DB before it is believed.
