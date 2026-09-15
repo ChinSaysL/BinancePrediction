@@ -8943,3 +8943,121 @@ An earlier live measurement of the same window agrees: 59% of 44 fills, net -0.0
 
 **The trap was never the gamma. It is that we pay above the displayed ask 84% of the
 time, and we only get filled on the crossings that are already failing.**
+
+## The execution-leak plan, measured (2026-09-15)
+
+Four proposals to fix the 20-point leak. Tools: `tools/cross_limit_sim.py`.
+Tape: live DB, 3,189 settled rounds, 386 first-crosses in tau 5-60.
+
+### IDEA 1, STRICT LIMIT (<= +1c): SUPPORTED. The only one of the four that works.
+
+Two measurements, because the live tape is ~1s resolution and the venue's head
+start is 249ms.
+
+**A. Tape.** One shot at the trigger ask A, fill only if the NEXT quote's ask is
+<= A+cap. ~1s is a CONSERVATIVE stand-in for 249ms, so this overstates rejection
+and is kind to the proposal. One entry per round, fees included.
+
+    cap            fills   rate     paid    win     net/sh   net/$1   day-t
+    no cap          386  100.0%   0.693  75.6%   +0.050   +0.085   +3.32
+    +5.0c           244   63.2%   0.666  76.6%   +0.087   +0.144   +3.90
+    +2.0c           204   52.8%   0.656  76.5%   +0.096   +0.160   +3.18
+    +1.0c           186   48.2%   0.657  75.8%   +0.088   +0.149   +3.16
+    +0.5c           159   41.2%   0.651  74.8%   +0.084   +0.138   +2.48
+
+**B. Exact 250ms**, from the 50ms ask paths the arm records (`cross fine`), 56
+triggers. Fill at ask(+250ms) iff ask(+250ms) <= ask(+50ms)+cap:
+
+    cap            fills   rate     paid    win     net/sh (ex-fee)
+    no cap           56  100.0%   0.609  60.7%   -0.002
+    +5.0c            26   46.4%   0.580  69.2%   +0.112
+    +2.0c            20   35.7%   0.573  80.0%   +0.227
+    +1.0c            18   32.1%   0.572  77.8%   +0.206
+
+Both point the same way: capping the fill tolerance at +1c to +2c roughly doubles
+the net edge per dollar off a base that is already positive, at the cost of about
+half the fills.
+
+**The proposed MECHANISM is only half right, and the half matters.** The claim was
+that the ceiling makes us reject our winners and fills us on losers. On the tape
+the cap leaves the win rate UNCHANGED (75.6% -> 76.5%): the entire gain is paying
+3.7c less, not selecting better rounds. At the 250ms horizon the win rate DOES
+rise (60.7% -> 80.0%), which is the described selection. So the narrative is right
+at 250ms and wrong at 1s, and either way the money comes from the price paid.
+
+CAVEATS, stated because they bound what this is worth:
+  * the exact-250ms test has n=20 at the +2c cap. The tape test carries the signal.
+  * the tape's population wins 75.6% at the trigger ask; the rounds we really got
+    filled in won 59.1%. The tape's LEVEL is therefore optimistic by ~16 points.
+    The GAIN from capping is the credible part; its absolute size is not.
+Implementable in exactly two places: `slippage_bps = 300` (config.py:219) is a
+floor on what the venue is authorised to pay, and `cross_limit_buffer = 0.25` /
+`cross_limit_buffer_inv = 0.125` (config.py:1146,1271) set
+`ceil_side = min(max_price, ask + buf)` which `slip` is then derived from.
+
+### IDEA 2, SIZE-TO-DEPTH: premise measured and REFUTED
+
+The claim is that a $1 MARKET order sweeps a thin top-of-book and that this
+"single-handedly creates the +0.055/sh slippage penalty". The venue's own recorded
+sweeps for our order sizes, 107 of them:
+
+    stake    median $3.12   range $1.00 - $3.57
+    premium  median +0.0100   mean +0.0108   max +0.0350
+    scaled to a $1.00 order:  median +0.0034/sh
+
+The +0.055/sh we actually pay is **6x the median sweep premium**, and the arm
+already carries an independent measurement reaching the same conclusion
+("the measured premium for a $1-5 order is +0.0004 across 19,452 real depth
+snapshots"). Sizing to the top of book recovers about 0.3c of a 5.5c problem. The
++0.055 is the book repricing, not the book being thin.
+
+### IDEA 3, COLOCATION: premise measured and REFUTED
+
+"Your bot is running in Tunisia/Europe, thousands of fiber miles away." It is not.
+The box is Contabo Tokyo and has been all session.
+
+    ICMP RTT to api.binance.com (CloudFront edge d3h36i1mno13q3)  2.05 ms
+    HTTPS cold, fresh TLS handshake                                28 ms
+    HTTPS warm, reused connection                                 6.2 ms
+
+And the 249ms is not transit at all. `venue ack` is the duration of ONE
+`await self._request("POST", PLACE_ORDER, ...)` (execution/live.py:649-663). Two
+authenticated POSTs to the same host, timed in-process by the same code:
+
+    POST trade/get-quote          n=27  p25 44  p50  47  p75  51  max  56 ms
+    POST trade/place-order-bundle n=32  p25 210 p50 249  p75 486  max 823 ms
+
+A one-shot POST to this host costs 6ms warm. The ~195ms the two calls differ by is
+the venue's own order path. **Network is 0.8% of the 249ms.** Colocation buys about
+2ms, or 0.8%, of a problem that is entirely on the venue's side of the socket.
+
+### IDEA 4, DEPTH FLOOR >= 1.2bps: no gain per dollar
+
+Is a deeper cross a better cross? First cross per round, tau 5-60, n=386:
+
+    depth through strike      n   mean ask    win    edge/sh   net/sh
+    <0.5 bps (a nick)       168    0.593    75.6%   +0.163   +0.152
+    0.5-1.2 bps             133    0.645    72.2%   +0.077   +0.066
+    1.2-2.0 bps              54    0.685    75.9%   +0.074   +0.063
+    2.0-3.5 bps              24    0.646    87.5%   +0.229   +0.218
+    3.5-5.0 bps               6    0.662   100.0%   +0.338   +0.327
+
+    >=1.2 bps (the rule)     85  (22%)  0.675    81.2%   +0.137/sh  = 0.203/$1
+    <1.2 bps  (current)     301  (78%)  0.616    74.1%   +0.125/sh  = 0.203/$1
+
+Per SHARE the deeper rule looks better (+0.137 against +0.125). Per DOLLAR it is
+identical, 0.203 either way -- the deeper cross charges a higher ask for the same
+edge. It throws away 78% of the trades to stand still. The bucket ordering is also
+non-monotone with the deep cells resting on n=24 and n=6, and the single best cell
+by sample size is the innermost nick (<0.5bps, +0.163/sh, n=168), which is the
+opposite of the "require clearance" hypothesis.
+
+### Verdict: one of four survives
+
+    1 strict limit <= +1..2c   SUPPORTED   net +0.050 -> +0.096/sh, +0.085 -> +0.160/$1
+    2 size-to-depth            refuted     sweep is +0.0034/sh against 0.055 paid
+    3 colocation               refuted     network is 0.8% of the 249ms
+    4 depth floor >= 1.2bps    no gain     identical per dollar, 78% fewer trades
+
+The one that works attacks the PRICE PAID. The three that fail attack geometry,
+size and distance -- none of which is where the leak is.
