@@ -1391,7 +1391,15 @@ class Settings(BaseSettings):
     # ask), and 76% of these fires sit on rounds the range gate refuses.
     cross_train_enabled: bool = False
     cross_train_min_tau_s: float = 60.0
-    cross_train_bps: float = 10.0
+    # TAU CEILING, added 2026-09-15 by tools/train_sweep.py. 0 = off.
+    # Train was `tau >= 60` with NO upper bound, which on a 900s round is 14 of
+    # the 15 minutes -- the opposite of a time-boxed complement. At X=15 a
+    # ceiling of 180 gives n=47 net +0.110 day-t +4.51 6/6 days, against n=39
+    # for the unrestricted window; at the old X=10 it lifts day-t 1.99 -> 2.31
+    # with 6/7 days positive while keeping 88% of the sample. It also removes
+    # the extreme-tau entries -- the live 15m legs fired at tau 820-854.
+    cross_train_max_tau_s: float = 180.0
+    cross_train_bps: float = 15.0
     cross_train_max_ask: float = 0.890
     cross_train_bound: float = 0.015
     cross_train_max_fill_px: float = 0.90
@@ -1419,7 +1427,7 @@ class Settings(BaseSettings):
     # catches it either: the caps count positions and stake, not correlation.
     # So: ONE train entry per burst, globally, not per family. 0 disables the
     # guard, which is the behaviour that took the eight.
-    cross_train_cooldown_s: float = 120.0
+    cross_train_cooldown_s: float = 0.0
     # TRAIN TRADES THE 5-MINUTE ROUNDS ONLY (operator decision 2026-09-15).
     #
     # The design puts Train in "the first 4 minutes", priced 0.75-0.88, with

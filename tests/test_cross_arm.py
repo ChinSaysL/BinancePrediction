@@ -1924,6 +1924,29 @@ class TestTheTrainTrigger:
         assert bot._train_round_ok(R("unitree-something-dead")) is False, (
             "an unreadable round length must fail CLOSED")
 
+    def test_the_tau_ceiling_BOUNDS_the_train_window(self, store, armed,
+                                                    monkeypatch):
+        """The sweep put a CEILING on the train window (cross_train_max_tau_s,
+        180s). Train was `tau >= 60` with no upper bound, which on a 900s round
+        is 14 of the 15 minutes -- the opposite of a time-boxed complement. It
+        also removes the extreme-tau entries the live 15m legs came from."""
+        monkeypatch.setattr("btcpredict.config.settings.cross_train_enabled", True)
+        monkeypatch.setattr("btcpredict.config.settings.cross_train_max_tau_s",
+                            180.0)
+        bot = make_bot(store, ticks(77000.0, 77040.0, 77080.0))
+        bot._round = make_round(tau_s=400.0)      # outside the 180s ceiling
+        self._history(bot, [77000.0, 77040.0, 77080.0])
+        calls = []
+
+        async def ex(*a, **k):
+            calls.append(k)
+
+        bot._cross_execute = ex
+        asyncio.run(bot._cross_tick())
+        assert not calls, (
+            "a fresh >=10bps breakout at tau 400s is outside the swept window "
+            "and must not fire")
+
     def test_the_arm_is_quiet_when_off(self, store, armed):
         from btcpredict.config import settings
         assert settings.cross_train_enabled is False, (

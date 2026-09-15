@@ -2028,9 +2028,11 @@ class Bot:
         # the reentry gap, the cooldown and the reversal rule.
         train = False
         side = None
+        tmax = self._ck("train_max_tau_s", r)
         if self._ck("train_enabled", r) and self._train_round_ok(r) \
                 and r.strike \
                 and tau >= self._ck("train_min_tau_s", r) \
+                and (tmax <= 0 or tau <= tmax) \
                 and feed.is_fresh(settings.max_spot_age_s):
             dist_bps = 1e4 * (feed.price - r.strike) / r.strike
             thr = self._ck("train_bps", r)
