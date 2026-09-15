@@ -1176,6 +1176,30 @@ class Settings(BaseSettings):
     # the >3s class turns negative over ~20 more fills, tighten toward 2; if
     # fills start appearing in the 6-20s band and win, extend toward 10-20.
     cross_limit_wait_s: float = 6.0
+    # Refuse a crossing whose side FLIPPED within this many seconds of the
+    # previous crossing in the same round. 0 = OFF.
+    #
+    # `cross_allow_reversal` already refuses the opposite side of a round, but it
+    # arms on the ENTRY. A crossing the arm DECLINES leaves it unarmed, so the
+    # opposite leg of the same oscillation is free to walk in -- which is what
+    # bnb-updown-15m did on 2026-09-15 00:59, declining the correct Up on the
+    # depth floor (2 ticks) and taking the Down 3s later on the return leg.
+    #
+    # Measured over 211 crossings that pass every gate, edge = win - ask:
+    #
+    #     FLIPPED within 20s    n= 14  win 0.643  ask 0.650  edge -0.0071
+    #     clean                 n=197  win 0.863  ask 0.686  edge +0.1771
+    #
+    # Consistent in sign on both families with enough data (btc -0.035 vs
+    # +0.197, eth -0.047 vs +0.076); bnb has one usable trigger and is not
+    # evidence either way. n=14 is thin, so the case rests on the sign agreeing
+    # across independent families AND on closing a hole the neighbouring guard
+    # was already written to close. It costs 6.6% of crossings.
+    #
+    # The window is flat from 2s to 60s in the fill-priced sweep -- the same 1-3
+    # trades are removed throughout -- so 20.0 is chosen as the middle of a flat
+    # region, not a peak.
+    cross_flip_block_s: float = 20.0
     cross_skip_opposite_to_main: bool = True
     # RAISED 0.5 -> 2.0 on 2026-09-13. The old 0.5 was picked by a fill-aware
     # sweep that called it a "clear peak", but that sweep could not have seen

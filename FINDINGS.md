@@ -6362,3 +6362,89 @@ anything.
 No config change made: the six-market widening was an explicit operator
 decision. Recorded so the choice is informed -- the case for dropping 15m from
 `CROSS_TRADED` is that it is unmeasurable, not that it is proven bad.
+
+## The whipsaw hole: `cross_allow_reversal` arms on the ENTRY, not on the CROSSING
+
+Reported: bnb-updown-15m bought Down on a round that settled Up, while
+bnb-updown-5m bought Up on the same move.
+
+### The spike is real
+
+The venue's own chart shows no move in that last minute, which looked at first
+like our tape carrying a bad tick. It is not. Binance 1s klines, independent of
+both the bot and the venue:
+
+    00:59:21   high 719.280  close 719.280   45 trades   crosses UP through 719.255
+    00:59:22   719.270 flat                   4 trades   entire bar above strike
+    00:59:23   719.270 flat                   0 trades   entire bar above strike
+    00:59:24   open 719.270  low 719.160     36 trades   crosses DOWN
+
+BNB traded above the strike for three seconds and fell back. The venue's chart
+is downsampled -- a 3s move cannot render at 15-minute width.
+
+Two other theories died on the way, both worth recording:
+
+  * **Not a wrong price series.** The venue's own API answers this:
+    `priceFeedProvider: CHAINLINK`, `priceFeedSymbol: BTCUSDT`,
+    `priceFeedId: 0x0003ef42...`, and `feeRateBps: 200` (which independently
+    confirms the fee measured from fills). We trigger on Binance spot. But
+    comparing each round's strike (Chainlink at the open) against our recorded
+    spot at the same instant, over ~2,100 rounds: median and p90 difference are
+    both **0.0000**. The two series track tick for tick.
+  * **The `oracle` column is empty on all 6 families, 0.0% coverage.** It was
+    never populated. Worth fixing if the basis ever matters again, but it does
+    not here.
+
+### The actual hole
+
+    00:59:21.356  15m  Up   REFUSED  only 2 tick(s) through the strike, floor is 5
+    00:59:21.643  5m   Up   TAKEN    spot 9 ticks past ITS strike (7c lower)
+    00:59:25.056  5m   Down REFUSED  reversal of the Up entry already taken
+    00:59:25.130  15m  Down TAKEN    spot 9 ticks past its strike on the way back
+
+`cross_allow_reversal` refuses the opposite side of a round -- that is what
+stopped the 5m arm 70ms earlier. But it arms on the **entry**. The 15m arm
+DECLINED its up-cross on the depth floor, so nothing armed, and the return leg
+of the same oscillation walked in. Depth is measured from each round's own
+strike, so with strikes 7c apart inside a 32c chop it is noise that decides
+which family is allowed to trade.
+
+### Flipped crossings have no edge
+
+Scored as a class, which needs no fill model and so uses far more of the tape --
+211 crossings that pass every gate, across three families and two independent
+data sources. `edge = win - ask`:
+
+                        n    win    ask     EDGE
+    btc  FLIPPED        6  0.667  0.702   -0.0350
+    btc  clean        160  0.887  0.691   +0.1969
+    eth  FLIPPED        7  0.571  0.619   -0.0471
+    eth  clean         33  0.727  0.652   +0.0755
+    POOLED FLIPPED     14  0.643  0.650   -0.0071
+    POOLED clean      197  0.863  0.686   +0.1771
+
+A flipped crossing has no edge at all, never mind enough to clear the limit
+buffer. Consistent in sign on both families with data. It is 6.6% of crossings.
+
+Priced through the full fill model the effect is small because it is rare --
+btc 83 -> 82 fills (growth +0.629 -> +0.705, day-t +1.84 -> +2.36, CI moves off
+zero), eth 23 -> 20 (-0.020 -> +0.087). n=14 blocked is thin, so the case rests
+on the sign agreeing across independent families AND on closing a hole the
+neighbouring guard was already written to close -- not on those CIs.
+
+**Shipped**: `cross_flip_block_s = 20.0` (0 = OFF), stamped on the CROSSING
+before any gate. The window is flat from 2s to 60s in the fill-priced sweep, so
+20 is the middle of a flat region rather than a peak.
+
+Four tests, and two notes on making them mean anything: the fixture's default
+asks are (0.30, 0.70) against a `cross_max_price` of 0.50, so a Down entry is
+refused on the price band and every assertion about a reverse leg passes for the
+wrong reason -- they now use (0.30, 0.40). And `cross_allow_reversal` is forced
+ON in the whipsaw test so it cannot do the blocking; otherwise the test would
+keep passing with the new guard deleted.
+
+### Not shipped
+
+A cross-FAMILY contradiction guard (refuse a cross on an asset opposite to one
+another family just took). Across all 36 cross fills ever, that has happened
+ONCE. Nothing to fit.

@@ -2181,3 +2181,108 @@ class TestTheRefusedProbe:
         r2 = SimpleNamespace(slug="btc-updown-5m-9999000001", symbol="BTCUSDT")
         assert bot._probe_fires(bot._round) is True
         assert bot._probe_fires(r2) is False, "cap 1/day must stop the second"
+
+
+class TestTheWhipsawGuard:
+    """`cross_allow_reversal` arms on the ENTRY, so a crossing the arm DECLINES
+    leaves it unarmed and the opposite leg of the same oscillation walks in.
+
+    LIVE 2026-09-15 00:59 on bnb-updown-15m, with Binance 1s klines confirming
+    both legs are real trades rather than a bad tick:
+
+        00:59:21  Up   DECLINED  only 2 tick(s) through the strike, floor is 5
+        00:59:24  Down TAKEN     9 ticks through the strike, passes
+        00:59:38  spot back above the strike; the round settles Up
+
+    Measured over 211 crossings that pass every gate, edge = win - ask:
+    flipped within 20s is -0.0071 on n=14, clean is +0.1771 on n=197.
+    """
+
+    def _bot(self, store, monkeypatch, ticks_):
+        monkeypatch.setattr("btcpredict.config.settings.cross_flip_block_s", 20.0)
+        monkeypatch.setattr("btcpredict.config.settings.cross_reentry_gap_s", 0.0)
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_open_stake_pct", 0.0)
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_round_stake_mult", 0.0)
+        # BOTH asks inside [cross_min_price, cross_max_price]. The default
+        # fixture is (0.30, 0.70) against a 0.50 ceiling, so a Down entry is
+        # refused on the price band and every assertion about the reverse leg
+        # would pass for the wrong reason.
+        bot = make_bot(store, ticks_, asks=(0.30, 0.40))
+        calls = []
+
+        async def execute(*a, **k):
+            calls.append(k.get("side"))
+
+        bot._cross_execute = execute
+        return bot, calls
+
+    @staticmethod
+    def _feed(bot, *prices):
+        """Swap the spot feed; `spots` is a dict of feeds, not a list of ticks."""
+        f = FakeFeed(ticks(*prices))
+        bot._primary_spot = f
+        bot.spot = f
+        bot.spots = {"BTCUSDT": f}
+
+    def test_the_opposite_leg_of_a_whipsaw_is_refused(self, store, armed, monkeypatch):
+        """Up through the strike, then straight back Down. Only the first trades.
+
+        `cross_allow_reversal` is turned ON here so it cannot do the blocking:
+        with it in its shipped state this case passes for the wrong reason, and
+        the test would keep passing if the flip guard were deleted.
+        """
+        monkeypatch.setattr("btcpredict.config.settings.cross_allow_reversal", True)
+        bot, calls = self._bot(store, monkeypatch,
+                               ticks(76997.0, 76998.0, 77001.0))
+        asyncio.run(bot._cross_tick())
+        assert calls == ["Up"], f"expected one Up entry, got {calls}"
+        # now walk the spot back DOWN through the strike
+        self._feed(bot, 77003.0, 77002.0, 76999.0)     # back DOWN through it
+        asyncio.run(bot._cross_tick())
+        assert calls == ["Up"], (
+            f"the return leg must be refused, got {calls}")
+
+    def test_it_arms_on_a_DECLINED_crossing(self, store, armed, monkeypatch):
+        """The whole point. The 15m arm never entered -- it was refused on the
+        depth floor -- so nothing armed and the reverse leg was free."""
+        monkeypatch.setattr("btcpredict.config.settings.cross_min_depth_ticks", 1e9)
+        bot, calls = self._bot(store, monkeypatch,
+                               ticks(76997.0, 76998.0, 77001.0))
+        asyncio.run(bot._cross_tick())
+        assert calls == [], "the depth floor should refuse this one"
+        # the flip must still be remembered, even though nothing was entered
+        monkeypatch.setattr("btcpredict.config.settings.cross_min_depth_ticks", 0.0)
+        self._feed(bot, 77003.0, 77002.0, 76999.0)
+        asyncio.run(bot._cross_tick())
+        assert calls == [], (
+            "a DECLINED crossing must still arm the guard -- this is the hole "
+            "cross_allow_reversal leaves")
+
+    def test_a_same_side_repeat_is_untouched(self, store, armed, monkeypatch):
+        """Same-side repeats are most of what cross_max_per_round buys and they
+        are profitable. The guard must only ever block a FLIP."""
+        bot, calls = self._bot(store, monkeypatch,
+                               ticks(76997.0, 76998.0, 77001.0))
+        asyncio.run(bot._cross_tick())
+        asyncio.run(bot._cross_tick())
+        assert calls == ["Up", "Up"], f"same-side repeats must pass, got {calls}"
+
+    def test_zero_means_off(self, store, armed, monkeypatch):
+        """0 = OFF, the repo convention for every other limit.
+
+        Tested through the DECLINED-crossing path on purpose. With an entry on
+        the book `cross_allow_reversal` refuses the opposite side by itself, so
+        that route cannot tell the two guards apart -- only the hole this one
+        was written to close can.
+        """
+        monkeypatch.setattr("btcpredict.config.settings.cross_min_depth_ticks", 1e9)
+        bot, calls = self._bot(store, monkeypatch,
+                               ticks(76997.0, 76998.0, 77001.0))
+        monkeypatch.setattr("btcpredict.config.settings.cross_flip_block_s", 0.0)
+        asyncio.run(bot._cross_tick())
+        assert calls == [], "the depth floor should refuse the first crossing"
+        monkeypatch.setattr("btcpredict.config.settings.cross_min_depth_ticks", 0.0)
+        self._feed(bot, 77003.0, 77002.0, 76999.0)
+        asyncio.run(bot._cross_tick())
+        assert calls == ["Down"], (
+            f"with the guard OFF the reverse leg must trade; got {calls}")

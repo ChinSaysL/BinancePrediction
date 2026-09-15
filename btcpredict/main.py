@@ -1817,6 +1817,50 @@ class Bot:
         side = crossed_side(list(ticks), r.strike, self._ck("look_s", r))
         if side is None:
             return
+        # WHIPSAW. Stamped on the CROSSING, before any gate, because that is the
+        # hole `cross_allow_reversal` leaves: it arms on the ENTRY, so a crossing
+        # the arm DECLINED leaves it unarmed and the opposite leg of the same
+        # oscillation walks straight in.
+        #
+        # LIVE 2026-09-15 00:59 on bnb-updown-15m -- Binance 1s klines confirm
+        # both legs are real trades, not a bad tick:
+        #
+        #   00:59:21  Up   DECLINED  only 2 tick(s) through the strike, floor 5
+        #   00:59:24  Down TAKEN     9 ticks through the strike, passes
+        #   00:59:38  spot back above the strike; the round settles Up
+        #
+        # bnb-updown-5m saw the identical move 70ms earlier, took the Up (its
+        # strike sat 7c lower, so the same move cleared the floor) and was then
+        # refused the Down BY the reversal guard. Depth is measured from each
+        # round's own strike, so inside a chop it is noise that decides which
+        # family is allowed to trade.
+        #
+        # Measured over 211 crossings that pass every gate (btc corpus, eth and
+        # bnb from the live DB), edge = win - ask:
+        #
+        #     FLIPPED within 20s    n= 14  win 0.643  ask 0.650  edge -0.0071
+        #     clean                 n=197  win 0.863  ask 0.686  edge +0.1771
+        #
+        # Consistent in sign on both families with data (btc -0.035 vs +0.197,
+        # eth -0.047 vs +0.076). A flipped crossing has no edge at all, never
+        # mind enough to clear the limit buffer. It is 6.6% of crossings.
+        fb = self._ck("flip_block_s", r)
+        if fb > 0:
+            fl = getattr(self, "_cross_flip", None)
+            if not isinstance(fl, dict):
+                fl = self._cross_flip = {}
+            prev = fl.get(r.slug)
+            seen_ms = int(time.time() * 1000)
+            if prev and prev[0] != side and (seen_ms - prev[1]) <= fb * 1000.0:
+                fl[r.slug] = (side, seen_ms)
+                self._cross_refuse(
+                    r, side,
+                    f"crossing flipped from {prev[0]} "
+                    f"{(seen_ms - prev[1]) / 1000.0:.1f}s ago, window is {fb:.0f}s",
+                    tau=r.tau_s(now_ms), spot=None, sigma=None)
+                return
+            fl[r.slug] = (side, seen_ms)
+            self._cross_flip = {k: v for k, v in fl.items() if k in live}
         # A crossing BACK through the strike is not a hedge on what we already
         # hold. With the first position sunk the second leg is worth taking iff
         # it is +EV on its own, and measured it is not: it wins 0.574 against
