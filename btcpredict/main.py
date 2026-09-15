@@ -2815,6 +2815,12 @@ class Bot:
                         fair_up if sig.side == "Up" else 1.0 - fair_up,
                         settings.limit_take_margin, sig.quote,
                         settings.limit_ask_tick, take_px)
+                    # Hard cap on the price PAID. Every other knob bounds the
+                    # ask; this bounds the fill. See config.cross_max_fill_px:
+                    # the arm is only profitable on fills of 0.55-0.65.
+                    if limit_ceiling is not None and settings.cross_max_fill_px > 0:
+                        limit_ceiling = min(limit_ceiling,
+                                            settings.cross_max_fill_px)
                     if limit_ceiling is not None:
                         # `take_limit_px` clamps to quote + tick LAST, which
                         # overrides everything else. That clamp is right for the
@@ -2864,7 +2870,10 @@ class Bot:
             # becomes the quote ceiling, so the venue's lagging DISPLAYED price
             # cannot sell us a 0.17 ask at 0.84 (2026-09-11, +47% EV -> -70%).
             if limit_ceiling is not None:
-                kw["max_px"] = min(round(limit_ceiling, 2), 0.99)
+                cap = min(round(limit_ceiling, 2), 0.99)
+                if settings.cross_max_fill_px > 0:
+                    cap = min(cap, settings.cross_max_fill_px)
+                kw["max_px"] = cap
             fill = await self.broker.buy(slug=r.slug, side=sig.side, token_id=token,
                                          price=sig.quote, stake=stake, **kw)
             if fill:

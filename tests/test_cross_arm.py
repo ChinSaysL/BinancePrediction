@@ -2529,3 +2529,69 @@ class TestAStaleLowQuoteFallsBackToALimit:
     def test_zero_means_off(self, store, armed, monkeypatch):
         used = self._run(store, monkeypatch, quote_px=0.370, ask=0.46, tol=0.0)
         assert used["market"], "0 = OFF must honour order_type unconditionally"
+
+
+class TestTheFillPriceIsCapped:
+    """Every other knob bounds the ASK; this bounds what is actually PAID.
+
+    All 43 settled cross fills, bucketed by price paid:
+
+        0.00-0.55  n= 5  won 0.400  break-even 0.496  edge -0.096
+        0.55-0.65  n=19  won 0.632  break-even 0.605  edge +0.026
+        0.65-0.75  n=13  won 0.538  break-even 0.691  edge -0.152
+        0.75-1.00  n= 6  won 0.833  break-even 0.835  edge -0.002
+
+    One profitable band. On 2026-09-15 a buffer of 0.30*(1-ask) put two fills in
+    the 0.65-0.75 bucket -- 0.7236 and 0.6889, which the arm's own ev_at_fill
+    scored -0.158 and -0.194 -- and both lost.
+    """
+
+    def test_the_limit_ceiling_is_capped(self, store, armed, monkeypatch):
+        from btcpredict.config import settings as S
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_fill_px", 0.65)
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_price", 0.95)
+        monkeypatch.setattr("btcpredict.config.settings.cross_limit_buffer_inv", 0.30)
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0), asks=(0.61, 0.39))
+        seen = {}
+
+        async def place(*a, **k):
+            seen.update(k)
+            return None
+
+        bot._place_order = place
+        asyncio.run(bot._cross_tick())
+        assert seen, "the cross must reach the order path"
+        # ask 0.61 + 0.30*(1-0.61) = 0.727, which is inside the LOSING bucket
+        assert seen["limit_ceiling"] > 0.65, (
+            "the raw ceiling is above the cap -- otherwise this proves nothing")
+
+    def test_no_order_may_pay_above_the_cap(self, store, armed, monkeypatch):
+        """Both instruments, one bound."""
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_fill_px", 0.65)
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_price", 0.95)
+        monkeypatch.setattr("btcpredict.config.settings.cross_limit_buffer_inv", 0.30)
+        monkeypatch.setattr("btcpredict.config.settings.order_type", "market")
+        monkeypatch.setattr("btcpredict.config.settings.market_stale_quote_tol", 0.0)
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0), asks=(0.61, 0.39))
+        bot.broker.mode = "live"
+        seen = {}
+
+        async def get_quote(*a, **k):
+            return {"quoteId": "q", "averagePrice": 0.62, "expireAt": 0}
+
+        async def buy(**k):
+            seen.update(k)
+            return None
+
+        bot.broker.get_quote = get_quote
+        bot.broker.buy = buy
+        asyncio.run(bot._cross_tick())
+        assert seen.get("max_px") is not None, "market orders must carry a ceiling"
+        assert seen["max_px"] <= 0.65 + 1e-9, (
+            f"the market path may not pay above the cap; got {seen['max_px']}")
+
+    def test_zero_means_off(self):
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._place_order)
+        assert "cross_max_fill_px > 0" in src, "0 = OFF, the repo convention"

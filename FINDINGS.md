@@ -6964,3 +6964,62 @@ central assumption that first order disproved, and the fallback is a repair of
 that model rather than a new measurement. What is solid: a failed FOK costs
 nothing but the trade, and the arm can no longer pay a stale-high quote or waste
 a trigger on a stale-low one.
+
+## 2026-09-15: a losing day, and the knob that caused the last of it
+
+Account $42.13 -> $36.13. Venue `todayRealizedPnl` **-$11.40, -22.53%** on
+$50.61 of cost. The daily cap halted the arm at 06:35:29 and it re-derived the
+halt on restart; nothing has traded since.
+
+### What the last two fills were
+
+    05:34  bnb  decided 0.6148  limit 0.73  FILLED 0.7236   ev_at_fill -0.1580
+    06:34  btc  decided 0.5617  limit 0.69  FILLED 0.6889   ev_at_fill -0.1937
+
+Both limits are exactly `ask + 0.30*(1-ask)` -- the buffer raised earlier the
+same morning. **The arm's own ev_at_fill scored both as badly negative and
+booked them anyway.** At the previous 0.125 the limits would have been 0.66 and
+0.62, and neither would have filled.
+
+### The number that should have governed this all along
+
+All 43 settled cross fills, bucketed by the price actually PAID:
+
+    fill 0.00-0.55  n= 5  won 0.400  break-even 0.496  edge -0.096
+    fill 0.55-0.65  n=19  won 0.632  break-even 0.605  edge +0.026
+    fill 0.65-0.75  n=13  won 0.538  break-even 0.691  edge -0.152
+    fill 0.75-1.00  n= 6  won 0.833  break-even 0.835  edge -0.002
+
+**The arm is profitable in exactly one band, 0.55-0.65.** Overall it wins
+26/43 = 0.605, so a fill above ~0.60 cannot pay for itself. Every knob in this
+file bounds the ASK -- `cross_min_price`, `cross_max_price`, the range gate --
+and then a buffer adds to it, leaving the price PAID unbounded up to
+`cross_max_price + buffer`. That is the hole the 0.30 buffer walked through.
+
+**Shipped**: `cross_max_fill_px = 0.65` (0 = OFF), applied to BOTH paths -- it
+caps the LIMIT ceiling and the MARKET `max_px`, so neither instrument can buy
+outside the band. `cross_limit_buffer_inv` reverted 0.30 -> 0.125 and
+`cross_limit_buffer` 0.40 -> 0.25.
+
+### What went wrong in the reasoning, twice
+
+Both of today's bad calls share a shape: a simulation was trusted past what its
+substrate could support.
+
+  * The **buffer raise** came from 34 live triggers, scored by assuming a fill
+    at the limit is as good as the outcome distribution of the trades it would
+    capture. It never asked what price those fills would land at. The answer was
+    0.69-0.72, inside the losing bucket.
+  * The **MARKET switch** modelled the path as always filling at `ask + slip`.
+    Its first live order failed because the venue quoted BELOW the book, a mode
+    the model did not contain at all.
+
+The band table above needs no model. It is 43 real fills and their real
+outcomes, and it contradicts both.
+
+### Standing recommendation
+
+The arm is marginal on its whole live record -- 26/43 at 0.605 -- and today cost
+22.5% of the account. It is halted until the next UTC day by the loss cap. It
+should stay halted until the 0.55-0.65 band is confirmed on fills taken UNDER
+the new cap, rather than resumed because the clock rolled over.

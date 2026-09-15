@@ -1112,7 +1112,7 @@ class Settings(BaseSettings):
     # RAISED 0.25 -> 0.40 with cross_limit_buffer_inv: at inv 0.30 a cheap ask
     # wants 0.30*(1-0.2) = 0.24, and the old cap would have clipped exactly the
     # cheap-ask cell where the reprice is largest (median +0.340).
-    cross_limit_buffer: float = 0.40
+    cross_limit_buffer: float = 0.25
     # SUPERSEDED 2026-09-14 by cross_limit_buffer_inv. Kept only so an
     # existing cross_overrides entry naming it does not KeyError; nothing
     # reads it.
@@ -1226,7 +1226,18 @@ class Settings(BaseSettings):
     # LATENCY IS THE BIGGER LEVER. The same 0.125 buffer against the +0.25s book
     # returns +5.447 -- double the best buffer can do at +1.00s. Cutting the
     # decision-to-order round trip is worth more than any value of this knob.
-    cross_limit_buffer_inv: float = 0.30
+    # REVERTED 0.30 -> 0.125 on 2026-09-15 06:40. The raise was made on a
+    # 34-trigger simulation and its first two live fills both lost, at prices
+    # the arm's OWN ev_at_fill scored -0.158 and -0.194:
+    #
+    #   05:34 bnb  decided 0.6148  limit 0.73  FILLED 0.7236
+    #   06:34 btc  decided 0.5617  limit 0.69  FILLED 0.6889
+    #
+    # Both limits are exactly ask + 0.30*(1-ask). At 0.125 they would have been
+    # 0.66 and 0.62 and neither would have filled. The raise did not buy better
+    # trades; it converted "no fill" into "fill at a price the arm cannot win
+    # at". See cross_max_fill_px for the bound that now enforces that directly.
+    cross_limit_buffer_inv: float = 0.125
     # How long a cross limit rests before it is cancelled. 0 keeps the shared
     # `limit_wait_s` (20s).
     #
@@ -1308,6 +1319,27 @@ class Settings(BaseSettings):
     # leaves it unarmed) and the tests still pin the behaviour. Re-enable only
     # with live fills, not another replay.
     cross_flip_block_s: float = 0.0
+    # HARD CEILING ON WHAT WE PAY, not on the ask. 0 = OFF.
+    #
+    # Every knob before this bounded the ASK and then let a buffer add to it, so
+    # the price actually PAID was unbounded up to cross_max_price + buffer. All
+    # 43 settled cross fills, bucketed by the price paid:
+    #
+    #     fill 0.00-0.55  n= 5  won 0.400  break-even 0.496  edge -0.096
+    #     fill 0.55-0.65  n=19  won 0.632  break-even 0.605  edge +0.026
+    #     fill 0.65-0.75  n=13  won 0.538  break-even 0.691  edge -0.152
+    #     fill 0.75-1.00  n= 6  won 0.833  break-even 0.835  edge -0.002
+    #
+    # The arm makes money in ONE band, 0.55-0.65. The overall win rate is
+    # 26/43 = 0.605, so a fill above ~0.60 cannot pay for itself -- and the
+    # 0.65-0.75 bucket, where the 0.30 buffer put two fills on 2026-09-15, loses
+    # 15 cents per dollar.
+    #
+    # A win rate is an arm-wide property; the price paid is per order. Bounding
+    # the second is the only one of the two that can be enforced at the moment
+    # it matters. Applied to BOTH paths: it caps the LIMIT ceiling and the
+    # MARKET `max_px`, so neither instrument can buy outside the band.
+    cross_max_fill_px: float = 0.65
     cross_skip_opposite_to_main: bool = True
     # RAISED 0.5 -> 2.0 on 2026-09-13. The old 0.5 was picked by a fill-aware
     # sweep that called it a "clear peak", but that sweep could not have seen
