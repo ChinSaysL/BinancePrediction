@@ -9168,3 +9168,65 @@ the live numbers, so they fail on the old expression and pass on the clamp).
 
 `bound == ceiling` in 27 of 34 attempts, so the 2c cap is the binding limit
 almost always -- the shipped change is doing its job.
+
+## The depth gate, corrected: I counted log lines and called them refusals
+## (2026-09-15)
+
+I reported "the depth gate dominates refusals -- 87 x `Nbps through the strike,
+gate is 5.00`". That was a LOG-LINE count. The arm re-evaluates on the tick clock
+and logs the refusal on every tick, so 87 lines came from **3 market-rounds** (2
+distinct time windows: 1789496100 and 1789498500). The real count:
+
+    depth-gate refusals   lines   distinct market-rounds
+    2026-09-11              0        0
+    2026-09-12              0        0
+    2026-09-13              0        0
+    2026-09-14              0        0
+    2026-09-15            124        8
+    cross ATTEMPTS (DB, acted)  09-13: 8 | 09-14: 21 | 09-15: 22
+
+So the gate refused **8 rounds**, not 87, and all 8 are from today.
+
+Counterfactual, priced at the ask we saw, one row per round (fee excluded):
+
+    depth band      n   mean ask    win     gross/sh   net/sh
+    5-6 bps         5     0.614    80.0%    +0.186    +0.179
+    7-8 bps         1     0.520   100.0%    +0.480    +0.474
+    ALL REFUSED     6     0.598    83.3%    +0.235    +0.228
+
+Every refused trade looks positive, and **that is not evidence**: n=6, one day, no
+day-cluster possible. My earlier tape-based depth sweep had n=1 above 5 bps, so it
+cannot support raising the gate either -- and that sweep measured depth from the
+poll-time spot while the gate uses the tick-clock spot, so the two are not
+comparable in the first place.
+
+**Verdict: leave `cross_max_depth_bps = 5.0` alone.** The event is rare (8 rounds
+in 5 days), the direction is unproven, and the sample needed is not here yet.
+
+### The anomaly I chased, and what it was NOT
+
+The refusal mix flipped today -- depth 0 -> 124, opposite-side 118 -> 0 -- which
+looked like a config change. It is not:
+
+* `diff .env.bak.1789458080 (07:41) .env.bak-20260915-171428 (17:14)` is **EMPTY**.
+  Nothing in .env changed before my 17:14 edit; the 07:43 mtime on .env is not a
+  content change.
+* No `max_depth_bps` and no `CROSS_OVERRIDES` appears in **any** of the 45 .env
+  backups on the box, so the code default 5.0 has applied throughout.
+* The opposite-side refusal needs the main arm to hold a position, and the main
+  arm has been winding down: `OPEN` lines 195 (09-13) -> 50 (09-14) -> 22 (09-15).
+  Its disappearance is that, not a gate change.
+
+Mechanism, for the record: `depth_bps` at a cross is the size of the spot's GAP
+across the strike inside `cross_look_s` (1.0s, 2.0s slack). A normal cross is
+shallow by construction -- the spot has just crossed K. Depth >5 bps means the
+spot jumped across K by more than 5 bps in that window. Those are rare; today had
+a cluster of three.
+
+### TRAP: per-tick refusal logging inflates any naive count ~20x
+
+For gates evaluated on the tick clock, `decisions` gets a row (and the log a line)
+per TICK, not per round. `2026-09-15` holds 124 rows over **7 slugs**. Always
+collapse to one row per slug (first occurrence = the moment the arm would
+otherwise have fired) before computing a rate or an EV. I did not, and mis-stated
+the refusal rate by more than 10x.
