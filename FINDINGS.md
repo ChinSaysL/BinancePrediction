@@ -10201,3 +10201,120 @@ This is the same shape as the absorption batch and the five fill-rate ideas. The
 microstructure of Binance spot and perp is well arbitraged at the horizons we can
 observe; what is left is real but sub-tick once it has to survive this venue's
 working time and fee.
+
+## MOMENTUM CONTINUATION: the first POSITIVE signal of this campaign (2026-09-15)
+
+The hypothesis, stated as it would be traded: a true breakout does not stop at the
+strike. Price thrusts 10-20bps past it over the next 5-15s. At T+5s the favourite
+is quoted 0.68 while its true P(ITM) has climbed to 0.85. You are not sniping a
+stale quote -- you are buying a running train whose fair value is drifting faster
+than the spread.
+
+**Why this is a different test from everything above it.** Every other idea in
+this campaign asked "can we FILL at a better price", and every one died on the
+venue's ~1.4s working time. This asks whether the PRICE IS WRONG, and a slow,
+expensive, partial fill does not matter if the contract is underpriced by more
+than the fee. It is a CALIBRATION test, so the queue is irrelevant to it.
+
+`tools/momentum_continuation.py`, live venue DB, 5,776 settled rounds, one entry
+per round, fee 0.0117 of price, day-clustered t over 8 days. `hit - px` is the
+whole claim: it must be large and positive.
+
+### COHERENCE FIRST, because my first run was wrong
+
+The first pass filtered only on `up_ask is not null` and returned a +2.4pp gap in
+almost every bucket with net positive in 6 of 7. That is the shape of a recorded
+artefact: FINDINGS logs that only 47.2% of rows carrying a bid AND an ask are
+coherent (`bid <= displayed <= ask`), and that scoring against the incoherent ones
+manufactured the +119%/$1 table, VEL_INV's day-t +6.79, and "every early rule's
+mirror going positive". An ask recorded BELOW the displayed price is not a price
+anyone could have paid.
+
+The tool now requires `bid <= displayed <= ask` by default. It matters:
+
+    dist 5.0-7.5bps   INCOHERENT n=431 px 0.961 hit 99.3% net +0.021 day-t +6.03
+                      COHERENT   n=295 px 0.957 hit 97.6% net +0.008 day-t +1.06
+    dist 10-12.5bps   INCOHERENT n= 69 px 0.952 hit 100%  net +0.037 day-t +8.04
+                      COHERENT   n= 31 px 0.959 hit 100%  net +0.029 day-t +11.11
+
+So the metric is highly sensitive to that filter, and only the coherent numbers
+should be quoted.
+
+### STATIC -- calibration by distance, NOW on coherent asks
+
+    dist  0.0- 2.5bps   n= 862  px 0.811  hit 79.7%  hit-px -0.014  net -0.024  day-t -0.47
+    dist  2.5- 5.0bps   n= 591  px 0.937  hit 95.8%  hit-px +0.021  net +0.010  day-t +2.74
+    dist  5.0- 7.5bps   n= 295  px 0.957  hit 97.6%  hit-px +0.019  net +0.008  day-t +1.06
+    dist  7.5-10.0bps   n= 105  px 0.959  hit 98.1%  hit-px +0.022  net +0.010  day-t +1.24
+    dist 10.0-12.5bps   n=  31  px 0.959  hit 100.%  hit-px +0.041  net +0.029  day-t +11.11
+    dist 12.5-15.0bps   n=  18  px 0.966  hit 100.%  hit-px +0.034  net +0.023  day-t +23.33
+
+Monotone in distance, positive from 2.5bps out, and it does NOT appear in the
+0-2.5bps bucket (-0.014). That last row matters: the gap is not a general
+favourite bias, it is specific to being well past the strike.
+
+### DYNAMIC -- the hypothesis as stated (breakout, wait D, buy the runner)
+
+    X>=5bp  D= 0s  n= 308  px 0.769  hit 79.2%  net +0.014  day-t +3.85
+    X>=5bp  D= 5s  n= 684  px 0.803  hit 79.7%  net -0.016  day-t -0.09
+    X>=5bp  D=10s  n= 688  px 0.811  hit 82.7%  net +0.007  day-t +2.44
+    X>=10bp D= 0s  n= 188  px 0.878  hit 94.1%  net +0.053  day-t +3.18
+    X>=10bp D= 5s  n= 366  px 0.873  hit 92.3%  net +0.040  day-t +2.58
+    X>=10bp D=10s  n= 352  px 0.888  hit 92.3%  net +0.025  day-t +2.30
+    X>=15bp D= 5s  n= 608  px 0.846  hit 87.7%  net +0.020  day-t +1.20
+    X>=20bp D= 5s  n= 333  px 0.866  hit 89.8%  net +0.021  day-t +2.48
+
+And the control, which is what makes this different from the rest of the file:
+
+    X>=10bp D=0s   OPPOSITE SIDE, same entries  n= 175  px 0.147
+                   hit 6.3%  net -0.086  day-t -6.57
+    X>=5bp  D=0s   OPPOSITE SIDE, same entries  n= 295  px 0.267
+                   hit 20.7% net -0.063  day-t -4.09
+
+The opposite side is strongly negative at every cell (day-t -4 to -6.6). For a
+directional continuation bet that is the correct shape, and it is the shape that
+five previous idea-batches failed to produce: their rules won on BOTH sides, which
+marks entry-moment selection rather than direction.
+
+### CORROBORATION FROM AN INDEPENDENT SUBSTRATE
+
+The April corpus's `DIST>=10bp` row -- which the "priced answer" table dismissed at
+day-t 1.15 and n=23, partly on the grounds that the corpus's ask under-reacts --
+reads **px 0.7246, hit 0.7826, +2.89pp**. The live coherent book at the same
+distance reads **px 0.959, hit 100%, +4.1pp** (n=31, day-t 11.11) and **+6.4pp**
+at X>=10 D=0 (n=188, day-t 3.18). Two venues, same sign, and the SAME SIZE at the
+bucket where the corpus had enough n. The corpus number sat there for a day
+looking like an artefact; the live book agrees with it.
+
+### The honest objections, and why this is not shipped
+
+1. **It contradicts a result in this file.** The coherent favourite subset logged
+   earlier (n=321, |spot-strike| >= 2bps, late) reads ASK 0.9738 against realised
+   0.9564 = **-0.0221, i.e. NEGATIVE**. My positive sits at a similar
+   conditioning and a lower ask (0.937-0.959 vs 0.9738). Two readings of "buy the
+   favourite late, at the ask" disagree in sign on overlapping data. Until that is
+   reconciled, one of the two is wrong and I do not know which.
+
+2. **It is a CALIBRATION result, not a fill result.** It says the ASK was too low
+   at that instant. It does not say we could have taken it, or taken size in it.
+   Every prior "we could have bought at X" in this file has died on that question,
+   including one this session (`DIST`-like counterfactuals that vanished once the
+   price actually on offer was used).
+
+3. **The same test on incoherent rows gives larger numbers**, so the magnitude is
+   demonstrably filter-sensitive even though the SIGN survives.
+
+4. n is thin in the best cells (31 / 18), and the strong day-t at 10-12.5bps is
+   n=31 across 7 days.
+
+VERDICT: **the first candidate in this campaign that has survived the coherence
+filter, has a correctly-signed opposite-side control, clears day-t >= 2 in the
+dynamic cells, and reproduces a dismissed corpus number.** It is also a
+calibration result contradicted by an earlier coherent-subset measurement in this
+same file. Nothing shipped. The next test is not another tape study -- it is a
+FILL-based one: place the trade live, at the ask, in the X>=10bp D=0..5s cell,
+and see whether the price we actually pay leaves the edge.
+
+This does NOT rescue the sub-second cross. It is a different trade: later, more
+expensive, and chosen precisely because the venue's queue is too slow to win the
+early one.
