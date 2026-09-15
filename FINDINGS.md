@@ -7433,6 +7433,15 @@ Gemini's lead-lag idea is untestable here (no free Binance FUTURES archive;
 spot bookTicker stopped 2024-03 per the tape section) and is second-order
 next to this.
 
+CORRECTION (2026-09-15 PM): the parenthetical above is WRONG. The futures
+archive DOES exist and is free -- `data.binance.vision/data/futures/um/daily/`
+serves aggTrades, trades, bookTicker, bookDepth, klines, markPriceKlines,
+indexPriceKlines, premiumIndexKlines and metrics, and returned HTTP 200 for the
+exact days we hold venue quotes. The lead-lag question was testable all along
+and is tested in the "four structural catalyst ideas" section below.
+`liquidationSnapshot` is the one data type that is NOT there (its bucket listing
+is empty), so the liquidation idea has no history to join against.
+
 DATA GAP for the money test. The strong signal needs bookTicker, which the
 archive has only for 2026-08-01 and 2026-09-01; the venue's own books (live
 DB) span 09-12..09-15; the Polymarket up/down recordings (data/hf/*.parquet,
@@ -7598,3 +7607,120 @@ filtered 3-day local copy. The lesson is about method, not about the signal:
 CHECK THE COVERAGE OF THE DB BEFORE RUNNING A MONEY TEST -- a local snapshot is
 a biased sample unless proven otherwise. A 17% slice produced a +0.007 that the
 full record turns into -0.026.
+
+## The four "structural catalyst" ideas, classified and (two of them) tested
+(2026-09-15)
+
+The proposal: top-of-book queue imbalance only predicts the 1-tick flicker, so
+stop modelling micro-ticks and trigger on the things that force SUSTAINED
+sweeps -- (1) futures liquidation cascades via `!forceOrder@arr`, (2) L2 "air
+pockets" across +/-5bps, (3) trade-arrival velocity / Hawkes clustering, (4)
+perp-to-prediction lead-lag. Target a 3-10s drift instead of a 1s impulse,
+because our ~1s decision-to-fill cannot front-run a 1s event.
+
+The latency logic is right and it is the same conclusion the timing work
+reached. But "testable" is decided by data, so each idea was checked against
+what exists:
+
+  idea                    data today?                         verdict
+  (4) perp lead-lag       YES - futures aggTrades, free      TESTED below
+  (3) arrival velocity    YES - aggTrades already on disk    TESTED below
+  (2) L2 air pockets      NO - needs live depth recording    NOT testable
+  (1) liquidation cascade NO - needs live recording          NOT testable
+
+Why (2) is not testable: the free `bookDepth` archive is **percentage bands**
+(-5,-4,-3,-2,-1,-0.2,+0.2,+1,+2,+3,+4,+5 %) at a ~30s cadence (34,561 rows/day
+= 2,880 snapshots = one every 30s). The finest band is 0.2% = **20 bps**, and
+the idea needs +/-5 bps resolution -- 4x too coarse, and 30s instead of 100ms.
+The archive cannot answer it at any sample size.
+
+Why (1) is not testable: `data/futures/um/daily/liquidationSnapshot/` does not
+exist (empty bucket listing), so there is no historical liquidation tape, and
+the live stream would have to be recorded from now. Unverified caveat, flagged
+rather than assumed: Binance documents the forceOrder stream as pushing at most
+one liquidation per symbol per 1000ms, which would make "aggregate liquidation
+volume inside a 500ms window" unmeasurable as described. The docs page is
+behind a WAF I could not get past, so this stays a to-check, not a finding.
+
+THE TWO THAT COULD BE TESTED. Perp tape pulled for BTC/ETH/BNB 09-08..09-12
+(15 files, 146MB, `data/perp/aggTrades/`), joined to the same 2,606 venue
+rounds, same honest +1000ms entry pricing, each rule paired against the
+OPPOSITE SIDE at its own entries:
+
+  rule       n    mean_px   win     EV/$1   EV_net   day-t
+  CROSS   1495     0.583   0.579   +0.052   +0.032   +0.31
+  PRE     1675     0.408   0.373   -0.044   -0.064   -1.62
+  PRE_MOM  447     0.415   0.383   -0.006   -0.026   -0.10
+  PRE_INV  447     0.596   0.617   +0.057   +0.037   +1.04
+  PERP     953     0.429   0.407   +0.067   +0.047   +0.54
+  PERP_INV 953     0.583   0.593   +0.036   +0.016   +1.80
+  VEL     1110     0.417   0.391   -0.007   -0.027   -0.51
+  VEL_INV 1110     0.595   0.609   +0.048   +0.028   +6.79
+  MOM_ONLY1649     0.418   0.363   -0.111   -0.131   -0.70
+  PRE_COIN1675     0.503   0.473   -0.049   -0.069   -1.11
+
+PERP = trailing perp displacement >= 1bps (1s window) in the direction needed;
+VEL = trades in the last 500ms >= 3x the trailing-10s rate, with the surge CVD
+taking that side.
+
+Paired against their own opposite side:
+
+  PERP minus OPPOSITE-SIDE: +0.0317/$1   se 0.0815   t +0.39   (n=953)
+  VEL  minus OPPOSITE-SIDE: -0.0549/$1   se 0.0697   t -0.79   (n=1110)
+  PRE_MOM minus OPPOSITE-SIDE: -0.0625/$1  se 0.1089  t -0.57  (n=447)
+
+So neither new idea has directional content. Note the give-away that is worse
+than the t-stat: for PERP, BOTH sides of the same entries are positive
+(+0.047 net vs +0.016 net). A rule that makes money on its own side and on the
+other side is not detecting a direction, it is selecting an entry moment.
+
+SENSITIVITY (perp threshold / window, velocity multiple) -- 7 cells, every one
+|t| <= 1.5, and the sign moves with the knob: perp 0.5bps +0.18, 2bps +0.15,
+5bps +1.49 (n=27, the smallest cell, EV +2.20 -- the familiar "smallest n
+looks best" artefact), 500ms window +0.03, 2000ms window -0.24, vel 5x +0.23,
+vel 8x +0.66.
+
+### THE ACTUAL REASON ALL OF THIS KEEPS ALMOST-WORKING: THE RULES ARE THE DAY
+
+Per-day EV for the six rules:
+
+  rule       09-08    09-09    09-10    09-11    09-12    mean
+  CROSS     -0.149   -0.033   +0.002   -0.015   +0.318   +0.025
+  PRE       -0.022   -0.098   +0.008   -0.153   +0.008   -0.051
+  PRE_MOM   -0.041   +0.100   -0.046   -0.489   +0.400   -0.015
+  PERP      -0.031   +0.025   -0.034   -0.156   +0.509   +0.063
+  VEL       -0.084   -0.053   -0.053   -0.063   +0.146   -0.021
+  MOM_ONLY  -0.091   -0.212   -0.129   -0.157   +0.280   -0.062
+
+  09-08: 0/6 positive.  09-11: 0/6 positive.  09-12: 6/6 positive.
+  Pairwise correlation of the six DAILY EV series: median r +0.73
+  (range +0.36..+0.97, 15 pairs).
+
+A perp lead-lag rule, a trade-velocity rule, a momentum rule, a CVD rule and
+the shipped crossing rule are 73%-correlated with each other day to day. They
+are not six signals; they are six measurements of one day factor, and on
+09-12 -- a trending day where every cheap-side entry won -- all six are
+positive. Any rule's 5-day mean is therefore mostly the question "how many
+09-12s did my sample contain", and with 5 days the effective sample size for a
+directional test is ~5, not 953-1675. That is why the honest statistic is the
+day-clustered t printed above, and why every one of them sits inside +/-1.8.
+
+One line in that table deserves an explicit warning rather than an invitation:
+VEL_INV (the OPPOSITE side of the velocity signal) reads +0.028 net with
+day-t +6.79. It is not a discovery. It is the favourite-side base rate -- buy
+the 0.595 side, win 60.9% of the time, collect ~1.4pp -- measured at the DISPLAYED
+price, and the displayed price is the one we established is not executable
+(`up_ask`/`down_ask` are NULL on these days, so `price_of` falls back to the
+mid-like `up_price`). Its paired test, which cancels that pricing error, is
+VEL t = -0.79. Before believing any favourite-side level effect, the ask column
+has to be populated; until then it is the pricing-assumption trap again.
+
+VERDICT ON THE FOUR IDEAS: (3) and (4) were testable and both fail -- no
+directional skill, flat across parameter sweeps, and their apparent EV is the
+day factor that all our rules share. (1) and (2) remain genuinely untested,
+because the data they need does not exist historically: depth at 100ms and a
+liquidation tape. They are also the two that would answer the question the
+tick-level work actually raised, so the productive move is not another
+backtest on five days -- it is to start recording `depth20@100ms` and
+`!forceOrder@arr` on the VPS now, and re-ask in a week with more days than five.
+Five days is the binding constraint, not the choice of feature.

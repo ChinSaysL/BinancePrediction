@@ -38,13 +38,29 @@ import zipfile
 W500_US = 500_000
 W300_US = 300_000
 W1000_US = 1_000_000
+VEL_WIN_US = 500_000
+VEL_BASE_US = 10_000_000
 DATA = "data"
 
 
-def load_trades(sym: str, day: str):
-    """(ts_us list, prefix-sum list of signed taker volume)."""
-    path = f"{DATA}/aggTrades/{sym}-aggTrades-{day}.zip"
+def _ts_us(v: int) -> int:
+    """Normalise a Binance trade timestamp to microseconds.
+
+    The spot daily files carry microseconds; the futures daily files do not
+    always, so the unit is taken from the magnitude rather than assumed.
+    """
+    if v > 10 ** 14:
+        return v                    # already microseconds
+    if v > 10 ** 11:
+        return v * 1000             # milliseconds
+    return v * 1_000_000            # seconds
+
+
+def load_tape(sym: str, day: str, base: str = f"{DATA}/aggTrades"):
+    """(ts_us, signed-volume prefix sums, trade prices) from an aggTrades zip."""
+    path = f"{base}/{sym}-aggTrades-{day}.zip"
     ts: list[int] = []
+    px: list[float] = []
     pre: list[float] = [0.0]
     with zipfile.ZipFile(path) as z:
         with z.open(z.namelist()[0]) as raw:
@@ -52,10 +68,43 @@ def load_trades(sym: str, day: str):
                 f = line.decode().split(",")
                 if len(f) < 7:
                     continue
-                ts.append(int(f[5]))
-                q = float(f[2])
+                try:
+                    t = _ts_us(int(f[5]))
+                    q = float(f[2])
+                    pr = float(f[1])
+                except ValueError:
+                    continue                          # header row
+                ts.append(t)
+                px.append(pr)
                 pre.append(pre[-1] + (-q if f[6] == "True" else q))
-    return ts, pre
+    return ts, pre, px
+
+
+def load_perp(sym: str, day: str):
+    """The futures (perp) tape for the same symbol/day."""
+    try:
+        return load_tape(sym, day, f"{DATA}/perp/aggTrades")
+    except FileNotFoundError:
+        return [], [0.0], []
+
+
+def ev(side: str, p: float, winner: str) -> float:
+    """P&L per $1: win pays (1-p)/p, lose pays -1."""
+    return (1 - p) / p if winner == side else -1.0
+
+
+def perp_move_bps(ts, px, t_us: int, win_ms: float) -> float | None:
+    """Signed perp displacement (bps) over the trailing win_ms."""
+    if not ts:
+        return None
+    j = bisect.bisect_right(ts, t_us)
+    if j == 0:
+        return None
+    i0 = bisect.bisect_right(ts, t_us - int(win_ms * 1000))
+    if i0 == 0:
+        return None
+    then, now = px[i0 - 1], px[j - 1]
+    return (now - then) / then * 1e4 if then else None
 
 
 def win_sum(ts, pre, lo: int, hi: int) -> float:
@@ -128,6 +177,13 @@ def main() -> int:
                     help="quote age before we could actually fill (0 = same tick)")
     ap.add_argument("--mom-bps", type=float, default=0.0,
                     help="minimum 1s momentum for MOM_ONLY / PRE_MOM")
+    ap.add_argument("--perp-bps", type=float, default=1.0,
+                    help="minimum trailing PERP displacement (bps) to fire "
+                         "the lead-lag rule")
+    ap.add_argument("--perp-win-ms", type=float, default=1000.0,
+                    help="window for the perp displacement")
+    ap.add_argument("--vel-x", type=float, default=3.0,
+                    help="trade-arrival multiple over the 10s baseline")
     ap.add_argument("--days", default="",
                     help="comma-separated MM-DD filter (empty = every day in "
                          "the DB that has quotes)")
@@ -145,11 +201,9 @@ def main() -> int:
     print(f"rounds with a winner: {len(rounds)}")
 
     cache: dict[tuple[str, str], tuple] = {}
+    pcache: dict[tuple[str, str], tuple] = {}
     res: dict[str, list] = {}
-    pair: list[float] = []
-
-    def q_of(r) -> tuple[int, int, float, float]:
-        return (0, 0, 0.0, 0.0)                      # placeholder (unused)
+    pairs: dict[str, list[float]] = {}
 
     for r in rounds:
         qs = quotes_for(conn, r["slug"])
@@ -159,16 +213,21 @@ def main() -> int:
         key = (r["symbol"], day)
         if key not in cache:
             try:
-                cache[key] = load_trades(*key)
+                cache[key] = load_tape(*key)
             except FileNotFoundError:
-                cache[key] = ([], [0.0])
-        ts, pre = cache[key]
+                cache[key] = ([], [0.0], [])
+        if key not in pcache:
+            pcache[key] = load_perp(*key)
+        ts, pre, _px = cache[key]
+        perp_ts, _perp_pre, perp_px = pcache[key]
         strike = r["strike"] or qs[0]["strike"]
         if not strike:
             continue
         s0 = None
         cross_done = False
         pre_done = False
+        perp_done = False
+        vel_done = False
         rows_pre = {}
         for i, q in enumerate(qs):
             spot = q.get("spot")
@@ -224,11 +283,9 @@ def main() -> int:
                                 res.setdefault("PRE_INV", []).append(
                                     (r["slug"], oside, pi, r["winner"],
                                      r["fee_rate_bps"], tau))
-                                ev_l = ((1 - p) / p if r["winner"] == side
-                                        else -1.0)
-                                ev_s = ((1 - pi) / pi if r["winner"] == oside
-                                        else -1.0)
-                                pair.append(ev_l - ev_s)
+                                pairs.setdefault("PRE_MOM", []).append(
+                                    ev(side, p, r["winner"])
+                                    - ev(oside, pi, r["winner"]))
                         rnd = random.Random(r["slug"]).random() < 0.5
                         cside = "Up" if rnd else "Down"
                         pc = entry_price(qs, i, cside, args.entry_lag_ms)
@@ -236,22 +293,87 @@ def main() -> int:
                             res.setdefault("PRE_COIN", []).append(
                                 (r["slug"], cside, pc, r["winner"],
                                  r["fee_rate_bps"], tau))
+            # ---- PERP: does the FUTURES tape lead the venue's odds?
+            if (not perp_done and perp_ts
+                    and args.min_tau <= tau <= args.max_tau
+                    and 0 < abs(dist_bps) <= args.gap_bps):
+                side = "Up" if dist_bps < 0 else "Down"
+                rp = perp_move_bps(perp_ts, perp_px, q["ts_ms"] * 1000,
+                                   args.perp_win_ms)
+                sgn = 1.0 if side == "Up" else -1.0
+                if rp is not None and rp * sgn >= args.perp_bps:
+                    perp_done = True
+                    p = entry_price(qs, i, side, args.entry_lag_ms)
+                    oside = "Down" if side == "Up" else "Up"
+                    pi = entry_price(qs, i, oside, args.entry_lag_ms)
+                    if p:
+                        res.setdefault("PERP", []).append(
+                            (r["slug"], side, p, r["winner"],
+                             r["fee_rate_bps"], tau))
+                        if pi:
+                            res.setdefault("PERP_INV", []).append(
+                                (r["slug"], oside, pi, r["winner"],
+                                 r["fee_rate_bps"], tau))
+                            pairs.setdefault("PERP", []).append(
+                                ev(side, p, r["winner"])
+                                - ev(oside, pi, r["winner"]))
+            # ---- VEL: trade-arrival velocity (algo parent orders cluster)
+            if (not vel_done and ts
+                    and args.min_tau <= tau <= args.max_tau
+                    and 0 < abs(dist_bps) <= args.gap_bps):
+                side = "Up" if dist_bps < 0 else "Down"
+                t_us = q["ts_ms"] * 1000
+                j = bisect.bisect_right(ts, t_us)
+                n_now = j - bisect.bisect_left(ts, t_us - VEL_WIN_US)
+                n_base = (j - bisect.bisect_left(ts, t_us - VEL_BASE_US)) \
+                    / (VEL_BASE_US / VEL_WIN_US)
+                if n_base >= 1.0 and n_now / n_base >= args.vel_x:
+                    c = win_sum(ts, pre, t_us - VEL_WIN_US, t_us)
+                    if (c > 0) if side == "Up" else (c < 0):
+                        vel_done = True
+                        p = entry_price(qs, i, side, args.entry_lag_ms)
+                        oside = "Down" if side == "Up" else "Up"
+                        pi = entry_price(qs, i, oside, args.entry_lag_ms)
+                        if p:
+                            res.setdefault("VEL", []).append(
+                                (r["slug"], side, p, r["winner"],
+                                 r["fee_rate_bps"], tau))
+                            if pi:
+                                res.setdefault("VEL_INV", []).append(
+                                    (r["slug"], oside, pi, r["winner"],
+                                     r["fee_rate_bps"], tau))
+                                pairs.setdefault("VEL", []).append(
+                                    ev(side, p, r["winner"])
+                                    - ev(oside, pi, r["winner"]))
 
     print(f"\n{'rule':9} {'n':>5} {'mean_px':>8} {'win':>6} {'EV/$1':>8} "
-          f"{'EV_net':>8} {'med_tau':>8}")
-    for k in ("CROSS", "PRE", "PRE_MOM", "PRE_INV", "MOM_ONLY", "PRE_COIN"):
+          f"{'EV_net':>8} {'med_tau':>8} {'day-t':>7}")
+    for k in ("CROSS", "PRE", "PRE_MOM", "PRE_INV", "PERP", "PERP_INV",
+              "VEL", "VEL_INV", "MOM_ONLY", "PRE_COIN"):
         v = res.get(k) or []
         if not v:
             print(f"{k:9} {0:5}")
             continue
-        ev = sum(((1 - p) / p if w == s else -1.0) for _, s, p, w, _, _ in v) / len(v)
+        gv = sum(((1 - p) / p if w == s else -1.0) for _, s, p, w, _, _ in v) / len(v)
         net = sum(((1 - p) / p if w == s else -1.0) - fee / 1e4
                   for _, s, p, w, fee, _ in v) / len(v)
         wins = sum(1 for _, s, p, w, _, _ in v if w == s) / len(v)
         px = sum(p for _, _, p, _, _, _ in v) / len(v)
         taus = sorted(t for *_, t in v)
-        print(f"{k:9} {len(v):5} {px:8.3f} {wins:6.3f} {ev:+8.3f} {net:+8.3f} "
-              f"{taus[len(taus)//2]:8.0f}")
+        # day-clustered t: the honest statistic once rules share a day factor
+        dgs: dict[str, list[float]] = {}
+        for x in v:
+            dgs.setdefault(slug_day(x[0]), []).append(
+                (1 - x[2]) / x[2] if x[3] == x[1] else -1.0)
+        dmeans = [sum(y) / len(y) for y in dgs.values()]
+        dt = 0.0
+        if len(dmeans) > 1:
+            m = sum(dmeans) / len(dmeans)
+            sd = (sum((x - m) ** 2 for x in dmeans)
+                  / (len(dmeans) - 1)) ** 0.5
+            dt = m / (sd / len(dmeans) ** 0.5) if sd else 0.0
+        print(f"{k:9} {len(v):5} {px:8.3f} {wins:6.3f} {gv:+8.3f} {net:+8.3f} "
+              f"{taus[len(taus)//2]:8.0f} {dt:+7.2f}")
 
     # paired view: on rounds where PRE fired, what did CROSS do?
     pre_slugs = {x[0] for x in (res.get("PRE") or [])}
@@ -270,39 +392,41 @@ def main() -> int:
               f"   CROSS {wc:.3f} @ px {sum(b[1][2] for b in both)/len(both):.3f}")
 
     # paired signal-vs-opposite-side test: is the direction skilful, or noise?
-    if pair:
-        m = sum(pair) / len(pair)
-        if len(pair) > 1:
-            var = sum((x - m) ** 2 for x in pair) / (len(pair) - 1)
-            se = (var / len(pair)) ** 0.5
-            print(f"\nPRE_MOM minus OPPOSITE-SIDE at the same entries: {m:+.4f}/$1"
-                  f"  se {se:.4f}  t {m/se if se else 0:+.2f}  (n={len(pair)})")
+    for rule, diffs in pairs.items():
+        if not diffs:
+            continue
+        m = sum(diffs) / len(diffs)
+        if len(diffs) > 1:
+            var = sum((x - m) ** 2 for x in diffs) / (len(diffs) - 1)
+            se = (var / len(diffs)) ** 0.5
+            print(f"\n{rule} minus OPPOSITE-SIDE at the same entries: {m:+.4f}/$1"
+                  f"  se {se:.4f}  t {m/se if se else 0:+.2f}  (n={len(diffs)})")
             print(f"   -> directional skill per side net of the pair's costs: "
                   f"{m/2:+.4f}/$1")
 
     print("\nby symbol (EV/$1, n):")
-    for k in ("CROSS", "PRE", "PRE_MOM", "MOM_ONLY"):
+    for k in ("CROSS", "PRE", "PRE_MOM", "PERP", "VEL", "MOM_ONLY"):
         v = res.get(k) or []
         parts = []
         for sym in sorted(syms):
             sub = [x for x in v if x[0].startswith(
                 {"BTCUSDT": "btc", "ETHUSDT": "eth", "BNBUSDT": "bnb"}[sym])]
             if sub:
-                ev = sum(((1 - p) / p if w == s else -1.0)
+                gv = sum(((1 - p) / p if w == s else -1.0)
                          for _, s, p, w, _, _ in sub) / len(sub)
-                parts.append(f"{sym[:3]} {ev:+.3f}({len(sub)})")
+                parts.append(f"{sym[:3]} {gv:+.3f}({len(sub)})")
         print(f"   {k:9} " + "  ".join(parts))
     print("\nby day (EV/$1, n) -- stability:")
     days_seen = sorted({slug_day(x[0]) for x in (res.get("CROSS") or [])})
-    for k in ("CROSS", "PRE", "PRE_MOM", "PRE_INV", "MOM_ONLY"):
+    for k in ("CROSS", "PRE", "PRE_MOM", "PERP", "VEL", "MOM_ONLY"):
         v = res.get(k) or []
         parts = []
         for d in days_seen:
             sub = [x for x in v if slug_day(x[0]) == d]
             if sub:
-                ev = sum(((1 - p) / p if w == s else -1.0)
+                gv = sum(((1 - p) / p if w == s else -1.0)
                          for _, s, p, w, _, _ in sub) / len(sub)
-                parts.append(f"{d} {ev:+.3f}({len(sub)})")
+                parts.append(f"{d} {gv:+.3f}({len(sub)})")
         print(f"   {k:9} " + "  ".join(parts))
     return 0
 
