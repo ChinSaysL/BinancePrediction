@@ -1904,6 +1904,26 @@ class TestTheTrainTrigger:
         asyncio.run(bot._cross_tick())
         assert bot._train_last_ms > 0, "the signal must stamp the burst clock"
 
+    def test_train_trades_5m_ROUNDS_ONLY(self, store, armed):
+        """Both of the design's train properties are properties of a 300s round.
+
+        "The first 4 minutes" is `tau >= 60s` ONLY on a 5-minute round; on a
+        15-minute round it is 14 of the 15 minutes. And 10bps at tau 820 is
+        ~1 sigma, not in the money: every live 5m leg filled in 0.79-0.88,
+        every 15m leg at 0.66/0.73/0.74 -- all three outside the stated band.
+        """
+        bot = make_bot(store, ticks(77000.0))
+
+        class R:
+            def __init__(self, slug):
+                self.slug = slug
+
+        assert bot._train_round_ok(R("btc-updown-5m-1789506600")) is True
+        assert bot._train_round_ok(R("eth-updown-15m-1789506600")) is False, (
+            "the 15m family has no time-box and prices outside the band")
+        assert bot._train_round_ok(R("unitree-something-dead")) is False, (
+            "an unreadable round length must fail CLOSED")
+
     def test_the_arm_is_quiet_when_off(self, store, armed):
         from btcpredict.config import settings
         assert settings.cross_train_enabled is False, (

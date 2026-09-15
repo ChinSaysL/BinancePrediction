@@ -1420,6 +1420,21 @@ class Settings(BaseSettings):
     # So: ONE train entry per burst, globally, not per family. 0 disables the
     # guard, which is the behaviour that took the eight.
     cross_train_cooldown_s: float = 120.0
+    # TRAIN TRADES THE 5-MINUTE ROUNDS ONLY (operator decision 2026-09-15).
+    #
+    # The design puts Train in "the first 4 minutes", priced 0.75-0.88, with
+    # saturated delta. BOTH of those are properties of a 300-SECOND round:
+    #   * `tau >= 60s` only means "the first 4 minutes" when the round is 300s
+    #     long. On a 900s round it means the arm is live for 14 of the 15
+    #     minutes -- the opposite of a time-boxed complement.
+    #   * 10bps at tau 820 is ~1 sigma, NOT in the money. The live record is
+    #     unambiguous: every 5m leg filled in 0.79-0.88, every 15m leg filled
+    #     at 0.66 / 0.73 / 0.74 -- all three outside the stated band, and the
+    #     15m legs are where tau 854 (46s into the round) came from.
+    # With the 5m restriction those two properties become the same property.
+    # Applies to the TRAIN trigger only; the cross arm still trades every
+    # family in CROSS_TRADED.
+    cross_train_5m_only: bool = True
     cross_skip_opposite_to_main: bool = True
     # RAISED 0.5 -> 2.0 on 2026-09-13. The old 0.5 was picked by a fill-aware
     # sweep that called it a "clear peak", but that sweep could not have seen

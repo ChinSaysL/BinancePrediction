@@ -1583,6 +1583,28 @@ class Bot:
         oldest = min(recent, key=lambda s: s[0])[1]
         return abs(1e4 * (oldest - r.strike) / r.strike) < thr_bps
 
+    def _train_round_ok(self, r) -> bool:
+        """May the TRAIN trigger trade this round? (cross_train_5m_only)
+
+        The trigger is time-boxed to "the first 4 minutes" and priced in the
+        money, and BOTH are properties of a 300-SECOND round. On a 15m round
+        `tau >= 60` is 14 of the 15 minutes, not the first four; and 10bps at
+        tau 820 is ~1 sigma, not in the money -- the three live 15m legs filled
+        at 0.66/0.73/0.74 against a stated 0.75-0.88 band, while every 5m leg
+        filled in 0.79-0.88. Restricting to 5m makes the two properties the
+        same property.
+
+        An unreadable slug FAILS CLOSED: a trigger that overrides three gates
+        should not act on a round whose length it cannot establish. This gates
+        the TRAIN trigger only -- the cross arm still trades every family.
+        """
+        if not self._ck("train_5m_only", r):
+            return True
+        try:
+            return int(str(r.slug).split("-")[2].rstrip("m")) * 60 == 300
+        except (AttributeError, IndexError, ValueError):
+            return False
+
     def _probe_fires(self, r) -> bool:
         """Quote a range-REFUSED crossing anyway, at a fixed tiny stake.
 
@@ -2002,7 +2024,8 @@ class Bot:
         # the reentry gap, the cooldown and the reversal rule.
         train = False
         side = None
-        if self._ck("train_enabled", r) and r.strike \
+        if self._ck("train_enabled", r) and self._train_round_ok(r) \
+                and r.strike \
                 and tau >= self._ck("train_min_tau_s", r) \
                 and feed.is_fresh(settings.max_spot_age_s):
             dist_bps = 1e4 * (feed.price - r.strike) / r.strike
