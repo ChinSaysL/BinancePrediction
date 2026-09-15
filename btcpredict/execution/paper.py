@@ -33,9 +33,15 @@ class PaperBroker:
         self._ids = itertools.count(1)
 
     async def buy(self, *, slug: str, side: str, token_id: str,
-                  price: float, stake: float) -> Fill | None:
+                  price: float, stake: float,
+                  max_px: float | None = None) -> Fill | None:
         fill_px = min(0.999, price + self.half_spread)
         if fill_px <= 0 or stake <= 0:
+            return None
+        # Same contract as the live broker: never fill above the caller's
+        # ceiling. Paper honours it so a backtest cannot show fills the live
+        # path would have refused.
+        if max_px is not None and fill_px > max_px + 1e-9:
             return None
         rate = self.fee_rate if self.fee_rate is not None else fee_rate_for_price(fill_px)
         fee = stake * rate if self.fee_on_notional else 0.0

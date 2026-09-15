@@ -2844,6 +2844,12 @@ class Bot:
                     break
                 break
             kw = {"quote": quote} if self.broker.mode == "live" else {}
+            # The cross arm's `limit_ceiling` is `ask + buffer` -- the highest
+            # price its own measurement says is worth paying. Under MARKET it
+            # becomes the quote ceiling, so the venue's lagging DISPLAYED price
+            # cannot sell us a 0.17 ask at 0.84 (2026-09-11, +47% EV -> -70%).
+            if limit_ceiling is not None:
+                kw["max_px"] = min(round(limit_ceiling, 2), 0.99)
             fill = await self.broker.buy(slug=r.slug, side=sig.side, token_id=token,
                                          price=sig.quote, stake=stake, **kw)
             if fill:

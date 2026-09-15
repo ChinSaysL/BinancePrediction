@@ -2398,3 +2398,76 @@ class TestOneEntryPerRound:
         asyncio.run(bot._cross_tick())
         assert calls == ["Up", "Up"], (
             f"a NEW round must still be tradeable; got {calls}")
+
+
+class TestTheMarketPathHasAPriceCeiling:
+    """A MARKET order prices off the venue's QUOTE, and that quote follows the
+    DISPLAYED price, which lags its own book -- by up to 0.40, and above the ask
+    in 5-7% of samples. Our own record has the failure: 2026-09-11, a Down on
+    offer at 0.17 was bought at 0.84, turning a +47% EV trade into -70%.
+
+    `slippageBps` cannot catch it: it bounds movement AFTER the quote, not the
+    quote being wrong to begin with. So the cross arm passes its
+    `limit_ceiling` (ask + buffer) as `max_px`, and the broker refuses above it.
+    This is what makes MARKET safe here -- immediacy, with the LIMIT path's one
+    real advantage kept: a bounded worst case.
+    """
+
+    def _bot(self, store, monkeypatch, quote_px):
+        monkeypatch.setattr("btcpredict.config.settings.order_type", "market")
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0), asks=(0.30, 0.40))
+        bot.broker.mode = "live"
+        seen = {}
+
+        async def get_quote(*a, **k):
+            return {"quoteId": "q", "averagePrice": quote_px, "expireAt": 0}
+
+        async def buy(**k):
+            seen.update(k)
+            # mimic the live broker's ceiling contract
+            if k.get("max_px") is not None and quote_px > k["max_px"] + 1e-9:
+                return None
+            return object()
+
+        bot.broker.get_quote = get_quote
+        bot.broker.buy = buy
+        return bot, seen
+
+    def test_the_ceiling_is_passed_to_the_market_path(self, store, armed,
+                                                      monkeypatch):
+        bot, seen = self._bot(store, monkeypatch, quote_px=0.32)
+        asyncio.run(bot._cross_tick())
+        assert "max_px" in seen, (
+            "a market order with no ceiling is how 0.17 got bought at 0.84")
+        assert seen["max_px"] == pytest.approx(expected_limit(0.30))
+
+    def test_a_quote_above_the_ceiling_is_refused(self, store, armed, monkeypatch):
+        """The 0.17 -> 0.84 case, in miniature."""
+        bot, seen = self._bot(store, monkeypatch, quote_px=0.84)
+        asyncio.run(bot._cross_tick())
+        assert seen.get("max_px") is not None
+        assert seen["max_px"] < 0.84, "the ceiling must bind below the bad quote"
+
+
+def test_the_live_broker_refuses_a_quote_above_max_px():
+    """The contract, on the real broker rather than a stub."""
+    import btcpredict.execution.live as live
+
+    b = live.LiveBroker(None, "k", "s", wallet_address="w", wallet_id="1")
+    placed = []
+
+    async def quote(*a, **kw):
+        return {"quoteId": "q1", "averagePrice": 0.84, "expireAt": 0,
+                "amountOut": str(10 * 10**18), "feeAmount": "0"}
+
+    async def request(method, path, params=None):
+        placed.append(params)
+        return {"orderId": "o1"}
+
+    b.get_quote = quote
+    b._request = request
+    fill = asyncio.run(b.buy(slug="s", side="Down", token_id="t",
+                             price=0.17, stake=1.0, max_px=0.30))
+    assert fill is None, "a quote of 0.84 against a ceiling of 0.30 must refuse"
+    assert not placed, "and must refuse BEFORE any order exists"
+    assert b.last_failure == "quote_above_ceiling"

@@ -53,8 +53,15 @@ class Broker(Protocol):
     mode: str
 
     async def buy(self, *, slug: str, side: str, token_id: str,
-                  price: float, stake: float) -> Fill | None:
-        """Buy `stake` USDT worth of `side`. Returns None if the order failed."""
+                  price: float, stake: float,
+                  max_px: float | None = None) -> Fill | None:
+        """Buy `stake` USDT worth of `side`. Returns None if the order failed.
+
+        `max_px` is the highest price the caller will accept. It exists because
+        a MARKET order prices off the venue's quote, and that quote follows the
+        DISPLAYED price, which lags the book -- once by 0.67, buying at 0.84
+        what was on offer at 0.17. Brokers MUST refuse rather than fill above it.
+        """
         ...
 
     async def settle(self, fill: Fill, winner: str) -> Settlement:

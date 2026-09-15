@@ -6854,3 +6854,60 @@ fake returning DIFFERENT numbers from `balance()` (20.0) and `equity()` (76.0)
 so that reading the wrong one fails loudly instead of passing plausibly.
 
 567 tests pass. Deployed; startup read $42.1275.
+
+## MARKET beats the resting LIMIT, and the ceiling is what makes it safe
+
+Decided with numbers, over the 34 live cross triggers that have both a reprice
+curve (`cross meter`) and a settled round. Fills priced at our own limit for the
+LIMIT path; the MARKET path drawn from the eight recorded market fills, whose
+slip against the ask on offer was `[+0.67, +0.21, and six at +0.067]` (the
+FINDINGS mean of +0.16 is those eight, with the two impulse entries dominating).
+
+    path                                fills   won   TOTAL EV   per fill
+    LIMIT inv 0.125 (yesterday)            10     7     +0.173    +0.0173
+    LIMIT inv 0.30 (this morning)          19    15     +2.668    +0.1404
+    LIMIT inv 0.40                         23    18     +1.963    +0.0853
+    MARKET FOK (observed slips)            34    25    +10.829    +0.3185
+
+MARKET wins because it fills all 34 while the limit fills 19, and the misses are
+disproportionately the winners. Sensitivity over the two things that could be
+wrong -- how much MARKET pays, and how often FOK fails:
+
+    market price assumption          FOK fail    TOTAL   vs LIMIT(+2.668)
+    ask + observed slip                    0%   10.890   MARKET
+    ask + observed slip                   50%    5.521   MARKET
+    ask + 0.16 flat                        0%    7.064   MARKET
+    ask + 0.16 flat                       50%    3.499   MARKET
+    the +1.00s repriced book               0%    4.616   MARKET
+    the +1.00s repriced book              50%    2.291   limit
+    +1.00s book PLUS 0.067                 0%    0.801   limit
+    +1.00s book PLUS 0.16                  0%   -2.206   limit
+
+MARKET wins in 10 of 15 cells, including at a 50% FOK failure rate. It loses
+only where the model charges it the fully repriced book AND another premium on
+top -- which double-counts, since the +0.16 was measured against the ask at the
+trigger, not against a book that had already moved.
+
+### The ceiling is the part that matters
+
+The case against MARKET was never the average, it was the tail. A market order
+prices off the venue's QUOTE, and that quote follows the DISPLAYED price, which
+lags its own book by up to 0.40 and sits above the ask in 5-7% of samples. The
+recorded failure: 2026-09-11, a Down on offer at **0.17 was bought at 0.84** --
++47% EV became -70%. `slippageBps` cannot catch it, because it bounds movement
+AFTER the quote, not the quote being wrong to begin with.
+
+So `buy()` now takes `max_px` and refuses before any order exists. The cross arm
+passes the same `ask + buffer` ceiling the LIMIT path used. That keeps MARKET's
+immediacy and borrows the LIMIT path's one real advantage -- a bounded worst
+case. It is a broker-wide contract: `base.buy` documents it and `paper.buy`
+honours it, so a backtest cannot show fills the live path would refuse.
+
+**Shipped**: `order_type=market` in the VPS `.env`, with the ceiling wired
+through. 570 tests pass, three of them new and one exercising the real
+`LiveBroker.buy` rather than a stub.
+
+n=34 triggers, and the market slip distribution is 8 observations. Thin. It is
+also the only substrate that can see any of this -- the 1s replay catches
+crossings after the venue reprices, which is what made the two earlier buffer
+conclusions wrong.

@@ -564,7 +564,8 @@ class LiveBroker:
 
     async def buy(self, *, slug: str, side: str, token_id: str,
                   price: float, stake: float,
-                  quote: dict | None = None) -> Fill | None:
+                  quote: dict | None = None,
+                  max_px: float | None = None) -> Fill | None:
         if not self.enabled:
             raise LiveBrokerError("wallet not configured; call discover_wallet() first")
         self.last_failure = None
@@ -587,6 +588,25 @@ class LiveBroker:
         if expire_at and expire_at <= time.time() * 1000:
             self.last_failure = "quote_expired"
             log.warning("quote %s already expired; skipping", quote["quoteId"])
+            return None
+        # PRICE CEILING. A MARKET order prices off the venue's quote, and that
+        # quote is pinned to the DISPLAYED price, which lags its own book -- by
+        # up to 0.40, and above the ask in 5-7% of samples. Our own record has
+        # the failure: on 2026-09-11 a Down offered at 0.17 was bought at 0.84,
+        # turning a +47% EV trade into -70%. `slippageBps` cannot catch that; it
+        # bounds movement AFTER the quote, not the quote being wrong to begin
+        # with.
+        #
+        # So the caller passes the highest price it is willing to pay -- for the
+        # cross arm, the same `ask + buffer` ceiling the LIMIT path used -- and
+        # a quote above it is refused before any order exists. This is what
+        # makes MARKET safe to use here: it keeps the immediacy and borrows the
+        # limit path's one real advantage, a bounded worst case.
+        if max_px is not None and avg_px > max_px + 1e-9:
+            self.last_failure = "quote_above_ceiling"
+            log.warning("quote %.4f for %s %s is above the ceiling %.4f "
+                        "(displayed price lags the book); refusing",
+                        avg_px, slug, side, max_px)
             return None
 
         resp = await self._request("POST", PLACE_ORDER, {
