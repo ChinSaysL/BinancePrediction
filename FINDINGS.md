@@ -9061,3 +9061,64 @@ opposite of the "require clearance" hypothesis.
 
 The one that works attacks the PRICE PAID. The three that fail attack geometry,
 size and distance -- none of which is where the leak is.
+
+## SHIPPED: ask+2c execution cap on the cross arm (2026-09-15 17:14:38 UTC)
+
+Deployed to live. This is the only one of the four execution-leak proposals that
+measured positive, so it is the one that went out.
+
+    slippage_bps            300   -> 200
+    cross_limit_buffer      0.25  -> 0.02
+    cross_limit_buffer_inv  0.125 -> 0.2
+
+Applied as three overrides appended to /root/BinancePrediction/.env (the VPS repo
+is NOT a git repo, so there is no pull step; the local and VPS copies of
+config.py/main.py/live.py were verified byte-identical first). Backup at
+.env.bak-20260915-171428. Service restarted, PID 253661 -> 257964.
+
+Effective ceiling, verified by loading the settings in a fresh process
+(`ceil_side = min(max_price, ask + buf)`, `buf = max(0.01, min(0.02, 0.2*(1-ask)))`):
+
+    ask 0.30 -> ceil 0.32      ask 0.58 -> ceil 0.60   (was 0.63, +5.25c)
+    ask 0.40 -> ceil 0.42      ask 0.70 -> ceil 0.72   (was 0.74, +3.75c)
+    ask 0.50 -> ceil 0.52      ask 0.80 -> ceil 0.82
+    (was 0.56, +6.25c)
+
+### Two corrections to the parameter set that was proposed
+
+**`cross_limit_buffer_inv` had to be 0.2, not 0.02.** The requested 2c cap would
+not have been delivered by the suggested value. `buf` is
+`max(0.01, min(limit_buffer, inv*(1-ask)))`, and `inv*(1-ask)` binds FIRST when
+inv is small: at 0.02 and a 0.58 ask it evaluates to 0.0084, so `min` picks it and
+the `max(0.01, ...)` floor then pins the cap at exactly +1c -- for every ask above
+about 0.50. Setting inv = 0.2 lets the flat `limit_buffer = 0.02` dominate across
+the whole tradeable band, which is what "+2c cap" actually means here. Verified
+numerically above, not assumed.
+
+**`slippage_bps` is not the binding cap, and lowering it is close to redundant.**
+In `execution/live.py`, `slip = max(slippage_bps, min(room, 10_000))` where
+`room = (max_px/avg_px - 1)*10_000`. With a +2c ceiling on a 0.58 ask, `room` is
+345bps, so `slip` is 345 whether the floor is 300 or 200. The floor only binds
+where `room` is small -- a very high ask, or a venue quote that drifted up toward
+the ceiling -- and there it is exactly what lets the FOK bound overshoot the
+ceiling by `slippage_bps/10_000` of the quote (3% before, 2% now). So 200 is kept
+as a tighten-the-worst-case measure, not as the cap itself.
+
+### Canary settings
+
+Stake is unchanged at the existing `stake_cap_usdt = 1.0`. Do not scale until the
+criteria below are met.
+
+    paid      baseline 0.623   target <= 0.585     <- the primary signal
+    win       baseline 59.1%   floor 60%, scale at >= 65%
+    fill rate 53% expected on the tape (52.8%)
+    net/sh    baseline -0.037
+
+`tools/canary_report.py` reports all four against these baselines; it was copied
+to the VPS alongside the change.
+
+    .venv/bin/python tools/canary_report.py --since "2026-09-15 17:14:38"
+
+Revert: restore `.env.bak-20260915-171428` and `systemctl restart btcpredict`.
+`quote_above_ceiling` is already in the broker's `no_cooldown` set, so a tighter
+ceiling that refuses more often does NOT trigger the 30s order cooldown.
