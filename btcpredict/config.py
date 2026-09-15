@@ -1138,14 +1138,29 @@ class Settings(BaseSettings):
     # It costs frequency: 91 modelled fills become 67. That is the trade, and it
     # is the right way round -- the old cell was not distinguishable from no edge.
     cross_limit_buffer_inv: float = 0.125
-    # How long a cross limit rests before it is cancelled. The shared
-    # `limit_wait_s` (20s) is for the model arm. For the cross arm a long rest is
-    # ADVERSE SELECTION, not patience: the order fills only when the ask comes
-    # back DOWN to it, which is precisely the move that makes the side we bought
-    # less likely to win. Every 20s row in the sweep above has a CI spanning
-    # zero; every short-rest row at inv <= 0.125 does not. 0 keeps the shared
-    # limit_wait_s.
-    cross_limit_wait_s: float = 2.0
+    # How long a cross limit rests before it is cancelled. 0 keeps the shared
+    # `limit_wait_s` (20s).
+    #
+    # SUPERSEDED 2026-09-15 -- the short rest was wrong. It shipped at 2.0 on
+    # 2026-09-14 on "a long rest is adverse selection", decided against 20s
+    # alone on an earlier 119-trigger snapshot. Swept properly
+    # (tools/cross_wait_sweep.py; 162 triggers / 7 days; the shipped limit
+    # rule; placement latency run at 2/3/4s):
+    #
+    #     wait    fills  fill%   win    growth  day-t  drop-best
+    #      2.0       85   52.5  0.824   +1.665  +2.12   +0.951   <- was shipped
+    #      5.0       98   60.5  0.827   +2.110  +2.66   +1.396
+    #     10.0      103   63.6  0.825   +2.180  +2.76   +1.466
+    #     20.0      113   69.8  0.841   +2.518  +2.98   +1.804   <- ships
+    #     30/45     113   69.8  0.841   identical -- every extra fill arrives
+    #               by ~20s and nothing fills after it; 20 IS the full window.
+    #
+    # The late fills are not adverse: the ask dips back to the limit after the
+    # venue's own reprice overshoots, while our side is still the favourite.
+    # The added fills win 0.84-0.89 at mean px 0.65; the gain holds at every
+    # latency assumption and on 5 of 7 days (no single day carries it). The
+    # 2s row also had the worse day-t and drop-best.
+    cross_limit_wait_s: float = 20.0
     cross_skip_opposite_to_main: bool = True
     # RAISED 0.5 -> 2.0 on 2026-09-13. The old 0.5 was picked by a fill-aware
     # sweep that called it a "clear peak", but that sweep could not have seen

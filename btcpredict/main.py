@@ -2748,14 +2748,12 @@ class Bot:
                 # Never rest past the bell: the cross fires 3-60s before it, and
                 # the configured 20s would outlive the round.
                 #
-                # The cross arm rests far shorter than the model arm. A limit
-                # that fills late fills because the ask came back DOWN to it,
-                # which is the move that makes the bought side less likely to
-                # win -- adverse selection wearing patience as a disguise. On
-                # 119 btc-5m triggers every 20s cell has a bootstrap CI spanning
-                # zero; the 2s cells at inv <= 0.125 do not. `limit_ceiling` is
-                # what marks this as the cross path (see above); the model arm
-                # keeps limit_wait_s.
+                # The cross path's wait is `cross_limit_wait_s` (20s since the
+                # 2026-09-15 sweep: the 2s short rest measured WORSE -- the
+                # late fills win 0.84-0.89 and growth rises monotonically to
+                # 20s; see the config block). `limit_ceiling` is what marks
+                # this as the cross path (see above); the model arm keeps
+                # limit_wait_s, and 0 falls back to it.
                 wait_cap = settings.limit_wait_s
                 if limit_ceiling is not None and settings.cross_limit_wait_s > 0:
                     wait_cap = settings.cross_limit_wait_s

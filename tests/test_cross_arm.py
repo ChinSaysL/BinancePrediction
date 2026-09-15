@@ -1884,17 +1884,21 @@ class TestTheInFlightGuard:
             "an exception must not leave the round permanently claimed")
 
 
-class TestTheCrossRestsFarShorterThanTheModelArm:
-    """A cross limit that fills LATE fills because the ask came back down to it.
+class TestTheCrossWaitTheAdverseSelectionCallWasWrong:
+    """The cross limit rests the same 20s the shared wait uses.
 
-    That is the move which makes the side just bought less likely to win, so a
-    long rest is adverse selection wearing patience as a disguise. Measured on
-    119 btc-5m triggers: every 20s cell has a bootstrap CI spanning zero, every
-    2s cell at inv <= 0.125 does not.
+    SUPERSEDED 2026-09-15: the 2s rest shipped 2026-09-14 on "a late fill is
+    adverse selection", chosen against 20s alone on an earlier 119-trigger
+    snapshot. Swept properly (tools/cross_wait_sweep.py; 162 triggers / 7
+    days; placement latency 2/3/4s): growth rises monotonically to 20s
+    (+1.665/+2.12/+0.951 at 2s -> +2.518/+2.98/+1.804), the added fills win
+    0.84-0.89 at mean px 0.65, and 30/45s are IDENTICAL to 20s -- every extra
+    fill arrives within it. The ask comes back after the venue's own
+    overshoot, not because our side is dying.
 
     `limit_ceiling is not None` is what distinguishes the cross path from the
     model arm inside the shared placement block, so that is what must select
-    the wait. The model arm keeps limit_wait_s.
+    the wait. The model arm keeps limit_wait_s; 0 falls back to it.
     """
 
     def _wait_for(self, store, monkeypatch, *, ceiling):
@@ -1923,12 +1927,18 @@ class TestTheCrossRestsFarShorterThanTheModelArm:
                                      limit_ceiling=ceiling))
         return seen.get("wait_s")
 
-    def test_the_cross_path_uses_the_short_wait(self, store, armed, monkeypatch):
-        monkeypatch.setattr("btcpredict.config.settings.cross_limit_wait_s", 2.0)
+    def test_the_cross_path_uses_the_shipped_wait(self, store, armed, monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.cross_limit_wait_s", 20.0)
         monkeypatch.setattr("btcpredict.config.settings.limit_wait_s", 20.0)
         w = self._wait_for(store, monkeypatch, ceiling=0.39)
-        assert w == pytest.approx(2.0), (
-            "a cross limit must not rest for the model arm's 20s")
+        assert w == pytest.approx(20.0), (
+            "the shipped cross wait is the shared 20s (2026-09-15 sweep)")
+
+    def test_a_custom_cross_wait_still_overrides(self, store, armed, monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.cross_limit_wait_s", 5.0)
+        monkeypatch.setattr("btcpredict.config.settings.limit_wait_s", 20.0)
+        w = self._wait_for(store, monkeypatch, ceiling=0.39)
+        assert w == pytest.approx(5.0)
 
     def test_the_model_path_keeps_the_long_wait(self, store, armed, monkeypatch):
         monkeypatch.setattr("btcpredict.config.settings.cross_limit_wait_s", 2.0)

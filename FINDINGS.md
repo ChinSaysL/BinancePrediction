@@ -6208,3 +6208,36 @@ zero-fill bucket, the buffer sweep, and the adverse-selection table
 (+7.17/$1 at our bids vs -0.73 at the real ask -- do not chase). Range gate
 stays 10; no knobs changed anywhere. Revert path: `CROSS_PROBE_ENABLED=true`
 + restart. The day's order count is back to the normal arm alone.
+
+## The 2s cancel was backwards: rest the full window (2026-09-15)
+
+Asked to re-verify the cross cancel wait. It had only ever been compared
+against 20s once, on an earlier 119-trigger snapshot, under the claim "a
+limit that fills late fills because the ask came back down -- adverse
+selection wearing patience as a disguise". Swept properly --
+`tools/cross_wait_sweep.py`, 162 triggers / 7 days, the shipped limit rule,
+run at placement latencies 2/3/4s:
+
+    wait    fills  fill%   win    growth  day-t  drop-best    (LAT=3)
+     0.5       47   29.0  0.830   +0.664  +2.86   +0.477
+     1.0       65   40.1  0.815   +1.105  +1.80   +0.578
+     2.0       85   52.5  0.824   +1.665  +2.12   +0.951     <- was shipped
+     5.0       98   60.5  0.827   +2.110  +2.66   +1.396
+    10.0      103   63.6  0.825   +2.180  +2.76   +1.466
+    20.0      113   69.8  0.841   +2.518  +2.98   +1.804     <- ships
+    30/45     113   69.8  0.841   +2.518  identical to 20
+
+Monotone to 20s under every latency assumption; 30 and 45 are identical to
+20 -- every additional fill arrives within ~20s, so 20 IS the full window.
+The added fills are NOT adverse: they win 0.84-0.89 at mean px 0.65. The
+feared mechanism -- "the ask comes back only because our side is dying" --
+is wrong on this tape: the ask dips back after the venue's own reprice
+overshoot, while the side is still the favourite. Broad across days (better
+on 5 of 7 at LAT=2; no single day carries it), and the 2s row also had the
+worse day-t (2.12 vs 2.98) and drop-best (+0.95 vs +1.80).
+
+Shipped `cross_limit_wait_s` 2.0 -> 20.0 (the shared value; rests still
+bounded by the bell at tau-1). Supersedes the 09-14 "20s -> 2s" change and
+its hold-column argument. Same-day: the guard audit also restored the daily
+loss cap (`daily_loss_cap_pct` 0.0 -> 0.20 in `.env`) -- it had been left off
+since the 09-11 no-guards experiment and was the only guard that was off.
