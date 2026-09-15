@@ -1141,26 +1141,35 @@ class Settings(BaseSettings):
     # How long a cross limit rests before it is cancelled. 0 keeps the shared
     # `limit_wait_s` (20s).
     #
-    # SUPERSEDED 2026-09-15 -- the short rest was wrong. It shipped at 2.0 on
-    # 2026-09-14 on "a long rest is adverse selection", decided against 20s
-    # alone on an earlier 119-trigger snapshot. Swept properly
-    # (tools/cross_wait_sweep.py; 162 triggers / 7 days; the shipped limit
-    # rule; placement latency run at 2/3/4s):
+    # HISTORY, because this knob was wrong in BOTH directions in one day.
+    # 2.0 shipped 2026-09-14 on "a late fill is adverse selection" -- decided
+    # in tools/cross_buffer_vs_fill.py, whose fill window starts AT THE
+    # TRIGGER (no placement latency) and whose hold-2 row rode the
+    # CI-clearing combo with cross_limit_buffer_inv = 0.125. Re-run on current
+    # data, that tool still prefers short holds (hold2 +0.84 vs hold20 +0.63),
+    # BUT the live record refutes its thesis directly -- every settled fill
+    # bucketed by completion latency (n=27):
+    #     <=2.5s    5 fills   2W  (0.40)
+    #     2.5-3.4s 10 fills   7W  (0.70)
+    #     >3.4s    12 fills   9W  (0.75)   <- the class a 2s cancel kills
+    # Slow fills are the BEST class measured live, not the worst. (The 5.5-20s
+    # band has also produced zero fills in ~39 orders -- unobserved either way.)
     #
-    #     wait    fills  fill%   win    growth  day-t  drop-best
-    #      2.0       85   52.5  0.824   +1.665  +2.12   +0.951   <- was shipped
-    #      5.0       98   60.5  0.827   +2.110  +2.66   +1.396
-    #     10.0      103   63.6  0.825   +2.180  +2.76   +1.466
-    #     20.0      113   69.8  0.841   +2.518  +2.98   +1.804   <- ships
-    #     30/45     113   69.8  0.841   identical -- every extra fill arrives
-    #               by ~20s and nothing fills after it; 20 IS the full window.
+    # But 2.0 is provably inside the venue's own fill process: fills complete
+    # up to ~5.2s after the decision (four observed, incl. 00:24 UTC 09-15:
+    # 92% at 0.5976, +0.67/$1), and a 2s cancel kills them by construction.
+    # The corrected sweep (tools/cross_wait_sweep.py -- re-entry gap and tick
+    # floor aligned to the calibrated tool, both fill-price conventions, LAT
+    # 2/3/4) puts 5s above 2s under EVERY convention (+0.39 vs +0.27 at
+    # pay-the-limit; +1.20 vs +0.83 at touch). The 5-20s extension is
+    # UNOBSERVED live (zero fills there in ~39 orders) and the two models
+    # disagree on it, so it is not ridden tonight.
     #
-    # The late fills are not adverse: the ask dips back to the limit after the
-    # venue's own reprice overshoots, while our side is still the favourite.
-    # The added fills win 0.84-0.89 at mean px 0.65; the gain holds at every
-    # latency assumption and on 5 of 7 days (no single day carries it). The
-    # 2s row also had the worse day-t and drop-best.
-    cross_limit_wait_s: float = 20.0
+    # 5.0 = captures every fill the live record has demonstrated, declines
+    # the unverified tail. CHECKPOINT: keep scoring live fills by latency --
+    # if the >3s class turns negative over ~20 more fills, tighten toward 2;
+    # if fills start appearing in the 5-20s band and win, extend.
+    cross_limit_wait_s: float = 5.0
     cross_skip_opposite_to_main: bool = True
     # RAISED 0.5 -> 2.0 on 2026-09-13. The old 0.5 was picked by a fill-aware
     # sweep that called it a "clear peak", but that sweep could not have seen

@@ -6209,35 +6209,54 @@ zero-fill bucket, the buffer sweep, and the adverse-selection table
 stays 10; no knobs changed anywhere. Revert path: `CROSS_PROBE_ENABLED=true`
 + restart. The day's order count is back to the normal arm alone.
 
-## The 2s cancel was backwards: rest the full window (2026-09-15)
+## The cross cancel wait: 2s had a reason; the live fills say it was wrong; 5s ships (2026-09-15)
 
-Asked to re-verify the cross cancel wait. It had only ever been compared
-against 20s once, on an earlier 119-trigger snapshot, under the claim "a
-limit that fills late fills because the ask came back down -- adverse
-selection wearing patience as a disguise". Swept properly --
-`tools/cross_wait_sweep.py`, 162 triggers / 7 days, the shipped limit rule,
-run at placement latencies 2/3/4s:
+Re-asked after the interim change to 20s, because the 2s had a documented
+rationale. It did -- and working it through moved the answer twice.
 
-    wait    fills  fill%   win    growth  day-t  drop-best    (LAT=3)
-     0.5       47   29.0  0.830   +0.664  +2.86   +0.477
-     1.0       65   40.1  0.815   +1.105  +1.80   +0.578
-     2.0       85   52.5  0.824   +1.665  +2.12   +0.951     <- was shipped
-     5.0       98   60.5  0.827   +2.110  +2.66   +1.396
-    10.0      103   63.6  0.825   +2.180  +2.76   +1.466
-    20.0      113   69.8  0.841   +2.518  +2.98   +1.804     <- ships
-    30/45     113   69.8  0.841   +2.518  identical to 20
+### The original reason (2026-09-14)
 
-Monotone to 20s under every latency assumption; 30 and 45 are identical to
-20 -- every additional fill arrives within ~20s, so 20 IS the full window.
-The added fills are NOT adverse: they win 0.84-0.89 at mean px 0.65. The
-feared mechanism -- "the ask comes back only because our side is dying" --
-is wrong on this tape: the ask dips back after the venue's own reprice
-overshoot, while the side is still the favourite. Broad across days (better
-on 5 of 7 at LAT=2; no single day carries it), and the 2s row also had the
-worse day-t (2.12 vs 2.98) and drop-best (+0.95 vs +1.80).
+`tools/cross_buffer_vs_fill.py` chose hold 2 with inv 0.125: "a cross limit
+that fills LATE fills because the ask came back DOWN to it -- adverse
+selection wearing patience as a disguise. Every 20s row has a CI spanning
+zero; the short-rest rows at inv <= 0.125 do not." Cost stated: 91 -> 67
+modelled fills. Re-run on current data, that tool still prefers short holds
+(hold2 +0.84 vs hold20 +0.63) -- but note its fill window starts AT THE
+TRIGGER, with no placement latency.
 
-Shipped `cross_limit_wait_s` 2.0 -> 20.0 (the shared value; rests still
-bounded by the bell at tau-1). Supersedes the 09-14 "20s -> 2s" change and
-its hold-column argument. Same-day: the guard audit also restored the daily
-loss cap (`daily_loss_cap_pct` 0.0 -> 0.20 in `.env`) -- it had been left off
-since the 09-11 no-guards experiment and was the only guard that was off.
+### The corrected sweep
+
+`tools/cross_wait_sweep.py`, aligned to the calibrated tool (re-entry gap,
+tick floor, both fill-price conventions, LAT 2/3/4). At the live convention
+(LAT=3s, pay-the-limit):
+
+    wait    fills  fill%   win    growth  day-t  drop-best
+     2.0       58   48.7  0.810   +0.265  +1.23   +0.098    <- was shipped
+     5.0       68   57.1  0.824   +0.389  +1.28   +0.198
+    10.0       72   60.5  0.819   +0.392  +1.24   +0.201
+    20.0       79   66.4  0.835   +0.573  +1.72   +0.347
+
+5s sits above 2s under every convention (+1.20 vs +0.83 at touch pricing).
+The 5-20s extension is model-dependent and UNOBSERVED live.
+
+### The live referee: every settled fill by completion latency (n=27)
+
+    <=2.5s     5 fills   2W   (0.40)
+    2.5-3.4s  10 fills   7W   (0.70)
+    >3.4s     12 fills   9W   (0.75)    <- the class a 2s cancel kills
+
+Slow fills are the BEST class the live record has, not the worst -- the
+adverse-selection thesis is refuted by the bot's own fills. (Includes 00:24
+UTC 09-15: 92% at 0.5976, reported in 5.20s, won +0.67/$1 -- an order a 2s
+cancel provably kills.) The 5.5-20s band has produced zero fills in ~39
+orders of the 20s-wait era, so 5-20 remains unobserved both ways.
+
+### Shipped
+
+`cross_limit_wait_s` -> 5.0 (from the interim 20.0): captures every fill the
+live record has demonstrated, declines the unobserved tail. CHECKPOINT: keep
+scoring live fills by latency -- if the >3s class turns negative over ~20
+more fills, tighten toward 2; if fills start appearing in the 5-20s band and
+win, extend toward 10-20. Same-day: the guard audit restored
+`daily_loss_cap_pct` 0.0 -> 0.20 in `.env` (left off since the 09-11
+no-guards experiment -- the only guard that was off).

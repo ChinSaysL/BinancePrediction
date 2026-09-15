@@ -47,10 +47,12 @@ def collect(q, rounds, market, horizon):
         ts = g.ts_ms.to_numpy(float); sp = g.spot.to_numpy(float)
         ua = g.up_ask.to_numpy(float); da = g.down_ask.to_numpy(float)
         K = float(rr.strike); end = float(rr.end_ms)
-        took, n = None, 0
+        took, n, last = None, 0, -9e9
         for i in range(len(ts)):
             tau = (end - ts[i]) / 1000.0
             if not (S.cross_min_tau_s <= tau <= S.cross_max_tau_s):
+                continue
+            if ts[i] - last < S.cross_reentry_gap_s * 1000.0:
                 continue
             j0 = int(np.searchsorted(ts, ts[i] - (S.cross_look_s + 2.0) * 1000.0, 'left'))
             if i - j0 < 1:
@@ -61,7 +63,10 @@ def collect(q, rounds, market, horizon):
                 continue
             if not S.cross_allow_reversal and took and took != side:
                 continue
-            if 1e4 * abs(sp[i] - K) / K > S.cross_max_depth_bps:
+            dep = abs(sp[i] - K)
+            if dep < S.cross_min_depth_ticks * S.cross_tick_size - 1e-12:
+                continue
+            if 1e4 * dep / K > S.cross_max_depth_bps:
                 continue
             seen = sp[:i + 1]
             if G > 0 and 1e4 * (np.nanmax(seen) - np.nanmin(seen)) / K > G:
@@ -77,7 +82,7 @@ def collect(q, rounds, market, horizon):
             out.append((pd.Timestamp(ts[i], unit='ms', tz='UTC').strftime('%Y-%m-%d'),
                         float(ts[i]), float(ask), int(side == rr.winner),
                         path_ts[ok], path_ask[ok]))
-            took, n = side, n + 1
+            took, n, last = side, n + 1, ts[i]
     return out
 
 
@@ -86,7 +91,7 @@ def limit_for(ask):
                                           0.125 * (1.0 - ask))), 2), 0.99)
 
 
-def run(row, wait):
+def run(row, wait, price):
     day, t0, ask, won, path_ts, path_ask = row
     lim = limit_for(ask)
     upto = t0 + (LAT + wait) * 1000.0
@@ -94,7 +99,8 @@ def run(row, wait):
     hit = seg[seg <= lim]
     if len(hit) == 0:
         return None
-    return (day, won, min(lim, float(hit[0])))
+    px = min(lim, float(hit[0])) if price == 'touch' else lim
+    return (day, won, px)
 
 
 def score(t):
@@ -113,6 +119,7 @@ def main() -> int:
     ap.add_argument('--base', default='data/recorded')
     ap.add_argument('--market', default='btc-updown-5m')
     ap.add_argument('--latency', type=float, default=3.0)
+    ap.add_argument('--price', choices=('touch', 'limit'), default='touch')
     a = ap.parse_args()
     LAT = a.latency
     q = pd.read_csv(f'{a.base}/quotes_arm.csv.gz')
@@ -126,7 +133,7 @@ def main() -> int:
     print(f"  {'wait(s)':>8}{'fills':>7}{'fill%':>7}{'win':>7}{'mean px':>9}"
           f"   growth / day-t / drop-best")
     for w in (0.5, 1.0, 2.0, 2.5, 3.0, 5.0, 10.0, 20.0, 30.0, 45.0):
-        got = [x for x in (run(row, w) for row in rows) if x is not None]
+        got = [x for x in (run(row, w, a.price) for row in rows) if x is not None]
         if len(got) < 10:
             print(f"  {w:>8.1f}{len(got):>7}  (too few)")
             continue
@@ -137,7 +144,7 @@ def main() -> int:
               f"{t.ask.mean():>9.3f}   {g:+.3f} / {tt:+.2f} / {dd:+.3f}{mark}")
     print("\n  per-day log sums, wait 2 vs 20 (stability check):")
     for w in (2.0, 20.0):
-        got = [x for x in (run(row, w) for row in rows) if x is not None]
+        got = [x for x in (run(row, w, a.price) for row in rows) if x is not None]
         t = pd.DataFrame(got, columns=['day', 'won', 'ask'])
         fill = np.clip(t.ask.to_numpy(), 1e-4, .9999)
         r = np.where(t.won.to_numpy() == 1, (1 - fill) / fill * (1 - FEE), -1.0)
