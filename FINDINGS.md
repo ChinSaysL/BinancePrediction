@@ -8582,3 +8582,78 @@ reason, so the theory changes no decision.
    1-10000) is the only price bound that exists.
 
 New tool: `tools/cross_asset_lag.py` (read-only).
+
+## The "re-run it at 250ms" request: the data cannot resolve 250ms (2026-09-15)
+
+Correcting the latency figure from 1000ms to 249ms was right, and the filter
+"don't re-test what already failed at lag 0" is right too (cross-asset, round-start
+and CVD all lose at lag 0, so latency cannot rescue them). But the one mechanic
+that looked "unfairly penalised" cannot be re-tested, and the reason is a
+measurement-resolution fact that had never been measured.
+
+### The venue quote series is ~1 SECOND apart, not 140ms
+
+`tools/quote_cadence.py`, 1,228,070 consecutive same-round quote gaps:
+
+  all taus     p10  976ms | p25  992 | **MEDIAN 1005** | p75 1025 | p90 2192
+  tau 0-40s    p10  974ms | p25  991 | **MEDIAN 1004** | p75 1024 | p90 1897
+  gap <= 100ms : 0.0%      gap <= 250ms : 0.2%      gap <= 400ms : 0.2%
+
+The "~140ms" figure in the logs is the robot's internal poll-loop cadence, not
+the stored quote spacing. `entry_price()` in `precursor_entry.py` takes *the first
+quote at/after t+lag*, so with a 1005ms grid:
+
+    --entry-lag-ms    0  -> the current row (same-tick fill, optimistic)
+    --entry-lag-ms  250/300/500  -> the NEXT quote, in 99.8% of cases
+    --entry-lag-ms 1000  -> the next quote 60.3% of the time, one further when gap<1000ms
+
+**250 and 300 are therefore the same measurement as each other, and differ from
+1000 only by one quote.** Demonstrated by running it: `precursor_entry.py
+--entry-lag-ms 250` vs `1000`, EV_net:
+
+    CROSS    +0.130 vs +0.125      PRE     -0.061 vs -0.064
+    VEL      -0.016 vs -0.027      SWEEP   +0.015 vs +0.030   <- largest gap, 0.015
+    BREAK    +0.077 vs +0.073      MOM_ONLY +0.145 vs +0.148
+    PRE_MOM  -0.014 vs -0.026      PERP    +0.044 vs +0.047
+
+The whole spread is <= 0.015. This is a 1s-vs-2s decay test, NOT a 250ms test,
+and it cannot answer "does the 2.5x drift lift survive 250ms". **The question is
+unanswerable on this database**, and the earlier `--entry-lag-ms 1000` run was
+never what killed the precursor: PRE is -0.061 at 250ms and -0.064 at 1000ms,
+negative either way.
+
+Sub-second venue prices exist only in the live log's 50ms `cross fine` paths
+(78 of them) and in the un-stored book websocket. `precursor_ticks.py`'s
+88-93% figure is built on a 100ms grid of the **Binance spot mid**, not the venue
+contract, so it cannot be converted into a venue fill at that resolution either.
+
+### The slippage question: the gap is 2,859 bps, not 20-50 bps
+
+From the live log's 50ms `cross fine` paths (78 paths), how far the price travelled
+past the bound we authorised is ALREADY at our ceiling (slip is derived as
+`room = max_px/quote - 1`, so the bound == max_px):
+
+  shortfall = maxP(1s) / bound - 1, in bps
+    p50 +1875   p75 +5423   p90 +39635
+    attempts whose price stayed INSIDE the bound : **7 of 32**
+    median shortfall where it was exceeded        : **+2859 bps = 28.6 cents**
+
+Widening `slippageBps` by 20-50 bps would close 0.2-0.5c of a 28.6c median gap --
+about 1-2% of it. And `slippageBps` is already maxed at `room`, so "widening it"
+means **raising the ceiling**, i.e. agreeing to pay ~0.84 for a contract quoted at
+0.55. Against a 96 bps fee and a ~1.2 pp spread there is nothing "tiny" about that
+buffer.
+
+The displacement data says the same thing from the other side. Over the 250ms after
+a signal the contract moves a **median 10.0 cents** (p75 17.8c, p90 37.0c), versus
+a median 2.0c over 500-1000ms -- the burst is IN the first quarter-second. So
+arriving 250ms late means paying ~10c more, and our own venue ack is a median
+249ms: 250ms is our floor, and the move has already happened inside it.
+
+And the decisive counter is in the fills we already got. Of the 6 filled
+decisions, **2 paid above the entire 1-second high**: eth-updown-5m-1789478700
+filled at 0.5495 when the contract never printed above 0.5300 in the following
+second, and bnb-updown-5m-1789479400 filled at 0.5686 against a 0.5300 high.
+Raising the ceiling makes exactly that failure mode worse, not better: the fills a
+taker gets are the ones where the market is running away, which is why the fill
+rate is 5.9% and why every priced test in this repo is negative.
