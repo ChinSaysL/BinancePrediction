@@ -10073,3 +10073,131 @@ was telling me, and I read it as an optimum instead.
 
 Not shipped. The +2c cap, `cross_limit_buffer=0.02`, `cross_limit_buffer_inv=0.2`
 and `slippage_bps=200` all stay exactly as deployed at 17:14:38.
+
+## The three "pre-trade structural stress" ideas, measured (2026-09-15, night)
+
+Basis dislocation, OI-with-CVD, and depth evaporation. All three are real
+microstructure effects and all three are too small or too slow to survive this
+venue's ~1.4s working time and the +5.5c execution leak already measured on our
+fills. One of them contains a correction: **I dismissed the OI idea too early.**
+
+### IDEA 1 -- perpetual basis dislocation >=4bps in 500ms: ZERO OCCURRENCES
+
+`tools/basis_dislocation.py`, BTCUSDT 2026-09-12, perp and spot aggTrades on a
+50ms grid (24.0h, 1,727,982 bins):
+
+    |basis| median 4.53 bps   p99 6.23 bps
+    spot within 1bp of the strike:  822,739 bins (47.8%)
+    basis EXPANDS >=4bps in 500ms:         0 bins
+    basis CONTRACTS <=-4bps in 500ms:      0 bins
+
+**Two separate problems, one of which is a category error.**
+
+1. The trigger never fires. A 500ms basis *change* of 4bps does not occur once in
+   1.7M bins. The basis is far more stable than "Perp gaps 3-6bps instantly"
+   implies.
+
+2. `|basis| median = 4.53 bps` -- so "basis > 4bps" is the **normal state**, not a
+   dislocation. The threshold as written compares an absolute level against a
+   level the basis sits at permanently (it is the carry/funding offset). The
+   signal would be long essentially 100% of the time.
+
+And the prediction it is supposed to support, measured directly:
+
+    spot within 1bp of strike, ANY basis ... P(cross in 1s) 27.9%  2s 28.9%
+    ALL bins (base rate)      ............. P(cross in 1s) 13.4%  2s 13.9%
+
+Proximity to the strike doubles the crossing probability (2.1x) and makes it
+**nowhere near certain** -- "near-certain over the next 1-2 seconds" is measured
+at 28%. Consistent with this file's own physics: the BTC mid needs a MEDIAN
+6,640ms to travel 1bp and only 16.1% of 1bp moves finish inside 1s.
+
+The lead-lag premise underneath it was already falsified separately: perp vs spot
+50ms returns correlate at **lag 0** with symmetric shoulders, and the conditional
+forward drift is as large in reverse. There is no tape that leads the other.
+
+### IDEA 2 -- OI + CVD for liquidation cascades: CORRECTION, THE SOURCE EXISTS --
+### BUT ITS RESOLUTION IS OFF BY 47x
+
+I previously wrote that the OI archive "is 289 rows/day, a 5-minute cadence, not
+100ms" and stopped there. **That was too quick, and most of it was wrong.** The
+full inventory, all verified live from the Tokyo box:
+
+    /fapi/v1/openInterest     (LIVE)   40 polls in 20s -> 7 DISTINCT readings
+                                       update intervals 4.7/4.9/0.5/4.6/0.2/4.9s
+                                       => effective OI resolution ~4.7s
+                                       RTT 23-31ms
+    /futures/data/openInterestHist     period=5m works; period=1m returns []
+                                       so 5m is the documented floor
+    daily metrics archive              sum_open_interest, sum_open_interest_value,
+                                       count_/sum_toptrader_long_short_ratio,
+                                       count_long_short_ratio,
+                                       sum_taker_long_short_vol_ratio
+                                       289 rows/day = 5-MINUTE cadence
+    !forceOrder@arr  (LIVE)            0 events in 75 SECONDS, all symbols
+
+So a live OI endpoint and a taker-flow ratio both exist, and the `metrics` archive
+does carry OI -- my "no source" framing was wrong and the archive is worth
+recording for.
+
+**But the idea needs 100ms and the best available instrument is ~4.7s, a 47x
+gap.** A 3-8s cascade sampled at 4.7s yields one or two readings; you cannot see
+an "abrupt contraction" or sequence it against CVD. And the one genuinely
+event-driven feed -- liquidations -- produced **zero events in 75s across every
+symbol**, which is far too sparse to trigger on (and this file already flags that
+Binance documents `forceOrder` as pushing at most one liquidation per symbol per
+1000ms, so even a cascade may be under-reported).
+
+Status: **not refuted, not testable, and no longer dismissible.** If it is
+pursued it has to be recorded forward, and the honest instrument is the 4.7s OI
+poll (cheap: weight 1, 25ms RTT) rather than the 100ms feed the idea assumes. The
+5-minute archive IS suitable for one question the idea actually asks -- whether
+OI contraction with one-sided taker flow has directional content over the next
+5 minutes, which is exactly the prediction round length. Not run here.
+
+### IDEA 3 -- depth evaporation: REAL, CORRECTLY SIGNED, 6-33x TOO SMALL
+
+`tools/depth_evaporation.py`, BTCUSDT 2026-09-01, 100ms grid, forward MID drift
+in bps after a >65% collapse in resting size at the inside quote:
+
+    A  ask size collapses >65%   n= 85,264   +0.15  +0.23  +0.34  +0.53
+    B  bid size collapses >65%   n= 90,345   -0.14  -0.23  -0.34  -0.54
+    C  ask size SURGES >2x       n=107,667   -0.07  -0.11  -0.17  -0.26
+    D  all bins (base rate)      n=863,988   -0.00  -0.00  -0.00  -0.01
+                                              500ms   1s     2s     5s
+
+**The mechanism is real and cleanly signed** -- row A and row B are near-exact
+mirrors (+0.53 vs -0.54 at 5s), and row D is 0.00, so this is information and not
+volatility. Row C falls too, so the family is really "less resting ask relative to
+its own recent norm".
+
+**And it is tiny.** The claim is that asks disappearing lets "modest retail buying
+displace spot 3-5bps". Measured: **0.53bps at 5 SECONDS**, and 0.15bps at 500ms.
+That is 6-10x below the claim at the horizon it wants, and the venue's own match
+takes ~1.4s, where the effect is ~0.2-0.3bps.
+
+It also fires on **85,264 of 864,000 bins -- 10% of the day.** An "informed
+market maker pulling quotes" that happens constantly is not that; it is top-of-book
+size flicker with a small tilt.
+
+CAVEAT on the instrument, because it limits the reach: the free `bookDepth`
+archive is 20bps bands at ~30s cadence, so it cannot see a 3bps band or a 100ms
+event, and the only sub-100ms depth on disk is `bookticker`, which is **top-1
+only** -- no 5-level history exists here. This tested a strictly weaker proxy
+than the claim. A real 5-level test needs recording forward.
+
+### The pattern, stated once
+
+Three ideas, three real mechanisms, and the same three failure modes:
+
+  * **too slow to see** (OI at 4.7s vs the 100ms the idea needs; the depth and
+    basis events need sub-second resolution that only top-1 has);
+  * **an order of magnitude too small** (0.53bps against a claimed 3-5bps,
+    0.15bps at 500ms against a +5.5c leak);
+  * **too common to be the signal** (10% of all bins for the depth event; a
+    basis threshold permanently exceeded).
+
+This is the same shape as the absorption batch and the five fill-rate ideas. The
+microstructure of Binance spot and perp is well arbitraged at the horizons we can
+observe; what is left is real but sub-tick once it has to survive this venue's
+working time and fee.
