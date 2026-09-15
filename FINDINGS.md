@@ -8657,3 +8657,56 @@ second, and bnb-updown-5m-1789479400 filled at 0.5686 against a 0.5300 high.
 Raising the ceiling makes exactly that failure mode worse, not better: the fills a
 taker gets are the ones where the market is running away, which is why the fill
 rate is 5.9% and why every priced test in this repo is negative.
+
+## "Post-spike exhaustion" fade: buy the unloved side at 0.15-0.20 (2026-09-15)
+
+The claim: when a fast move blows the contract to >=0.80 and the spot STALLS,
+retail is over-extrapolating, so buy the unloved side at 0.15-0.20 -- and because
+spot is stationary the 249ms latency costs nothing.
+
+`tools/fade_spike_exhaustion.py`, live DB, one entry per round, tau 60-180s, the
+unloved side bought at its ASK, **per share**, fee 96 bps of stake. `--fav-px`
+sweeps the trigger and `--stall-bps` sweeps the stall filter (0 = no filter),
+because the stall clause is the load-bearing part of the claim and had to be
+tested rather than assumed:
+
+  fav>=  stall<    n     ask    won  edge/sh  day-t  days+ | MIRROR(fav)
+   0.75    none  2256  0.2034  0.1928  **-0.0125**  -1.52   1/8 | -0.0119
+   0.75     1bp   591  0.2390  0.2453   +0.0040  +0.34   4/8 | -0.0264
+   0.75     3bp   958  0.2265  0.2244   -0.0042  -0.16   4/8 | -0.0183
+   0.80    none  2106  0.1714  0.1586  **-0.0144**  -2.22   1/8 | -0.0099
+   0.80     1bp   670  0.1909  0.1925   -0.0001  +0.17   2/8 | -0.0222
+   0.80     3bp  1117  0.1816  0.1755   -0.0079  -0.44   4/8 | -0.0147
+   0.85    none  1895  0.1395  0.1208  **-0.0200**  -3.16   1/8 | -0.0046
+   0.85     1bp   700  0.1450  0.1500   +0.0036  +0.12   6/8 | -0.0262
+   0.85     3bp  1167  0.1395  0.1302   -0.0106  -1.02   3/8 | -0.0121
+
+**The mechanism is inverted, not merely absent.** In every unfiltered cell the
+realised win rate is BELOW the ask paid -- 0.1928 vs 0.2034, 0.1586 vs 0.1714,
+0.1208 vs 0.1395. If retail were over-extrapolating the favourite, the unloved
+side would win MORE often than its price. It wins LESS. The unloved side is
+RICH here, so "buy the battered side" is systematically buying the expensive
+side, and it gets worse as the favourite strengthens (-0.0125 -> -0.0200,
+day-t -1.52 -> -3.16, 1/8 days positive). That is the eighth face again: the
+cheap side loses to its own mirror.
+
+**The stall filter flips the sign but only to zero.** Best cell is +0.0040
+(day-t +0.34) at fav>=0.75/1bp; the other two are -0.0001 and +0.0036 (day-t
++0.17, +0.12). Three cells, all indistinguishable from zero, no dose-response,
+and the per-day split is 7 of 8 days negative at all three thresholds with the
+single positive day being 09-12 -- the recurring day factor, not the mechanism.
+
+**And the filter does not buy the discount it claims to.** The claim is that
+waiting for the stall gets you the 0.15-0.20 entry. Measured: with no filter the
+unloved ask averages **0.2034**; with the stall filter it averages **0.2390**.
+Stalled moments are where the unloved side is MORE expensive, not less -- when
+spot is running, the unloved side is the one being marked down. The 0.15-0.20
+band is also only 33.4% of entries (median unloved ask 0.160).
+
+**On the latency point, the claim is right and it does not matter.** A stall
+filter does by construction select stationary spot, so entry slippage there is
+genuinely small. But that only protects an edge; it cannot create one, and there
+is nothing here to protect: the best of nine cells is +0.0040 at day-t +0.34.
+Both sides lose at the ask (mirror -0.0046 to -0.0264, and
+edge_unloved + edge_fav = 1 - ask_sum - fees ~= -0.025), which is the same
+ask-sum-exceeds-one-plus-fee wall every other variant hits.
