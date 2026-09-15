@@ -1391,14 +1391,15 @@ class Settings(BaseSettings):
     # ask), and 76% of these fires sit on rounds the range gate refuses.
     cross_train_enabled: bool = False
     cross_train_min_tau_s: float = 60.0
-    # TAU CEILING, added 2026-09-15 by tools/train_sweep.py. 0 = off.
-    # Train was `tau >= 60` with NO upper bound, which on a 900s round is 14 of
-    # the 15 minutes -- the opposite of a time-boxed complement. At X=15 a
-    # ceiling of 180 gives n=47 net +0.110 day-t +4.51 6/6 days, against n=39
-    # for the unrestricted window; at the old X=10 it lifts day-t 1.99 -> 2.31
-    # with 6/7 days positive while keeping 88% of the sample. It also removes
-    # the extreme-tau entries -- the live 15m legs fired at tau 820-854.
-    cross_train_max_tau_s: float = 180.0
+    # TAU CEILING. Added 2026-09-15 by the sweep, and TURNED OFF THE SAME HOUR.
+    # I read the joint table's `t>=180` column as a CEILING when it is MIN_TAU,
+    # shipped 180 as a ceiling, and the combination X=15 + tau<=180 collapses the
+    # population to n=16 (net +0.018, day-t +1.36) against n=39 (net +0.123,
+    # day-t +4.04) for X=15 alone. The ceiling is real but modest at X=10
+    # (day-t 1.99 -> 2.31) and non-monotone (240 is negative, t -0.08), and at
+    # X=15 it is actively harmful. min_tau is flat 60->180 at X=15, so it was
+    # never the lever the joint table's label made it look like. 0 = OFF.
+    cross_train_max_tau_s: float = 0.0
     cross_train_bps: float = 15.0
     cross_train_max_ask: float = 0.890
     cross_train_bound: float = 0.015

@@ -1936,10 +1936,11 @@ class TestTheTrainTrigger:
 
     def test_the_tau_ceiling_BOUNDS_the_train_window(self, store, armed,
                                                     monkeypatch):
-        """The sweep put a CEILING on the train window (cross_train_max_tau_s,
-        180s). Train was `tau >= 60` with no upper bound, which on a 900s round
-        is 14 of the 15 minutes -- the opposite of a time-boxed complement. It
-        also removes the extreme-tau entries the live 15m legs came from."""
+        """The ceiling MECHANISM (cross_train_max_tau_s; 0 = off, which is the
+        shipped default). Built by the sweep, then turned off the same hour: at
+        X=15 a ceiling collapses the population n=39 -> n=16. The knob is set
+        explicitly here because a test that leans on a DEFAULT starts measuring
+        the default (the cooldown tests taught that one)."""
         monkeypatch.setattr("btcpredict.config.settings.cross_train_enabled", True)
         monkeypatch.setattr("btcpredict.config.settings.cross_train_max_tau_s",
                             180.0)

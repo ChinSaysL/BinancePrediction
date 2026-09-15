@@ -158,6 +158,10 @@ def round_range_bps(slug, T, K, upto_ms):
 BASE = dict(X=10.0, D=0, min_tau=60.0, max_tau=0.0, max_ask=0.89,
             min_ask=0.0, family="all", rise_s=0.0, max_range_bps=0.0)
 
+# What is LIVE as of 2026-09-15. The ceiling is OFF: shipping max_tau=180 was a
+# MISREAD of the joint table's `t>=180` column, which is MIN_TAU, not a ceiling.
+SHIPPED = dict(BASE, X=15.0, max_tau=0.0)
+
 SWEEP = {
     "X (distance bps)":       [("X", v) for v in (5, 7.5, 10, 12.5, 15, 20, 25)],
     "D (delay s)":            [("D", v) for v in (0, 1, 2, 5)],
@@ -169,6 +173,80 @@ SWEEP = {
     "rise_s (momentum)":      [("rise_s", v) for v in (0, 3, 5, 10)],
     "max_range_bps":          [("max_range_bps", v) for v in (0, 10, 15, 20, 30)],
 }
+
+
+def portfolio_sweep(series, ranges, cfg, pay_up, fee):
+    """THE EXPOSURE KNOBS -- which the signal sweep above does not touch.
+
+    A signal sweep answers "is this entry good". It CANNOT answer "how many of
+    them should be open at once", and for this trigger that is not a secondary
+    question: it fires in BURSTS (btc/eth/bnb all cross the threshold inside the
+    same ten seconds), so a concurrency cap removes the most CORRELATED legs
+    first. Dropping a leg is therefore not a random subsample of the entrants --
+    it is a selection, and it can help or hurt independently of each leg's EV.
+
+    Simulated on the real clock: a position is open from its entry ts until its
+    round settles (slug start + family length) and consumes one slot. The peak
+    column is the true high-water mark of concurrent positions.
+    """
+    ents = []
+    for ts, ask, hit, slug in simulate(series, ranges, cfg, pay_up, fee):
+        p = slug.split("-")
+        dur = DUR.get(p[2] if len(p) > 2 else "", 0)
+        try:
+            start = int(p[3]) * 1000
+        except (ValueError, IndexError):
+            continue
+        ents.append((ts, ask, hit, slug, p[0], start + dur * 1000))
+    ents.sort(key=lambda e: e[0])
+    print(f"\n  entrants under the SHIPPED signal config: {len(ents)}")
+
+    def sim(max_open, max_day, max_sym, gap_s):
+        op, taken, per_day, per_sym = [], [], collections.Counter(), {}
+        peak, last = 0, None
+        for ts, ask, hit, slug, sym, settle in ents:
+            op = [s for s in op if s > ts]           # settle first
+            if max_open and len(op) >= max_open:
+                continue
+            d = dt.datetime.fromtimestamp(ts / 1000, dt.timezone.utc).date()
+            if max_day and per_day[d] >= max_day:
+                continue
+            if max_sym and per_sym.get(sym, 0) >= max_sym:
+                continue
+            if gap_s and last is not None and ts - last < gap_s * 1000:
+                continue
+            taken.append((ts, ask, hit, slug))
+            op.append(settle)
+            peak = max(peak, len(op))
+            per_day[d] += 1
+            per_sym[sym] = per_sym.get(sym, 0) + 1
+            last = ts
+        return taken, peak
+
+    def line(name, taken, peak):
+        if not taken:
+            print(f"  {name:34s} -- nothing taken")
+            return
+        money = sum((1.0 if r[2] else 0.0) - (r[1] + pay_up)
+                    - fee * (r[1] + pay_up) for r in taken)
+        got = report(name, taken, fee, pay_up, 1)
+        print(f"{got[5]}  peak {peak:2d} open  ${money:+6.2f} total")
+
+    for mo in (0, 1, 2, 3, 5, 10):
+        t, pk = sim(mo, 0, 0, 0)
+        line(f"max_open={mo or 'off'}", t, pk)
+    for md in (0, 5, 10, 20, 50):
+        t, pk = sim(0, md, 0, 0)
+        line(f"max_per_day={md or 'off'}", t, pk)
+    for ms in (0, 1, 2):
+        t, pk = sim(0, 0, ms, 0)
+        line(f"max_per_symbol={ms or 'off'}", t, pk)
+    for g in (0, 30, 60, 120, 300):
+        t, pk = sim(0, 0, 0, g)
+        line(f"global_gap={g}s", t, pk)
+    for mo, ms in ((2, 1), (3, 1), (1, 1)):
+        t, pk = sim(mo, 0, ms, 0)
+        line(f"max_open={mo}+per_symbol={ms}", t, pk)
 
 
 def main():
@@ -257,6 +335,12 @@ def main():
           "anything:")
     for got in cells[-5:]:
         print(got[5])
+
+    print("\n" + "=" * 78)
+    print("PORTFOLIO / CONCURRENCY -- the knobs the signal sweep does NOT touch")
+    print("  A cap drops the most CORRELATED legs first, so it selects; it is not")
+    print("  a random subsample. `$` is the total on these entries at $1 a leg.")
+    portfolio_sweep(series, ranges, SHIPPED, args.pay_up, fee)
 
 
 if __name__ == "__main__":
