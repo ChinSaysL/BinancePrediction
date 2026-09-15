@@ -10661,3 +10661,82 @@ the case that fired three live positions.
   `ask <= 0.890`, so it excluded those rounds by construction. The arm may be
   tested on a population it rarely reaches -- watch the refusal rate, not the
   fill count.
+
+## THE TRAIN BURST — a distance trigger cannot help but cluster; STOPPED AND FIXED
+## (2026-09-15 21:01 found -> 21:10 bot stopped -> 21:12 fixed and restarted)
+
+The Train trigger was enabled at 20:53. Between 20:57 and 21:01 it took **eight
+entries, every one of them Down, in 241 seconds**:
+
+    20:57:12  bnb-5m   Down @0.881  tau 167s
+    20:57:21  eth-5m   Down @0.830  tau 158s
+    21:00:45  eth-5m   Down @0.790  tau 254s   \ same tick, SAME symbol,
+    21:00:45  eth-15m  Down @0.660  tau 854s   / SAME strike 2407.97
+    21:01:05  bnb-5m   Down @0.840  tau 234s   \ same tick, SAME symbol,
+    21:01:05  bnb-15m  Down @0.730  tau 834s   / SAME strike 715.12
+    21:01:19  btc-5m   Down @0.870  tau 220s   \ same tick, SAME symbol,
+    21:01:19  btc-15m  Down @0.740  tau 820s   / SAME strike 75935.24
+
+The Up side fired **zero** times in the whole period.
+
+### Why this is STRUCTURAL, not bad luck
+
+1. **The trigger is a LEVEL.** `|spot - strike| >= 10bps` goes true for EVERY
+   family at once when btc/eth/bnb move together. The cross arm never clusters
+   like this because a CROSSING happens at unrelated times per family; a
+   distance condition always will. So the arm's natural output is a synchronised
+   batch, not a stream. This is the same "one bet x N" shape as the 20:49 bug,
+   and it is not a bug in the code -- it is what the trigger IS.
+2. **A 5m round and its 15m sibling SHARE a strike** (2407.97 / 715.12 /
+   75935.24). `eth-5m Down` and `eth-15m Down` are the same bet on the same
+   strike, differing only in expiry. The arm bought BOTH, every time -- a
+   guaranteed duplicate, by construction.
+3. **Nothing that bounds RISK catches it.** `cross_max_open_positions=10` and
+   `cross_max_open_stake_pct=0.30` count positions and stake, not correlation.
+   Eight correlated $1 legs is one $8 directional bet, not eight.
+4. **The freshness anchor cannot protect a new round.** The 15m legs fired at
+   tau 854/834/820 -- **46, 66 and 80 seconds into a 900-second round**. On a
+   fresh round the strike IS the open price, so the spot starts at exactly
+   0bps and any 10bps move in the first minute is "fresh" by construction.
+   `_train_is_fresh` fixed the STALE case; it does nothing about NEW rounds,
+   which is now the trigger's main habitat.
+
+### The fix
+
+    cross_train_cooldown_s: float = 120.0     new knob, .env explicit
+
+ONE train entry per burst, globally, not per family. Checked at the trigger,
+before any other gate; **stamped on the SIGNAL rather than on the fill**, so a
+refused order cannot let the same move be re-attempted family by family -- that
+retry is precisely what rebuilds the burst. A suppressed family is recorded via
+`_cross_refuse`, so the refusals are countable.
+
+Also fixed: **train fires were logged as `CROSS`**. `CROSS btc-updown-15m-... tau
+820s` reads as the cross arm violating its own 5-60s tau gate, and that is
+exactly how it was misread. The log line now prints `TRAIN` for a train entry.
+
+    3 new tests (622 total): a second family inside the cooldown is refused,
+    the guard EXPIRES, and the signal stamps the clock.
+    commit 6e25ec5. VPS md5 main.py 47a76b5cb0db config.py 340c932805bb
+
+### What this does NOT fix, and must be measured next
+
+**The tau band is still unmeasured.** The Train spec came from
+`--min-tau 60`, with no ceiling anyone can point to, so a 15m entry 46 seconds
+into its round is *numerically* in-sample and *statistically* a different object
+from a 10bps move with 60s left. The cooldown means a burst now yields ONE entry
+and, because the 5m family is evaluated first, it is normally the 5m -- but a
+15m can still be the first of a burst in principle. Deciding the ceiling needs
+the measurement, not an argument.
+
+Also open and untouched: the `pre-trade check ok: px=0.870 fee=30bps
+ev/$=-1.0000` lines -- logged four times, always on a **5m leg**, with the 15m
+legs carrying real numbers. A degenerate 5m pricing path that nothing stops.
+
+### One honest note on the outcome
+
+The arm was stopped at 21:05 having settled `trades=6 win_rate=1.000 pnl=$+1.29`
+-- the Down bets WON, because the move continued. **That is luck, not
+validation.** The eight entries were a single directional bet sized 8x too
+large; it happened to be right. The concentration risk was real whether or not
+this instance paid.
