@@ -2919,9 +2919,19 @@ class Bot:
             # each 20s of wait plus 30s of pause) and, worse, the cooldown is
             # SHARED: an unfilled model-arm limit silently blocked the impulse
             # and cross arms, which fire in windows only seconds wide.
-            if getattr(self.broker, "last_failure", None) == "limit_unfilled":
-                log.info("no fill for %s %s: limit rested and was cancelled "
-                         "(not a venue failure; no cooldown)", r.slug, sig.side)
+            #
+            # `quote_above_ceiling` is the SAME class and was added 2026-09-15.
+            # It is not a venue failure at all -- it is this bot refusing a
+            # price. Measured live at 07:29:06 on eth-updown-5m-1789457100: the
+            # book ran 0.53 -> 0.67 in six seconds, attempt 2's quote came back
+            # over the ceiling, we correctly declined, and that refusal then
+            # paused every family for 30s. Declining a bad price has to be free,
+            # or the ceiling that protects the arm silently throttles it.
+            no_cooldown = {"limit_unfilled", "quote_above_ceiling"}
+            if getattr(self.broker, "last_failure", None) in no_cooldown:
+                log.info("no fill for %s %s: %s (not a venue failure; "
+                         "no cooldown)", r.slug, sig.side,
+                         self.broker.last_failure)
                 return fill
             self._order_cooldown_until = time.time() + settings.order_cooldown_s
             log.warning("order failed for %s %s after %d attempt(s); "

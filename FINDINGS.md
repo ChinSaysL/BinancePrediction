@@ -7076,3 +7076,43 @@ pin that only a CONFIRMED venue failure is retried; an unknown outcome never is.
 that the operator rejected had nonetheless executed -- `.env.bak.1789455821`
 (07:03:41) holds `order_type=market`, and a restart is logged at 07:03:42.
 Restored to `market`. Worth knowing that a rejected command here still ran.
+
+## Retry works everywhere; the price ceiling was paying a 30s tax to use it
+
+Reported: an eth trade did not retry, possibly because retry is wired only to
+btc. It is not -- `_place_order` is shared by every family -- and the log shows
+the retry firing:
+
+    07:29:06.126  order ...808625 status=FAILED (eth-updown-5m-1789457100)
+    07:29:06.126  order attempt 1/3 failed for eth ... Down (venue_failed)
+    07:29:06.989  order failed for eth ... Down (quote_above_ceiling); not retrying
+    07:29:06.989  order failed ... after 2 attempt(s); pausing orders for 30s
+
+Two attempts, not one. `order_status_wait_s = 9.0` did its job: attempt 1 got
+the venue's own FAILED verdict, which classified as `venue_failed` and IS
+retryable. The loop then ended because attempt 2's fresh quote came back above
+the price ceiling -- the book had run 0.53 -> 0.67 in six seconds -- and the arm
+correctly declined to chase it.
+
+### The defect that line exposes
+
+**`pausing orders for 30s`.** The order cooldown is SHARED across every arm and
+family, and it exists for a venue that is rejecting orders, where retrying at
+1 Hz would only hammer it. `quote_above_ceiling` is not that: the venue is
+healthy and this bot is declining a price.
+
+The file already carries the identical argument for `limit_unfilled`:
+
+> A RESTING LIMIT THAT NOBODY CROSSED IS NOT THAT ... the cooldown is SHARED: an
+> unfilled model-arm limit silently blocked the impulse and cross arms, which
+> fire in windows only seconds wide.
+
+So a refusal by `max_px` -- the guard added hours earlier specifically to stop
+the arm overpaying -- was costing 30 seconds of trading across all six families
+every time it worked. **The protection was throttling the thing it protects.**
+
+Fixed: `quote_above_ceiling` joins `limit_unfilled` in the no-cooldown set.
+Three tests, including one asserting a genuine `venue_failed` STILL pauses, so
+the exemption cannot widen into "never cool down".
+
+580 tests pass. Deployed.

@@ -2674,3 +2674,51 @@ class TestAFailedFOKGetsItsRetries:
                                      skip_pretrade_gates=True, take_px=0.30))
         assert len(calls) == 3, (
             f"90s of round left must allow all three attempts; got {len(calls)}")
+
+
+class TestRefusingAPriceIsFree:
+    """The order cooldown is SHARED across every arm and family. It exists for
+    a venue that is rejecting orders -- retrying at 1 Hz would just hammer it.
+
+    `quote_above_ceiling` is not that. It is this bot declining a price, with a
+    perfectly healthy venue. Live at 07:29:06 on eth-updown-5m-1789457100 the
+    book ran 0.53 -> 0.67 in six seconds, attempt 2's quote came back over the
+    ceiling, the arm correctly refused -- and that refusal paused all six
+    families for 30s.
+
+    Declining a bad price has to be free, or the ceiling that protects the arm
+    silently throttles it. Same reasoning the `limit_unfilled` exemption already
+    carries.
+    """
+
+    def _run(self, store, monkeypatch, failure):
+        monkeypatch.setattr("btcpredict.config.settings.order_cooldown_s", 30.0)
+        monkeypatch.setattr("btcpredict.config.settings.order_max_attempts", 1)
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0), asks=(0.30, 0.40))
+        bot._order_cooldown_until = 0.0
+
+        async def buy(**k):
+            bot.broker.last_failure = failure
+            return None
+
+        bot.broker.buy = buy
+        bot.broker.last_failure = None
+        r = types.SimpleNamespace(slug="btc-updown-5m-1", tau_s=lambda _ms: 90.0)
+        sig = types.SimpleNamespace(side="Up", quote=0.30, fair=0.60, edge=0.1)
+        asyncio.run(bot._place_order(r, sig, fair_up=0.40, token="t", stake=1.0,
+                                     skip_pretrade_gates=True, take_px=0.30))
+        return bot._order_cooldown_until
+
+    def test_a_refused_price_does_not_pause_the_other_families(self, store, armed,
+                                                               monkeypatch):
+        assert self._run(store, monkeypatch, "quote_above_ceiling") == 0.0, (
+            "declining a price must not cost 30s of every family's trading")
+
+    def test_an_unfilled_limit_still_does_not_pause(self, store, armed, monkeypatch):
+        assert self._run(store, monkeypatch, "limit_unfilled") == 0.0
+
+    def test_a_real_venue_failure_STILL_pauses(self, store, armed, monkeypatch):
+        """The exemption must stay narrow -- a venue actually rejecting orders
+        is what the cooldown is for."""
+        assert self._run(store, monkeypatch, "venue_failed") > 0.0, (
+            "a genuine venue failure must still trigger the cooldown")
