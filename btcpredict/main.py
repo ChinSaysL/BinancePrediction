@@ -2719,16 +2719,39 @@ class Bot:
                      ("%.4f" % (cash / shares)) if (cash and shares) else "n/a",
                      ("%.4f" % book_now) if book_now is not None else "n/a")
             if not fill:
+                self._release_round_slot(r)
                 return
             await self._book_fill(r, sig, fill, did=did, up=up, spot=spot,
                                   sigma=sigma, tau=tau, token=token, mode="cross")
         except Exception as e:                              # pragma: no cover
+            self._release_round_slot(r)
             log.exception("cross order failed for %s %s: %s: %s",
                           r.slug, side, type(e).__name__, e)
         finally:
             self._pending_n = max(0, getattr(self, "_pending_n", 1) - 1)
             self._pending_stake = max(
                 0.0, getattr(self, "_pending_stake", stake) - stake)
+
+    def _release_round_slot(self, r) -> None:
+        """Give the round's entry slot back when an order fills NOTHING.
+
+        `_cross_fired[slug]` is claimed at DECISION time -- that is what stops
+        the websocket clock submitting one trigger twice -- but on a NO FILL we
+        hold no position, and leaving the slot claimed locks the CROSS arm out
+        of this round's late entry (tau 5-60: net +0.115/sh, day-t +5.43, the
+        best-measured cell in this whole arm).
+
+        Measured live 2026-09-15: four consecutive train NO FILLs at 21:36,
+        21:37 and 21:51 twice, and the cross window produced NOTHING on every
+        one of those rounds. A slot-blocked tick returns before it can log a
+        refusal, so the cost is SILENT -- there is no line to grep.
+
+        Only the COUNT is returned. `_cross_side` keeps the side it saw, so the
+        reversal guard still refuses a subsequent flip.
+        """
+        fired = getattr(self, "_cross_fired", None)
+        if isinstance(fired, dict) and fired.get(r.slug, 0) > 0:
+            fired[r.slug] -= 1
 
     def _spawn_shadow_quote(self, slug, side, token, stake, ceiling) -> None:
         """Launch the log-only shadow quote; never raise into the fire path."""

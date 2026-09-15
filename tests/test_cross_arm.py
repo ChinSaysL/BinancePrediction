@@ -1958,6 +1958,25 @@ class TestTheTrainTrigger:
             "a fresh >=10bps breakout at tau 400s is outside the swept window "
             "and must not fire")
 
+    def test_a_NO_FILL_gives_back_the_round_slot(self, store, armed):
+        """A train entry that fills NOTHING must not consume the round.
+
+        `_cross_fired` is claimed at DECISION time. Leaving it claimed on a NO
+        FILL locks the CROSS arm out of that round's tau 5-60 entry -- the
+        best-measured cell in the arm -- and the loss is SILENT, because a
+        slot-blocked tick returns before it can log anything. Live 2026-09-15:
+        four consecutive train NO FILLs (21:36, 21:37, 21:51 x2) and the cross
+        window was silent on every one of those rounds.
+        """
+        bot = make_bot(store, ticks(77000.0, 77100.0, 77200.0))
+        r = make_round(tau_s=120.0)
+        bot._cross_fired = {r.slug: 1}
+        bot._release_round_slot(r)
+        assert bot._cross_fired.get(r.slug, 0) == 0, (
+            "a zero fill must give the round back to the cross arm")
+        bot._release_round_slot(r)                    # never goes negative
+        assert bot._cross_fired.get(r.slug, 0) == 0
+
     def test_the_arm_is_quiet_when_off(self, store, armed):
         from btcpredict.config import settings
         assert settings.cross_train_enabled is False, (
