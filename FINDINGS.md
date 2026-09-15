@@ -9284,3 +9284,72 @@ the quote has already drifted onto the ceiling, `room` is 0 and the order has no
 tolerance left at all. Whether that costs fills we wanted is NOT yet measured --
 the first four clean attempts are all NO FILL, and n=4 settles nothing. The canary
 criteria (paid <= 0.585, win >= 60%) still need ~50 fills.
+
+## Round-range gate re-tested: the gate is RIGHT and I was wrong to suspect it
+## (2026-09-15) -- tools/range_gate_sweep.py
+
+The gate shipped with an explicit instruction in config.py: "day-t at <=10 is
+1.72, under this repo's t=2 bar ... Revisit at ~30 more fills." This is that
+revisit. 386 first-crosses per round, tau 5-60, live tape, replicating
+`Bot._round_range_bps` exactly (`1e4*(max(spot)-min(spot))/strike` over the round
+so far -- the round's TRAVEL, not its distance from the strike, so an up-and-back
+round scores wide).
+
+### The premise is confirmed, monotonically
+
+TRIO rows (one per round-boundary, btc>eth>bnb) split by range / the market's own
+live gate -- this is the test of "a round that has swung wide is one where a late
+crossing reverses again":
+
+    ratio     n    ask     win     gross    net(haircut)  day-t
+    0.0-0.8  146  0.652   84.9%   +0.197     +0.135       +4.83
+    0.8-1.0   50  0.641   78.0%   +0.139     +0.077       +1.90
+    1.0-1.5   61  0.610   62.3%   +0.013     -0.049       -0.53
+    1.5-2.5   36  0.604   63.9%   +0.034     -0.027       +0.95
+    >2.5      16  0.606   56.2%   -0.043     -0.105       +0.18
+
+Win rate falls 84.9% -> 78.0% -> 62.3% -> 63.9% -> 56.2% as the round travels
+further. And **net of the measured +0.055/share slippage, every bucket above
+ratio 1.0 is NEGATIVE.** So the refused region loses money and the gate is doing
+exactly what it claims.
+
+**This refutes the suspicion I raised an hour ago.** I had looked at the refused
+rows and reported a +0.188/sh counterfactual on n=69. That number was wrong. The
+specific BTC miss (btc-updown-5m-1789500000, refused at 28.5bps vs a 10.0 gate =
+ratio 2.85) sits in the >2.5 bucket: win 56.2%, net -0.105. It won. The bucket
+loses. One winner does not validate the trade.
+
+### The threshold sweep
+
+    gate    kept    gross    net     day-t        (config's recorded sweep, for contrast)
+    off     100%   +0.128   +0.066   +5.43        off  0.1535
+    <=16     84%   +0.145   +0.083   +7.20
+    <=14     80%   +0.155   +0.093   +9.33
+    <=12     73%   +0.157   +0.095   +6.94        <=12 0.2347
+    <=10     62%   +0.183   +0.121   +4.70        <=10 0.2473  <- config's peak
+    <=8      46%   +0.182   +0.120   +4.75        <=8  0.2436
+    <=6      32%   +0.210   +0.147   +6.45
+
+<=8 through <=12 form a plateau (+0.120 net); the live 10.0 sits inside it. My
+sweep says tightening past 10 keeps helping, the config's says 10 peaked -- but the
+config never tested <=6, and <=8 vs <=10 is flat in both. **No change is
+justified**: the current value is inside the plateau, and <=6 buys +0.03/sh for
+half the sample.
+
+Day-t: every rung clears t=2 on this 8-day sample (off +5.43, <=10 +4.70,
+<=6 +6.45), unlike the 1.72 the config recorded. So the "revisit at ~30 more
+fills" instruction is now satisfied and the answer is: keep it.
+
+### UNRESOLVED inconsistency, recorded rather than smoothed over
+
+Two estimates of the SAME refused region disagree by an order of magnitude:
+
+    DB refusal rows, one per round (n=69)   ask 0.479  win 66.7%  gross +0.188
+    tape first-cross, ratio>1.0   (n=113)   ask 0.610  win 62.3%  gross +0.013
+
+I trust the tape. The tape's pair is coherent -- the market priced those at 0.610
+and they won 62.3%, i.e. the market was right and there is no edge. The DB pair
+implies the market priced them at 0.479 and they won 66.7%, a 19-point edge, which
+is not credible and is the signature of the recorded `quote` on a refusal row not
+being the executable ask. Same trap as the warm-quote question: a recorded price
+is not a price you can trade. Left open, flagged.
