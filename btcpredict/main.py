@@ -1689,7 +1689,9 @@ class Bot:
             if wsb is not None:
                 top = wsb.best(r.market_id, settings.ws_book_max_age_s)
                 quote = top.ask(side) if top is not None else None
-        self._schedule_cross_meter(r, side, "refuse")
+        self._schedule_cross_meter(r, side, "refuse",
+                                   label=("train" if "train" in (reason or "")
+                                          else "cross"))
         with contextlib.suppress(Exception):
             self.store.insert("decisions", {
                 "slug": r.slug, "ts_ms": int(time.time() * 1000), "tau_s": tau,
@@ -1703,7 +1705,8 @@ class Bot:
                 "stake": stake, "acted": 0, "reason": f"cross refused: {reason}",
             })
 
-    def _schedule_cross_meter(self, r, side, kind: str = "trigger") -> None:
+    def _schedule_cross_meter(self, r, side, kind: str = "trigger",
+                              label: str = "cross") -> None:
         """Sample the book after a trigger, once per (round, side, kind).
 
         `kind` separates a FIRED trigger from a refused one. Without it a fire
@@ -1721,13 +1724,13 @@ class Bot:
         seen = getattr(self, "_meter_seen", None)
         if not isinstance(seen, set):
             seen = self._meter_seen = set()
-        if (r.slug, side, kind) in seen:
+        if (r.slug, side, kind, label) in seen:
             return
         if len(seen) > 400:                 # ~a day of triggers; keep it bounded
             seen.clear()
-        seen.add((r.slug, side, kind))
+        seen.add((r.slug, side, kind, label))
         try:
-            task = asyncio.create_task(self._cross_meter(r, side, kind))
+            task = asyncio.create_task(self._cross_meter(r, side, kind, label))
         except RuntimeError:                # no running loop (sync/fixture use)
             return
         tasks = getattr(self, "_meter_tasks", None)
@@ -1736,7 +1739,8 @@ class Bot:
         tasks.add(task)
         task.add_done_callback(tasks.discard)
 
-    async def _cross_meter(self, r, side, kind: str = "trigger") -> None:
+    async def _cross_meter(self, r, side, kind: str = "trigger",
+                           label: str = "cross") -> None:
         """The book after a trigger, at 50ms resolution where the race lives.
 
         250/500/1000ms marks cannot tell a reprice at +330 from one at +540,
@@ -1761,10 +1765,10 @@ class Bot:
                 fine.append(f"{int(round(mark * 100)):02d}={txt}")
                 if mark in (0.25, 0.50, 1.00):
                     coarse[mark] = txt
-            log.info("cross meter %s %s: +0.25s=%s +0.50s=%s +1.00s=%s [%s]",
-                     r.slug, side, coarse[0.25], coarse[0.50], coarse[1.00],
-                     kind)
-            log.info("cross fine %s %s %s: %s", r.slug, side, kind,
+            log.info("%s meter %s %s: +0.25s=%s +0.50s=%s +1.00s=%s [%s]",
+                     label, r.slug, side, coarse[0.25], coarse[0.50],
+                     coarse[1.00], kind)
+            log.info("%s fine %s %s %s: %s", label, r.slug, side, kind,
                      " ".join(fine))
         except asyncio.CancelledError:
             raise
@@ -2051,6 +2055,24 @@ class Bot:
                     # window, i.e. a second signal killed by the first one's
                     # burst guard. Falling through lets the ordinary window gate
                     # and the crossing path decide.
+                    #
+                    # SELF-DIAGNOSING. A refusal was logged at 2026-09-15
+                    # 21:13:16 that sat 124.8s after the only visible entry --
+                    # PAST this window -- and it could not be reconstructed from
+                    # the rows. Two processes and `_ck` returning 0 were both
+                    # ruled out (one stats line per minute; cross_knob falls
+                    # through correctly), so log the age itself, once per round,
+                    # and let the next occurrence name its own number.
+                    dbg = getattr(self, "_train_cd_dbg", None)
+                    if not isinstance(dbg, set):
+                        dbg = self._train_cd_dbg = set()
+                    if len(dbg) > 400:
+                        dbg.clear()
+                    if r.slug not in dbg:
+                        dbg.add(r.slug)
+                        log.info("train cooldown HIT %s: last entry %.1fs ago "
+                                 "(cooldown %.0fs), tau %.0fs", r.slug,
+                                 (now_ms - last_ms) / 1000.0, cd, tau)
                     self._cross_refuse(
                         r, "Up" if dist_bps > 0 else "Down",
                         f"train cooldown {cd:.0f}s: one entry per burst",
@@ -2573,7 +2595,9 @@ class Bot:
         # (we fill when the book moves AGAINST us, not for us).
         #
         # Pricing at cross_max_price gives the limit room to chase the book up
-        self._schedule_cross_meter(r, side, "fire")   # the +0.25/0.5/1.0s book path
+        self._schedule_cross_meter(
+            r, side, "fire",                         # the +0.25/0.5/1.0s path
+            label=("train" if train else "cross"))
         # to the ceiling and no further, which is the same shape that makes the
         # model arm fill 95%. `take_px` stays the trigger ask as the floor.
         # The limit sits just above the ask we actually observed, NOT at
@@ -2680,9 +2704,12 @@ class Bot:
             # discriminator -- a 100% fill paid its limit, partial fills beat it.
             cash = getattr(fill, "stake", None) if fill else None
             shares = getattr(fill, "shares", None) if fill else None
-            log.info("cross exec %s %s: decided %.4f limit %.2f -> %s in %.2fs | "
+            log.info("%s exec %s %s: decided %.4f limit %.2f -> %s in %.2fs | "
                      "committed $%s of $%.2f (%s) | shares %s | cash/shares %s | "
-                     "book now %s", r.slug, side, book_at_send, ceil_side,
+                     "book now %s",
+                     ("train" if str(getattr(sig, "reason", "")).startswith("train")
+                      else "cross"),
+                     r.slug, side, book_at_send, ceil_side,
                      ("%.4f" % got) if got else "NO FILL", elapsed,
                      ("%.4f" % cash) if cash else "0", stake,
                      ("%.0f%%" % (100 * cash / stake)) if cash and stake else "0%",

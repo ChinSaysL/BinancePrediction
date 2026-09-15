@@ -2267,8 +2267,9 @@ class TestTheCatchMeter:
         assert rows, "the reversal refusal must leave a row"
         assert rows[0][1] == pytest.approx(0.35), (
             "the refusal row must carry the WS ask, not None")
-        assert (bot._round.slug, "Up", "refuse") in bot._meter_seen, (
-            "the refusal must also schedule the post-trigger meter")
+        assert (bot._round.slug, "Up", "refuse", "cross") in bot._meter_seen, (
+            "the refusal must also schedule the post-trigger meter, keyed "
+            "under its own label")
 
     def test_the_meter_samples_the_window_and_logs_it(self, store, armed,
                                                       monkeypatch):
@@ -2284,11 +2285,19 @@ class TestTheCatchMeter:
             info=lambda *a: seen.append(a)))
         asyncio.run(bot._cross_meter(bot._round, "Up"))
         assert seen and seen[0][0] == (
-            "cross meter %s %s: +0.25s=%s +0.50s=%s +1.00s=%s [%s]")
-        assert seen[0][2:] == ("Up", "0.350", "0.350", "0.350", "trigger")
-        assert seen[1][0] == "cross fine %s %s %s: %s"
-        assert seen[1][2] == "Up" and seen[1][3] == "trigger"
-        assert "25=0.350" in seen[1][4] and "100=0.350" in seen[1][4]
+            "%s meter %s %s: +0.25s=%s +0.50s=%s +1.00s=%s [%s]")
+        assert seen[0][1] == "cross"
+        assert seen[0][3:] == ("Up", "0.350", "0.350", "0.350", "trigger")
+        assert seen[1][0] == "%s fine %s %s %s: %s"
+        assert seen[1][1] == "cross"
+        assert seen[1][3] == "Up" and seen[1][4] == "trigger"
+        assert "25=0.350" in seen[1][5] and "100=0.350" in seen[1][5]
+        # A TRAIN entry must NOT be logged as a cross. `cross exec` on a
+        # `tau 820s` line reads as the cross arm breaking its own 5-60s gate,
+        # which is exactly how the 21:01 burst was misread.
+        seen.clear()
+        asyncio.run(bot._cross_meter(bot._round, "Up", "fire", "train"))
+        assert seen[0][1] == "train" and seen[1][1] == "train"
 
     def test_it_is_inert_without_a_ws_book(self, store, armed):
         bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0))
