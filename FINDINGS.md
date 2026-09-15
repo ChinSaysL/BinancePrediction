@@ -9781,3 +9781,128 @@ the venue's own match (~425ms) is slower than the window (~250ms) in which the
 price is still inside our bound. Nothing on the client can fix that, which is why
 every client-side saving measured so far (47ms fetch, 9ms TLS, 2ms colocation,
 125ms decision-to-create) has moved the fill rate by zero.
+
+## "Iceberg absorption" and "exchange lead-lag", measured (2026-09-15, night)
+
+Two mechanisms, both already partly answered here. What is new below: the
+transport measurement to the other venues, the lead-lag measured directly on the
+tape, and the absorption event measured exactly as specified.
+
+### Both were already classified (this file, earlier today)
+
+    absorption IC         +0.014 / +0.032 / +0.038   <- the WEAKEST flow feature
+    cvd500 IC             +0.07 / +0.05 / +0.03
+    queue imbalance IC    +0.22 .. +0.30             <- 6-20x anything else
+    "the precursor exists but it is the WRONG CLASS ... the violent jump that
+     kills our FOKs (0.09 -> 0.90 inside 250-500ms) stays a COIN FLIP"
+
+and the perp lead-lag rule, traded on 953 venue rounds: EV_net +0.047, but
+**paired against its own opposite side t = +0.39**, and both sides positive
+(+0.047 own vs +0.016 opposite) -- a rule that wins on both sides is selecting an
+entry MOMENT, not a direction. Its day series is 73% correlated with four other
+rules and with the shipped crossing rule.
+
+Also relevant: the futures archive was first called untestable, then corrected in
+this file -- `data.binance.vision/data/futures/um/daily/` serves aggTrades for
+the exact days we hold venue quotes. So the mechanism was testable all along.
+
+### NEW 1 -- the transport to the other venues, from the Tokyo box
+
+Idea 2 needs a venue we hold no tape for, so the first question is whether we can
+even reach it in time. TCP connect to `api.exchange.coinbase.com` reads 0.8ms and
+to `api.bybit.com` 2.1ms -- but those are **CDN edge IPs** (Cloudflare 172.64.x,
+AWS CloudFront 54.239.x), and a Tokyo edge says nothing about reaching a matching
+engine in Virginia. The application round trip is the number that matters:
+
+    binance spot BTCUSDT   p50  16.5ms     (same metro as the box)
+    binance perp BTCUSDT   p50   9.2ms
+    bybit    spot BTCUSDT  p50  82.7ms     <- ~41ms ONE-WAY, before any lead
+    coinbase spot BTC-USD  p50  30.0ms     (WAF needs a UA; edge-cached)
+
+So a claimed 50-150ms Bybit lead arrives as **9-109ms of usable edge** after
+propagation alone, before the 125ms our own order takes to reach Binance. And the
+pipeline needs ~300ms of lead to place the order before the cross. The transport
+eats most of the claimed edge.
+
+TRAP: ICMP/TCP latency to a CDN endpoint is not venue latency. Cloudflare answers
+in Tokyo for a venue that matches in Virginia.
+
+### NEW 2 -- the lead-lag itself, measured on a pair we can test
+
+`tools/perp_spot_lead.py`, BTC and ETH, 2026-09-12, 50ms grid over 24h, perp
+aggTrades vs spot aggTrades. Cross-correlation of 50ms returns:
+
+    lag       -1000 -200 -150 -100  -50   0   +50  +100 +150 +200 +1000
+    BTC       .005  .017 .025 .049 .137 .660 .137 .051 .031 .024  .021
+    ETH       .004  .022 .033 .058 .191 .658 .144 .058 .034 .028  .005
+
+**The peak is at lag 0 and the shoulders are symmetric.** On ETH the
+spot-leads-perp shoulder (+50ms .144) is larger than the perp-leads-spot one
+(-50ms .191 is larger still, i.e. it leans the other way), and at 100ms it is
++0.058 vs -0.058. There is no lead in either direction: these two tapes are
+synchronous at 50ms resolution.
+
+Conditional forward drift after a 100ms move of >=2bps (bps):
+
+    BTC  perp -> spot   +0.22  +0.32  +0.43  +0.47  +0.54  +0.59   (50ms..2s)
+    BTC  spot -> perp   +0.28  +0.38  +0.40  +0.43  +0.36  +0.34
+    ETH  perp -> spot   +0.24  +0.31  +0.42  +0.51  +0.38  +0.33
+    ETH  spot -> perp   +0.42  +0.51  +0.59  +0.64  +0.56  +0.51
+
+The reverse direction is as large or LARGER in every cell. That is common
+volatility, not a lead -- which is the same verdict the traded version reached
+from the opposite end (t = +0.39 against its own opposite side).
+
+TRAP, and it cost a run: `transact_time` IS IN DIFFERENT UNITS ON THE TWO TAPES
+under the same column name -- spot is microseconds (1789171200412148), USD-M perp
+is MILLISECONDS (1789171200002). Dividing both by 1e6 puts the perp in 1970 and
+the overlap is silently empty. The spot daily csv also carries one extra trailing
+field (`is_best_match`), so columns must be taken by position, never by name.
+
+### NEW 3 -- the absorption event, exactly as specified
+
+`tools/absorption_probe.py`, BTCUSDT 2026-09-01 (the one day holding both a
+~114/s bookTicker and the print tape), 500ms window, aggressive sells =
+`is_buyer_maker`, mid drift after the event in bps:
+
+    >= 25 BTC of market sells in 500ms:   ONLY 37 EVENTS IN 24H
+      A volume only                     n=37   -0.27 -0.60 -1.16 -3.71 -5.14 -4.06 -2.91
+      B volume + BID FROZEN (the claim) n= 9   too few to test
+      C volume + bid FELL (mirror)      n=22   -0.52 -1.43 -2.63 -7.06 -9.05 -7.10 -5.65
+
+    >= 5 BTC of market sells in 500ms:    n=640
+      A volume only                     n=640  -0.25 -0.55 -0.79 -1.00 -1.05 -0.86 -0.51
+      B volume + BID FROZEN             n=306  +0.00 +0.00 +0.00 -0.05 -0.16 -0.21 -0.06
+      C volume + bid FELL               n=246  -0.69 -1.63 -2.40 -3.05 -3.03 -2.70 -2.11
+      D baseline (all bins)                     -0.00 -0.00 -0.00 -0.00 -0.01 -0.01 -0.01
+                                                 100ms 300ms 500ms   1s    3s    5s    8s
+
+**At the stated 25 BTC threshold the event is 37 in 24 hours and only 9 of them
+have a frozen bid** -- the bid gives way 59% of the time, so the premise ("the
+best bid doesn't budge") describes a minority of its own trigger, and the whole
+class is too rare to trade at any rate.
+
+**At a testable threshold the clause is doing real work and the payoff is not
+there.** B (bid frozen) sits at 0.00 through 500ms and reaches **-0.21bps at 5s**;
+A is -1.05 and C is -3.03 at the same horizon. So the detector genuinely
+separates absorption from a price that gives way -- a 15x spread between B and C
+-- **but what follows absorption is nothing, and the claim is a violent upward
+snap.** There is no snap. Even at 1 BTC (n=3,844) B is -0.34bps at 5s.
+
+Read against scale: dP/dS at the strike is ~0.4/(sigma*sqrt(tau)), about 9-11c of
+contract value per bp of spot, so a 0.3bps drift is worth ~3c -- BELOW the +5.5c
+execution leak already measured on our fills, and with the sign wrong for a long.
+
+### Verdict: neither ships
+
+Idea 1's detector works and its prediction does not: the "bid frozen" clause
+isolates absorption cleanly (0.00 vs -3.03bps) and the upward snap it is supposed
+to precede is absent, at -0.21bps over 5s. At the specified 25 BTC it is 37
+events in 24 hours, 9 of them qualifying. This is the same shape as the rest of
+the file -- a real microstructure effect, too small to survive the fee and the
+spread.
+
+Idea 2 is not refuted, it is priced out: the mechanism shows no lead on the pair
+that can be measured, the transport to the venues named costs ~41ms one-way from
+Tokyo before any lead is banked, and the analogous trigger already failed its
+own opposite-side control when traded (t = +0.39).
