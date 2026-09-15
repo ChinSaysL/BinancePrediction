@@ -9994,3 +9994,82 @@ margin stated, not a finding.
 Also flagged: `cross_max_fill_px = 0.65` declines a fire whose ask is already
 above it, so any ceiling above 0.65 is unreachable client-side regardless of cap.
 At +3c that bites for asks > ~0.62.
+
+## CORRECTION: the +3c recommendation does NOT survive — the sweep priced fills
+## at the book ask, and this arm pays about the LIMIT (2026-09-15, not shipped)
+
+Asked to check this file for contradictions before shipping the +3c cap, because
+the horizon sweep above recommended it. Two contradictions, one decisive. **It is
+not shipped; the +2c cap stays.**
+
+### 1. The decisive one: the sweep prices the fill wrong, and the error is the
+### same size as the effect
+
+`cap_drift_sweep.py` prices every fill at `arrived` -- the venue ask at the arrival
+hop. Under that model a wider cap costs only the extra DRIFT of the observed ask,
+which is why +3c looked like it cost 0.003/sh while buying 0.007/sh of win rate.
+
+This file already falsified that model, in "The cross arm pays its own limit"
+(2026-09-14, 38 cross orders):
+
+    requested_px - filled_px   +0.0113    price improvement: almost none
+    filled_px    - book ask    +0.0943    when the buffer was +0.10
+    fills land AT the limit 33.3% of the time, within two ticks 55.6%
+    "the venue quotes, then bundles the order, and fills at about the limit
+     rather than price-improving to the book"
+
+The same section is where the +2c cap came from: `cross_limit_buffer_inv` is
+"a direct COST, not a safety margin".
+
+That measurement was made on the old LIMIT path, so it was re-checked on the
+MARKET path that is live now. It is not weaker -- it is stronger:
+
+    48 cross fills, decided vs filled px:
+      AT the limit exactly           33  (69%)
+      within half a cent             13  (27%)
+      below by more than half a cent  2  (4%)
+
+**So a 1c widening of the cap raises what we pay on ~69% of fills by ~1c**, not
+by the 0.3c the sweep charged. Re-priced:
+
+    win rate   74.0% -> 74.7%   =  +0.007/sh
+    price paid                =  -0.0069/sh  (0.69 x the 1c)
+    --------------------------------------------
+    net                          ~ 0.000/sh
+
+against the +0.003/sh the sweep reported. **The correction is twice the size of
+the effect being recommended, and what is left is a wash, not an edge.** A wash
+does not clear this repo's bar (day-t >= 2 on a mechanism), and the whole
+recommendation came from the mispricing.
+
+### 2. A standing rule this file already wrote down
+
+    4118 (2026-09-14): "Do not raise `cross_limit_buffer_pct` or
+    `cross_limit_buffer` on this evidence. Nothing shipped from this
+    investigation."
+
+and 4523 swept flat buffers 0.02 / 0.04 / 0.06 / 0.10 / 0.15 at modelled 2/3/4s
+latency. Worth noting exactly what it found, because it agrees with my sweep's
+direction and still refused to ship:
+
+    flat 0.02  +1.581/t+2.44     <- the tight end
+    flat 0.04  +1.770/t+2.86
+    flat 0.06  +1.766/t+2.98
+    "the ranking flips with the latency assumption (0.06 wins at 2s, 0.04 at 3s,
+     0.15 at 4s). A smaller buffer buys a better price and loses fills, and the
+     two cancel. **Nothing to win here.**"
+
+So prior work had already noticed that 0.02 sits at the tight end, and still
+declined to move it -- for the reason that survives here: a small, latency-
+dependent gain is a fitted knob, not a mechanism.
+
+### What this says about the horizon sweep itself
+
+The hop sweep measured the right quantity (horizon) and then priced it with a
+model this file had already falsified. Both substrates are now consistent about
+the cap and both say the same thing: **the cap is load-bearing as a BOUND and its
+width barely matters** -- which is also what the flat plateau in the hop tables
+was telling me, and I read it as an optimum instead.
+
+Not shipped. The +2c cap, `cross_limit_buffer=0.02`, `cross_limit_buffer_inv=0.2`
+and `slippage_bps=200` all stay exactly as deployed at 17:14:38.
