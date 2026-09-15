@@ -2975,11 +2975,34 @@ class TestTheFOKToleranceTracksTheCeiling:
         assert s.get("slippageBps") == pytest.approx(1928, abs=5), (
             f"the FOK must be allowed to reach the ceiling; got {s.get('slippageBps')}")
 
-    def test_it_never_goes_below_the_configured_default(self):
-        """A ceiling tighter than the default must not shrink the tolerance
-        below what the venue already needs for ordinary jitter."""
+    def test_the_ceiling_wins_over_the_configured_default(self):
+        """REVERSED 2026-09-15. This test used to assert the opposite.
+
+        It read: "a ceiling tighter than the default must not shrink the
+        tolerance below what the venue already needs for ordinary jitter", and
+        asserted 300 for a 0.601 ceiling on a 0.60 quote. The reasoning was
+        that a ceiling this tight leaves a FOK unfillable.
+
+        It does -- and that is the correct outcome, because the venue anchors
+        the bound to the QUOTE: `bound = quote * (1 + slip/1e4)`. A floor of 300
+        on a 0.60 quote authorises 0.618, which is 1.7c ABOVE the ceiling the
+        caller just named. The ceiling is the promise this arm makes, and the
+        floor was silently breaking it at exactly the moment the ceiling binds
+        (room falls below the default only when the quote has drifted up to
+        within default/1e4 of the ceiling).
+
+        Measured live, one attempt in the log:
+            venue ack ... quote 0.5800 slip 300 -> bound 0.5974, ceiling 0.58
+        i.e. 3.74c above a trigger ask of 0.56, on an arm whose ceiling had just
+        been tightened to 2c -- re-opening part of the leak the 2c cap was
+        shipped to close.
+
+        The floor still applies to callers with NO ceiling; see
+        test_no_ceiling_means_the_configured_default.
+        """
         s = self._sent(avg_px=0.60, max_px=0.601, default=300)
-        assert s.get("slippageBps") == 300
+        assert s.get("slippageBps") == 16      # int((0.601/0.60 - 1) * 1e4)
+        assert 0.60 * (1 + s["slippageBps"] / 10_000) <= 0.601 + 1e-9
 
     def test_it_is_clamped_at_the_venues_own_maximum(self):
         """10_000 is the venue's documented maximum, not a house number:

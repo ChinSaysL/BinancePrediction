@@ -61,6 +61,28 @@ ACTIVE_ORDERS = f"{P}/order/list"
 BATCH_CANCEL = f"{P}/trade/batch-cancel"
 
 
+def derived_slip_bps(default_bps: int, max_px: float | None,
+                     avg_px: float) -> int:
+    """The `slippageBps` to send, given the caller's own price ceiling.
+
+    The venue anchors the FOK bound to the QUOTE's price -- bound = quote *
+    (1 + slip/10000) -- and caps `slip` at 10000 (2x the quote) for every
+    client. So when the caller names a ceiling, the ceiling is only actually
+    enforced if `slip` is derived from it.
+
+    `default_bps` is used ONLY when there is no ceiling, and it must NOT be a
+    floor on the derived value. With a ceiling, flooring can only ever push the
+    bound ABOVE that ceiling, because `room` falls below `default_bps` exactly
+    when the quote has drifted within default_bps/10000 of it. Measured live
+    2026-09-15: quote 0.5800 against ceiling 0.58 authorised 0.5974 -- 3.74c
+    above a trigger ask of 0.56 when the ceiling said 2c. Clamp to the ceiling.
+    """
+    if max_px is None or avg_px <= 0:
+        return default_bps
+    room = int((max_px / avg_px - 1.0) * 10_000)
+    return max(0, min(room, 10_000))
+
+
 def amount_usdt(x: str | int | float | None) -> float:
     """An order-record amount as USDT.
 
@@ -637,10 +659,7 @@ class LiveBroker:
         # own maximum, unfillable at any latency by any participant. Within
         # the range the venue enforces OUR ceiling exactly, which is the
         # property this arm wants.
-        slip = self.slippage_bps
-        if max_px is not None and avg_px > 0:
-            room = int((max_px / avg_px - 1.0) * 10_000)
-            slip = max(self.slippage_bps, min(room, 10_000))
+        slip = derived_slip_bps(self.slippage_bps, max_px, avg_px)
         # Log-only, one line per attempt, so the 2026-09-15 loss classes are
         # legible from the log alone: `quote` is the venue's FOK reference
         # (echoed verbatim in the order record's `price`), `bound` is what

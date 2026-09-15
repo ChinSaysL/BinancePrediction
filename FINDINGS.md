@@ -9122,3 +9122,49 @@ to the VPS alongside the change.
 Revert: restore `.env.bak-20260915-171428` and `systemctl restart btcpredict`.
 `quote_above_ceiling` is already in the broker's `no_cooldown` set, so a tighter
 ceiling that refuses more often does NOT trigger the 30s order cooldown.
+
+## FIXED: the FOK bound could be authorised ABOVE our own ceiling (2026-09-15)
+
+Found by scanning all 34 order attempts in the live log, not by reasoning.
+
+    slip = max(slippage_bps, min(room, 10_000))     # room = (max_px/avg_px-1)*1e4
+
+The floor was deliberate and TESTED (test_cross_arm.py:
+`test_it_never_goes_below_the_configured_default`), on the reasoning that a
+ceiling tighter than the default leaves a FOK unfillable. It does -- and that is
+the right outcome. The problem is the venue anchors the bound to the QUOTE
+(`bound = quote*(1+slip/1e4)`), so the floor raises the bound above the ceiling
+exactly when the ceiling binds: `room` falls below the default only when the
+quote has drifted up to within `default/1e4` of the ceiling.
+
+Live proof, one line from the log:
+
+    venue ack ... quote 0.5800 slip 300 -> bound 0.5974, ceiling 0.58
+
+3.74c above a trigger ask of 0.56, on an arm whose ceiling had just been
+tightened to 2c -- re-opening part of the leak the 2c cap was shipped to close.
+Measured across four ceiling/quote pairs, the old expression overshoots by
+1.46c / 1.70c / 1.74c / 1.82c.
+
+Fix. The derivation moved into `derived_slip_bps()` in execution/live.py:
+`default_bps` is used ONLY when there is no ceiling; with a ceiling the slip is
+`max(0, min(room, 10_000))` and the bound equals the ceiling exactly. The
+no-ceiling default is unchanged (still `slippage_bps`).
+
+Reversal recorded in the test that asserted the old contract, renamed
+`test_the_ceiling_wins_over_the_configured_default` and rewritten with the live
+line that forced it. Adds tests/test_slip_ceiling.py (11 tests, written against
+the live numbers, so they fail on the old expression and pass on the clamp).
+
+### Two things I measured and did NOT fix
+
+* **Stale warm quote as the FOK anchor.** Refuted, not fixed. I suspected the
+  2.16s warm quote at px 0.2600 (vs sweep 0.580) was systematic. Across 34
+  attempts: warm-quote AGE median **0.52s**, p90 1.59s, max 2.16s; fresh-px
+  MINUS warm-px median **+0.0000** (min -0.02, max +0.25). It matters in 2 of 34.
+  Not worth a code change.
+* **Retry loop running past the round's expiry.** The tau=10s cross retried for
+  14.25s, 4.25s past expiry. 1 of 34. Costs time, not money.
+
+`bound == ceiling` in 27 of 34 attempts, so the 2c cap is the binding limit
+almost always -- the shipped change is doing its job.
