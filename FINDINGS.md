@@ -6587,3 +6587,54 @@ Measured four minutes after deploy:
 **Nothing about trading changed.** This buys the data that per-symbol tuning
 needs; the tuning itself waits until bnb and the 15m families have enough
 priceable crossings to answer with, rather than being fitted to 4.
+
+## `cross_max_per_round` was 5 on evidence that could not exist
+
+Flagged live: bnb-updown-15m placed two orders one second apart.
+
+    01:29:27.666  CROSS Up sweep_px=0.693  tau 32s   -> 15 today
+    01:29:28.735  CROSS Up sweep_px=0.732  tau 31s   -> 16 today
+    01:29:29.673  FILLED @0.6993  $3.21
+    01:29:30.706  FILLED @0.7356  $3.20
+
+**The guards are working.** This is not the duplicate bug fixed earlier the same
+day -- those were 36-70ms apart, this is 1.07s, clearing `cross_reentry_gap_s`
+(1.0s) by 69ms. Both entries are the SAME side, so neither the flip guard nor
+`cross_allow_reversal` applies. It is the designed same-side repeat.
+
+The design is what does not hold up.
+
+### The replay cannot produce a second entry
+
+`quotes_arm` is sampled at 1s and `cross_reentry_gap_s` is 1.0s, so consecutive
+entries are all but impossible in it. Across the whole corpus:
+
+    btc-updown-5m   ONE second entry
+    eth-updown-5m   TWO
+
+and so `max_per_round` 1 vs 5 moves btc from 82 to 83 fills and eth from 25 to
+27. The +0.022 growth that appears to favour 5 IS those two trades. Likewise
+`reentry_gap` 1s / 2s / 5s / 10s are all identical on btc. **Every one of these
+knobs is inert on the only substrate they were measured on.**
+
+Live is a different clock -- the websocket runs ~114/s -- so repeats happen
+constantly, and that is the only place they can be judged:
+
+    FIRST entry in a round   n=31  won 21/31  staked $79.62  pnl -$3.35  ev/$1 -0.042
+    LATER entries            n= 7  won  3/7   staked $20.83  pnl -$6.58  ev/$1 -0.316
+
+n=7 and contaminated -- five came from the sub-second duplicate bug fixed the
+same day, one was a reversal `cross_allow_reversal` now blocks -- so it is not
+proof. But there is no evidence on the other side either, and the mechanism is
+adverse by construction: a repeat one second later buys the SAME bet after the
+venue has repriced it. In the flagged case, 3.6 cents worse for an identical
+position, and $6.41 of a ~$40 bankroll on one coin flip.
+
+**Shipped `cross_max_per_round = 1`.** It costs no ROUNDS -- the arm still takes
+every round it would have -- it only stops doubling inside one. That distinction
+is what makes it an acceptable cut while the arm is short of frequency. Revert
+to 5 if repeats ever measure positive on live fills.
+
+A test-harness note: `test_a_same_side_repeat_is_untouched` in the whipsaw class
+now raises `cross_max_per_round` explicitly. Left alone it would pass because of
+the new cap, hiding a flip guard that had started refusing same-side entries.

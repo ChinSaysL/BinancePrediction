@@ -2259,8 +2259,14 @@ class TestTheWhipsawGuard:
             "cross_allow_reversal leaves")
 
     def test_a_same_side_repeat_is_untouched(self, store, armed, monkeypatch):
-        """Same-side repeats are most of what cross_max_per_round buys and they
-        are profitable. The guard must only ever block a FLIP."""
+        """The guard must only ever block a FLIP, never a same-side repeat.
+
+        `cross_max_per_round` is raised here so the per-round cap cannot do the
+        blocking -- it was cut to 1 on 2026-09-15, which would make this pass
+        for the wrong reason and hide a flip guard that had started refusing
+        same-side entries too.
+        """
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_per_round", 2)
         bot, calls = self._bot(store, monkeypatch,
                                ticks(76997.0, 76998.0, 77001.0))
         asyncio.run(bot._cross_tick())
@@ -2331,3 +2337,60 @@ class TestTheShippedDepthFloorAdmitsAShallowCross:
         ambiguous; btc's extra growth at floor 0 rested on 3 trades."""
         from btcpredict.config import settings as S
         assert S.cross_min_depth_ticks > 0.0, "0 would admit spot == strike"
+
+
+class TestOneEntryPerRound:
+    """`cross_max_per_round` was 5 on evidence that could not exist.
+
+    The replay is sampled at 1s and cross_reentry_gap_s is 1.0s, so a second
+    entry is all but impossible in it -- the whole corpus yields ONE on btc-5m
+    and TWO on eth-5m. Live runs the websocket at ~114/s, where repeats happen
+    constantly, and there:
+
+        FIRST entry in a round   n=31  won 21/31  staked $79.62  ev/$1 -0.042
+        LATER entries            n= 7  won  3/7   staked $20.83  ev/$1 -0.316
+
+    2026-09-15 01:29 on bnb-updown-15m, one second apart:
+        Up decided 0.6934 filled 0.6993   then   Up decided 0.7320 filled 0.7356
+    -- the same bet, 3.6c worse, after the venue repriced.
+    """
+
+    def test_a_second_entry_in_the_same_round_is_refused(self, store, armed,
+                                                         monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.cross_reentry_gap_s", 0.0)
+        monkeypatch.setattr("btcpredict.config.settings.cross_flip_block_s", 0.0)
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_open_stake_pct", 0.0)
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_round_stake_mult", 0.0)
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0), asks=(0.30, 0.40))
+        calls = []
+
+        async def execute(*a, **k):
+            calls.append(k.get("side"))
+
+        bot._cross_execute = execute
+        asyncio.run(bot._cross_tick())
+        asyncio.run(bot._cross_tick())
+        assert calls == ["Up"], (
+            f"the round is one bet; got {len(calls)} entries")
+
+    def test_it_does_not_cost_a_ROUND(self, store, armed, monkeypatch):
+        """The cap bounds entries WITHIN a round, never rounds taken. A fresh
+        round must still trade -- that distinction is the whole reason this was
+        an acceptable cut while the arm is short of frequency."""
+        monkeypatch.setattr("btcpredict.config.settings.cross_reentry_gap_s", 0.0)
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_open_stake_pct", 0.0)
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_round_stake_mult", 0.0)
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0), asks=(0.30, 0.40))
+        calls = []
+
+        async def execute(*a, **k):
+            calls.append(k.get("side"))
+
+        bot._cross_execute = execute
+        asyncio.run(bot._cross_tick())
+        assert calls == ["Up"]
+        bot._round = make_round()               # the next round
+        bot._round.slug = "btc-updown-5m-next"
+        asyncio.run(bot._cross_tick())
+        assert calls == ["Up", "Up"], (
+            f"a NEW round must still be tradeable; got {calls}")

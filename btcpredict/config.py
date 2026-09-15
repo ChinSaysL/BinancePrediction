@@ -1557,7 +1557,37 @@ class Settings(BaseSettings):
     # entries on the recorded book repeat the SAME side; alternation only looks
     # universal on the corpus's coarse 10s grid), and where it does happen it
     # is not a hedge. See cross_allow_reversal.
-    cross_max_per_round: int = 5
+    # ---- CUT 5 -> 1 on 2026-09-15 ---------------------------------------
+    # This knob has never been measured on a substrate that can produce a
+    # second entry. The replay is sampled at 1s and `cross_reentry_gap_s` is
+    # 1.0s, so consecutive entries are all but impossible in it: across the
+    # whole corpus btc-5m yields ONE second entry and eth-5m TWO. Setting this
+    # to 1 or to 5 moves btc by 82 -> 83 fills and eth by 25 -> 27. The +0.022
+    # growth that appears to favour 5 is those two trades.
+    #
+    # Live is a different clock -- the websocket runs ~114/s -- so repeats
+    # happen constantly there, and that is the only place they can be judged:
+    #
+    #     FIRST entry in a round   n=31  won 21/31  staked $79.62  ev/$1 -0.042
+    #     LATER entries            n= 7  won  3/7   staked $20.83  ev/$1 -0.316
+    #
+    # n=7 and contaminated (five came from the sub-second duplicate bug fixed
+    # the same day, one was a reversal `cross_allow_reversal` now blocks), so it
+    # is not proof. But there is no evidence on the other side either, and the
+    # mechanism is adverse by construction: a repeat one second later buys the
+    # SAME bet after the venue has repriced it. 2026-09-15 01:29 on
+    # bnb-updown-15m, the two entries the operator flagged:
+    #
+    #     01:29:27.666  Up  decided 0.6934  filled 0.6993  $3.21
+    #     01:29:28.735  Up  decided 0.7320  filled 0.7356  $3.20
+    #
+    # 3.6 cents worse for an identical position, and $6.41 of a ~$40 bankroll on
+    # one coin flip.
+    #
+    # This costs no ROUNDS -- the arm still takes every round it would have. It
+    # only stops doubling inside one. Revert to 5 if repeats ever measure
+    # positive on live fills.
+    cross_max_per_round: int = 1
     # May a cross entry take the side OPPOSITE a position already held in this
     # round? No. Buying both sides is not a hedge: with the first position sunk,
     #     EV(take) - EV(decline) = stake_B * [ (1 - p)/b - 1 ]
