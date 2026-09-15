@@ -57,11 +57,17 @@ def _ts_us(v: int) -> int:
 
 
 def load_tape(sym: str, day: str, base: str = f"{DATA}/aggTrades"):
-    """(ts_us, signed-volume prefix sums, trade prices) from an aggTrades zip."""
+    """(ts_us, signed-volume prefix, trade prices, absolute-volume prefix).
+
+    The absolute prefix is what lets one-sidedness be measured: a forced sweep
+    is |net|/total near 1. The sign convention is taker: isBuyerMaker=True is an
+    aggressive SELL (negative), False is an aggressive BUY (positive).
+    """
     path = f"{base}/{sym}-aggTrades-{day}.zip"
     ts: list[int] = []
     px: list[float] = []
     pre: list[float] = [0.0]
+    absq: list[float] = [0.0]
     with zipfile.ZipFile(path) as z:
         with z.open(z.namelist()[0]) as raw:
             for line in raw:
@@ -77,7 +83,8 @@ def load_tape(sym: str, day: str, base: str = f"{DATA}/aggTrades"):
                 ts.append(t)
                 px.append(pr)
                 pre.append(pre[-1] + (-q if f[6] == "True" else q))
-    return ts, pre, px
+                absq.append(absq[-1] + q)
+    return ts, pre, px, absq
 
 
 def load_perp(sym: str, day: str):
@@ -85,7 +92,38 @@ def load_perp(sym: str, day: str):
     try:
         return load_tape(sym, day, f"{DATA}/perp/aggTrades")
     except FileNotFoundError:
-        return [], [0.0], []
+        return [], [0.0], [], [0.0]
+
+
+def sweep_at(ts, spre, apre, px, t_us: int, win_us: int, min_usd: float,
+             min_ticks: int, ratio: float):
+    """The mechanical footprint of a forced sweep, in the last win_us.
+
+    Liquidations are not tagged in the public tape any more (allForceOrders was
+    deprecated and the forceOrder stream is throttled), but a liquidation is
+    executed as an aggressive market order, so the footprint is the same: one
+    side only, several distinct price ticks, and a large notional in a burst.
+
+    Returns (direction, notional_usd, ticks) or None. direction +1 = buy sweep.
+    """
+    if not ts:
+        return None
+    j = bisect.bisect_right(ts, t_us)
+    i0 = bisect.bisect_left(ts, t_us - win_us)
+    if j - i0 < 3:                                # a burst, not a single print
+        return None
+    net = spre[j] - spre[i0]
+    tot = apre[j] - apre[i0]
+    if tot <= 0 or abs(net) / tot < ratio:        # must be one-sided
+        return None
+    last = px[j - 1]
+    notional = tot * last
+    if notional < min_usd:
+        return None
+    ticks = len(set(px[i0:j]))
+    if ticks < min_ticks:                         # must walk the book
+        return None
+    return (1 if net > 0 else -1, notional, ticks)
 
 
 def ev(side: str, p: float, winner: str) -> float:
@@ -184,6 +222,16 @@ def main() -> int:
                     help="window for the perp displacement")
     ap.add_argument("--vel-x", type=float, default=3.0,
                     help="trade-arrival multiple over the 10s baseline")
+    ap.add_argument("--sweep-ms", type=float, default=200.0,
+                    help="burst window for the forced-sweep footprint")
+    ap.add_argument("--sweep-usd", type=float, default=300_000.0,
+                    help="min notional in the burst; 0 disables the rule")
+    ap.add_argument("--sweep-ticks", type=int, default=3,
+                    help="distinct price ticks the burst must walk")
+    ap.add_argument("--sweep-ratio", type=float, default=0.9,
+                    help="min one-sidedness |net|/total")
+    ap.add_argument("--sweep-tape", default="perp", choices=["perp", "spot"],
+                    help="which tape the sweep is detected on")
     ap.add_argument("--days", default="",
                     help="comma-separated MM-DD filter (empty = every day in "
                          "the DB that has quotes)")
@@ -215,11 +263,11 @@ def main() -> int:
             try:
                 cache[key] = load_tape(*key)
             except FileNotFoundError:
-                cache[key] = ([], [0.0], [])
+                cache[key] = ([], [0.0], [], [0.0])
         if key not in pcache:
             pcache[key] = load_perp(*key)
-        ts, pre, _px = cache[key]
-        perp_ts, _perp_pre, perp_px = pcache[key]
+        ts, pre, _px, absq = cache[key]
+        perp_ts, _perp_pre, perp_px, perp_absq = pcache[key]
         strike = r["strike"] or qs[0]["strike"]
         if not strike:
             continue
@@ -228,6 +276,7 @@ def main() -> int:
         pre_done = False
         perp_done = False
         vel_done = False
+        sweep_done = False
         rows_pre = {}
         for i, q in enumerate(qs):
             spot = q.get("spot")
@@ -345,11 +394,41 @@ def main() -> int:
                                 pairs.setdefault("VEL", []).append(
                                     ev(side, p, r["winner"])
                                     - ev(oside, pi, r["winner"]))
+            # ---- SWEEP: forced-sweep footprint (liquidations are not tagged
+            #      any more, but they print as aggressive market orders)
+            if (not sweep_done and args.sweep_usd > 0
+                    and args.min_tau <= tau <= args.max_tau
+                    and 0 < abs(dist_bps) <= args.gap_bps):
+                side = "Up" if dist_bps < 0 else "Down"
+                if args.sweep_tape == "spot":
+                    sts, spre, spx, sap = ts, pre, _px, absq
+                else:
+                    sts, spre, spx, sap = (perp_ts, _perp_pre, perp_px,
+                                           perp_absq)
+                sw = sweep_at(sts, spre, sap, spx, q["ts_ms"] * 1000,
+                              int(args.sweep_ms * 1000), args.sweep_usd,
+                              args.sweep_ticks, args.sweep_ratio)
+                if sw is not None and (sw[0] > 0) == (side == "Up"):
+                    sweep_done = True
+                    p = entry_price(qs, i, side, args.entry_lag_ms)
+                    oside = "Down" if side == "Up" else "Up"
+                    pi = entry_price(qs, i, oside, args.entry_lag_ms)
+                    if p:
+                        res.setdefault("SWEEP", []).append(
+                            (r["slug"], side, p, r["winner"],
+                             r["fee_rate_bps"], tau))
+                        if pi:
+                            res.setdefault("SWEEP_INV", []).append(
+                                (r["slug"], oside, pi, r["winner"],
+                                 r["fee_rate_bps"], tau))
+                            pairs.setdefault("SWEEP", []).append(
+                                ev(side, p, r["winner"])
+                                - ev(oside, pi, r["winner"]))
 
     print(f"\n{'rule':9} {'n':>5} {'mean_px':>8} {'win':>6} {'EV/$1':>8} "
           f"{'EV_net':>8} {'med_tau':>8} {'day-t':>7}")
     for k in ("CROSS", "PRE", "PRE_MOM", "PRE_INV", "PERP", "PERP_INV",
-              "VEL", "VEL_INV", "MOM_ONLY", "PRE_COIN"):
+              "VEL", "VEL_INV", "SWEEP", "SWEEP_INV", "MOM_ONLY", "PRE_COIN"):
         v = res.get(k) or []
         if not v:
             print(f"{k:9} {0:5}")
@@ -405,7 +484,7 @@ def main() -> int:
                   f"{m/2:+.4f}/$1")
 
     print("\nby symbol (EV/$1, n):")
-    for k in ("CROSS", "PRE", "PRE_MOM", "PERP", "VEL", "MOM_ONLY"):
+    for k in ("CROSS", "PRE", "PRE_MOM", "PERP", "VEL", "SWEEP", "MOM_ONLY"):
         v = res.get(k) or []
         parts = []
         for sym in sorted(syms):
@@ -418,7 +497,7 @@ def main() -> int:
         print(f"   {k:9} " + "  ".join(parts))
     print("\nby day (EV/$1, n) -- stability:")
     days_seen = sorted({slug_day(x[0]) for x in (res.get("CROSS") or [])})
-    for k in ("CROSS", "PRE", "PRE_MOM", "PERP", "VEL", "MOM_ONLY"):
+    for k in ("CROSS", "PRE", "PRE_MOM", "PERP", "VEL", "SWEEP", "MOM_ONLY"):
         v = res.get(k) or []
         parts = []
         for d in days_seen:

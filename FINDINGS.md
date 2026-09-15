@@ -7724,3 +7724,93 @@ tick-level work actually raised, so the productive move is not another
 backtest on five days -- it is to start recording `depth20@100ms` and
 `!forceOrder@arr` on the VPS now, and re-ask in a week with more days than five.
 Five days is the binding constraint, not the choice of feature.
+
+## The synthetic-sweep idea, tested -- and the recorder that now exists
+(2026-09-15)
+
+The follow-up proposal conceded the two data claims and proposed detecting
+forced sweeps directly in the tape we already hold, on the grounds that a
+liquidation is executed as an aggressive market order and leaves the same
+footprint: one-sided, several price ticks, large notional in a burst (no
+liquidation tag needed).
+
+VERIFIED FIRST, each against a working control:
+
+  GET fapi/v1/allForceOrders   -> HTTP 404, an HTML error page (route is gone)
+  GET fapi/v1/forceOrders      -> HTTP 401 {"code":-2014,"msg":"API-key format invalid."}
+  GET fapi/v1/aggTrades        -> HTTP 200   <- control: the API itself is up
+
+so the public liquidation tape is gone and only a private, signed one remains,
+and `!forceOrder@arr` is the only public liquidation signal left (throttled to
+at most one order per symbol per second -- recorded now rather than assumed).
+
+THE TEST. `tools/precursor_entry.py --sweep-*`: futures tape, burst window,
+one-sidedness |net|/total >= --sweep-ratio, >= --sweep-ticks distinct prices
+walked, notional >= --sweep-usd. Paired against the OPPOSITE side at the same
+entries, same honest +1000ms entry pricing, day-clustered t:
+
+  config                                n     EV_net   day-t   paired t
+  $300k / 200ms / 3 ticks / ratio 0.9  249    +0.030   +0.27     +0.39
+  $100k notional                       484    -0.074   -0.77     -1.33
+  $1M notional                          84    -0.061   -0.11     -0.17
+  100ms burst window                   124    +0.130   +0.26     +0.47
+  500ms burst window                   540    -0.054   -0.60     -1.50
+  2 ticks instead of 3                 255    +0.028   +0.19     +0.38
+  spot tape instead of perp             29    +0.221   +0.50     +0.41
+  loose ($50k / 500ms / 2 / 0.8)      1030    -0.058   -0.59     -1.81
+
+No cell reaches |t| = 2, and the sign follows the knob: tightening the notional
+to $100k turns the default's +0.39 into -1.33; widening the window to 500ms
+turns it into -1.50. The LARGEST sample -- n=1030, the loosest definition, i.e.
+the closest thing to "all sweeps" -- reads -1.81, so the inverse side (buying
+the side the sweep is running AGAINST) is the better trade.
+
+### The pattern that explains every one of these results
+
+Every trigger tested buys the CHEAP side (mean price 0.36-0.43) and every one of
+them does worse than its own mirror image, which buys the EXPENSIVE side
+(mean 0.60-0.66): SWEEP_INV +0.121 vs SWEEP -0.074 at $100k, and VEL_INV's
+day-t +6.79 against VEL's -0.51. That asymmetry is not a discovery about sweeps;
+it is a property of the DISPLAYED price, which we established is not executable
+(`up_ask`/`down_ask` are NULL on these days, so `price_of` falls back to the
+mid-like `up_price`). The paired test cancels it, and the paired test is the one
+that keeps coming back flat.
+
+Three independent "structural catalyst" ideas -- perp displacement, burst
+velocity, sweep footprint -- are now flat-to-negative, and in each case the
+better-looking side is the one the rule does not take. Together with the
+day-factor finding above (six rules, median daily-EV correlation +0.73, 6/6
+positive on 09-12 and 0/6 on 09-08 and 09-11), the honest read is that on these
+five days no microstructure trigger separates from the day.
+
+VERDICT: do not ship any of it, and stop hunting for a trigger inside this
+window. Five days, rules that are 73% correlated with each other, and a
+non-executable entry price are the binding constraints -- not the choice of
+feature.
+
+## `tools/record_micro.py` -- the recorder (built 2026-09-15, NOT deployed)
+
+Both sides of this conversation converged on recording, so it exists now.
+It subscribes to futures `depth20@100ms` per symbol plus `!forceOrder@arr` and
+writes RAW json prefixed with the local receive timestamp (no schema decision
+can lose data later) into hourly gzip files under
+`data/micro/depth/<sym>-<YYYYMMDD-HH>.jsonl.gz` and `data/micro/liq/`.
+Reconnects with exponential backoff, flushes every 5s, prints a heartbeat with
+msg/s and a projected GB/day, and is entirely separate from the trading path --
+it cannot touch the venue, the ledger or the bot's state.
+
+Smoke-tested live twice: 4 streams connected, hourly rotation correct, ~7 depth
+msgs/s/symbol observed (100ms nominal, so some intervals go unpublished).
+
+FOOTPRINT, measured rather than guessed: ~4.5 KB/s gzipped for ONE symbol at
+depth20@100ms => **~1.2 GB/day for BTC/ETH/BNB**, ~8 GB/week. `--depth-levels 5`
+or BTC-only cuts that ~4x. The VPS has ~89 GB free, so a week is comfortable and
+a month is affordable with pruning.
+
+WHY THIS IS THE ONLY PATH LEFT: the two questions that survived the tick-level
+work -- does a depth void, or a forced sweep, predict a drift of 3-10s, long
+enough to outlive our ~1s decision-to-fill? -- cannot be asked of any archive.
+Depth at that resolution was never published for 2026 (and the free futures
+`bookDepth` archive is 20bps bands at 30s), and the liquidation tape is behind
+a private endpoint. Recording starts the clock; in about a week there will be
+more days than five.
