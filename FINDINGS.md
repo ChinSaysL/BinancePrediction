@@ -8548,6 +8548,30 @@ reason, so the theory changes no decision.
    -> -0.0212 (2s). BNB cells rest on 2 days and their day-t values are
    meaningless; the ETH cells on 5 days are solidly negative.
 
+   **Refinement, because a second tool disagrees at lag 0 and the difference is
+   the sample definition.** `tools/venue_lag_pullback.py` (IDEA 2b) uses a 1-second
+   BTC break with NO tau band and finds the lag-0 cross cell marginally POSITIVE:
+       thr  lag     n     ask  realized    edge   day-t
+       3bps   0     543  0.6123   0.6335  +0.0212  +1.28
+       3bps   1000    543  0.6394   0.6335  **-0.0059**  +0.92
+       3bps   2000    543  0.6576   0.6335  **-0.0241**  +0.48
+   So "every cross cell is negative" is true for the tau-banded 5s-lookback
+   matrix above and NOT true for the 1s-break variant -- I overstated it. Both
+   agree on the thing that decides: the edge is gone by +1 s, and +0.0212 at
+   day-t +1.28 is not significant anyway.
+
+   **And the lag itself is real -- just smaller than our latency.** The same tool
+   regresses the contract's next-1s mid change on the BTC move and the own-spot
+   move jointly (67,804 eth / 60,526 bnb observations, overlapping 1s windows):
+       eth: BTC coef +0.00670  t +25.83 | own-spot coef +0.00330  t +26.55
+       bnb: BTC coef +0.00820  t +27.21 | own-spot coef +0.00451  t +20.01
+   The BTC coefficient is significant and POSITIVE, which is exactly the dealer
+   lag the claim predicts. But those t-stats are inflated by overlapping windows,
+   and the trade test is what decides: a lag that is worth +2.1c at zero latency
+   and -0.6c at 1 s is worth nothing to us, because our venue ack alone is a
+   median 249 ms and fills take seconds. **The mechanism is real; the edge is
+   sub-latency.** That is the honest form of this finding.
+
 3. **Pullback entry (wait for the retrace, then fire)** -- FALSIFIED earlier:
    -0.0150/share, day-t +0.00, 1/8 days positive.
 
