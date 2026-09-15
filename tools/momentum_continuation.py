@@ -56,7 +56,7 @@ def day_t(rows):
             else statistics.fmean(means) / (sd / math.sqrt(len(means)))), len(means)
 
 
-def report(name, rows, fee):
+def report(name, rows, fee, tag=""):
     n = len(rows)
     if n < 15:
         print(f"  {name:34s} n={n:5d}  -- too few")
@@ -68,7 +68,7 @@ def report(name, rows, fee):
                            for r in rows)
     t, days = day_t([(r[1], (1.0 if r[3] else 0.0) - r[2]) for r in rows])
     print(f"  {name:34s} n={n:5d} px {px:6.3f}  hit {hit:6.1%}  "
-          f"hit-px {edge:+7.3f}  net {net:+7.3f}  day-t {t:+5.2f}  {days}d")
+          f"hit-px {edge:+7.3f}  net {net:+7.3f}  day-t {t:+5.2f}  {days}d  {tag}")
 
 
 def main():
@@ -76,6 +76,14 @@ def main():
     ap.add_argument("--db", default="data/btcpredict.db")
     ap.add_argument("--tau-lo", type=float, default=10.0)
     ap.add_argument("--tau-hi", type=float, default=60.0)
+    ap.add_argument("--min-tau", type=float, default=0.0,
+                    help="tau at the BREAKOUT must be >= this (Train spec: 60)")
+    ap.add_argument("--max-ask", type=float, default=0.98,
+                    help="fire only if the coherent ask is <= this")
+    ap.add_argument("--pay-up", type=float, default=0.0,
+                    help="also report EV at ask+this, i.e. paying the LIMIT. "
+                         "The arm pays about the limit: 69%% of live fills land "
+                         "exactly on it, so this is the honest price.")
     ap.add_argument("--coherent", action="store_true", default=True,
                     help="require bid <= displayed <= ask (default ON)")
     ap.add_argument("--no-coherent", dest="coherent", action="store_false")
@@ -124,6 +132,8 @@ def main():
         ask = ua if side == "Up" else da
         if not ask or ask <= 0.02 or ask >= 0.98:
             return None
+        if ask > args.max_ask:
+            return None
         if args.coherent:
             bid = ub if side == "Up" else db
             px = upx if side == "Up" else dpx
@@ -166,14 +176,15 @@ def main():
     print("  `hit-px` is the whole claim: it should be LARGE positive.")
     for X in (5.0, 10.0, 15.0, 20.0):
         for D in (0, 2, 5, 10):
-            rows, ctrl = [], []
+            rows, ctrl, paid = [], [], []
             for slug, T in series.items():
                 K, winner = rounds[slug]
                 bi = None
                 for i, row in enumerate(T):
                     tau = row[1]
                     spot = row[2]
-                    if tau is None or tau < 3:
+                    floor = max(3.0, args.min_tau)
+                    if tau is None or tau < floor:
                         continue
                     if abs((spot - K) / K * 1e4) >= X:
                         bi = i
@@ -193,10 +204,16 @@ def main():
                 if ask is None:
                     continue
                 rows.append((slug, ts, ask, winner == side))
+                if args.pay_up:
+                    paid.append((slug, ts, min(ask + args.pay_up, 0.995),
+                                 winner == side))
                 if oask is not None:
                     ctrl.append((slug, ts, oask, winner != side))
             if rows:
-                report(f"X>={X:.0f}bp  D={D}s", rows, fee)
+                report(f"X>={X:.0f}bp  D={D}s", rows, fee, "AT THE ASK")
+                if paid:
+                    report(f"   (paying ask+{args.pay_up*100:.1f}c = the limit)",
+                           paid, fee, "PAYING THE LIMIT")
                 if ctrl:
                     report(f"   (opposite side, same entries)", ctrl, fee)
 

@@ -10318,3 +10318,85 @@ and see whether the price we actually pay leaves the edge.
 This does NOT rescue the sub-second cross. It is a different trade: later, more
 expensive, and chosen precisely because the venue's queue is too slow to win the
 early one.
+
+## The TRAIN spec tested exactly, and priced the way this arm actually pays
+## (2026-09-15) -- the edge is real, and the DELAY is the parameter that kills it
+
+Spec as proposed: breakout at |spot-K| >= 10bps with tau >= 60s at the breakout,
+wait D = 3-5s, fire only if the coherent ask <= 0.890, bound the order at
+ask + 0.015.
+
+The pricing question is the one that matters, because this file has measured what
+this arm actually pays: **69% of live fills land exactly ON the limit** (33 of 48).
+So every cell is now reported twice -- at the ask we saw, and at ask + 1.5c, which
+is the honest price. Both are shown; the second is the one to believe.
+
+Gates applied: `--min-tau 60 --max-ask 0.890 --pay-up 0.015`, coherent asks only.
+
+    X>=10bp                        AT THE ASK            PAYING THE LIMIT (ask+1.5c)
+      D= 0s  n= 75  px 0.784  hit 89.3%  +0.100  t+3.37   +0.085  t+2.94
+      D= 2s  n=127  px 0.796  hit 83.5%  +0.029  t-0.07   +0.014  t-0.33
+      D= 5s  n=145  px 0.775  hit 84.1%  +0.057  t+0.80   +0.042  t+0.52
+      D=10s  n=129  px 0.801  hit 81.4%  +0.003  t+0.75   -0.012  t+0.32
+
+    X>=15bp                        AT THE ASK            PAYING THE LIMIT
+      D= 0s  n= 39  px 0.802  hit 94.9%  +0.138  t+4.55   +0.123  t+4.04
+      D= 2s  n= 44  px 0.812  hit 88.6%  +0.065  t+2.83   +0.050  t+2.32
+      D= 5s  n= 49  px 0.811  hit 83.7%  +0.016  t+0.86   +0.001  t+0.49
+      D=10s  n= 53  px 0.810  hit 86.8%  +0.048  t+0.99   +0.033  t+0.67
+
+    X>=5bp   D=0  n=244  PAYING THE LIMIT  -0.000  t+0.02    <- too shallow
+    X>=20bp  D=5  n= 23  PAYING THE LIMIT  -0.019  t-0.38    <- too deep
+
+    OPPOSITE SIDE, same entries, at the ask:
+      X>=10 D=0  n= 68  px 0.243  hit 11.8%  net -0.128  t-3.83
+      X>=15 D=0  n= 35  px 0.228  hit  5.7%  net -0.174  t-3.72
+
+### It survives paying the cap. That is new and it is the point.
+
+`X>=10 D=0` pays 0.085/share net of fee AFTER paying ask+1.5c, with day-t +2.94.
+`X>=15 D=0` pays 0.123, day-t +4.04. The opposite side is -0.13 to -0.17 at
+t -3.7 to -3.8. So this is not the ask-we-saw artefact: **the edge is larger than
+the 1.5c the limit costs us**, which is the test the whole campaign has been
+failing.
+
+### But the DELAY is what kills it, and it is monotone
+
+Waiting does not raise the price and it does lower the hit rate:
+
+    X>=10:  D=0  hit 89.3%  px 0.784   ->  D=5  hit 84.1%  px 0.775
+    X>=15:  D=0  hit 94.9%  px 0.802   ->  D=5  hit 83.7%  px 0.811
+
+and the day-t collapses with it (X>=10: +2.94 -> -0.33 -> +0.52 -> +0.32;
+X>=15: +4.04 -> +2.32 -> +0.49 -> +0.67).
+
+**The stated reason for the delay -- "wait 3-5s to ensure spot does not immediately
+wick back below 8bps" -- is intuitively right and measurably backwards.** The
+confirmation window does filter out wick-backs; it also lets the failures back in,
+and the second effect is larger. Whatever continuation premium exists after a
+breakout is spent in the first seconds. D=0 here means the first quote at/after
+the breakout, ~1s later at this cadence -- not instantly.
+
+**The spec as written (D=3-5s) lands on the cells that FAIL the house bar
+(day-t 0.5-0.9). The spec corrected to D=0 is the one with an edge.**
+
+### Not built. Four reasons, stated plainly.
+
+1. **The specified delay is measured to be the losing configuration.** Building
+   D=3-5s would be shipping a known-negative setting; building D=0 is a departure
+   from the spec, and that is the user's call, not mine.
+2. n is thin: 75 (X>=10) and 39 (X>=15) at D=0, over 6-7 days. A live arm at
+   ~12 fires/day takes weeks to reach 50.
+3. **The contradiction with the n=321 coherent-favourite result is still
+   unresolved** (-0.0221 at the ask for "buy the favourite late"). Two readings of
+   a nearby trade disagree in sign and I have not reconciled them.
+4. **The Train arm is the SAME BET as the cross arm on the SAME round**, entered
+   later at a higher price -- cross fires at |d|~0, Train at |d|>=10bps, same side,
+   same settlement. This file already found the six families are 94.5%
+   same-side-correlated; adding a parallel arm on identical rounds doubles
+   exposure to one bet rather than diversifying. If it is built it needs to share
+   the arm's exposure accounting, not sit beside it.
+
+RECOMMENDATION: build it at **D=0** with the tau>=60 and ask<=0.890 gates, as an
+additional ENTRY TRIGGER on the existing arm (or sharing its exposure cap) rather
+than a separate book. Do not build D=3-5.
