@@ -7441,3 +7441,92 @@ The fix is cheap and local: record Binance bookTicker + aggTrade for BTC/ETH/
 BNB on the VPS (the bot already holds the spot ws) and join against the
 venue's own recorded quotes -- that is what would settle whether a qi-triggered
 EARLY entry beats waiting for the crossing.
+
+## The money question, decided: a pre-cross entry does NOT pay (2026-09-15)
+
+Asked to settle it now rather than wait for the tape archive: "we already have
+all data ... i want it decided now, experiment, if positive implement it and
+ship it." So the join was done with what exists -- the venue's OWN quotes from
+the live DB (09-08..09-10, 964 rounds with a recorded winner) priced against
+Binance aggTrades for the flow features. Tool `tools/precursor_entry.py`,
+read-only, committed. Entry price = the first venue quote at/after t+lag (so
+latency is charged, not assumed away), settle = the recorded winner, EV/$1 =
+(1-p)/p if it wins else -1, and the `EV_net` column subtracts the round's
+recorded `fee_rate_bps`.
+
+RULES. CROSS = the shipped idea (first quote past the strike). PRE = |spot -
+strike| <= gap bps toward the crossing side AND CVD500 > 0 AND CVD500
+accelerating. PRE_MOM = PRE + 1s spot momentum agreeing. MOM_ONLY = momentum
+alone. PRE_INV = the OPPOSITE side at the same entries (the honest control:
+same times, same prices, other direction). PRE_COIN = a random side at the
+same times.
+
+LATENCY IS HALF THE "EDGE":
+
+  entry lag      PRE_MOM gross    net     CROSS gross
+  0 ms (cheat)        +0.074     +0.054      -0.037
+  1000 ms             +0.027     +0.007      -0.056
+  2000 ms             +0.026     +0.006      -0.057
+
+The first run -- same-tick pricing -- read +0.054 net and looked shippable.
+Charging a realistic 1s (quote cadence is ~1Hz) removed two-thirds of it.
+Any precursor rule pays a latency tax by construction; here it eats the edge.
+
+IT ALSO DOES NOT SURVIVE THE KNOBS:
+
+  gap (lag 1s)   PRE_MOM net    n
+  2 bps             -0.130      194
+  3 bps             +0.007      226
+  5 bps             -0.012      216
+  3 bps, mom>=1bp   +0.143      112   <- only positive survivor, n=112
+
+A point estimate that flips sign between 2 and 5 bps of the gap is not a
+mechanism, it is a fitted window. The one good cell (momentum >= 1bp) is the
+smallest sample in the matrix, which is what overfitting looks like.
+
+THE CONTROL KILLS IT. Same entries, opposite side:
+
+  PRE_MOM minus OPPOSITE-SIDE: +0.0734/$1  se 0.1351  t +0.54  (n=226)
+
+t = 0.54. Directional skill is not distinguishable from zero. And day by day
+the control BEATS the signal on two of three days:
+
+  day       PRE_MOM              PRE_INV (opposite side)
+  09-08     -0.041 (58)          +0.024 (58)
+  09-09     +0.100 (135)         -0.112 (135)
+  09-10     -0.153 (33)          +0.097 (33)
+
+The entire positive total is one day, 09-09, and on that day the opposite
+side is the loser -- i.e. the "signal" picked the winning side about as often
+as a coin would, and the sign of the result is set by which way that day
+broke. Flow-only PRE is negative (-0.099) and MOM_ONLY is strongly negative
+(-0.197): momentum alone is a loser, and the flow+accel+mom combination is
+where the fitting happened. PRE_COIN at -0.111 confirms that entering the
+cheap side mid-round with no signal loses the fee + spread, as it should.
+
+VERDICT: DO NOT SHIP. The pre-cross logic is not a shippable edge -- not
+because it was measured badly, but because when it is priced honestly (1s
+latency), given a proper opposite-side control, and asked to hold across a
++/-1bp parameter change, it returns t = 0.54 with a sign that depends on one
+day of three. Shipping it would mean adding a second entry path (new trigger,
+new reason code, its own cap) on a point estimate inside its own error bar --
+for a mechanism whose own control is indistinguishable from it. The
+engineering and the risk are certain; the edge is not.
+
+Two realism caveats, both of which would have to be resolved before any
+pre-cross rule could be re-tested -- and neither of which rescues this one:
+(a) fills are priced off the DB's DISPLAYED price (up_ask/down_ask are mostly
+NULL), which is a mid-like number; the real fill pays the spread, so both the
+signal and its control are optimistic by roughly the same amount and the
+PAIRED test -- the one that decides -- is unaffected. (b) the CROSS column
+here is the UNFILTERED crossing rule (-0.076 net); the shipped arm's gates
+(range, depth, buffer, tau) refuse those losers and run near break-even, so
+the correct yardstick for anything new is the gated arm, not this proxy -- and
++0.007 net at t=0.54 does not clear it.
+
+WHAT WOULD CHANGE THE ANSWER is still the same missing dataset: recorded
+top-of-book for BTC/ETH/BNB contemporaneous with the venue's quotes, so the
+qi-triggered entry can be tested on the signal that actually replicated
+(88-93% next-tick direction, 2.4-2.7x drift lift) instead of on aggTrade flow
+alone. That recording is cheap, local, and now the only thing standing between
+the tick-level result and a money answer.
