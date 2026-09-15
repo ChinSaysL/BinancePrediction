@@ -2471,3 +2471,61 @@ def test_the_live_broker_refuses_a_quote_above_max_px():
     assert fill is None, "a quote of 0.84 against a ceiling of 0.30 must refuse"
     assert not placed, "and must refuse BEFORE any order exists"
     assert b.last_failure == "quote_above_ceiling"
+
+
+class TestAStaleLowQuoteFallsBackToALimit:
+    """The venue prices a MARKET order off its DISPLAYED price, which lags the
+    book in BOTH directions.
+
+    Too HIGH is the 2026-09-11 case -- 0.17 on offer, bought at 0.84 -- which
+    `max_px` now refuses. Too LOW is the first live MARKET order after the
+    switch, 2026-09-15 05:09:13 on btc-updown-5m-1789448700: sweep_px 0.460,
+    book running 0.600 -> 0.650, venue quoted 0.370, FAILED with 0 filled and
+    7.8s burned. Nothing is offered at 0.37 when the book is 0.46+, so the FOK
+    was doomed before it was sent.
+
+    A LIMIT does not go through the quote/bundle path and reaches the real
+    book, so it is strictly the better instrument for those quotes.
+    """
+
+    def _run(self, store, monkeypatch, quote_px, ask=0.46, tol=0.03):
+        monkeypatch.setattr("btcpredict.config.settings.order_type", "market")
+        monkeypatch.setattr("btcpredict.config.settings.market_stale_quote_tol", tol)
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_price", 0.95)
+        bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0), asks=(ask, 0.40))
+        bot.broker.mode = "live"
+        used = {"limit": False, "market": False}
+
+        async def get_quote(*a, **k):
+            return {"quoteId": "q", "averagePrice": quote_px, "expireAt": 0}
+
+        async def buy_limit(**k):
+            used["limit"] = True
+            return None
+
+        async def buy(**k):
+            used["market"] = True
+            return None
+
+        bot.broker.get_quote = get_quote
+        bot.broker.buy_limit = buy_limit
+        bot.broker.buy = buy
+        asyncio.run(bot._cross_tick())
+        return used
+
+    def test_a_quote_below_the_book_uses_the_limit_path(self, store, armed,
+                                                        monkeypatch):
+        """0.370 against a 0.460 book -- the live failure."""
+        used = self._run(store, monkeypatch, quote_px=0.370, ask=0.46)
+        assert used["limit"], "a FOK at 0.37 against a 0.46 book cannot fill"
+        assert not used["market"]
+
+    def test_a_healthy_quote_still_goes_to_MARKET(self, store, armed, monkeypatch):
+        """The fallback must not quietly turn the arm back into a maker."""
+        used = self._run(store, monkeypatch, quote_px=0.465, ask=0.46)
+        assert used["market"], "a sound quote must still take with a FOK"
+        assert not used["limit"]
+
+    def test_zero_means_off(self, store, armed, monkeypatch):
+        used = self._run(store, monkeypatch, quote_px=0.370, ask=0.46, tol=0.0)
+        assert used["market"], "0 = OFF must honour order_type unconditionally"

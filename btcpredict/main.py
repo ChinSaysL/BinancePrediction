@@ -2756,8 +2756,23 @@ class Bot:
                              r.slug, sig.side, sec)
                     return
 
-            if (self.broker.mode == "live"
-                    and settings.order_type in ("limit", "limit_take")):
+            # MARKET -> LIMIT fallback on a stale-low quote. The venue prices
+            # a MARKET order off its DISPLAYED price, which lags the book both
+            # ways; below the book the FOK simply cannot fill. Measured live at
+            # 05:09:13 on 2026-09-15: sweep_px 0.460, book running to 0.650,
+            # venue quoted 0.370, order FAILED with 7.8s burned. A LIMIT does
+            # not use the quote/bundle path and reaches the real book, so it is
+            # strictly the better instrument for exactly these quotes.
+            use_limit = settings.order_type in ("limit", "limit_take")
+            if (self.broker.mode == "live" and not use_limit
+                    and take_px is not None
+                    and settings.market_stale_quote_tol > 0
+                    and real_px < take_px - settings.market_stale_quote_tol):
+                log.info("market quote %.3f is %.3f below the book ask %.3f for "
+                         "%s %s; a FOK cannot fill that -- using a LIMIT",
+                         real_px, take_px - real_px, take_px, r.slug, sig.side)
+                use_limit = True
+            if self.broker.mode == "live" and use_limit:
                 if settings.order_type == "limit":
                     # Maker-first: post one tick below the quote and let it rest.
                     # A miss ENDS the round -- no retry and no crossing, because

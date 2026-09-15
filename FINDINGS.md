@@ -6911,3 +6911,56 @@ n=34 triggers, and the market slip distribution is 8 observations. Thin. It is
 also the only substrate that can see any of this -- the 1s replay catches
 crossings after the venue reprices, which is what made the two earlier buffer
 conclusions wrong.
+
+## The first live MARKET order failed, and it falsified the model I shipped on
+
+05:09:13, `btc-updown-5m-1789448700`:
+
+    CROSS Down sweep_px=0.460 (spot 77610.01 vs strike 77610.15, tau 47s)
+    cross meter: +0.25s=0.600 +0.50s=0.650 +1.00s=0.650
+    order 26091500001887549423  MARKET  status FAILED  price 0.37  filled 0
+    NO FILL in 7.83s
+
+The venue quoted **0.370** while the book was at 0.460 and running to 0.650.
+Nothing is offered at 0.37 when the book is 0.46+, so the FOK was doomed before
+it was sent.
+
+**This is not the failure mode the decision modelled.** The simulation priced
+MARKET as always filling at `ask + slip`; it does not. The displayed price the
+quote follows lags the book in BOTH directions:
+
+  * too HIGH -- 2026-09-11, a Down on offer at 0.17 bought at 0.84, +47% EV to
+    -70%. `max_px` now refuses this before an order exists.
+  * too LOW -- this order. The FOK cannot fill and the trigger is spent.
+
+The mitigating fact is that a FAILED order costs **no money**: no fill, no fee.
+The cost is the trade, which is the same cost a cancelled LIMIT carries.
+
+### The fix, which dominates either path alone
+
+`market_stale_quote_tol = 0.03` (0 = OFF). When the pre-trade quote comes back
+more than 3c BELOW the book ask the arm already has, the order goes out as a
+LIMIT instead. A LIMIT does not use the quote/bundle path at all -- it reaches
+the real book -- so it is strictly the better instrument for exactly the quotes
+that doom a FOK. In the case above, the limit would have gone out at 0.62
+against a book at 0.60.
+
+So the arm now picks per ORDER rather than per config:
+
+    quote sound         -> MARKET FOK, capped by max_px
+    quote stale-HIGH    -> refused by max_px, no order placed
+    quote stale-LOW     -> LIMIT at ask + buffer, which reaches the book
+
+That is MARKET's immediacy where the quote is usable, the LIMIT's book access
+where it is not, and a bounded worst case in both.
+
+573 tests pass, three new -- including one asserting a sound quote still takes
+with a FOK, so the fallback cannot quietly turn the arm back into a maker.
+
+### Honest status
+
+n=1 on live MARKET orders. The decision to switch rested on a simulation whose
+central assumption that first order disproved, and the fallback is a repair of
+that model rather than a new measurement. What is solid: a failed FOK costs
+nothing but the trade, and the arm can no longer pay a stale-high quote or waste
+a trigger on a stale-low one.

@@ -249,6 +249,26 @@ class Settings(BaseSettings):
     # than the price we chose, which a slippageBps cap on a market order cannot
     # promise.
     order_type: Literal["market", "limit", "limit_take"] = "market"
+    # A MARKET quote materially BELOW the book is a FOK that cannot fill, and
+    # this routes it to the LIMIT path instead of burning the trigger on it.
+    #
+    # The venue's quote follows its DISPLAYED price, which lags the book in BOTH
+    # directions. Too high is the 2026-09-11 case (0.17 on offer, bought at
+    # 0.84) and `max_px` now refuses it. Too low is the first live MARKET order
+    # after the switch, 2026-09-15 05:09:13 on btc-updown-5m-1789448700:
+    #
+    #     sweep_px 0.460, book running 0.600 -> 0.650
+    #     venue quoted 0.370  ->  MARKET FAILED, 0 filled, 7.8s burned
+    #
+    # Nothing is offered at 0.37 when the book is 0.46+, so the FOK was doomed
+    # before it was sent. A FAILED order costs no money -- only the trade -- but
+    # the trade is the expensive part.
+    #
+    # A LIMIT does not go through the quote/bundle path at all; it reaches the
+    # real book. So when the quote is stale-low, the limit is strictly the
+    # better instrument, and this picks per-order rather than per-config.
+    # 0 = OFF (always honour order_type).
+    market_stale_quote_tol: float = 0.03
     limit_offset: float = 0.01
     limit_wait_s: float = 20.0
     # Kelly sizes against this. Kept explicit rather than derived from the stake,
