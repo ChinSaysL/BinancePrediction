@@ -1089,7 +1089,10 @@ class Settings(BaseSettings):
     # its limit to the tick, while the two that filled 72-76% beat it). That is
     # the P(pin) risk swept in cross_limit_buffer_inv below, and it is why the
     # inverse coefficient is 0.25 rather than 0.50.
-    cross_limit_buffer: float = 0.25
+    # RAISED 0.25 -> 0.40 with cross_limit_buffer_inv: at inv 0.30 a cheap ask
+    # wants 0.30*(1-0.2) = 0.24, and the old cap would have clipped exactly the
+    # cheap-ask cell where the reprice is largest (median +0.340).
+    cross_limit_buffer: float = 0.40
     # SUPERSEDED 2026-09-14 by cross_limit_buffer_inv. Kept only so an
     # existing cross_overrides entry naming it does not KeyError; nothing
     # reads it.
@@ -1156,7 +1159,54 @@ class Settings(BaseSettings):
     #
     # It costs frequency: 91 modelled fills become 67. That is the trade, and it
     # is the right way round -- the old cell was not distinguishable from no edge.
-    cross_limit_buffer_inv: float = 0.125
+    # ---- REVERSED 0.125 -> 0.30 on 2026-09-15, on the LIVE substrate ------
+    # The halving to 0.125 earlier the same day was measured on `quotes_arm`,
+    # and this file already records why that replay cannot answer this question:
+    # "the 1s replay is 6.8% cheap triggers while live is 28.6% (live runs the
+    # websocket at ~114/s and catches crossings BEFORE the venue reprices; the
+    # replay catches them AFTER)". A substrate that only sees post-reprice asks
+    # structurally cannot measure the buffer needed to survive the reprice.
+    #
+    # The arm logs its own answer. `cross meter` records the book at +0.25s,
+    # +0.50s and +1.00s after every trigger. Over 34 live triggers with a
+    # settled round, the reprice after a cross is:
+    #
+    #     +0.25s  median +0.1200   p90 +0.2800
+    #     +1.00s  median +0.1490   p90 +0.3500
+    #
+    # against a buffer of 0.125*(1-ask), which is 0.059 at an ask of 0.53. So
+    # the limit was covering roughly a quarter of the move it exists to chase:
+    #
+    #     ask 0.0-0.4  buffer 0.088  median reprice +0.340  covered   0.0%
+    #     ask 0.4-0.6  buffer 0.059  median reprice +0.140  covered  23.5%
+    #     ask 0.6-0.8  buffer 0.044  median reprice +0.040  covered  60.0%
+    #
+    # The consequence is adverse selection, and it is severe. The limit is only
+    # hit when the crossing was NOISE; when it is real the book runs past us:
+    #
+    #     FILLED  n=12  win 0.583  paid 0.622            EV/$1 -0.0572
+    #     MISSED  n=22  win 0.818  (+1.00s book 0.685)   EV/$1 +0.2466
+    #
+    # We were filling the losers and missing the winners. Simulated over those
+    # 34 triggers, filling at our own limit (which is what this venue does --
+    # realised price improvement is +0.0113) against the +1.00s book:
+    #
+    #     inv    fills  win   EV/$1    TOTAL
+    #     0.125     10    7  +0.0173   +0.173   was shipped
+    #     0.200     12    9  +0.1332   +1.598
+    #     0.300     19   15  +0.1404   +2.668   <- here
+    #     0.400     23   18  +0.0853   +1.963
+    #     0.500     28   21  -0.0003   -0.009
+    #     1.000     34   25  -0.2771   -9.420
+    #
+    # It is a peak, not an edge of a range: too small and the good trades escape,
+    # too large and we overpay for the noise ones. n=34 (19 fills at this cell)
+    # is thin, but it is the only substrate that can see the effect at all.
+    #
+    # LATENCY IS THE BIGGER LEVER. The same 0.125 buffer against the +0.25s book
+    # returns +5.447 -- double the best buffer can do at +1.00s. Cutting the
+    # decision-to-order round trip is worth more than any value of this knob.
+    cross_limit_buffer_inv: float = 0.30
     # How long a cross limit rests before it is cancelled. 0 keeps the shared
     # `limit_wait_s` (20s).
     #
@@ -1218,7 +1268,26 @@ class Settings(BaseSettings):
     # The window is flat from 2s to 60s in the fill-priced sweep -- the same 1-3
     # trades are removed throughout -- so 20.0 is chosen as the middle of a flat
     # region, not a peak.
-    cross_flip_block_s: float = 20.0
+    # ---- DISABLED 20.0 -> 0.0 on 2026-09-15, on its own live record -------
+    # It fired four times and blocked THREE WINNERS:
+    #
+    #   01:29:36  bnb-updown-15m-1789434900  blocked Down  winner Down  WOULD HAVE WON
+    #   01:29:38  bnb-updown-15m-1789434900  blocked Up    winner Down  would have lost
+    #   01:29:45  bnb-updown-15m-1789434900  blocked Down  winner Down  WOULD HAVE WON
+    #   04:34:18  bnb-updown-5m-1789446600   blocked Up    winner Up    WOULD HAVE WON
+    #
+    # The class statistic it shipped on (flipped crossings edge -0.0071 on n=14
+    # against +0.1771 for clean ones) has not been refuted -- but it was n=14,
+    # and it was scored on a 1s replay where a "flip" is a different object from
+    # the one the live websocket clock produces at ~114/s. Four live blocks, 3
+    # of them winners, is the first evidence from the substrate that matters and
+    # it points the other way.
+    #
+    # Kept in the code with 0 = OFF rather than deleted: the hole it closes is
+    # real (`cross_allow_reversal` arms on the ENTRY, so a DECLINED crossing
+    # leaves it unarmed) and the tests still pin the behaviour. Re-enable only
+    # with live fills, not another replay.
+    cross_flip_block_s: float = 0.0
     cross_skip_opposite_to_main: bool = True
     # RAISED 0.5 -> 2.0 on 2026-09-13. The old 0.5 was picked by a fill-aware
     # sweep that called it a "clear peak", but that sweep could not have seen

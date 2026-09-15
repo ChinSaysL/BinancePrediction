@@ -150,7 +150,11 @@ def expected_limit(ask):
     """
     from btcpredict.config import settings as S
     buf = max(0.01, min(S.cross_limit_buffer, S.cross_limit_buffer_inv * (1.0 - ask)))
-    return round(ask + buf, 2)          # main.py rounds the ceiling to 2dp
+    # cross_max_price still caps it -- above that the measured cell is negative,
+    # so the buffer must not smuggle a trade past the ceiling. This became live
+    # when cross_limit_buffer_inv went 0.125 -> 0.30: at an ask of 0.30 the
+    # buffer is now 0.21, which reaches the fixture's 0.50 ceiling.
+    return min(round(ask + buf, 2), S.cross_max_price)
 
 class TestTheArm:
     def test_it_fires_on_a_cross_and_reaches_the_order_path(self, store, armed):

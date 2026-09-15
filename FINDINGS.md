@@ -6638,3 +6638,90 @@ to 5 if repeats ever measure positive on live fills.
 A test-harness note: `test_a_same_side_repeat_is_untouched` in the whipsaw class
 now raises `cross_max_per_round` explicitly. Left alone it would pass because of
 the new cap, hiding a flip guard that had started refusing same-side entries.
+
+## The cancelled orders were adverse selection, and the buffer sweep used the wrong substrate
+
+Two instructions: disable the whipsaw guard if it fired, and find out why so many
+orders cancel.
+
+### The whipsaw guard fired four times and blocked three winners
+
+    01:29:36  bnb-updown-15m-1789434900  blocked Down  winner Down  WOULD HAVE WON
+    01:29:38  bnb-updown-15m-1789434900  blocked Up    winner Down  would have lost
+    01:29:45  bnb-updown-15m-1789434900  blocked Down  winner Down  WOULD HAVE WON
+    04:34:18  bnb-updown-5m-1789446600   blocked Up    winner Up    WOULD HAVE WON
+
+`cross_flip_block_s = 0.0`. The class statistic it shipped on (flipped crossings
+edge -0.0071 on n=14 vs +0.1771 clean) is not refuted, but it was scored on the
+1s replay, where a "flip" is a different object from what the websocket clock
+produces at ~114/s. Kept in the code behind 0 = OFF, with its tests, because the
+hole it closes is real; re-enable only on live fills.
+
+### The cancellations are not a fault. They are the arm losing its best trades
+
+34 of the last 100 orders cancelled, nearly all with zero filled. One in full:
+
+    04:39:12.029  CROSS btc Up sweep_px=0.620 (spot 77590.38 vs strike 77590.01)
+    04:39:13.033  cross meter: +0.25s=0.620  +0.50s=0.660  +1.00s=0.730
+    04:39:18.889  limit @0.67 unfilled after 6s -> cancelled | book now 0.8900
+
+The venue repriced through the limit inside a second. The arm has been recording
+this all along in its `cross meter` lines. Over 34 live triggers with a settled
+round:
+
+    reprice  +0.25s  median +0.1200  p90 +0.2800
+             +1.00s  median +0.1490  p90 +0.3500
+
+    buffer 0.125*(1-ask) vs that move:
+      ask 0.0-0.4  buffer 0.088  median reprice +0.340  covered   0.0%
+      ask 0.4-0.6  buffer 0.059  median reprice +0.140  covered  23.5%
+      ask 0.6-0.8  buffer 0.044  median reprice +0.040  covered  60.0%
+
+So the limit was covering about a quarter of the move it exists to chase, and
+the selection that produces is brutal -- it is only hit when the crossing was
+NOISE:
+
+    FILLED  n=12  win 0.583  paid 0.622             EV/$1 -0.0572
+    MISSED  n=22  win 0.818  (+1.00s book 0.685)    EV/$1 +0.2466
+
+**The arm was filling the losers and missing the winners.**
+
+### Why the afternoon's sweep said the opposite
+
+`cross_limit_buffer_inv` was halved 0.25 -> 0.125 earlier the same day on a
+`quotes_arm` sweep. This file already recorded why that cannot work: *"the 1s
+replay is 6.8% cheap triggers while live is 28.6% (live runs the websocket at
+~114/s and catches crossings BEFORE the venue reprices; the replay catches them
+AFTER)"*. A substrate that only ever sees post-reprice asks cannot measure the
+buffer needed to survive the reprice. Same error as `cross_max_per_round`, twice
+in one day: **a knob measured on a replay that structurally cannot contain the
+phenomenon.**
+
+Simulated over the 34 live triggers, filling at our own limit (realised price
+improvement is +0.0113, so that is the honest assumption), against the +1.00s book:
+
+    inv    fills  win   EV/$1    TOTAL
+    0.125     10    7  +0.0173   +0.173   was shipped
+    0.200     12    9  +0.1332   +1.598
+    0.300     19   15  +0.1404   +2.668   <- shipped now
+    0.400     23   18  +0.0853   +1.963
+    0.500     28   21  -0.0003   -0.009
+    1.000     34   25  -0.2771   -9.420
+
+A peak, not a range edge: too small and the good trades escape, too large and we
+overpay for the noise ones. **Shipped `cross_limit_buffer_inv = 0.30`,
+`cross_limit_buffer = 0.40`** (the old 0.25 cap would have clipped exactly the
+cheap-ask cell where the reprice is largest).
+
+### Latency is worth more than the buffer
+
+The same 0.125 buffer judged against the +0.25s book returns **+5.447**, double
+what the best buffer achieves at +1.00s:
+
+    vs +0.25s book:  inv 0.125  16 fills  EV +0.3404  TOTAL +5.447
+
+Cutting the decision-to-order round trip beats any value of this knob. That is
+the next piece of work, and it is engineering rather than a constant.
+
+n=34 (19 fills at the shipped cell) is thin. It is also the only substrate that
+can see the effect at all.
