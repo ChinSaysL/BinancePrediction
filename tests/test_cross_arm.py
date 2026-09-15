@@ -2286,3 +2286,48 @@ class TestTheWhipsawGuard:
         asyncio.run(bot._cross_tick())
         assert calls == ["Down"], (
             f"with the guard OFF the reverse leg must trade; got {calls}")
+
+
+class TestTheShippedDepthFloorAdmitsAShallowCross:
+    """LIVE 2026-09-15 01:19, both refused at the old floor of 5:
+
+        cross eth-updown-5m Up not taken: only 2 tick(s) through the strike
+        cross bnb-updown-5m Up not taken: only 3 tick(s) through the strike
+
+    Both then went the way the crossing pointed, and the venue agreed inside a
+    second (bnb's Up quote ran 0.720 -> 0.750 on the cross meter).
+
+    A shallow crossing is one the venue has NOT repriced yet, so it is CHEAP.
+    Measured with the ask column the old table lacked, over 216 crossings:
+    below the old floor edge +0.2311 at an ask of 0.558, at/above it +0.1771 at
+    0.686. The old floor refused 42.9% of bnb crossings and 23.3% of eth's.
+
+    This pins the SHIPPED value, not the mechanism -- TestTickDepthFloor
+    monkeypatches 5.0 and still covers that.
+    """
+
+    def test_a_two_tick_cross_trades_at_the_shipped_floor(self, store, armed,
+                                                          monkeypatch):
+        from btcpredict.config import settings as S
+        assert S.cross_min_depth_ticks <= 2.0, (
+            "the shipped floor must admit the 2-3 tick crossings that were "
+            "being refused live")
+        # strike 77000.0; end 2 ticks past it
+        bot = make_bot(store, ticks(76999.0, 76999.5, 77000.02),
+                       asks=(0.30, 0.40))
+        calls = []
+
+        async def execute(*a, **k):
+            calls.append(k.get("side"))
+
+        bot._cross_execute = execute
+        asyncio.run(bot._cross_tick())
+        assert calls == ["Up"], (
+            f"a 2-tick crossing must trade at the shipped floor; got {calls}")
+
+    def test_spot_exactly_on_the_strike_is_still_refused(self, store, armed,
+                                                         monkeypatch):
+        """1, not 0. At zero ticks spot sits ON the strike and the side is
+        ambiguous; btc's extra growth at floor 0 rested on 3 trades."""
+        from btcpredict.config import settings as S
+        assert S.cross_min_depth_ticks > 0.0, "0 would admit spot == strike"

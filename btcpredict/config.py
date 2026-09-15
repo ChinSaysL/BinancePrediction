@@ -1469,7 +1469,46 @@ class Settings(BaseSettings):
     # That test was in BPS and BTC-ONLY, where the median trigger is 193 ticks
     # and a floor only removes real moves. The question is different on a symbol
     # whose median trigger is one tick.
-    cross_min_depth_ticks: float = 5.0
+    #
+    # ---- LOWERED 5.0 -> 1.0 on 2026-09-15 -------------------------------
+    # The table above has no ASK column, and that is the whole error. It is the
+    # trap this file has now recorded FOUR times: the bar is the mean ask OF THE
+    # SAME SUBSET, never a win rate compared across subsets priced differently.
+    #
+    # A shallow crossing is one the venue has NOT REPRICED YET, so it is cheap.
+    # Re-measured over 216 crossings passing every gate except this floor (btc
+    # corpus, eth and bnb from the live DB, whipsaw guard applied), with the ask:
+    #
+    #                        n    win    ask     EDGE
+    #     below floor (<5t) 19  0.789  0.558  +0.2311
+    #     at/above floor   197  0.863  0.686  +0.1771
+    #
+    # Shallow crossings win less AND cost less, and the second effect is larger.
+    # Consistent in sign on all three families: btc +0.243 vs +0.197, eth +0.185
+    # vs +0.076, bnb +0.360 vs +0.225.
+    #
+    # Priced through the full fill model:
+    #
+    #     btc  floor 0  n=86  growth +0.899  day-t +2.23  CI [+0.212, +1.539]
+    #          floor 1  n=83         +0.711        +2.36     [+0.093, +1.264]
+    #          floor 5  n=82         +0.705        +2.36     [+0.078, +1.287]
+    #     eth  floor 0  n=29         +0.175        +0.87     [-0.390, +0.717]
+    #          floor 1  n=27         +0.192        +1.50     [-0.308, +0.737]
+    #          floor 5  n=20         +0.087        +1.10     [-0.325, +0.443]
+    #
+    # 1, not 0: at exactly zero ticks spot sits ON the strike and the side is
+    # ambiguous, and btc's extra +0.19 at floor 0 rests on 3 trades. 1 keeps
+    # btc where it is and roughly doubles eth's growth.
+    #
+    # What made this safe to relax is `cross_flip_block_s`, shipped the same
+    # day. The floor was doing two jobs -- refusing OSCILLATION (the last
+    # decimal flipping back and forth) and refusing SHALLOW-BUT-REAL crossings.
+    # The flip guard now does the first job directly, so the floor no longer has
+    # to buy it by throwing away the second.
+    #
+    # Cost of the old value, in the frequency this arm is short of: it refused
+    # 42.9% of bnb crossings and 23.3% of eth's, against 3.6% of btc's.
+    cross_min_depth_ticks: float = 1.0
     # Venue price increment per symbol, used only by the floor above.
     cross_tick_size: float = 0.01
     cross_reentry_gap_s: float = 1.0

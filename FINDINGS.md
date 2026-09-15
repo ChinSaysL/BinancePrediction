@@ -6448,3 +6448,77 @@ keep passing with the new guard deleted.
 A cross-FAMILY contradiction guard (refuse a cross on an asset opposite to one
 another family just took). Across all 36 cross fills ever, that has happened
 ONCE. Nothing to fit.
+
+## CORRECTION: the depth floor was refusing the arm's CHEAPEST trades
+
+Reported live: two crossings missed in five minutes on bnb and eth -- "price
+stalled at the line then went the good direction". Confirmed, and it is the
+depth floor, not the whipsaw guard shipped minutes earlier:
+
+    01:19:17  cross eth-updown-5m Up not taken: only 2 tick(s) through the strike, floor is 5
+    01:19:32  cross bnb-updown-5m Up not taken: only 3 tick(s) through the strike, floor is 5
+
+Both went the way the crossing pointed, and the venue agreed within a second --
+bnb's Up quote ran 0.720 -> 0.750 on the cross meter.
+
+### The error: a win-rate table with no ask column
+
+`cross_min_depth_ticks = 5` rested on this:
+
+    ticks    n    win
+    0-1     34   0.647
+    2-4     36   0.611
+    5-15    57   0.825
+    51+    145   0.876
+
+Shallow crossings really do win less. But the table prices nothing. **This is
+the trap this file has now recorded FOUR times**: the bar is the mean ask OF THE
+SAME SUBSET, never a win rate compared across subsets that are priced
+differently.
+
+A shallow crossing is, by definition, one the venue HAS NOT REPRICED YET -- so
+it is cheap. Re-measured over 216 crossings passing every gate except this floor
+(btc corpus, eth and bnb from the live DB, whipsaw guard applied), with the ask:
+
+                           n    win    ask     EDGE
+    below floor (<5t)     19  0.789  0.558  +0.2311
+    at/above floor       197  0.863  0.686  +0.1771
+
+They win less AND cost less, and the second effect is the larger one. The sign
+is consistent on all three families -- btc +0.243 vs +0.197, eth +0.185 vs
++0.076, bnb +0.360 vs +0.225.
+
+Priced through the full fill model:
+
+    btc  floor 0  n=86  growth +0.899  day-t +2.23  CI [+0.212, +1.539]
+         floor 1  n=83         +0.711        +2.36     [+0.093, +1.264]
+         floor 5  n=82         +0.705        +2.36     [+0.078, +1.287]   was shipped
+    eth  floor 0  n=29         +0.175        +0.87     [-0.390, +0.717]
+         floor 1  n=27         +0.192        +1.50     [-0.308, +0.737]
+         floor 5  n=20         +0.087        +1.10     [-0.325, +0.443]   was shipped
+
+**Shipped `cross_min_depth_ticks = 1.0`.** Not 0: at exactly zero ticks spot
+sits ON the strike and the side is ambiguous, and btc's extra +0.19 at floor 0
+rests on 3 trades. 1 leaves btc where it is and roughly doubles eth's growth.
+
+### Why it is safe to relax now and was not before
+
+The floor was doing two jobs: refusing OSCILLATION (bnb's last decimal flipping
+back and forth, the case it was written for) and refusing SHALLOW-BUT-REAL
+crossings. `cross_flip_block_s`, shipped hours earlier, does the first job
+directly. The floor no longer has to buy it by throwing the second away.
+
+### What it was costing
+
+    family           refused by the old floor
+    bnb-updown-5m    3 of   7 crossings = 42.9%
+    eth-updown-5m   10 of  43           = 23.3%
+    btc-updown-5m    6 of 166           =  3.6%
+
+Which is why every live refusal being reported was eth or bnb: a 5-tick floor is
+$0.05 on every symbol, i.e. 0.006 bps on BTC at $78,000 and 0.69 bps on BNB at
+$720. The tick unit was chosen to scale across symbols and does the opposite.
+
+Two tests pin the SHIPPED value against the live case (a 2-tick crossing must
+trade; spot exactly on the strike must not). `TestTickDepthFloor` monkeypatches
+5.0 and still covers the mechanism.
