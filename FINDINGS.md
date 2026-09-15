@@ -7278,6 +7278,10 @@ decision -> venue-accepted 116-152ms. The drought continued anyway, and the
                   Even the clamped bound (0.11 x 1.9 = 0.209) was satisfied
                   while we were there; the venue's own execution latency is
                   what lost it.
+                  >= CORRECTED same day, see "The timing lever, measured":
+                  that meter belonged to the REFUSAL ~290ms EARLIER; the
+                  fire's own run was 0.30 at the decision and 0.90 by
+                  +215ms. The door had already shut.
     09:44 bnb     quote 0.10, book 0.66 by +250ms. Doomed at ANY latency.
     08:39 eth     the counter-example -- the fill. Book stayed put; the
                   venue executed at 0.5405 (~its ceiling) 1.5s later.
@@ -7315,3 +7319,61 @@ expected 0.82) but the market path caps at cross_max_fill_px=0.65, so all
 three attempts were declined client-side. A fire whose ask is already above
 the cap can never place; the exec summary's "limit 0.82" hides that.
 Consider gating the fire on ask <= cross_max_fill_px (or at least logging).
+
+### The timing lever, measured -- and it is not the lever (2026-09-15 PM)
+
+Pulled the venue's own order records (order/history) and lined them up with
+the decisions table (ts_ms = the method's first timestamp, before every
+await). Seventeen fires have both sides; the chain is strikingly stable:
+
+    decision -> venue createTime     +171..+246ms   (median ~185)
+      * the venue-position read on the fire path is 52-69ms of it
+        (20 live samples of position/list)
+      * the rest is task + warm-quote + POST + the venue's own stamping
+    venue create -> terminal (FOK)   260..1237ms   (fails cluster ~425)
+    ------------------------------------------------------------------
+    decision -> the venue's verdict   ~610ms
+
+The runs finish far sooner. With the meter anchored correctly (see the
+instrumentation note below), the 09:44 eth-15m race reads 0.09 -> 0.30 ->
+0.90 within ~215ms of the decision. THE FIRE NEVER HAD A DOOR: even a 0ms
+client still needs the venue's own ~425ms match, and every fire that day
+had left its bound by then. Classifying all of the day's market orders by
+what the venue recorded:
+
+  * quote undershoot beyond ANY slippage: btc-5m 09:44 (ref 0.07 vs a 0.21
+    book), eth-5m 09:44 (0.03 vs 0.59) -- ref x 2.0 still short
+  * run past the bound mid-match: the 09:29 batch, bnb-5m 09:54 (book 0.85
+    vs bound 0.59), btc-15m 09:59 (0.34 vs new-max bound 0.32; the old
+    9_000 bound was 0.304 -- the clamp raise helped and still fell short)
+  * timing-only: NONE. Every miss closes at <=600ms against a ~610ms
+    verdict. The 57ms position read is the only client lever left, and the
+    band where 57ms flips a fire (door closes inside the last 57ms before
+    the match) is empty in the data -- so it was NOT removed. It guards
+    double buys (Sep 8); the evidence does not pay for weakening it.
+
+Two more things the venue records settled, both killing a standing theory:
+
+  * "MARKET orders never fill on this venue" and the schema's ~1.5 USDT
+    MARKET minimum do NOT block us: at 10:29:15 order ...162602 FILLED,
+    type MARKET, $1.00 -> 2.23 shares (~0.448), on the RETRY -- after
+    attempt ...162199 (ref 0.50) failed in 406ms, the whipsaw brought the
+    price back under the ceiling and the fresh quote (0.44) did. The
+    machinery converted a venue-fail into a cheap fill; the retry fix
+    doing exactly its job.
+  * the venue anchors the FOK bound to OUR submitted quote: the order
+    record's `price` equals the quote's averagePrice to 15 digits (e.g.
+    0.4518220214124349 on both the decision row and the order). The fires
+    show refs lagging the book during storms (0.03 vs 0.59). A fresher
+    quote at fire time might lift the bound -- now instrumented (shadow
+    quote) instead of guessed.
+
+Instrumentation shipped (all log-only): `cross fine` -- 50ms book marks
+across the +100..600ms window (the `cross meter` line kept verbatim for
+tools/cross_catch_report.py); fire/refusal tags on the meter with per-kind
+dedup (the bug that mis-anchored the 09:44 read: a fire's meter was deduped
+against an earlier refusal's, ~290ms off); the warm-quote marker now carries
+age+px; a SHADOW fresh quote fetched concurrently with each cross order
+(answers "would a current reference have been accepted?" without touching
+the order); and one `venue ack` line per attempt with quote, slip, bound,
+ceiling and ms.

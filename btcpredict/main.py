@@ -1636,7 +1636,7 @@ class Bot:
             if wsb is not None:
                 top = wsb.best(r.market_id, settings.ws_book_max_age_s)
                 quote = top.ask(side) if top is not None else None
-        self._schedule_cross_meter(r, side)
+        self._schedule_cross_meter(r, side, "refuse")
         with contextlib.suppress(Exception):
             self.store.insert("decisions", {
                 "slug": r.slug, "ts_ms": int(time.time() * 1000), "tau_s": tau,
@@ -1650,28 +1650,31 @@ class Bot:
                 "stake": stake, "acted": 0, "reason": f"cross refused: {reason}",
             })
 
-    def _schedule_cross_meter(self, r, side) -> None:
-        """Sample the book after a trigger, once per (round, side).
+    def _schedule_cross_meter(self, r, side, kind: str = "trigger") -> None:
+        """Sample the book after a trigger, once per (round, side, kind).
+
+        `kind` separates a FIRED trigger from a refused one. Without it a fire
+        whose round had been refused a few hundred ms earlier was deduped away
+        -- the only meter on the log belonged to the refusal, which
+        mis-anchored the 09:44 timing reads by ~290ms until the venue's own
+        order records exposed it (2026-09-15). A fire always gets its own.
 
         The trigger path records what the book showed at the decision; this
-        records what it did NEXT. That is the number the catch question stands
-        on -- how much of the repricing a faster trigger would still find in
-        front of it -- and it has never been measured on OUR market at a
-        resolution finer than the 1s poll. Log-only: it cannot place, price or
-        change an order, and a failure here must never touch the arm.
+        records what it did NEXT. Log-only: it cannot place, price or change
+        an order, and a failure here must never touch the arm.
         """
         if getattr(self, "ws_book", None) is None:
             return
         seen = getattr(self, "_meter_seen", None)
         if not isinstance(seen, set):
             seen = self._meter_seen = set()
-        if (r.slug, side) in seen:
+        if (r.slug, side, kind) in seen:
             return
         if len(seen) > 400:                 # ~a day of triggers; keep it bounded
             seen.clear()
-        seen.add((r.slug, side))
+        seen.add((r.slug, side, kind))
         try:
-            task = asyncio.create_task(self._cross_meter(r, side))
+            task = asyncio.create_task(self._cross_meter(r, side, kind))
         except RuntimeError:                # no running loop (sync/fixture use)
             return
         tasks = getattr(self, "_meter_tasks", None)
@@ -1680,21 +1683,36 @@ class Bot:
         tasks.add(task)
         task.add_done_callback(tasks.discard)
 
-    async def _cross_meter(self, r, side) -> None:
-        """The book at +0.25s / +0.5s / +1.0s after a trigger. Log only."""
+    async def _cross_meter(self, r, side, kind: str = "trigger") -> None:
+        """The book after a trigger, at 50ms resolution where the race lives.
+
+        250/500/1000ms marks cannot tell a reprice at +330 from one at +540,
+        and that band is where a client-side saving would or would not flip a
+        fire: measured 2026-09-15 from the venue's own records, the order is
+        created ~185ms after the decision and the FOK answers ~425ms later,
+        against runs that finish in <=600ms. The `fine` line samples the
+        window; the legacy line is kept verbatim for tools/cross_catch_report.
+        """
         wsb = getattr(self, "ws_book", None)
         if wsb is None:
             return
-        out, prev = [], 0.0
+        coarse, fine, prev = {}, [], 0.0
         try:
-            for mark in (0.25, 0.50, 1.00):
+            for mark in (0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40,
+                         0.45, 0.50, 0.60, 0.75, 1.00):
                 await asyncio.sleep(mark - prev)
                 prev = mark
                 top = wsb.best(r.market_id, settings.ws_book_max_age_s)
                 q = top.ask(side) if top is not None else None
-                out.append("n/a" if q is None else f"{q:.3f}")
-            log.info("cross meter %s %s: +0.25s=%s +0.50s=%s +1.00s=%s",
-                     r.slug, side, out[0], out[1], out[2])
+                txt = "n/a" if q is None else f"{q:.3f}"
+                fine.append(f"{int(round(mark * 100)):02d}={txt}")
+                if mark in (0.25, 0.50, 1.00):
+                    coarse[mark] = txt
+            log.info("cross meter %s %s: +0.25s=%s +0.50s=%s +1.00s=%s [%s]",
+                     r.slug, side, coarse[0.25], coarse[0.50], coarse[1.00],
+                     kind)
+            log.info("cross fine %s %s %s: %s", r.slug, side, kind,
+                     " ".join(fine))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1840,10 +1858,16 @@ class Bot:
         if entry is None:
             return None
         ts, q_stake, q = entry
-        if time.monotonic() - ts > _QUOTE_PREFETCH_MAX_AGE_S:
+        age = time.monotonic() - ts
+        if age > _QUOTE_PREFETCH_MAX_AGE_S:
             return None
         if round(float(q_stake), 2) != round(float(stake), 2):
             return None
+        # The caller's marker logs this: the venue anchors the FOK bound to
+        # THIS quote's averagePrice (verified 2026-09-15 -- the order record's
+        # `price` equals the submitted quote's avg to 15 digits), so the age
+        # is part of the bound's meaning.
+        self._warm_age_s = age
         return q
 
     async def _cross_all(self) -> None:
@@ -2425,7 +2449,7 @@ class Bot:
         # (we fill when the book moves AGAINST us, not for us).
         #
         # Pricing at cross_max_price gives the limit room to chase the book up
-        self._schedule_cross_meter(r, side)      # the +0.25/0.5/1.0s book path
+        self._schedule_cross_meter(r, side, "fire")   # the +0.25/0.5/1.0s book path
         # to the ceiling and no further, which is the same shape that makes the
         # model arm fill 95%. `take_px` stays the trigger ask as the floor.
         # The limit sits just above the ask we actually observed, NOT at
@@ -2496,6 +2520,13 @@ class Bot:
         try:
             t_send = time.monotonic()
             book_at_send = ask
+            # SHADOW QUOTE, log-only: the order below carries the WARM quote,
+            # and the venue anchors the FOK bound to that quote's price. A
+            # fresh quote fetched NOW answers the counterfactual the catch
+            # question needs -- "would a current reference have been
+            # accepted?" -- concurrently with the POST, read-only, and it can
+            # never touch the order itself.
+            self._spawn_shadow_quote(r.slug, side, token, stake, ceil_side)
             fill = await self._place_order(
                 r, sig,
                 fair_up=(ceil_side if side == "Up" else 1.0 - ceil_side),
@@ -2534,6 +2565,54 @@ class Bot:
             self._pending_n = max(0, getattr(self, "_pending_n", 1) - 1)
             self._pending_stake = max(
                 0.0, getattr(self, "_pending_stake", stake) - stake)
+
+    def _spawn_shadow_quote(self, slug, side, token, stake, ceiling) -> None:
+        """Launch the log-only shadow quote; never raise into the fire path."""
+        if getattr(self.broker, "mode", "") != "live":
+            return
+        try:
+            task = asyncio.create_task(
+                self._shadow_quote(slug, side, token, stake, ceiling))
+        except RuntimeError:                # no running loop (fixture use)
+            return
+        tasks = getattr(self, "_shadow_tasks", None)
+        if tasks is None:
+            tasks = self._shadow_tasks = set()
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    async def _shadow_quote(self, slug, side, token, stake, ceiling) -> None:
+        """A fresh quote at fire time, logged; the ORDER never sees it.
+
+        get-quote does not execute, so this is read-only. What it measures:
+        our place-order carries the WARM quote, the venue anchors its FOK
+        bound to that quote's averagePrice (the order record's `price` equals
+        it), and the 2026-09-15 fires show refs lagging the book by up to 20x
+        (0.03 against a 0.59 book). If fresh refs are systematically higher
+        at fire time, moving the quote fetch back onto the critical path --
+        or refreshing the warm entry -- becomes a measured argument instead
+        of a guess.
+        """
+        t0 = time.monotonic()
+        try:
+            q = await self.broker.get_quote(token, stake)
+        except Exception:
+            return
+        if not q:
+            log.info("shadow quote %s %s: none", slug, side)
+            return
+        try:
+            px = float(q.get("averagePrice") or 0.0)
+        except (TypeError, ValueError):
+            return
+        if px <= 0 or not ceiling:
+            return
+        room = int((ceiling / px - 1.0) * 10_000)
+        slip = max(settings.slippage_bps, min(room, 10_000))
+        log.info("shadow quote %s %s: fresh px %.4f after %.0fms -> "
+                 "bound %.4f (ceiling %.3f)",
+                 slug, side, px, (time.monotonic() - t0) * 1000.0,
+                 px * (1 + slip / 10_000.0), ceiling)
 
     @staticmethod
     def double_trigger(*, entry_px: float | None, ask: float | None, tau: float,
@@ -2854,8 +2933,17 @@ class Bot:
                         # Marks the warm hits so the decision -> venue delta
                         # (order createTime minus the CROSS line) can be
                         # scored against the 169-186ms cold baseline; see
-                        # FINDINGS "Can we execute faster".
-                        log.info("warm quote used for %s %s", r.slug, sig.side)
+                        # FINDINGS "Can we execute faster". The age and px
+                        # are part of the bound: the venue anchors the FOK to
+                        # this quote's price, and the 2026-09-15 fires show
+                        # refs lagging the book by up to 20x (0.03 vs 0.59).
+                        try:
+                            _wpx = float(quote.get("averagePrice") or 0.0)
+                        except (TypeError, ValueError):
+                            _wpx = 0.0
+                        log.info("warm quote used for %s %s: age %.2fs px %.4f",
+                                 r.slug, sig.side,
+                                 getattr(self, "_warm_age_s", -1.0), _wpx)
                 if quote is None:
                     quote = await self.broker.get_quote(token, stake)
                 if not quote:

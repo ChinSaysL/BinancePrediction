@@ -641,6 +641,12 @@ class LiveBroker:
         if max_px is not None and avg_px > 0:
             room = int((max_px / avg_px - 1.0) * 10_000)
             slip = max(self.slippage_bps, min(room, 10_000))
+        # Log-only, one line per attempt, so the 2026-09-15 loss classes are
+        # legible from the log alone: `quote` is the venue's FOK reference
+        # (echoed verbatim in the order record's `price`), `bound` is what
+        # the FOK will accept (quote x (1 + slip)), and the ack ms is the
+        # decision->venue share of the race.
+        t_ack = time.monotonic()
         resp = await self._request("POST", PLACE_ORDER, {
             "walletAddress": self.wallet_address,
             "walletId": self.wallet_id,
@@ -653,6 +659,10 @@ class LiveBroker:
             "orderType": "MARKET",
             "slippageBps": slip,
         })
+        log.info("venue ack %s %s: %.0fms, quote %.4f slip %d -> bound %.4f%s",
+                 slug, side, (time.monotonic() - t_ack) * 1000.0, avg_px, slip,
+                 avg_px * (1 + slip / 10_000.0),
+                 "" if max_px is None else f", ceiling {max_px:.3f}")
         if not resp:
             # A 4xx carries a venue error code (-1102, -3026, ...): the order
             # was refused outright and nothing is live. A transport failure or
