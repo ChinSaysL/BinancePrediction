@@ -7941,6 +7941,101 @@ Today's fills show we already pay up: executed price vs requested is median
 +16 bps (mean +13.3, p95 +373). The complaint that we lose 1-2 ticks to venue
 latency describes a different failure than the one we have.
 
+## The 30-day corpus: found it, used it, and it settles the question (2026-09-15)
+
+"we have a historical 30 day corpus i think on the vps or here, so test on
+that" -- it is here, and it is bigger than 30 days. Census:
+
+  data/btc5m/                     53 days (2026-04-29 .. 06-20), 15,264 round
+                                  dirs, 13 GB. Per round: ticks_dense.parquet
+                                  (300 x 1s of the underlying tape),
+                                  trades_raw.json, metadata.json
+  data/btc5m_prices.parquet       8 days, 2,240 windows, 358,808 rows. Per
+                                  second: up_px/dn_px (odds), up_buy_px /
+                                  dn_buy_px, up_sell_px / dn_sell_px, mid,
+                                  fees, n_up/n_dn, vol_up/vol_dn
+  data/btc5m_ml.parquet          31 days, 8,436 windows, 177,156 rows, 71 cols:
+                                  mom_1..mom_300_bps, vol_surge, cvd_ratio,
+                                  z_tau, delta_bps, sigma_*, efficiency, ...
+                                  plus y_up. NOTE `px` here is the BTC PRICE
+                                  (72k-82k), NOT the odds.
+
+The prize is `up_sell_px`/`dn_sell_px`: real executable quotes, which the live
+venue DB never had in usable form. That is what makes a priced test possible at
+all. Tools: `tools/corpus_btc5m_test.py`, `tools/corpus_signal_power.py`,
+`tools/corpus_paired_rules.py`, all read-only.
+
+### FIRST: the column names are inverted, and it costs 6.65%/$1 to believe them
+
+`*_buy_px` is the BID and `*_sell_px` is the ASK. Proof, on 166,215 rows that
+carry both:
+
+    up_sell - up_buy: median +0.0100, 85.6% positive
+    up_buy + dn_buy : median  0.9900, and <1.0 on 93.1% of rows
+    up_sell + dn_sell: median 1.0100
+
+Buying BOTH sides at the "*buy*" price would cost 0.99 and pay 1.00 -- free
+money, which is the proof those are resting bids. Same corpus, same rule, same
+days, only the side of the book changed:
+
+    FAVOURITE, tau 5-20s    n    mean paid  realized  EV_net    day-t  days +
+    paying the BID         968    0.8487     0.8936   +0.0665   +4.24   8/8
+    paying the ASK         452    0.8672     0.8584   -0.0166   -0.91   2/8
+
+A t of +4.24 positive on eight days of eight becomes -0.91 on six of eight
+negative. That is the third appearance of this trap today (venue `up_price`,
+the venue's `chance`, now this) and the cleanest demonstration of it yet.
+
+### SECOND: the per-$ "EV" estimator is unsafe on cheap sides
+
+The mean of `(1-p)/p if win else -1` is dominated by leverage, so the same cell
+read +0.0665/$1 under it and -0.0043 per SHARE. The repo already carried the
+rule ("per-SHARE EV, never per-$ staked: cheap tokens make it levered") and
+this is a fresh demonstration: two artifacts (the bid, then the estimator)
+stacked to manufacture a +6.65% mirage out of nothing. Everything below is
+per-share: `edge = P(win) - price - fee`.
+
+### THIRD: the 31-day table cannot answer a priced question
+
+A hit rate against a 50% baseline over 31 days looks spectacular --
+`dist>=10bp` scores 0.9982 with day-t +686, `mom_300>=8bp` 0.9819 with +179 --
+and all of it is the delta-selection mirage this file already documents: being
+10 bps from the strike with under 60s left does not PREDICT a win, it IS the
+win, and the price of that side is ~0.99, not 0.50. Nine such rules came back
+"+0.05 to +0.48 edge, day-t 8 to 686". A hit rate is necessary and nowhere near
+sufficient; the price has to be below it. Discard this table for P&L.
+
+### THE ANSWER: 8 days, 1,840 rounds, priced at the real ask
+
+Rules joined to real quotes, one row per round (the last quote in tau 10-60s),
+paying the executable ask, per-share edge, day-clustered t over 8 days:
+
+    rule                 n   side_px    hit   edge/sh    ROI    day-t  days +
+    FAV (priced side) 1840    0.9126  0.9207  -0.0067  -0.74%   -1.29   2/8
+    DIST>=2bp          722    0.6272  0.6343  -0.0063  -1.01%   -0.56   2/8
+    DIST>=5bp          158    0.6340  0.6456  +0.0009  +0.13%   +0.06   4/8
+    DIST>=10bp          23    0.7246  0.7826  +0.0289  +3.99%   +1.15   5/7
+    MOM_30>=4bp        247    0.6696  0.6802  -0.0094  -1.40%   -0.64   5/8
+    MOM_120>=4bp       680    0.5749  0.5794  -0.0110  -1.91%   -1.25   3/8
+    VOLSURGE>=2.5       71    0.6514  0.6761  -0.0237  -3.64%   -0.54   4/8
+    CVD>=0.6          1742    0.5166  0.5098  -0.0226  -4.37%   -2.84   1/8
+    ZTAU>=1.0          818    0.5609  0.5452  -0.0251  -4.47%   -2.84   0/8
+
+Nothing is positive with significance. The two cells that are positive
+(DIST>=5, DIST>=10) have day-t 0.06 and 1.15, and the second is n=23. The two
+that ARE significant are significant NEGATIVE, on 1/8 and 0/8 days: taking the
+favourite side at the executable ask loses 4.4% per share over 8 days. This is
+the same cheap-side/expensive-side asymmetry measured on the live venue, now
+reproduced on an independent venue with trustworthy quotes and 1,840 rounds.
+
+VERDICT: the corpus does not rescue the ideas -- it confirms the venue result
+with better data. Across two venues, 13 days of priced rounds and ~3,400
+entries, buying the side a signal prefers at the executable ask is between
+-4.5% and +0.1% per share, and the honest reading is "no edge, and specifically
+no favourite-side edge". What the corpus DID produce is worth more than the
+answer: three measured traps, of which the bid/ask inversion is the one that
+just cost this session a 6.65% false positive.
+
 ## The synthetic-sweep idea, tested -- and the recorder that now exists
 (2026-09-15)
 
