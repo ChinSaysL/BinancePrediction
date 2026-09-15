@@ -10550,3 +10550,114 @@ Still open and NOT resolved by shipping it: the n=321 coherent-favourite
 contradiction (-0.0221 at the ask), and the fact that 76% of the measured fires
 sit on rounds the range gate refuses. The live record now accumulates against
 both.
+
+## AUDIT + FIX: the Train trigger's first minutes live (2026-09-15 21:00 UTC)
+
+The arm was shipped at 20:48 with the entry trigger enabled, and the operator
+reported three positions executing immediately. The report was correct and the
+cause was a bug, not the market.
+
+### The bug: a LEVEL test where the measurement used an EVENT
+
+    reported   eth-updown-15m-1789505100 Down @0.7698  (restart 20:49:34)
+    the three  btc-15m Up @0.7986  20:49:54   ev_at_fill -0.0158
+               eth-15m Up @0.7698  20:49:54   ev_at_fill -0.0187
+               bnb-15m Up @0.8944  20:50:19   ev_at_fill -0.0073
+               at the fires: tau ~= 605s, dist +18.2 / +16.3 / +25.2 bps
+               same round, same side, same expiry -- one bet, not three
+
+The shipped trigger tested the INSTANTANEOUS distance:
+
+    if abs(dist_bps) >= cross_train_bps and tau >= cross_train_min_tau_s: train = True
+
+There is nothing in that condition that can be true only once, and nothing that
+knows when the round broke out. `self._ticks` is in-memory and empty after a
+restart, so the first poll that accumulated a few ticks found the spot ALREADY
+18-25bps from a strike set 4.5 minutes earlier and fired. The rounds were
+15-minute rounds that had been extended for minutes -- a population the
+backtest never sampled, because the backtest entered at the FIRST quote at which
+|d| crossed X.
+
+**That is the audit finding that matters most: the measurement anchored at the
+first quote crossing the threshold while the shipped code anchored at nothing.
+The +0.085/share cell did not describe what went live.** The live arm was not
+"enter the breakout"; it was "enter anything already extended", at any tau, on
+any round -- and the arm's own `ev_at_fill` scored all three negative, which is
+the tell that the entries were not the measured ones.
+
+### Four more findings from the same audit
+
+1. **Ledger mislabelling.** The decision `kind` was
+   `("cross probe" if probe else "cross into")` -- no train branch at all, so a
+   train entry was recorded as a cross entry and was indistinguishable from the
+   arm's normal trades in every later analysis. Fixed to
+   `("train into" if train else ("cross probe" if probe else "cross into"))`.
+   Live now: `train into Down @0.830 tau158s run+0.000`.
+
+2. **The ask gate could be skipped.** The train-specific ask gate was written
+   before the `top is None` path, which REASSIGNS `ask` from the primary's
+   fallback. So on any tick where the websocket top was missing, the order was
+   priced off the fallback ask with the train gate never applied. Moved the gate
+   after the generic `min_price <= ask <= max_price` check so it applies to
+   whichever ask actually won.
+
+3. **Refusal spam defeated the dedupe.** The reason carried the per-cent ask --
+   `f"train ask {ask:.3f} above the gate {tmax:.3f}"` -- and `_cross_refuse`
+   dedupes per `(round, reason)`. Every cent produced a NEW row: 7 rows in the
+   log for one round, 0.90 through 0.98. Fixed to the constant
+   `f"train ask above the gate {tmax:.3f}"`, which is what the dedupe was built
+   for. The 7 rows still in the log are all pre-fix and carry the old text.
+
+4. **The flip guard was armed by a non-crossing entry.** The `fb > 0` guard
+   exists to stop re-entry after a LEVEL FLIPS, and `fb` is computed from a
+   crossing. A train entry is by definition not a crossing, so it armed a guard
+   against a flip that had not happened, muting the arm for rounds afterward.
+   Fixed with `if not train and fb > 0:` alongside the depth/range/ticks skips.
+
+5. **Residual, NOT fixed.** `book_run` still reads `self._asks`, which with
+   several families in flight holds the PRIMARY's book. It is only used on the
+   primary-only fallback path, so it cannot mis-price an off-primary order today
+   -- but it is exactly the bug the comment directly above it warns about, and
+   it should be read from `asks` if that path is ever widened.
+
+### The fix
+
+    _train_is_fresh(r, thr_bps)   new, next to _round_range_bps
+      buf    = self._ticks[symbol]                  (2400 samples, one per poll)
+      recent = ticks from the last cross_train_fresh_s (5.0)
+      if not recent: return False                   <- fails CLOSED
+      oldest = the OLDEST tick in that window
+      return abs(1e4*(oldest - strike)/strike) < thr_bps
+
+The test is inverted from the broken one on purpose: it asks whether the spot
+was still INSIDE the threshold at the start of the window, i.e. whether the
+breakout happened within the last 5 seconds. No history, no trade. An empty
+buffer now means silence rather than an immediate entry -- which is precisely
+the case that fired three live positions.
+
+    cross_train_fresh_s: float = 5.0     new knob, .env: cross_train_fresh_s=5.0
+    tests                              TestTheTrainTrigger, 5 cases, all pass
+                                       (fresh fires / stale does not / no
+                                       history fails closed / ledger label /
+                                       quiet when off); 619 pass in total
+
+### Live verification after the fix (re-enabled)
+
+    restart -> train_enabled = True | fresh_s = 5.0   service active
+    0 fills in the 240s after the restart             (pre-fix: fired at +20s)
+    0 new train refusals inside the window            (7 in the log are pre-fix)
+    the only train decisions are legitimate ones, correctly labelled:
+      train into Down @0.830 tau158s run+0.000
+      train into Down @0.881 tau167s run+0.000
+    errors: 8, all the unrelated 19:14 place-order 400s
+
+### Still open, unaffected by any of this
+
+- the three pre-fix positions and their own negative `ev_at_fill`
+- the n=321 coherent-favourite contradiction (-0.0221 at the ask)
+- and the first thing to watch: on a broken-out 15-minute round the ask sits at
+  0.90-0.98, not the ~0.80 the cell assumed, so the >0.890 gate will refuse most
+  of what the live trigger sees. The measured cell was conditioned on
+  `ask <= 0.890`, so it excluded those rounds by construction. The arm may be
+  tested on a population it rarely reaches -- watch the refusal rate, not the
+  fill count.
