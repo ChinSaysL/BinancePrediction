@@ -9477,3 +9477,120 @@ the only lever found this session that sits on the right side of the cliff.
 Every other finding this session moved EV per share by 0.01-0.05 on a base that is
 one latency doubling from negative. This one moves the arm between the 250ms column
 and the 500ms column.
+
+## Re-opened: does our OWN concurrency slow our orders? (2026-09-15, night)
+
+FINDINGS.md already named "cutting the decision-to-order round trip" the top
+lever -- the same 0.125 buffer is worth +5.447 against the +0.25s book and
++1.965 against the +1.00s one -- and then closed it:
+
+    decision -> order ON THE VENUE   n=50  median 0.208s  p90 0.233s  max 0.270s
+    208ms is ours; the remaining ~1.2s is venue-side matching. There is
+    nothing to win there.
+
+Tonight's log does not look like that n=50. 39 order POSTs on 09-15: p50 219ms,
+p75 315ms, **max 823ms, 16/39 (41%) at or above 300ms**, where the earlier run's
+p90 was 233ms and its max 270ms. The median agrees; the TAIL is new, and the
+tail is the part that sits on the far side of the 250ms/500ms cliff.
+
+The candidate mechanism needs stating precisely, because it is not the one
+already ruled out. Geography is closed (Tokyo, ping 1.086ms). What was never
+measured is whether OUR OWN second order in flight delays the first.
+
+### Step 1 -- exact intervals, not the proxy
+
+`tools/order_concurrency.py`. The earlier pass counted "other acks within 1.5s",
+a proxy. Every `venue ack` line carries its own duration and is logged the
+instant the POST returns, so each order's true service window is exactly
+[ack_ts - dur_ms, ack_ts], and overlap is a fact rather than an estimate.
+
+    others in flight    n    min    p25    p50    p75    max
+                   0   33     18    204    219    315    640
+                   1    6    315    506    602    674    823
+
+    p50 alone 219ms   p50 with company 602ms   2.75x   permutation p < 0.0002
+
+The proxy was right in direction and, if anything, understated it.
+
+### Step 3 -- asked the venue directly instead of arguing about the log
+
+`tools/venue_serialisation.py` fires K concurrent `trade/get-quote` POSTs and
+times each. get-quote is a READ -- it returns a price and places nothing -- and
+it is the closest authenticated POST to `place-order-bundle` that cannot move
+money. K=1 is interleaved as the control, so a slow minute cannot be read as a
+queueing effect.
+
+    probing bnb-updown-5m-1789501200 (a market that ANSWERS with a quote)
+    K=1  n=10  min 39  p50 44  max 56
+    K=2  n=20  min 39  p50 45  max 54
+    K=3  n=30  min 39  p50 44  max 53     ratio K=3/K=1 = 1.01x
+    wall clock for 3 concurrent: 47ms     (K=3 costs 1ms more than K=1)
+
+**The wallet API does not serialise.** Three authenticated POSTs are served in
+parallel, in the time of one. So per-wallet queueing is NOT the mechanism.
+
+Caveat, stated because it limits the reach: get-quote has no ~185ms hold while
+place-order-bundle does, so the two may sit in different queues. This probe
+falsifies serialisation at the API layer; it cannot prove the order engine is
+parallel.
+
+### Trap recorded: a 400 is not the quote path
+
+The first run printed a clean, confident, meaningless table -- "PARALLEL, ratio
+0.97x" -- because the round was selected with `ORDER BY slug DESC`. Slug is TEXT,
+so `unitree-up-or-down-on-september-8-2026` sorts above every `btc-updown-5m-...`.
+Every call went to a dead market and came back HTTP 400 "This market is
+currently inactive" in ~40ms. That is the VALIDATION path, and it is parallel
+because it rejects before touching anything.
+
+The measurement was the thing under test. The tool now refuses to print a table
+until a candidate market has actually returned a quote.
+
+### The confound that keeps this from being a result
+
+The 6 co-submitted orders are not a random sample of moments. Our code fires a
+second symbol only when the move is big enough to cross several strikes at once,
+which is exactly when the venue is busiest. `tools/concurrency_control.py`, using
+venue bars that know nothing about our orders:
+
+    ambient |1m return|      alone 2.4bps     with company 3.6bps
+    ambient volume ratio     alone 0.81x      with company 2.30x   <-- 2.8x
+
+The bursts sit in genuinely busy minutes. So "busy minute" and "two orders in
+flight" enter together and cannot be separated by this data.
+
+Three things then decide how much weight the association can carry:
+
+  1. within the ALONE group, ambient activity does not predict duration --
+     high-vol half p50 225ms (6/17 >=300ms), low-vol half p50 216ms (4/16).
+     A busy minute is not by itself enough to make an order slow.
+  2. 10 of the 16 slow orders had NO peer at all. The base rate of >=300ms
+     with no company is 30%, not 0%.
+  3. the 6 are not 6 samples. They are 3 EVENTS, each a pair. The permutation
+     p of 0.0000 is computed over 6 rows that are not independent, and the
+     honest n is 3.
+
+And the pairs are not FIFO staircases. Burst 1 spans 883ms for 1474ms of work --
+less than sequential, much more than parallel. That is queueing or contention,
+not serialisation, which is what the direct probe also found.
+
+### Verdict, and what was not changed
+
+H3 is NOT established. Directionally real, mechanistically falsified at the API
+layer, confounded by a busy minute, and n=3 events. **Step 2 -- cap in-flight
+orders at 1 and serialise submission -- is not justified and was not made.** The
+live config is untouched.
+
+The standing warning applies with full force here. The live referee (above) found
+that slow-COMPLETING fills win MORE (>=3.4s: 9/12) than the fastest class
+(<=2.5s: 2/5), and called the adverse-selection thesis refuted by the bot's own
+fills. "Faster is better" is established on the TAPE, and this repo has now
+found four separate times that the recorded price is not the executable price.
+Making orders faster is not yet shown to be good; it is shown to be
+theoretically good under a model of arrival that has not survived contact.
+
+Open, and cheap to settle later: why 41% of tonight's orders exceed 300ms when an
+earlier n=50 never exceeded 270ms. The multi-family widening is the obvious
+suspect and the timestamps are consistent with it, but the two measurements come
+from different periods and could be different regimes. Do not act on the
+difference until both are measured the same way.
