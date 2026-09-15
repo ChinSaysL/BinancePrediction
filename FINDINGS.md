@@ -6237,8 +6237,9 @@ tick floor, both fill-price conventions, LAT 2/3/4). At the live convention
     10.0       72   60.5  0.819   +0.392  +1.24   +0.201
     20.0       79   66.4  0.835   +0.573  +1.72   +0.347
 
-5s sits above 2s under every convention (+1.20 vs +0.83 at touch pricing).
-The 5-20s extension is model-dependent and UNOBSERVED live.
+5s (and now 6.0) sits above 2s under every convention (+1.20 vs +0.83 at
+touch pricing). The extension past the live-observed ~5.2s is model-dependent
+and UNOBSERVED live.
 
 ### The live referee: every settled fill by completion latency (n=27)
 
@@ -6249,8 +6250,8 @@ The 5-20s extension is model-dependent and UNOBSERVED live.
 Slow fills are the BEST class the live record has, not the worst -- the
 adverse-selection thesis is refuted by the bot's own fills. (Includes 00:24
 UTC 09-15: 92% at 0.5976, reported in 5.20s, won +0.67/$1 -- an order a 2s
-cancel provably kills.) The 5.5-20s band has produced zero fills in ~39
-orders of the 20s-wait era, so 5-20 remains unobserved both ways.
+cancel provably kills.) The band past ~5.2s has produced zero fills in 45
+exec attempts to date, so the extension remains unobserved both ways.
 
 ### Shipped
 
