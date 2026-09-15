@@ -10740,3 +10740,59 @@ The arm was stopped at 21:05 having settled `trades=6 win_rate=1.000 pnl=$+1.29`
 validation.** The eight entries were a single directional bet sized 8x too
 large; it happened to be right. The concentration risk was real whether or not
 this instance paid.
+
+## TRAIN PARAMETER SWEEP -- 10 knobs OFAT + 216 joint cells (2026-09-15)
+## tools/train_sweep.py, live DB, 3,501 coherent rounds, priced at ask+1.5c
+
+Method is `momentum_continuation.py`'s verbatim: coherent asks only, FIRST quote
+at/after the tau floor past X (the event anchor), one entry per round, per-share
+net, day-clustered t, fee 0.0114 of price. Baseline = the shipped config.
+
+    BASELINE  X=10 D=0 tau>=60 ask<=0.89 fam=all
+              n= 76  px 0.800  hit 88.2%  net +0.073  day-t +1.99  6d 5/6+
+    CONTROL   OPPOSITE side, same entries
+              n=214  px 0.158  hit  6.5%  net -0.094  day-t -5.97  7d 0/7+
+The control is the strongest in the campaign: 0/7 days positive. The direction
+is real, not an entry-moment artefact.
+
+### SUPPORTED
+* **D=0** -- D=0 +1.99 / D=1 +0.33 / D=2 -0.31 / D=5 +0.53. The delay is
+  monotone-bad, independently reproduced. Ship D=0 (already shipped).
+* **X=15 beats X=10 on EVERY measure**: net +0.123 vs +0.073, day-t +4.04 vs
+  +1.99, **6/6 days positive vs 5/6**, px 0.817 vs 0.800. Cost: n 76 -> 39.
+  X=15 appears in 8 of the top 14 joint cells.
+* **max_tau=180** -- n=67, day-t +2.31, **6/7 days positive** vs the baseline's
+  5/6, i.e. a tau ceiling improves consistency and keeps 88% of the sample.
+* **5m ONLY (already shipped)** -- `family=15m` yields **n=4**. The 15m family is
+  essentially ABSENT from the coherent measured population, so the restriction
+  costs 4 entries of 76 and the live 0.66/0.73/0.74 legs were never in this
+  sample at all. The cleanest possible justification for the restriction.
+
+### REFUTED -- do NOT add these
+* **A price FLOOR (min_ask)** -- the design's "0.75-0.88 in the money" band is
+  not supported: 0.0 -> +1.99, 0.70 -> +0.33, 0.75 -> +0.67, 0.80 -> -0.34.
+  Imposing the band COSTS EV. Diagnosing the family by price was right;
+  filtering by price is wrong.
+* **A momentum-consistency clause (require |d| rising)** -- OFF +1.99, rise_s
+  3/5/10 -> +1.37/+1.35/+1.58. Confirming that the distance is INCREASING
+  destroys the edge. The LEVEL is the signal.
+* **The cross arm's range gate** -- `max_range_bps=10` leaves **n=19** of 76, so
+  that gate would kill 75% of this population; and no range filter improves the
+  cell (15/20/30 -> +0.08/+0.61/+1.43).
+
+### INSENSITIVE
+* **max_ask** -- 0.80 +2.37 / 0.89 +1.99 / 0.92 +2.17 (n=102) / 0.95 +1.71
+  (n=162). Net per share falls as the cap rises and day-t does not care.
+* **min_tau** 60-180 flat (+1.99/+1.50/+1.50/+1.47); 240 -> +2.37 on n=32, but
+  tau 240 on a 300s round is the CROSS arm's own window, so that cell is the
+  cross arm wearing a train label.
+
+### CAVEATS, stated before any of this is acted on
+* **Non-monotonicity**: X=12.5 is a HOLE (-0.030, t+0.12) between two good cells
+  (10 and 15). A dip inside a rising sequence is a noise signature and it is why
+  X=15 must be re-confirmed forward, not trusted because it is the maximum.
+* 212 joint cells: |t|>2 is expected by chance. The defence is not the t, it is
+  that the top cells share a STRUCTURE (X=15, D=0, tau>=180) rather than being
+  scattered -- and that the bottom 5 are all negative.
+* n=39 at X=15 is thin; the arm's own note says a live arm at ~12 fires/day takes
+  weeks to reach 50.
