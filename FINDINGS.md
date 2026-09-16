@@ -10884,3 +10884,76 @@ scale-INVARIANT, so sizing cannot change the edge -- only the $ and the path. On
 not, the arm's contribution shrinks toward nothing, which the config already
 warns about ("a flat $1 cannot compound, so the arm's contribution shrinks as a
 share of the book"). That is a decision with a known shelf life.
+
+## TRAIN arm RE-ACTIVATED and FIXED: fresh_s 5.0 -> 1.0 (2026-09-16)
+
+The arm was shipped live 2026-09-15 on FINDINGS' own recommendation ("build it at
+D=0 with the tau>=60 and ask<=0.890 gates"), then KILLED earlier today on a
+falsification that was itself wrong. Both halves of that are recorded here.
+
+### The false refutation, and what caused it
+
+The arm's cohort (|gap| ~ 15bps, one entry per round) was measured live at
+n=41, win 78.0%, mean paid 0.8406 -> EV/sh -0.063. Against this file's headline
+`X>=15 D=0  hit 94.9%  px 0.802` that is p = 1.8e-04, which was read as a
+refuted calibration and the arm was switched off.
+
+**The 94.9% is an n=39 artefact.** Re-tested on our own tape -- 4,362 rounds
+carrying quotes (of 6,684 settled), real strikes, real settlements, one entry
+per round, coherent asks, fee included -- the SAME cell measures:
+
+    X>=15 D<=1s   n=164   hit 86.6%   px 0.801   @ask +0.0600   @ask+1.5c +0.0455
+    X>=15 D<=2s   n=253   hit 84.6%   px 0.803   @ask +0.0373   @ask+1.5c +0.0228
+    X>=15 D<=5s   n=300   hit 85.0%   px 0.808   @ask +0.0365   @ask+1.5c +0.0220
+    X>=10 D<=1s   n=420   hit 83.1%   px 0.783   @ask +0.0424   @ask+1.5c +0.0279
+
+So the true rate is 86.6%, not 94.9%. Live's 32 of 41 against 86.6% is z = -1.24,
+p ~ 0.11 -- **noise**. The edge survives paying the cap at every cell.
+
+**The lesson is about which sample the p-value was computed against.** Testing a
+live cohort against a thin (n=39) backtest cell treats that cell as ground truth;
+its own sampling error is then charged to the live arm. Against the properly
+sized estimate the same live record is unremarkable.
+
+### The real defect: the shipped value contradicted the note above it
+
+`cross_train_fresh_s` IS the D parameter -- `_train_is_fresh` takes the OLDEST
+tick inside the last `fresh_s` seconds and requires it to have been below the
+threshold, so 5.0 admits any crossing up to five seconds old. The config comment
+directly above the knob already said:
+
+    # DELAY: D=0 only. D=2/5/10 collapse the day-t to -0.33/+0.52/+0.32, because
+    # the continuation premium is spent in the first seconds.
+
+**The code was trading the exact cells its own note rejects.** Day-clustered
+confirmation, and this is the decisive table:
+
+    cell                                  n    days   EV/sh     day-t   days+
+    X>=15 D<=1s   @ask+1.5c             164     7    +0.0459   +1.39    4/7
+    X>=15 D<=5s   @ask+1.5c (SHIPPED)   300     8    +0.0220   +0.82    4/8
+
+Nearly 2x the EV and the t more than doubles, at roughly half the fire rate.
+`cross_train_fresh_s: 5.0 -> 1.0` (commit 5a94b02), re-enabled via .env.
+
+### Two things NOT changed, and why
+
+* **`cross_train_bound` stays 0.015.** The sweep likes 0.005 (+0.0556 vs +0.0459)
+  but that column models `ask + pay_up` as a COST, not as a fill. A resting limit
+  set 0.5c above the ask fills only when the market comes to us, which is
+  adverse selection the table cannot see. Tightening it needs a fill model, and
+  the first post-restart signal is already `TRAIN no fill ... limit_unfilled`.
+* **`cross_train_bps` stays 15.** Swept: X>=10 is +0.0424, X>=15 is +0.0600,
+  X>=20 is +0.0393. 15 is the peak, and it is also the best hit rate.
+
+### Still open and not resolved by any of the above
+
+1. The contradiction with the n=321 coherent-favourite result (-0.0221 at the
+   ask) is STILL unreconciled. Two nearby trades, opposite signs.
+2. 76% of Train fires sit on rounds `cross_max_round_range_bps` refuses, and the
+   refused region was independently measured loser-dense. The arm overrides three
+   validated gates; that override was never re-justified at n=164.
+3. D was measured two ways and they disagree. From the in-memory feed semantics D
+   must be <=5.0s; walking `quotes` for the 41 live fills gives median 2.1s, p90
+   8.3s, max 25.8s, with NO monotone decay in the buckets (D>5 won 4/4). The two
+   resolutions are not the same series, so treat the live D distribution as
+   unmeasured until it is logged directly.
