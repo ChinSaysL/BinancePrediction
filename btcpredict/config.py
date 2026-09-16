@@ -1776,34 +1776,46 @@ class Settings(BaseSettings):
     #     1 - 2            8   50.0%   -3.39      18.45
     #     ALL             51   56.9%  -11.37     123.43
     #
-    # Bucketed in sigma instead of bps, the same fills split cleanly:
+    # Bucketed in sigma instead of bps, with the sign aligned to the side taken
+    # (an earlier pass bucketed the SIGNED gap, which silently dropped all 20
+    # Down trades -- 51 fills became 31, and every number below was Up-only):
     #
-    #     z              n    win     P&L
-    #     0 - 0.15      18   50.0%   -6.59
-    #     0.15 - 0.30    9   66.7%   +1.37
-    #     0.50 - 0.80    2  100.0%   +0.96
+    #   z band        n    win     mean_ask   fee      edge/sh    P&L
+    #   0 - 0.15     27   51.9%    0.6032   0.0098   -0.0945   -10.96   <- 54% of stake
+    #   0.15 - 0.30  13   69.2%    0.6228   0.0099   +0.0596    +3.52
+    #   0.30 - 0.50   4   25.0%    0.4978   0.0044   -0.2522    -2.70
+    #   >= 0.50       6   83.3%    0.8151   0.0033   +0.0149    -0.67
+    #   ALL          51   56.9%    0.6238   0.0088   -0.0640   -11.37
     #
-    # And the boundary lands in the same place on data that contains none of
-    # our trades -- 1,645 settled btc-5m rounds, true strikes, priced at a
-    # fixed tau=19s (independent of when the arm would have entered):
+    # THE ASK DOES NOT RESCUE THE SHALLOW BAND, which is the reconciliation this
+    # knob was held back for. At z<0.15 the win rate is 50.0% and the mean ask is
+    # 0.6013 -- break-even needs 0.50, so the shortfall is -0.1013/sh BEFORE fee.
+    # The cheapest fill in the band was 0.2812 and the dearest 0.7562; the mean
+    # carries no discount. And there is no sweet spot higher up either: at
+    # z>=0.50 the ask is 0.8151 and the edge +0.0149, i.e. deep crossings are
+    # priced CORRECTLY. The leak is overpaying for the shallow band, not a
+    # shortage of depth.
     #
-    #     gap -1 .. 1 bps  = z -0.40 .. +0.40   P(close Up)  53.4%
-    #     gap  1 .. 2 bps  = z +0.40 .. +0.80   P(close Up)  86.8%
-    #     gap  2 .. 4 bps  = z +0.80 .. +1.59   P(close Up)  95.0%
+    # ...AND FOR THAT REASON THIS KNOB DOES NOT FIX IT. The counterfactual is
+    # non-monotone, the same failure mode that killed the bps floor:
     #
-    # One honest conflict, recorded rather than resolved: the note above
-    # `cross_min_depth_ticks` re-measured the tick floor WITH the ask and found
-    # shallow crossings have MORE edge (+0.2311 at ask 0.558 vs +0.1771 at
-    # 0.686), which is why the floor was lowered 5.0 -> 1.0. That test's
-    # "shallow" is < 5 ticks = < $0.05, i.e. 0.0007 bps on BTC; this knob's
-    # band is 0 - 0.5 bps = $0 - $3.81, seventy-six times wider. They are not
-    # the same population and both can be true. Do not lower this one on the
-    # strength of that one until they are reconciled in the same unit.
+    #   floor z    kept  /day   P&L      P&L/fill
+    #   0 (LIVE)    50  16.67  -10.80   -0.2161
+    #   0.15        23   7.67   +0.16   +0.0068     <- the only positive cell
+    #   0.20        14   4.67   -2.11   -0.1509
+    #   0.25        11   3.67   -5.32   -0.4839
+    #   0.30        10   3.33   -3.37   -0.3366
+    #   0.40         8   2.67   -1.13   -0.1412
     #
-    # LEFT AT 0.0 (OFF) deliberately. z >= 0.4 keeps ~2-5 of 31 fills, so
-    # enabling it is a strategy change, not a bug fix; and the counterfactual
-    # is 3 days / one DB snapshot. The measurement above is what was missing,
-    # not the decision.
+    # 0.40 was recommended from the 1,645-round anchor and is REFUTED here. The
+    # two are not measuring the same object: the anchor priced a FIXED tau=19s,
+    # while the arm enters across tau=20-60s. Every band above the first holds
+    # n=4-13 over 3 days, so no threshold in this range is identifiable yet.
+    #
+    # Do not enable this on the strength of the mechanism alone. The mechanism is
+    # settled (a ~0-gap crossing is a coin flip bought at 0.6); the THRESHOLD is
+    # not. If it is enabled, 0.15 is the only value this data supports, and its
+    # measured value is +0.0068/fill -- indistinguishable from zero.
     cross_min_depth_sigma: float = 0.0
     cross_reentry_gap_s: float = 1.0
     cross_max_round_stake_mult: float = 2.0
