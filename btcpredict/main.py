@@ -140,6 +140,18 @@ def pool_for_mode(mode: str | None) -> tuple[bool, str | None]:
     return False, None
 
 
+def arm_of(sig) -> str:
+    """The UPPERCASE arm label for a signal, for lines shared by both arms.
+
+    The Train arm is the only one whose `reason` names it ("train into ...",
+    "train cooldown ..."), so that string is the discriminator. Both arms send
+    their orders through `_place_order`, so without this the retry, decline and
+    no-fill lines read identically whichever arm produced them, as did OPEN.
+    """
+    return ("TRAIN" if str(getattr(sig, "reason", "")).startswith("train")
+            else "CROSS")
+
+
 def crossed_side(ticks, strike: float, look_s: float,
                  slack_s: float = 2.0) -> str | None:
     """Which side did the spot just cross INTO, or None if it did not.
@@ -1335,8 +1347,7 @@ class Bot:
         # fabricated zero, the same class of lie as the -1.0 sentinel. All 658
         # OPEN lines were indistinguishable between the two arms. No tool parses
         # this line (checked), so the prefix is safe to extend.
-        arm = ("TRAIN" if str(getattr(sig, "reason", "")).startswith("train")
-               else "CROSS")
+        arm = arm_of(sig)
         log.info("OPEN %s %s %s stake=$%.2f @%.3f | %s | mkt_iv=%s realised=%.5f "
                  "| ev/$ gate->fill %s -> %s",
                  arm, r.slug, fill.side, fill.stake, fill.filled_px, sig,
@@ -1649,7 +1660,8 @@ class Bot:
         return True
 
     def _cross_refuse(self, r, side, reason: str, *, tau: float = 0.0,
-                      spot=None, stake: float = 0.0, sigma=None) -> None:
+                      spot=None, stake: float = 0.0, sigma=None,
+                      arm: str | None = None) -> None:
         """Record a cross trigger that was DETECTED and then refused.
 
         Two problems this fixes, both found on 2026-09-14 while reconstructing
@@ -1687,7 +1699,17 @@ class Bot:
         if reason in bucket:
             return
         bucket.add(reason)
-        log.info("cross %s %s not taken: %s", r.slug, side, reason)
+        # WHICH ARM REFUSED. This method is shared by both arms, and `train` is a
+        # local in the caller that cannot be read from here. The Train arm's own
+        # refusal messages name it ("train cooldown ...", "train ask ... above
+        # the gate"); every other refusal reaching this path is the Cross arm's.
+        # The word "cross" used to be stamped on ALL of them -- 846 log lines
+        # and every row in decisions.reason -- so a refused Train trigger was
+        # indistinguishable from a refused Cross one in either record. Callers
+        # that can name the arm outright should pass it, not rely on the text.
+        if arm is None:
+            arm = "train" if "train" in (reason or "") else "cross"
+        log.info("%s %s %s not taken: %s", arm, r.slug, side, reason)
         # Record what the book showed at the refusal. A refusal is the only
         # clean read of "the venue had not repriced yet" that arrives without
         # an order, and the row used to carry quote=None -- which threw that
@@ -1700,9 +1722,7 @@ class Bot:
             if wsb is not None:
                 top = wsb.best(r.market_id, settings.ws_book_max_age_s)
                 quote = top.ask(side) if top is not None else None
-        self._schedule_cross_meter(r, side, "refuse",
-                                   label=("train" if "train" in (reason or "")
-                                          else "cross"))
+        self._schedule_cross_meter(r, side, "refuse", label=arm)
         with contextlib.suppress(Exception):
             self.store.insert("decisions", {
                 "slug": r.slug, "ts_ms": int(time.time() * 1000), "tau_s": tau,
@@ -1713,7 +1733,7 @@ class Bot:
                 "sigma_1m": (sigma if sigma is not None
                              else getattr(self, "_sigma", 0.0)),
                 "spot": spot, "oracle": None, "strike": r.strike,
-                "stake": stake, "acted": 0, "reason": f"cross refused: {reason}",
+                "stake": stake, "acted": 0, "reason": f"{arm} refused: {reason}",
             })
 
     def _schedule_cross_meter(self, r, side, kind: str = "trigger",
@@ -2089,7 +2109,7 @@ class Bot:
                     self._cross_refuse(
                         r, "Up" if dist_bps > 0 else "Down",
                         f"train cooldown {cd:.0f}s: one entry per burst",
-                        tau=tau, spot=feed.price)
+                        tau=tau, spot=feed.price, arm="train")
                 else:
                     # Stamped on the SIGNAL, before any later gate, so a refused
                     # order cannot let the same move be re-attempted family by
@@ -3213,7 +3233,8 @@ class Bot:
                 # passed check that had never run: 198 `pre-trade check ok ...
                 # ev/$=-1.0000` lines, which were read as "an EV gate approved
                 # this trade at -1.0". Nothing had approved anything.
-                log.info("pre-trade check %s: px=%.3f fee=%dbps ev/$=%s",
+                log.info("%s pre-trade check %s: px=%.3f fee=%dbps ev/$=%s",
+                         arm_of(sig),
                          "BYPASSED(skip_pretrade_gates)" if skip_pretrade_gates
                          else "ok",
                          real_px, int(real_fee * 10_000),
@@ -3365,15 +3386,18 @@ class Bot:
             # while the log said "attempt 1/3; not retrying": the operator's
             # "retry doesn't work" report, 2026-09-15.
             if reason == "quote_above_ceiling":
-                log.info("attempt %d/%d declined: quote above the ceiling "
-                         "(price left the band)", attempt + 1, attempts)
+                log.info("%s attempt %d/%d declined: quote above the ceiling "
+                         "(price left the band)", arm_of(sig), attempt + 1,
+                         attempts)
                 continue
             if reason not in RETRYABLE_FAILURES:
-                log.error("order failed for %s %s (%s); not retrying",
-                          r.slug, sig.side, reason or "outcome unknown")
+                log.error("%s order failed for %s %s (%s); not retrying",
+                          arm_of(sig), r.slug, sig.side,
+                          reason or "outcome unknown")
                 break
-            log.warning("order attempt %d/%d failed for %s %s (%s)",
-                        attempt + 1, attempts, r.slug, sig.side, reason)
+            log.warning("%s order attempt %d/%d failed for %s %s (%s)",
+                        arm_of(sig), attempt + 1, attempts, r.slug, sig.side,
+                        reason)
 
         if not fill:
             # Back off rather than re-firing every tick: a rejection that
@@ -3400,14 +3424,14 @@ class Bot:
                            "quote_unfillable", "quote_stale",
                            "quote_price_missing"}
             if getattr(self.broker, "last_failure", None) in no_cooldown:
-                log.info("no fill for %s %s: %s (not a venue failure; "
-                         "no cooldown)", r.slug, sig.side,
+                log.info("%s no fill for %s %s: %s (not a venue failure; "
+                         "no cooldown)", arm_of(sig), r.slug, sig.side,
                          self.broker.last_failure)
                 return fill
             self._order_cooldown_until = time.time() + settings.order_cooldown_s
-            log.warning("order failed for %s %s after %d attempt(s); "
-                        "pausing orders for %.0fs",
-                        r.slug, sig.side, attempt + 1, settings.order_cooldown_s)
+            log.warning("%s order failed for %s %s after %d attempt(s); "
+                        "pausing orders for %.0fs", arm_of(sig), r.slug, sig.side,
+                        attempt + 1, settings.order_cooldown_s)
         return fill
 
     # -- settlement ---------------------------------------------------------
