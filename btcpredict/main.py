@@ -3371,7 +3371,9 @@ class Bot:
             # over the ceiling, we correctly declined, and that refusal then
             # paused every family for 30s. Declining a bad price has to be free,
             # or the ceiling that protects the arm silently throttles it.
-            no_cooldown = {"limit_unfilled", "quote_above_ceiling"}
+            no_cooldown = {"limit_unfilled", "quote_above_ceiling",
+                           "quote_unfillable", "quote_stale",
+                           "quote_price_missing"}
             if getattr(self.broker, "last_failure", None) in no_cooldown:
                 log.info("no fill for %s %s: %s (not a venue failure; "
                          "no cooldown)", r.slug, sig.side,

@@ -105,3 +105,50 @@ def test_the_venue_maximum_is_respected():
 def test_room_is_positive_over_the_normal_range():
     assert derived_slip_bps(200, 0.60, 0.58) == 344
     assert derived_slip_bps(200, 0.52, 0.50) == 400
+
+
+class TestQuoteViability:
+    """A quote that cannot reach the ceiling must never become an order.
+
+    Measured live 2026-09-15/16 over 112 attempts: 7 (6.25%) were PROVABLY
+    unfillable -- `quote * 2 < ceiling`, because the venue anchors the FOK bound
+    to the quote and caps slippage at 10000bps, i.e. 2x the quote, for every
+    client. Every one of the 7 carried `slip 10000`, which is the clamp showing
+    its work:
+        quote 0.0696 -> x2 = 0.1392 against a ceiling of 0.650
+        quote 0.0400 -> x2 = 0.0800 against a ceiling of 0.190
+    Those are not market rejections. They are dead on arrival, signed by us, and
+    recorded against the canary as if the market had refused them.
+
+    A further 42 of 112 (38%) were merely STALE -- far enough below the ceiling
+    that the slippage has to run at or near maximum, anchoring the order to a
+    price the venue no longer has.
+    """
+
+    from btcpredict.execution.live import quote_is_unusable as _q
+    _bad = staticmethod(_q)      # staticmethod: `self._bad` must not bind self
+
+    def test_the_measured_unfillable_case_is_caught(self):
+        why = self._bad(0.0696, 0.65)
+        assert why and why.startswith("quote_unfillable"), why
+
+    def test_the_measured_stale_case_is_caught(self):
+        # Their example: 0.30 x2 = 0.60 >= 0.58 so the 2x math passes, but the
+        # quote is 28c below the tape and would force maximum slippage.
+        why = self._bad(0.30, 0.58)
+        assert why and why.startswith("quote_stale"), why
+
+    def test_a_healthy_quote_passes(self):
+        assert self._bad(0.64, 0.65) is None
+
+    def test_the_gate_uses_the_VENUE_max_not_ours(self):
+        # 2q == ceiling exactly is still reachable; one tick under is not.
+        assert self._bad(0.05, 0.10) is None          # 2q = 0.10, drop = 0.05
+        assert self._bad(0.049, 0.10) is not None
+
+    def test_a_quote_ABOVE_the_ceiling_is_left_to_the_existing_gate(self):
+        # `quote_above_ceiling` already refuses it; this gate must not shadow it
+        assert self._bad(0.70, 0.65) is None
+
+    def test_no_ceiling_disables_the_gate(self):
+        assert self._bad(0.01, None) is None

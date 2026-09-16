@@ -94,6 +94,53 @@ def derived_slip_bps(default_bps: int, max_px: float | None,
     return max(1, min(room, 10_000))
 
 
+# The venue anchors the FOK bound to the QUOTE and caps `slippageBps` at 10000,
+# so `bound <= quote * 2` FOR EVERY CLIENT. A quote whose 2x cannot reach our
+# ceiling therefore cannot fill -- not slowly, not at any latency. It is dead
+# when it is signed, and it is signable from our side, which makes it a
+# protocol error rather than a strategy outcome.
+_VENUE_MAX_SLIP_BPS = 10_000
+# A quote this far BELOW the ceiling is anchoring the order to liquidity that
+# is gone. Measured 2026-09-16 over 112 live attempts: 42 (38%) were more than
+# 5c displaced, and the rejects they produced were recorded as market
+# rejections -- polluting the very canary that exists to measure the market.
+_STALE_QUOTE_MAX_DROP = 0.05
+
+
+def quote_is_unusable(avg_px: float, max_px: float | None) -> str | None:
+    """Why this quote cannot produce a fillable order, or None if it can.
+
+    Two distinct defects, both measured live on 2026-09-15/16:
+
+      UNFILLABLE  `quote * 2 < ceiling`. 7 of 112 attempts. Every one carried
+                  `slip 10000` -- the venue's own maximum -- because the clamp
+                  is what makes the bound unreachable:
+                      quote 0.0696 (x2 = 0.1392) against a ceiling of 0.650
+                      quote 0.0400 (x2 = 0.0800) against a ceiling of 0.190
+                  The order cannot fill above 0.1392 while the market is 0.64.
+
+      STALE       The quote sits more than `_STALE_QUOTE_MAX_DROP` below the
+                  ceiling. It may still be fillable in principle, but the
+                  slippage has to run at or near maximum, so the order is
+                  anchored to a price the venue no longer has.
+
+    Both are answered the same way and it is cheap: discard the quote and take
+    a fresh one. `get_quote` measures ~43ms, and the rejected branch had a 100%
+    failure rate, so the round trip costs nothing that was not already lost.
+    """
+    if avg_px <= 0:
+        return "quote_price_missing"
+    if max_px is None:
+        return None
+    if avg_px * (1.0 + _VENUE_MAX_SLIP_BPS / 10_000.0) < max_px:
+        return (f"quote_unfillable: quote {avg_px:.4f} x2 = {avg_px * 2:.4f} "
+                f"cannot reach the ceiling {max_px:.4f}")
+    if (max_px - avg_px) > _STALE_QUOTE_MAX_DROP:
+        return (f"quote_stale: quote {avg_px:.4f} is "
+                f"{max_px - avg_px:.4f} below the ceiling {max_px:.4f}")
+    return None
+
+
 def amount_usdt(x: str | int | float | None) -> float:
     """An order-record amount as USDT.
 
@@ -607,11 +654,30 @@ class LiveBroker:
         # A quote may be supplied by the caller (the pre-trade recheck already
         # fetched one). Using it avoids a second round trip that eats into the
         # quote's ~5s expireAt window -- the dominant cause of FOK failures.
-        if quote is None:
-            quote = await self.get_quote(token_id, stake)
-        if not quote or not quote.get("quoteId"):
-            self.last_failure = "no_quote"
-            log.error("no quote for %s %s stake=%.2f", slug, side, stake)
+        # ---- QUOTE VIABILITY, BEFORE ANY ORDER EXISTS -----------------------
+        # The caller may hand us a pre-fetched (WARM) quote to save a round
+        # trip. That saves real time, but a stale one is NOT harmless: the
+        # venue anchors the FOK bound to this quote, so a quote that has
+        # drifted is an order that cannot fill. Discard it and re-fetch rather
+        # than sign a dead order -- see `quote_is_unusable` for the two classes
+        # measured live on 2026-09-15/16, and note that 7 of 112 attempts were
+        # PROVABLY unfillable, every one carrying slip 10000.
+        for _attempt in (0, 1):
+            if quote is None:
+                quote = await self.get_quote(token_id, stake)
+            if not quote or not quote.get("quoteId"):
+                self.last_failure = "no_quote"
+                log.error("no quote for %s %s stake=%.2f", slug, side, stake)
+                return None
+            why = quote_is_unusable(
+                float(quote.get("averagePrice") or price), max_px)
+            if why is None:
+                break
+            log.warning("%s %s: discarding quote (%s); re-quoting",
+                        slug, side, why)
+            self.last_failure = why.split(":")[0]
+            quote = None
+        else:
             return None
 
         shares_gross = from_wei(quote.get("amountOut"))

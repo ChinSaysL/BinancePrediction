@@ -3221,8 +3221,13 @@ class TestTheFOKToleranceTracksTheCeiling:
         return sent
 
     def test_the_tolerance_is_the_room_up_to_the_ceiling(self):
-        s = self._sent(avg_px=0.394, max_px=0.47)
-        # (0.47 / 0.394 - 1) = 19.3%
+        # INPUTS CHANGED 2026-09-16. This used 0.394 against a 0.47 ceiling,
+        # which is 7.6c of displacement and is now (correctly) discarded as a
+        # stale quote before it can reach the venue -- so it was measuring the
+        # gate, not the tolerance. These inputs keep the same 19.3% of room
+        # while staying inside the 5c displacement the gate tolerates.
+        s = self._sent(avg_px=0.25, max_px=0.2982)
+        # (0.2982 / 0.25 - 1) = 19.28%
         assert s.get("slippageBps") == pytest.approx(1928, abs=5), (
             f"the FOK must be allowed to reach the ceiling; got {s.get('slippageBps')}")
 
@@ -3260,9 +3265,53 @@ class TestTheFOKToleranceTracksTheCeiling:
         the OpenAPI schema types `slippageBps` on both trade/get-quote and
         trade/place-order-bundle as an integer, "Range 1-10000". Asking for
         more leaves the documented range -- and the old 9_000 gave away
-        1000bps of headroom the venue permits."""
-        s = self._sent(avg_px=0.02, max_px=0.65)      # room = 315_000bps
+        1000bps of headroom the venue permits.
+
+        REACHABILITY NOTED 2026-09-16. Room above 10000bps means
+        `avg_px * 2 < max_px` -- which is precisely the condition
+        `quote_is_unusable` now rejects, because it cannot fill. So the CLAMP
+        is no longer reachable through `buy` and is asserted on the pure
+        function; the boundary (room of exactly 10000, which is reachable) is
+        asserted end to end through `buy` to prove the value still lands on
+        the wire.
+        """
+        import btcpredict.execution.live as live
+        assert live.derived_slip_bps(300, 0.65, 0.02) == 10_000   # room 315_000
+        s = self._sent(avg_px=0.05, max_px=0.10)                   # room exactly 10000
         assert s.get("slippageBps") == 10_000
+
+    def test_a_stale_quote_is_discarded_and_re_quoted(self):
+        """The other half of the fix. The warm quote is a latency
+        optimisation, not a commitment: 42 of 112 live attempts (38%) carried a
+        quote more than 5c below the ceiling, i.e. an order anchored to a price
+        the venue no longer had. Discarding it costs one ~43ms round trip and
+        replaces a branch whose failure rate was 65%.
+        """
+        import btcpredict.execution.live as live
+
+        b = live.LiveBroker(None, "k", "s", wallet_address="w", wallet_id="1",
+                            slippage_bps=300)
+        sent, asked = {}, []
+        prices = iter([0.30, 0.64])        # stale, then healthy
+
+        async def quote(*a, **kw):
+            px = next(prices)
+            asked.append(px)
+            return {"quoteId": "q", "averagePrice": px, "expireAt": 0,
+                    "amountOut": str(10 * 10**18), "feeAmount": "0"}
+
+        async def request(method, path, params=None):
+            if path.endswith("place-order-bundle"):
+                sent.update(params or {})
+            return None
+
+        b.get_quote = quote
+        b._request = request
+        asyncio.run(b.buy(slug="s", side="Down", token_id="t",
+                          price=0.64, stake=1.0, max_px=0.65))
+        assert asked == [0.30, 0.64], asked
+        assert sent, "the healthy second quote must reach the venue"
+        assert sent.get("slippageBps") == live.derived_slip_bps(300, 0.65, 0.64)
 
     def test_no_ceiling_means_the_configured_default(self):
         import btcpredict.execution.live as live
