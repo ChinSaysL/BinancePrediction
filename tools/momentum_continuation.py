@@ -80,6 +80,11 @@ def main():
                     help="tau at the BREAKOUT must be >= this (Train spec: 60)")
     ap.add_argument("--max-ask", type=float, default=0.98,
                     help="fire only if the coherent ask is <= this")
+    ap.add_argument("--min-ask", type=float, default=0.0,
+                    help="fire only if the coherent ask is >= this. Pair with "
+                         "--max-ask to slice a PRICE BAND: --max-ask is a CAP, "
+                         "not a target, so a bucket's mean px can sit far below "
+                         "its ceiling and mask a negative tail inside it.")
     ap.add_argument("--max-range-bps", type=float, default=0.0,
                     help="skip entries where the round has ALREADY travelled more "
                          "than this, open->entry. 0 = off. The cross arm ships "
@@ -137,7 +142,7 @@ def main():
         ask = ua if side == "Up" else da
         if not ask or ask <= 0.02 or ask >= 0.98:
             return None
-        if ask > args.max_ask:
+        if ask > args.max_ask or ask < args.min_ask:
             return None
         if args.coherent:
             bid = ub if side == "Up" else db

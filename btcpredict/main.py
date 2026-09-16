@@ -3192,8 +3192,22 @@ class Bot:
                              r.slug, sig.side, real_px, int(real_fee * 10_000),
                              recheck.reason)
                     return
-                log.info("pre-trade check ok: px=%.3f fee=%dbps ev/$=%+.4f",
-                         real_px, int(real_fee * 10_000), recheck.ev_per_dollar)
+                # Two different things happen here and the old line reported
+                # only one of them. This statement is a SIBLING of the refusal
+                # above, not a child of it, so it printed "pre-trade check ok"
+                # even when `skip_pretrade_gates` short-circuited that refusal
+                # -- which is every live order path (main.py:1260, :2694,
+                # :2896). The recheck was still computed eagerly and its
+                # degenerate EV was still formatted, so the log asserted a
+                # passed check that had never run: 198 `pre-trade check ok ...
+                # ev/$=-1.0000` lines, which were read as "an EV gate approved
+                # this trade at -1.0". Nothing had approved anything.
+                log.info("pre-trade check %s: px=%.3f fee=%dbps ev/$=%s",
+                         "BYPASSED(skip_pretrade_gates)" if skip_pretrade_gates
+                         else "ok",
+                         real_px, int(real_fee * 10_000),
+                         f"{recheck.ev_per_dollar:+.4f}" if recheck.ev_valid
+                         else "n/a (quote outside the priced band)")
 
             # Re-gate at execution time. The decision fired inside the open window,
             # but the live quote recheck above costs a second or two of round trip

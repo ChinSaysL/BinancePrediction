@@ -67,24 +67,38 @@ class Signal:
     quote: float              # market price for that side
     edge: float               # fair - quote
     hurdle: float             # what edge had to beat
-    ev_per_dollar: float      # expected profit per $1 staked
+    ev_per_dollar: float      # expected profit per $1 staked; NaN if not priced
     act: bool
     reason: str
     fair_up_model: float | None = None  # raw P(Up) that produced it (rechecks)
+    # False when ev_per_dollar is NaN because nothing could be priced. The value
+    # is not a return then, and must not be logged, compared or stored as one.
+    ev_valid: bool = True
 
     def __str__(self) -> str:
         if not self.act:
             return f"NO-TRADE ({self.reason})"
+        ev = f"{self.ev_per_dollar:+.4f}" if self.ev_valid else "n/a"
         return (f"{self.side} fair={self.fair:.3f} quote={self.quote:.3f} "
                 f"edge={self.edge:+.3f} hurdle={self.hurdle:.3f} "
-                f"ev/$={self.ev_per_dollar:+.4f}")
+                f"ev/$={ev}")
 
 
 def expected_value(p: float, q: float, fee: float,
                    model: FeeModel = FeeModel.NOTIONAL) -> float:
-    """Expected profit per $1 staked. Negative means the bet loses money."""
+    """Expected profit per $1 staked. Negative means the bet loses money.
+
+    An out-of-range quote returns NaN, NOT -1.0. The old -1.0 sentinel was
+    indistinguishable from a genuine "-100% per dollar" outcome -- and it was
+    read exactly that way, from this repo's own log: 198
+    `pre-trade check ok ... ev/$=-1.0000` lines were taken as evidence that an
+    EV gate had approved a -1.0 trade. It had not; the value only ever meant
+    "no priceable quote". NaN also fails every `>`/`<` comparison an EV gate
+    performs, so a degenerate value cannot pass one by accident. Callers that
+    need to tell the two apart must consult `Signal.ev_valid`.
+    """
     if not 0.0 < q < 1.0:
-        return -1.0
+        return float("nan")
     if model is FeeModel.NOTIONAL:
         return p / q - 1.0 - fee
     return p * (1.0 / q - 1.0) * (1.0 - fee) - (1.0 - p)
@@ -149,8 +163,8 @@ def evaluate(
         candidates.append((ev, side, p, q, hurdle))
 
     if not candidates:
-        return Signal(None, fair_up, quote_up, 0.0, 0.0, -1.0, False,
-                      "no valid quote", fair_up_model=fair_up)
+        return Signal(None, fair_up, quote_up, 0.0, 0.0, float("nan"), False,
+                      "no valid quote", fair_up_model=fair_up, ev_valid=False)
 
     # Refuse deep favourites. At q=0.98 a $1 bet wins $0.02 and needs ~98.6%
     # accuracy to break even, but measured reliability in the top bucket was
@@ -162,9 +176,9 @@ def evaluate(
     if not candidates:
         q = min(c[3] for c in priced_out)
         side = "above max_quote" if q > max_quote else "below min_quote"
-        return Signal(None, fair_up, quote_up, 0.0, 0.0, -1.0, False,
+        return Signal(None, fair_up, quote_up, 0.0, 0.0, float("nan"), False,
                       f"quote {q:.2f} {side} [{min_quote:.2f},{max_quote:.2f}]",
-                      fair_up_model=fair_up)
+                      fair_up_model=fair_up, ev_valid=False)
 
     ev, side, p, q, hurdle = max(candidates, key=lambda c: c[0])
     edge = p - q
@@ -176,6 +190,16 @@ def evaluate(
     )
     return Signal(side, p, q, edge, hurdle, ev, act, reason,
                   fair_up_model=fair_up)
+
+
+def _ev_key(sig: Signal) -> float:
+    """Sort key for EV that puts an invalid (NaN) EV below every real one.
+
+    NaN is unordered, so `>=` against it is False in BOTH directions and the
+    winner of a tie-break becomes an accident of argument order. This makes the
+    ordering total and explicit.
+    """
+    return sig.ev_per_dollar if sig.ev_valid else float("-inf")
 
 
 def evaluate_hybrid(fair_up_down_model: float, fair_up_up_model: float,
@@ -205,8 +229,7 @@ def evaluate_hybrid(fair_up_down_model: float, fair_up_up_model: float,
     if up_sig.act and up_sig.side == "Up":
         cands.append(up_sig)
     if not cands:
-        best = (down_sig if down_sig.ev_per_dollar >= up_sig.ev_per_dollar
-                else up_sig)
+        best = (down_sig if _ev_key(down_sig) >= _ev_key(up_sig) else up_sig)
         # `best` may have acted, but on the side its own model does not price
         # here (the down model's Up call, the up model's Down call), so the
         # per-side rule discards it. Say that explicitly: reusing the discarded
@@ -216,7 +239,7 @@ def evaluate_hybrid(fair_up_down_model: float, fair_up_up_model: float,
                   if best.act else best.reason)
         return Signal(None, best.fair, best.quote, best.edge, best.hurdle,
                       best.ev_per_dollar, False, reason)
-    return max(cands, key=lambda s: s.ev_per_dollar)
+    return max(cands, key=_ev_key)
 
 
 def take_limit_px(fair_side: float, margin: float, quote: float | None,
