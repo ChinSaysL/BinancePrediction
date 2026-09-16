@@ -31,7 +31,7 @@ from btcpredict.config import (CROSS_TRADED, MARKETS, cross_knob,
 from btcpredict.edge.signal import (FeeModel, Signal, evaluate,
                                     evaluate_hybrid, expected_value,
                                     fee_rate_for_price, impulse_price_refusal,
-                                    kelly_stake, take_limit_px,
+                                    kelly_stake, limit_post_px, take_limit_px,
                                     stake_for_edge, stake_for_fraction,
                                     tilt_factor)
 from btcpredict.execution.base import Fill
@@ -3341,8 +3341,10 @@ class Bot:
                         # `limit_ceiling` replaces that clamp with an explicit
                         # one. It is a RISK bound, not a valuation: above it the
                         # cell measures negative, so the order simply refuses.
-                        limit_px = max(limit_px,
-                                       min(round(limit_ceiling, 2), 0.99))
+                        # That makes it a bound in BOTH directions -- see
+                        # `limit_post_px`, which is where the upper side is
+                        # enforced (a bare max() posts through the cap).
+                        limit_px = limit_post_px(limit_px, limit_ceiling)
                 # Never rest past the bell: the cross fires 3-60s before it, and
                 # the configured 20s would outlive the round.
                 #
@@ -3372,8 +3374,15 @@ class Bot:
                 # the earlier assignment. This raises it where nothing can gate
                 # it: immediately before the POST. It is a no-op for the model
                 # arm, which passes limit_ceiling=None.
+                #
+                # `limit_post_px`, not a bare max(): the ceiling is
+                # `min(ask + buffer, cross_max_fill_px)`, so when the ask is
+                # above the cap the value from `take_limit_px` is already
+                # higher than the ceiling and max() posts it through the cap.
+                # The market branch clamps with min() and the venue enforces
+                # it; this makes the limit path agree.
                 if limit_ceiling is not None:
-                    limit_px = max(limit_px, min(round(limit_ceiling, 2), 0.99))
+                    limit_px = limit_post_px(limit_px, limit_ceiling)
                     log.info("limit post %s %s %s: %.2f (ceiling %.2f, quote "
                              "%s, take_px %s, wait cap %.1fs)", arm_of(sig),
                              r.slug, sig.side, limit_px, limit_ceiling,

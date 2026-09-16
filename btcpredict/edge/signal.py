@@ -279,6 +279,41 @@ def take_limit_px(fair_side: float, margin: float, quote: float | None,
     return max(0.01, limit)
 
 
+def limit_post_px(limit_px: float, limit_ceiling: float | None) -> float:
+    """The price to POST, given the computed take price and the cross ceiling.
+
+    The cross `limit_ceiling` is a bound in BOTH directions, and the UPPER one
+    is the one that bites, because it is already
+    `min(ask + cross_limit_buffer, cross_max_fill_px)`. `take_limit_px` returns
+    about the ask, so above the cap its value is already HIGHER than the
+    ceiling -- and `max(limit_px, ceiling)` posts that higher value straight
+    through the arm's own hard price cap.
+
+    Measured on the live config (cap 0.65, buffer 0.02), ask -> take_limit_px
+    -> what `max()` would post:
+
+        0.66 -> 0.66 -> 0.66    ]
+        0.70 -> 0.70 -> 0.70    ]  every one of these is ABOVE the 0.65 cap the
+        0.80 -> 0.80 -> 0.80    ]  MARKET branch enforces through `max_px`
+        0.88 -> 0.88 -> 0.88    ]
+
+    And that is the cohort that fills BEST (a ceiling above the cap fills 60%
+    against 21.5% below it on 208 recorded cross attempts), so the leak would
+    have been frequent rather than theoretical.
+
+    Staying at the ceiling is the correct behaviour in both directions: when
+    the cap is not binding the post sits `buffer` above the ask and crosses;
+    when it IS binding the post sits below the ask and simply rests, which is
+    the documented intent -- `limit_ceiling` is a RISK bound, not a valuation,
+    and above it the cell measures negative.
+
+    `limit_ceiling=None` (the model arm) returns `limit_px` unchanged.
+    """
+    if limit_ceiling is None:
+        return max(0.01, limit_px)
+    return max(0.01, min(round(limit_ceiling, 2), 0.99))
+
+
 def impulse_price_refusal(entry_mode: str, real_px: float | None,
                           cap: float) -> str | None:
     """Why an impulse order must not be placed at THIS price, or None to go.
