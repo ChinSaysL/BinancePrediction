@@ -39,30 +39,48 @@ def _ticks(*specs):
     return [(now - ago, px) for ago, px in specs]
 
 
-def test_age_is_measured_from_the_start_of_the_current_run():
+def test_age_is_the_time_since_the_last_IN_BAND_sample():
     bot = _bot(_ticks((4000, 100.00), (900, 100.00), (800, 100.20), (0, 100.25)))
     age = bot._train_age_ms(_round(), THR)
     assert age is not None
-    assert 780 <= age <= 900, age
+    assert 860 <= age <= 1000, age
 
 
-def test_a_run_that_reaches_the_buffer_start_is_unknown_not_zero():
-    """Fail closed, like the gate. A truncated buffer cannot date the crossing."""
+def test_THE_PRODUCTION_FAILURE_newest_sample_in_band_but_price_already_out():
+    """REGRESSION: this returned None on EVERY live fire.
+
+    `self._ticks` is appended once per poll (~1 Hz), so at a fire the newest
+    SAMPLE is usually still inside the threshold -- that sample is exactly what
+    makes `_train_is_fresh` pass -- while `feed.price` has already moved out.
+    Anchoring on a run of above-threshold samples finds no run and returns None,
+    which is what shipped: every TRAIN reason was written with no D at all.
+    """
+    # NO sample in the buffer is out-of-band: the poll simply has not caught up
+    # with a price that `feed.price` already reports as far outside.
+    bot = _bot(_ticks((2000, 100.05), (900, 99.98)))
+    age = bot._train_age_ms(_round(), THR)
+    assert age is not None, "must date the excursion, not bail"
+    assert 860 <= age <= 1000, age
+
+
+def test_a_buffer_with_no_in_band_sample_is_unknown_not_zero():
+    """Fail closed, like the gate: nothing below the threshold to anchor on."""
     bot = _bot(_ticks((3000, 100.20), (2000, 100.25), (1000, 100.30), (0, 100.35)))
     assert bot._train_age_ms(_round(), THR) is None
 
 
-def test_a_wick_below_restarts_the_run():
-    """The age is the CURRENT excursion, not the oldest time we were far away."""
-    bot = _bot(_ticks((5000, 100.20), (3000, 100.00),
-                      (1000, 100.20), (0, 100.25)))
+def test_a_wick_back_inside_resets_the_anchor():
+    """The anchor is the MOST RECENT in-band sample, not the oldest one."""
+    bot = _bot(_ticks((5000, 100.25), (3000, 100.00),
+                      (1000, 100.25), (0, 100.30)))
     age = bot._train_age_ms(_round(), THR)
-    assert age is not None and 950 <= age <= 1100, age
+    assert age is not None and 2800 <= age <= 3200, age
 
 
-def test_inside_the_threshold_is_not_a_run():
+def test_a_sample_inside_the_threshold_right_now_reads_as_zero():
     bot = _bot(_ticks((2000, 100.05), (1000, 100.08), (0, 100.10)))
-    assert bot._train_age_ms(_round(), THR) is None
+    age = bot._train_age_ms(_round(), THR)
+    assert age is not None and age <= 50, age
 
 
 def test_degenerate_inputs_return_none():
@@ -78,11 +96,11 @@ def test_degenerate_inputs_return_none():
 def test_a_logged_age_can_never_exceed_the_gate_that_passed():
     """THE INVARIANT THAT MAKES THIS SAFE TO LOG.
 
-    `_train_is_fresh` is the stricter, window-edge test: it requires the OLDEST
-    sample in the window to be below the threshold, which forces the crossing to
-    sit inside the window. So whenever the gate passes, the age must be <= the
-    window -- otherwise the logged D would appear to contradict a gate the
-    trigger had already cleared, and the number would be worse than no number.
+    `_train_is_fresh` is the window-edge test: it requires the OLDEST sample in
+    the window to be in-band, which forces the anchor to sit inside the window.
+    So whenever the gate passes, the age must be <= the window -- otherwise the
+    logged D would appear to contradict a gate the trigger had already cleared,
+    and the number would be worse than no number.
     """
     fresh_s = 1.0
     for crossing_ms_ago in (100, 400, 800, 950):
