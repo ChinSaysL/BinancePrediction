@@ -2046,6 +2046,28 @@ class Bot:
         if not isinstance(getattr(self, "_cross_side", None), dict):
             self._cross_side = {}
         if self._cross_fired.get(r.slug, 0) >= self._ck("max_per_round", r):
+            # SILENT BY DEFAULT, and that is a measurement blind spot. A
+            # slot-blocked tick returns before anything is logged OR written to
+            # `decisions`, so every crossing a round's cap rejects is absent
+            # from the record: a log-derived fire count is a count of UNBLOCKED
+            # fires, and the cap's cost cannot be measured from it at all. The
+            # 3b92a87 note records the same silence hiding a whole cross window
+            # on 2026-09-15 -- four consecutive train NO FILLs locked the slot
+            # and the cross arm was silent on all four.
+            #
+            # Log the FIRST block per round only. The arm ticks ~7/s and a
+            # blocked round can produce hundreds of these, so logging each one
+            # would bury the log it is meant to make honest.
+            blocked = getattr(self, "_cross_blocked", None)
+            if not isinstance(blocked, set):
+                blocked = self._cross_blocked = set()
+            if r.slug not in blocked:
+                blocked.add(r.slug)
+                log.info("cross %s: %d already fired this round (cap %d); this "
+                         "crossing is DROPPED and appears nowhere else -- "
+                         "further blocks this round are not logged",
+                         r.slug, self._cross_fired.get(r.slug, 0),
+                         self._ck("max_per_round", r))
             return
         # Keep every LIVE round, not just this one. Pruning to `r.slug` was
         # correct with a single family and is a bug with six: each family's call
@@ -2055,6 +2077,8 @@ class Bot:
                 if c.get("round") is not None} | {r.slug}
         self._cross_fired = {k: v for k, v in self._cross_fired.items() if k in live}
         self._cross_side = {k: v for k, v in self._cross_side.items() if k in live}
+        self._cross_blocked = {k for k in getattr(self, "_cross_blocked", set())
+                               if k in live}
         now_ms = int(time.time() * 1000)
         tau = r.tau_s(now_ms)
         # ---- TRAIN TRIGGER (config.cross_train_*) --------------------------
