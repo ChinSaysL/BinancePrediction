@@ -1621,6 +1621,57 @@ class Bot:
         oldest = min(recent, key=lambda s: s[0])[1]
         return abs(1e4 * (oldest - r.strike) / r.strike) < thr_bps
 
+    def _train_age_ms(self, r, thr_bps: float) -> int | None:
+        """Milliseconds since the spot crossed `thr_bps` from the strike.
+
+        This IS the D the whole edge turns on: the sweep measures hit 94.9% at
+        D=0 decaying to 83.7% by D=5s, and `fresh_s` is nothing but the D gate.
+        D used to be RECONSTRUCTED after the fact from the `quotes` table, and
+        that reconstruction is known to disagree with the gate -- walking the
+        live train fills gave median 2.1s, p90 8.3s and max 25.8s under a 5.0s
+        bound, which cannot all be true. The reason is that the gate reads the
+        in-memory TICK buffer and `quotes` is a different, coarser series; so
+        log the gate's own quantity instead of inferring it.
+
+        Returns the age of the CURRENT contiguous above-threshold run, i.e.
+        now minus its first sample. That is the same definition the sweep's D
+        cells use, so the two are directly comparable.
+
+        `_train_is_fresh` is the stricter, WINDOW-EDGE test (it requires the
+        OLDEST sample in the window to be below), so it can refuse a wick case
+        whose run is young. The useful direction holds, though: passing the
+        gate implies age <= fresh_s, so a logged age can never exceed the gate
+        it passed. None means the run reaches the start of the buffer, i.e. the
+        boundary is not in the buffer -- the same case the gate fails closed
+        on.
+        """
+        if not r.strike or thr_bps <= 0:
+            return None
+        buf = (getattr(self, "_ticks", None) or {}).get(
+            getattr(r, "symbol", "")) or []
+        if not buf:
+            return None
+        now = int(time.time() * 1000)
+        run_start = None
+        boundary = False
+        for t, px in sorted(buf, key=lambda s: s[0], reverse=True):
+            if px <= 0 or t > now:
+                continue
+            if abs(1e4 * (px - r.strike) / r.strike) >= thr_bps:
+                run_start = t                    # still inside the run
+            else:
+                boundary = True                  # the below sample that ended it
+                break
+        if run_start is None or not boundary:
+            # No boundary means the run reaches the START of the buffer, so the
+            # crossing predates everything we hold and the true age is unbounded
+            # ABOVE. Reporting `now - run_start` here would quote a lower bound
+            # as if it were the age -- the exact silent-wrong-number failure
+            # this measurement exists to end. Unknown is the honest answer, and
+            # it is the same case `_train_is_fresh` fails closed on.
+            return None
+        return now - run_start
+
     def _train_round_ok(self, r) -> bool:
         """May the TRAIN trigger trade this round? (cross_train_5m_only)
 
@@ -2150,6 +2201,9 @@ class Bot:
         # the reentry gap, the cooldown and the reversal rule.
         train = False
         side = None
+        # The train arm's D, measured at the trigger and carried to the fire
+        # log AND the decisions row. See _train_age_ms.
+        train_age_ms = None
         tmax = self._ck("train_max_tau_s", r)
         if self._ck("train_enabled", r) and self._train_round_ok(r) \
                 and r.strike \
@@ -2159,6 +2213,9 @@ class Bot:
             dist_bps = 1e4 * (feed.price - r.strike) / r.strike
             thr = self._ck("train_bps", r)
             if abs(dist_bps) >= thr and self._train_is_fresh(r, thr):
+                # Measured here, BEFORE the burst guard, so the number is the
+                # one the freshness gate actually decided on.
+                train_age_ms = self._train_age_ms(r, thr)
                 # BURST GUARD, 2026-09-15 21:01. See cross_train_cooldown_s.
                 #
                 # The trigger is a LEVEL (`|spot-strike| >= thr`), so the
@@ -2709,16 +2766,20 @@ class Bot:
         # reads as the cross arm violating its own 5-60s tau gate -- it did at
         # tau 820s on 2026-09-15 21:01, and that is exactly how it was misread.
         log.info("%s %s %s %s_px=%.3f (spot %.2f vs strike %.2f, tau %.0fs) "
-                 "stake=$%.2f -> %d today",
+                 "stake=$%.2f -> %d today%s",
                  "TRAIN" if train else "CROSS", r.slug, side, src, ask, spot,
-                 r.strike, tau, stake, self._cross_count)
+                 r.strike, tau, stake, self._cross_count,
+                 (" D=%dms" % train_age_ms) if train_age_ms is not None else "")
         # `run` goes into the reason so every trigger carries the number the
         # gate decision will be made on, recoverable from the decisions table.
         run_txt = "" if book_run is None else f" run{book_run:+.3f}"
+        # Same idiom, same reason: the number the gate decided on rides in the
+        # reason so it is recoverable from `decisions` with no reconstruction.
+        age_txt = "" if train_age_ms is None else f" D={train_age_ms}ms"
         kind = ("train into" if train
                 else ("cross probe" if probe else "cross into"))
         sig = Signal(side, ask, ask, 0.0, 0.0, 0.0, True,
-                     f"{kind} {side} @{ask:.3f} tau{tau:.0f}s{run_txt}")
+                     f"{kind} {side} @{ask:.3f} tau{tau:.0f}s{run_txt}{age_txt}")
         did = self.store.insert("decisions", {
             "slug": r.slug, "ts_ms": now_ms, "tau_s": tau, "side": side,
             "fair": ask, "quote": ask, "edge": 0.0, "hurdle": 0.0,

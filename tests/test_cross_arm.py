@@ -1768,6 +1768,26 @@ class TestTheTrainTrigger:
     restart -- strike ten minutes old, spot already 16-25bps out, asks 0.77-0.89.
     """
 
+    @pytest.fixture(autouse=True)
+    def _frozen_clock(self, monkeypatch):
+        """Freeze wall time so the freshness window is not a race.
+
+        `_history` dates the tick series from `time.time()` at FIXTURE time and
+        puts the below-threshold boundary sample exactly `step_ms` (=1000ms)
+        back, while `_cross_tick` reads its OWN `time.time()` a moment later. So
+        the gate's test `t >= now_ms - win_ms` becomes `now-1000 >= now+d-1000`,
+        which holds only while d <= 0. Any elapsed millisecond drops the
+        boundary sample out of the window and flips the gate to a refusal.
+
+        Measured on the unmodified tree: this class failed roughly one full-suite
+        run in three, a DIFFERENT test each time -- and it is worse now that
+        `cross_train_fresh_s` is 1.0, because the boundary sample then sits
+        exactly on the window edge rather than comfortably inside a 5.0s window.
+        A suite whose result depends on how many microseconds elapsed between a
+        fixture and the code under test is not a suite.
+        """
+        monkeypatch.setattr("time.time", lambda: 1_800_000_000.0)
+
     @staticmethod
     def _history(bot, prices, step_ms=1000, symbol="BTCUSDT"):
         now = int(time.time() * 1000)
