@@ -2035,10 +2035,44 @@ class Bot:
         ticks = getattr(feed, "ticks", None)
         if r is None or not ticks or r.strike is None:
             return
-        # Entries already taken in THIS round. Several are allowed: consecutive
-        # crosses alternate sides, so a round oscillating around the strike is
-        # naturally hedged rather than doubled, and taking every one measured
-        # +$31.37 against +$14.16 for the first alone (see config).
+        # Entries already taken in THIS round. `max_per_round` is the cap.
+        #
+        # The note that used to sit here claimed consecutive crosses "alternate
+        # sides, so a round oscillating around the strike is naturally hedged
+        # rather than doubled, and taking every one measured +$31.37 against
+        # +$14.16 for the first alone". BOTH halves of that are wrong, and it
+        # was quoted as a reason to raise this cap:
+        #
+        #  * Binary contracts do not hedge. Measured on the real fills, a round
+        #    that took Up then Down paid 0.6106 + 0.5885 = 1.1991 per share for
+        #    a $1.00 payout -- a guaranteed -0.1991/share before fees. That is a
+        #    synthetic NEGATIVE BOX SPREAD, not a hedge. Realized on
+        #    btc-updown-5m-1789387500: -$0.87.
+        #  * Same-side repeats are concentration, not diversification. The one
+        #    multi-entry round that won took FOUR fills on one side in 2s
+        #    (eth-updown-5m-1789413600, +$6.73) -- a 4x bet on a single oracle
+        #    print, equally capable of being -$11.64. Across the five multi-entry
+        #    rounds the realized total is -$12.89 on $35.60 = -36%.
+        #
+        # The +$31.37 figure cannot be reconciled with the fills; it comes from a
+        # replay that priced neither the box nor the concentration.
+        #
+        # The cap also costs almost nothing, which is the measurement that
+        # settles it. `cross_max_tau_s=60` already confines this arm to the last
+        # 60s, and over 2,119 settled btc-5m rounds (1s klines, true strikes):
+        #
+        #   first crossing in tau 5-60   n=354   win 69.8%   med z 0.113
+        #   first crossing in tau 60-300 n=2119  win 51.8%   med z 0.000
+        #
+        #   83% of rounds hold ZERO crossings in the 5-60s window and only 6%
+        #   hold more than one (median 0). So max_per_round=1 is not spending a
+        #   ticket on noise -- it spends it in the window whose first crossing
+        #   wins 69.8%, and there is usually only one to spend it on.
+        #
+        # Do not raise this cap on the strength of the old note. Re-measure if it
+        # is ever revisited: `_cross_refuse` now records each cap-blocked
+        # crossing as a decision row (spot/strike/tau/sigma_1m) so the blocked
+        # population can be priced directly rather than replayed.
         if not isinstance(self._cross_fired, dict):
             self._cross_fired = {}
         # getattr, not a bare attribute: fixtures build Bot via __new__, which
