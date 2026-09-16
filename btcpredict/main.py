@@ -1348,12 +1348,21 @@ class Bot:
         # OPEN lines were indistinguishable between the two arms. No tool parses
         # this line (checked), so the prefix is safe to extend.
         arm = arm_of(sig)
+        # The gate EV is only meaningful when the signal HAS a model valuation.
+        # BOTH arms build a synthetic Signal whose `fair` is the ask they are
+        # about to pay, so edge == 0 and ev/$ is a structural zero -- while
+        # `ev_valid` defaults True, so OPEN printed a fabricated "+0.0000" for
+        # Cross as well. Labelling only Train (earlier today) was an incomplete
+        # fix resting on the wrong assumption that Train alone lacked a
+        # valuation. The 06:04:14 Cross fill proves otherwise: OPEN printed
+        # ev/$=+0.0000 while the pre-trade recheck on that same order reported a
+        # real ev/$ of +0.0577 at px 0.5500.
         log.info("OPEN %s %s %s stake=$%.2f @%.3f | %s | mkt_iv=%s realised=%.5f "
                  "| ev/$ gate->fill %s -> %s",
                  arm, r.slug, fill.side, fill.stake, fill.filled_px, sig,
                  f"{iv:.5f}" if iv else "n/a", sigma,
                  f"{sig.ev_per_dollar:+.4f}"
-                 if (sig.ev_valid and arm == "CROSS") else "n/a",
+                 if (sig.ev_valid and sig.edge) else "n/a",
                  f"{ev_at_fill:+.4f}" if ev_at_fill is not None else "n/a")
 
     async def _impulse_tick(self) -> None:
