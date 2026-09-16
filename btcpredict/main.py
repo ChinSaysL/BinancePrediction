@@ -131,10 +131,16 @@ def pool_for_mode(mode: str | None) -> tuple[bool, str | None]:
     permanently silent), and claiming the wrong one lets an arm double.
 
     'maker' is the impulse arm's resting path, not a separate arm, so it shares
-    the impulse budget. Everything else -- 'live', 'stale_maker', 'double',
-    'paper' -- is the main arm under a different execution label.
+    the impulse budget. 'train' is not a separate arm either: the Train arm
+    claims the same reserved slot as Cross (`_cross_fired`) and is released by
+    the same path, so it MUST book and release the same budget. Listing it here
+    is what stops the two arms' fill labels from becoming two pools -- a pool
+    split without a matching `_cross_fired` split would leave the reserved slot
+    claimed by one arm and released by another, i.e. silent forever.
+    Everything else -- 'live', 'stale_maker', 'double', 'paper' -- is the main
+    arm under a different execution label.
     """
-    if mode == "cross":
+    if mode in ("cross", "train"):
         return True, None
     if mode in ("impulse", "maker"):
         return False, "impulse"
@@ -1817,7 +1823,7 @@ class Bot:
             pass
 
     def _open_cross_stake(self) -> float:
-        """Total stake in cross positions that have not settled yet.
+        """Total stake in cross + train positions that have not settled yet.
 
         Read from the LEDGER, not tracked in memory: a restart must not reset it
         to zero, which is precisely how an exposure cap silently stops capping.
@@ -1836,7 +1842,12 @@ class Bot:
             rows = self.store.query(
                 "SELECT COALESCE(SUM(f.stake), 0.0) AS s FROM fills f "
                 "LEFT JOIN settlements st ON st.fill_id = f.id "
-                "WHERE st.id IS NULL AND f.mode = 'cross'")
+                # BOTH arms, because both hold the same reserved slot. Train
+                # was added to this list the same commit that started labelling
+                # its fills 'train' -- a label change without this line would
+                # have made the cap blind to every train position, which is the
+                # "silently stops capping" failure this docstring warns about.
+                "WHERE st.id IS NULL AND f.mode IN ('cross', 'train')")
             val = float(rows[0]["s"] or 0.0) if rows else 0.0
         except Exception:                                   # pragma: no cover
             return getattr(self, "_open_stake", 0.0) + self._inflight_stake()
@@ -2795,7 +2806,7 @@ class Bot:
         task = asyncio.create_task(self._cross_execute(
             r=r, sig=sig, side=side, token=token, stake=stake, ask=ask,
             ceil_side=ceil_side, did=did, up=up, spot=spot, sigma=sigma,
-            tau=tau, wsb=wsb,
+            tau=tau, wsb=wsb, train=train,
             fill_cap=(self._ck("train_max_fill_px", r) if train else None)))
         tasks = getattr(self, "_order_tasks", None)
         if tasks is None:
@@ -2805,12 +2816,25 @@ class Bot:
 
     async def _cross_execute(self, *, r, sig, side, token, stake, ask,
                              ceil_side, did, up, spot, sigma, tau, wsb,
+                             train: bool = False,
                              fill_cap: float | None = None) -> None:
         """Place one cross order and book it, OFF the poll loop.
 
         Same code that used to run inline in `_cross_tick`; what changed is
         that the decision loop no longer waits for it.
+
+        `train` selects the arm LABEL only. It is passed from `_cross_tick`,
+        where it already decides the ceiling and the fill cap, and it names the
+        arm that actually fired rather than re-deriving it here.
         """
+        # ONE label for the log line AND the booked fill mode. These were
+        # derived separately: the log from `sig.reason`, the ledger hardcoded to
+        # 'cross'. So for the Train arm's entire life the log said TRAIN and the
+        # database said cross, which buried 46 train fills -- win 78.3%, paid
+        # 0.8406, EV/sh -0.0612 -- inside the Cross cohort (win 62.6%, EV/sh
+        # +0.0015). Two arms with opposite signs under one label, and nothing in
+        # the log to reconcile against, because the log was already right.
+        arm_mode = "train" if train else "cross"
         try:
             t_send = time.monotonic()
             book_at_send = ask
@@ -2842,8 +2866,7 @@ class Bot:
             log.info("%s exec %s %s: decided %.4f limit %.2f -> %s in %.2fs | "
                      "committed $%s of $%.2f (%s) | shares %s | cash/shares %s | "
                      "book now %s",
-                     ("train" if str(getattr(sig, "reason", "")).startswith("train")
-                      else "cross"),
+                     arm_mode,
                      r.slug, side, book_at_send, ceil_side,
                      ("%.4f" % got) if got else "NO FILL", elapsed,
                      ("%.4f" % cash) if cash else "0", stake,
@@ -2855,7 +2878,8 @@ class Bot:
                 self._release_round_slot(r)
                 return
             await self._book_fill(r, sig, fill, did=did, up=up, spot=spot,
-                                  sigma=sigma, tau=tau, token=token, mode="cross")
+                                  sigma=sigma, tau=tau, token=token,
+                                  mode=arm_mode)
         except Exception as e:                              # pragma: no cover
             self._release_round_slot(r)
             log.exception("cross order failed for %s %s: %s: %s",
