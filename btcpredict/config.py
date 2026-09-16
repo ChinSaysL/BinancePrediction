@@ -1413,7 +1413,25 @@ class Settings(BaseSettings):
     # crossing is provably recent. Fails CLOSED without enough history (the
     # restart case). Do not set this to 0 -- 0 means "cannot prove freshness"
     # and the trigger goes inert.
-    cross_train_fresh_s: float = 5.0
+    #
+    # 5.0 -> 1.0 on 2026-09-16. This knob IS the D parameter the sweep above
+    # calls "the parameter that kills it", and 5.0 shipped the losing cells:
+    # _train_is_fresh takes the OLDEST tick inside the window, so 5.0 admits
+    # any crossing up to five seconds old. Re-measured on our own tape (4,362
+    # rounds with quotes, real strikes, real settlements, one entry per round,
+    # X>=15, tau>=60, ask<=0.890, fee included):
+    #     D<=1s  n=164  hit 86.6%  @ask+1.5c  +0.0459/sh  day-t +1.39  4/7 days+
+    #     D<=5s  n=300  hit 85.0%  @ask+1.5c  +0.0220/sh  day-t +0.82  4/8 days+
+    # So 5.0 was trading the +0.022 cell while the +0.046 cell sat inside its
+    # own window. Nearly 2x the EV and a t that more than doubles, at roughly
+    # half the fire rate -- the right trade when the edge is the scarce thing.
+    #
+    # The 94.9% this arm was built on is an n=39 artefact: at n=172 the same
+    # cell measures 86.6%. Live's 78.0% (32 of 41) against 86.6% is z -1.24,
+    # p~0.11 -- NOISE, not a refutation. An earlier verdict in this session
+    # compared live against the inflated 94.9% figure and got p=1.8e-04; that
+    # comparison was the error, not the arm.
+    cross_train_fresh_s: float = 1.0
     # BURST GUARD (2026-09-15 21:01). `|spot-strike| >= 10bps` is a LEVEL, so
     # when btc/eth/bnb move together it goes true for EVERY family at once --
     # and a 5m and its 15m sibling SHARE a strike, so those two are literally
