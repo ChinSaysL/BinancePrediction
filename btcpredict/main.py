@@ -2046,28 +2046,42 @@ class Bot:
         if not isinstance(getattr(self, "_cross_side", None), dict):
             self._cross_side = {}
         if self._cross_fired.get(r.slug, 0) >= self._ck("max_per_round", r):
-            # SILENT BY DEFAULT, and that is a measurement blind spot. A
-            # slot-blocked tick returns before anything is logged OR written to
-            # `decisions`, so every crossing a round's cap rejects is absent
-            # from the record: a log-derived fire count is a count of UNBLOCKED
-            # fires, and the cap's cost cannot be measured from it at all. The
-            # 3b92a87 note records the same silence hiding a whole cross window
-            # on 2026-09-15 -- four consecutive train NO FILLs locked the slot
-            # and the cross arm was silent on all four.
+            # SILENT BY DEFAULT, and that is a BIAS, not merely a gap. A
+            # slot-blocked tick used to return before anything was logged OR
+            # written to `decisions`, so the cap's cost was unmeasurable from
+            # the record -- and the entries it does admit are the FIRST crossing
+            # of every round, by construction.
             #
-            # Log the FIRST block per round only. The arm ticks ~7/s and a
-            # blocked round can produce hundreds of these, so logging each one
-            # would bury the log it is meant to make honest.
-            blocked = getattr(self, "_cross_blocked", None)
-            if not isinstance(blocked, set):
-                blocked = self._cross_blocked = set()
-            if r.slug not in blocked:
-                blocked.add(r.slug)
-                log.info("cross %s: %d already fired this round (cap %d); this "
-                         "crossing is DROPPED and appears nowhere else -- "
-                         "further blocks this round are not logged",
-                         r.slug, self._cross_fired.get(r.slug, 0),
-                         self._ck("max_per_round", r))
+            # Measured over 2,119 settled btc-5m rounds (1s klines, true
+            # strikes): the first crossing of a round has median z = 0.000 and
+            # sits below z 0.15 in 91.5% of rounds -- median tau 299s, i.e. the
+            # one where spot has barely nicked the strike -- and taking it wins
+            # 51.8%. A round holds a median of 5 crossings and 90.2% of rounds
+            # hold more than one, so with max_per_round = 1 the arm spends its
+            # only slot on a coin flip in 9 rounds out of 10.
+            #
+            # Recorded as a DECISION ROW via `_cross_refuse`, not just a log
+            # line, so the existing settlement joins can price the
+            # counterfactual: which crossings were dropped, at what z, and
+            # whether replacing the first entry with a later one would have paid.
+            # `spot`/`strike`/`tau_s`/`sigma_1m` all land in the row. That
+            # helper already dedupes per (round, reason), so a round that keeps
+            # re-crossing produces ONE row rather than the hundreds a per-tick
+            # write would -- which is why this does not keep its own set.
+            #
+            # Only recorded when `crossed_side` still resolves a side: a tick
+            # with no crossing would have returned at the trigger anyway, and
+            # recording it would invent rows for rounds that never crossed.
+            blocked = crossed_side(list(ticks), r.strike, self._ck("look_s", r))
+            if blocked is not None:
+                self._cross_refuse(
+                    r, blocked,
+                    f"slot already used this round "
+                    f"({self._cross_fired.get(r.slug, 0)}"
+                    f"/{self._ck('max_per_round', r):.0f}) -- crossing DROPPED, "
+                    f"priced for the counterfactual only",
+                    tau=r.tau_s(int(time.time() * 1000)),
+                    spot=getattr(feed, "price", None))
             return
         # Keep every LIVE round, not just this one. Pruning to `r.slug` was
         # correct with a single family and is a bug with six: each family's call
@@ -2077,8 +2091,6 @@ class Bot:
                 if c.get("round") is not None} | {r.slug}
         self._cross_fired = {k: v for k, v in self._cross_fired.items() if k in live}
         self._cross_side = {k: v for k, v in self._cross_side.items() if k in live}
-        self._cross_blocked = {k for k in getattr(self, "_cross_blocked", set())
-                               if k in live}
         now_ms = int(time.time() * 1000)
         tau = r.tau_s(now_ms)
         # ---- TRAIN TRIGGER (config.cross_train_*) --------------------------

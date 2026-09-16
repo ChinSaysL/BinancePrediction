@@ -41,39 +41,62 @@ def test_the_per_round_cap_guard_exists():
     assert _cap_guard(), "the _cross_fired vs max_per_round guard is gone"
 
 
-def test_every_cap_guard_logs_before_it_returns():
-    """A bare `return` here drops a crossing with no trace anywhere."""
+def _refuse_calls(node):
+    return [c for c in ast.walk(node)
+            if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+            and c.func.attr == "_cross_refuse"]
+
+
+def test_the_cap_guard_records_a_decision_row_not_just_a_log():
+    """`_cross_refuse` is the helper that LOGS and INSERTS into `decisions`.
+    A bare return, or a bare log.info, leaves the cap's cost unmeasurable --
+    a log line cannot be joined against settled P&L."""
     for node in _cap_guard():
-        calls = [n for n in ast.walk(node) if isinstance(n, ast.Call)]
-        logged = [
-            c for c in calls
-            if isinstance(c.func, ast.Attribute) and c.func.attr in
-            ("info", "warning", "debug")
-        ]
-        assert logged, (
-            "the max_per_round guard returns without logging -- every crossing "
-            "it rejects is invisible in both live.log and the decisions table "
+        assert _refuse_calls(node), (
+            "the max_per_round guard drops the crossing without recording it "
             "(main.py line %d)" % node.lineno
         )
 
 
-def test_the_log_says_the_crossing_is_dropped():
-    """The message must be findable by someone asking this exact question.
+def test_the_recorded_row_carries_what_the_counterfactual_needs():
+    """spot + strike give the gap; tau + sigma_1m give z. Without them the row
+    cannot be priced, which is the entire point of recording it."""
+    for node in _cap_guard():
+        for call in _refuse_calls(node):
+            kws = {k.arg for k in call.keywords}
+            assert {"tau", "spot"} <= kws, (
+                "the cap-block decision row must pass tau and spot so z is "
+                "recoverable (main.py line %d)" % node.lineno
+            )
 
-    Search for the fragment, not the whole sentence: the source splits it across
-    two adjacent string literals, so the full phrase never appears contiguously.
+
+def test_it_only_records_when_a_crossing_was_actually_detected():
+    """A tick with no crossing would have returned at the trigger anyway;
+    recording it would invent rows for rounds that never crossed.
+
+    `crossed_side` is a module-level function, so it appears as a Name call --
+    not an Attribute call like the `_cross_refuse` and `_ck` methods.
     """
+    for node in _cap_guard():
+        called = set()
+        for c in ast.walk(node):
+            if not isinstance(c, ast.Call):
+                continue
+            if isinstance(c.func, ast.Name):
+                called.add(c.func.id)
+            elif isinstance(c.func, ast.Attribute):
+                called.add(c.func.attr)
+        assert "crossed_side" in called, (
+            "_cross_refuse is called without resolving the side first, so every "
+            "blocked tick records a row whether or not a crossing existed "
+            "(main.py line %d)" % node.lineno
+        )
+
+
+def test_the_message_says_the_crossing_is_dropped():
+    """Findable by someone asking this exact question."""
     text = SRC.read_text()
-    idx = text.find("crossing is DROPPED")
-    assert idx > 0, "the cap-block log line lost the word DROPPED"
-    # and it must sit inside the guard, not somewhere else in the file
+    idx = text.find("crossing DROPPED")
+    assert idx > 0, "the cap-block reason lost the word DROPPED"
     guard_start = min(n.lineno for n in _cap_guard())
     assert text[:idx].count("\n") + 1 > guard_start
-
-
-def test_it_logs_once_per_round_not_per_tick():
-    """The arm ticks ~7/s; logging every blocked tick would bury the log it is
-    meant to make honest, so the guard is behind a per-round set."""
-    text = SRC.read_text()
-    assert "_cross_blocked" in text
-    assert "if r.slug not in blocked" in text
