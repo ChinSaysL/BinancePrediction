@@ -3355,6 +3355,29 @@ class Bot:
                 wait_cap = settings.limit_wait_s
                 if limit_ceiling is not None and settings.cross_limit_wait_s > 0:
                     wait_cap = settings.cross_limit_wait_s
+                # POST AT THE CEILING, not below the ask.
+                #
+                # Measured live 2026-09-16, immediately after the market->limit
+                # swap: three consecutive orders went out at quote-1 tick
+                # (0.13 / 0.55 / 0.16) against ceilings of 0.16 / 0.58 / 0.19,
+                # and not one of them filled. That is the PASSIVE maker
+                # configuration -- priced by tools/cross_limit_sim.py at 8.5%
+                # fill against 86% for a limit posted at the arriving ask -- and
+                # it is the same failure the 2026-09-13 note above records
+                # costing a ~5x win.
+                #
+                # The refinement further up does the same thing, but it sits
+                # behind an upstream branch that did not run for those orders,
+                # so the price that reached the venue was the passive one from
+                # the earlier assignment. This raises it where nothing can gate
+                # it: immediately before the POST. It is a no-op for the model
+                # arm, which passes limit_ceiling=None.
+                if limit_ceiling is not None:
+                    limit_px = max(limit_px, min(round(limit_ceiling, 2), 0.99))
+                    log.info("limit post %s %s %s: %.2f (ceiling %.2f, quote "
+                             "%s, take_px %s, wait cap %.1fs)", arm_of(sig),
+                             r.slug, sig.side, limit_px, limit_ceiling,
+                             sig.quote, take_px, wait_cap)
                 tau_fn = getattr(r, "tau_s", None)
                 tau_left = tau_fn(int(time.time() * 1000)) if tau_fn else 1e9
                 fill = await self.broker.buy_limit(
