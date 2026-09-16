@@ -100,33 +100,42 @@ def derived_slip_bps(default_bps: int, max_px: float | None,
 # when it is signed, and it is signable from our side, which makes it a
 # protocol error rather than a strategy outcome.
 _VENUE_MAX_SLIP_BPS = 10_000
-# A quote this far BELOW the ceiling is anchoring the order to liquidity that
-# is gone. Measured 2026-09-16 over 112 live attempts: 42 (38%) were more than
-# 5c displaced, and the rejects they produced were recorded as market
-# rejections -- polluting the very canary that exists to measure the market.
-_STALE_QUOTE_MAX_DROP = 0.05
+# REMOVED 2026-09-16, ~25 minutes after shipping. There was a
+# `_STALE_QUOTE_MAX_DROP` branch that discarded any quote more than 5c BELOW the
+# ceiling. It was wrong, and it cost a fill on eth-updown-15m-1789537500 within
+# the hour:
+#
+#   CROSS eth-updown-15m-1789537500 Down sweep_px=0.490 (spot 2406.64 ...)
+#   warm quote used ... age 0.98s px 0.4400
+#   shadow quote ... fresh px 0.4400 after 52ms -> bound 0.5100 (ceiling 0.510)
+#   ... discarding quote (quote_stale: 0.4400 is 0.0700 below ceiling 0.5100)
+#   CROSS order failed ... (quote_stale); not retrying -> NO FILL in 0.05s
+#
+# The quote was FRESH -- 52ms -- and the venue really was at 0.44. The premise
+# was wrong: `max_px` is OUR OWN limit (the decided price plus our bound), so a
+# quote BELOW it is the market offering a BETTER price than we authorised. That
+# is the case we want, not a defect, and refusing it is exactly backwards. The
+# harmful displacement is the other direction and `quote_above_ceiling` already
+# refuses it. The 42-of-112 "displaced" cohort that motivated the branch was
+# this same benign situation miscounted as harm.
+#
+# `quote_unfillable` below is KEPT: that one is a genuine protocol error.
 
 
 def quote_is_unusable(avg_px: float, max_px: float | None) -> str | None:
-    """Why this quote cannot produce a fillable order, or None if it can.
+    """Why this quote can never produce a fill, or None if it can fill.
 
-    Two distinct defects, both measured live on 2026-09-15/16:
+    ONE test only, and it is structural: the venue anchors the FOK bound to the
+    QUOTE and caps `slippageBps` at 10000, so `bound <= quote * 2` for every
+    client. When `quote * 2 < ceiling` the ceiling is unreachable and the order
+    is dead when it is signed -- not slow, not at any latency. 7 of 112 live
+    attempts were in exactly that state and every one carried `slip 10000`, the
+    clamp showing its work:
+        quote 0.0696 (x2 = 0.1392) against a ceiling of 0.650
+        quote 0.0400 (x2 = 0.0800) against a ceiling of 0.190
 
-      UNFILLABLE  `quote * 2 < ceiling`. 7 of 112 attempts. Every one carried
-                  `slip 10000` -- the venue's own maximum -- because the clamp
-                  is what makes the bound unreachable:
-                      quote 0.0696 (x2 = 0.1392) against a ceiling of 0.650
-                      quote 0.0400 (x2 = 0.0800) against a ceiling of 0.190
-                  The order cannot fill above 0.1392 while the market is 0.64.
-
-      STALE       The quote sits more than `_STALE_QUOTE_MAX_DROP` below the
-                  ceiling. It may still be fillable in principle, but the
-                  slippage has to run at or near maximum, so the order is
-                  anchored to a price the venue no longer has.
-
-    Both are answered the same way and it is cheap: discard the quote and take
-    a fresh one. `get_quote` measures ~43ms, and the rejected branch had a 100%
-    failure rate, so the round trip costs nothing that was not already lost.
+    Nothing else belongs here. In particular a quote BELOW the ceiling is not a
+    defect -- see the note above.
     """
     if avg_px <= 0:
         return "quote_price_missing"
@@ -135,9 +144,6 @@ def quote_is_unusable(avg_px: float, max_px: float | None) -> str | None:
     if avg_px * (1.0 + _VENUE_MAX_SLIP_BPS / 10_000.0) < max_px:
         return (f"quote_unfillable: quote {avg_px:.4f} x2 = {avg_px * 2:.4f} "
                 f"cannot reach the ceiling {max_px:.4f}")
-    if (max_px - avg_px) > _STALE_QUOTE_MAX_DROP:
-        return (f"quote_stale: quote {avg_px:.4f} is "
-                f"{max_px - avg_px:.4f} below the ceiling {max_px:.4f}")
     return None
 
 

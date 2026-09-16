@@ -132,11 +132,22 @@ class TestQuoteViability:
         why = self._bad(0.0696, 0.65)
         assert why and why.startswith("quote_unfillable"), why
 
-    def test_the_measured_stale_case_is_caught(self):
-        # Their example: 0.30 x2 = 0.60 >= 0.58 so the 2x math passes, but the
-        # quote is 28c below the tape and would force maximum slippage.
-        why = self._bad(0.30, 0.58)
-        assert why and why.startswith("quote_stale"), why
+    def test_a_quote_BELOW_the_ceiling_is_ACCEPTED(self):
+        """REVERSED 2026-09-16, ~25 minutes after it shipped.
+
+        This used to assert that a quote well below the ceiling is "stale" and
+        must be discarded. It is not stale, and the branch that enforced it cost
+        a fill on eth-updown-15m-1789537500: the quote was 52ms old, the venue
+        really was at 0.44 against a 0.51 ceiling, and the order aborted in
+        0.05s with NO FILL.
+
+        `max_px` is OUR OWN ceiling -- the decided price plus our bound -- so a
+        quote BELOW it is the market offering a BETTER price than we authorised.
+        That is the outcome we want; refusing it is backwards. The harmful
+        displacement is upward, and `quote_above_ceiling` already refuses it.
+        """
+        assert self._bad(0.30, 0.58) is None
+        assert self._bad(0.44, 0.51) is None      # the live case, verbatim
 
     def test_a_healthy_quote_passes(self):
         assert self._bad(0.64, 0.65) is None
