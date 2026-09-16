@@ -314,6 +314,30 @@ def limit_post_px(limit_px: float, limit_ceiling: float | None) -> float:
     return max(0.01, min(round(limit_ceiling, 2), 0.99))
 
 
+def depth_sigma(spot: float, strike: float, sigma_1m: float,
+                tau_s: float) -> float:
+    """How deep through the strike we are, in SIGMA of the time remaining.
+
+        z = |spot - strike| / strike / (sigma_1m * sqrt(tau_s / 60))
+
+    The only unit that means the same thing across symbols and horizons. A
+    crossing of z ~ 0 is a coin flip at ANY tau, because the diffusion still to
+    come decides the round -- while the price paid for the contract is ~0.6.
+    See config.cross_min_depth_sigma for the two independent measurements that
+    put the coin-flip/signal boundary at z ~ 0.4 (51 real fills, and 1,645
+    settled rounds priced at true strikes).
+
+    Returns 0.0 when the inputs cannot express a depth (bad strike/sigma/tau),
+    which reads as "not deep" and lets a floor refuse it.
+    """
+    if not (strike and sigma_1m > 0 and tau_s > 0):
+        return 0.0
+    sig_left = sigma_1m * (tau_s / 60.0) ** 0.5
+    if sig_left <= 0:
+        return 0.0
+    return abs(spot - strike) / strike / sig_left
+
+
 def impulse_price_refusal(entry_mode: str, real_px: float | None,
                           cap: float) -> str | None:
     """Why an impulse order must not be placed at THIS price, or None to go.

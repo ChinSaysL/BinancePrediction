@@ -1755,6 +1755,56 @@ class Settings(BaseSettings):
     cross_min_depth_ticks: float = 1.0
     # Venue price increment per symbol, used only by the floor above.
     cross_tick_size: float = 0.01
+    # MINIMUM crossing depth in SIGMA of the time remaining. 0 = OFF.
+    #
+    # The tick floor above is a per-symbol correction and is a no-op on BTC
+    # (median trigger 193 ticks). This one is the actual signal-to-noise test:
+    #
+    #     z = |spot - strike| / strike / (sigma_1m * sqrt(tau_min))
+    #
+    # A crossing of z ~ 0 is a coin flip at ANY horizon, because what decides
+    # the round is the diffusion still to come -- and the arm pays ~0.55-0.70
+    # for it, so it is a losing bet by construction.
+    #
+    # Measured on the 51 recorded cross fills against the venue's TRUE strikes
+    # (bars_1s, 09-13..09-15), which is the last measurement this floor needs
+    # because it is the first one that signs the gap instead of using abs():
+    #
+    #     |gap| at entry   n    win     P&L      staked
+    #     0 - 0.5 bps     29   51.7%  -10.70      69.86   <- 57% of the stake
+    #     0.5 - 1         13   69.2%   +2.14      31.74
+    #     1 - 2            8   50.0%   -3.39      18.45
+    #     ALL             51   56.9%  -11.37     123.43
+    #
+    # Bucketed in sigma instead of bps, the same fills split cleanly:
+    #
+    #     z              n    win     P&L
+    #     0 - 0.15      18   50.0%   -6.59
+    #     0.15 - 0.30    9   66.7%   +1.37
+    #     0.50 - 0.80    2  100.0%   +0.96
+    #
+    # And the boundary lands in the same place on data that contains none of
+    # our trades -- 1,645 settled btc-5m rounds, true strikes, priced at a
+    # fixed tau=19s (independent of when the arm would have entered):
+    #
+    #     gap -1 .. 1 bps  = z -0.40 .. +0.40   P(close Up)  53.4%
+    #     gap  1 .. 2 bps  = z +0.40 .. +0.80   P(close Up)  86.8%
+    #     gap  2 .. 4 bps  = z +0.80 .. +1.59   P(close Up)  95.0%
+    #
+    # One honest conflict, recorded rather than resolved: the note above
+    # `cross_min_depth_ticks` re-measured the tick floor WITH the ask and found
+    # shallow crossings have MORE edge (+0.2311 at ask 0.558 vs +0.1771 at
+    # 0.686), which is why the floor was lowered 5.0 -> 1.0. That test's
+    # "shallow" is < 5 ticks = < $0.05, i.e. 0.0007 bps on BTC; this knob's
+    # band is 0 - 0.5 bps = $0 - $3.81, seventy-six times wider. They are not
+    # the same population and both can be true. Do not lower this one on the
+    # strength of that one until they are reconciled in the same unit.
+    #
+    # LEFT AT 0.0 (OFF) deliberately. z >= 0.4 keeps ~2-5 of 31 fills, so
+    # enabling it is a strategy change, not a bug fix; and the counterfactual
+    # is 3 days / one DB snapshot. The measurement above is what was missing,
+    # not the decision.
+    cross_min_depth_sigma: float = 0.0
     cross_reentry_gap_s: float = 1.0
     cross_max_round_stake_mult: float = 2.0
     cross_max_open_stake_pct: float = 0.30

@@ -32,6 +32,7 @@ from btcpredict.edge.signal import (FeeModel, Signal, evaluate,
                                     evaluate_hybrid, expected_value,
                                     fee_rate_for_price, impulse_price_refusal,
                                     kelly_stake, limit_post_px, take_limit_px,
+                                    depth_sigma,
                                     stake_for_edge, stake_for_fraction,
                                     tilt_factor)
 from btcpredict.execution.base import Fill
@@ -2256,6 +2257,28 @@ class Bot:
                     r, side,
                     f"only {abs(spot_now - r.strike) / tick:.0f} tick(s) through "
                     f"the strike, floor is {min_ticks:.0f}",
+                    tau=tau, spot=spot_now, sigma=sigma_now)
+                return
+        # MINIMUM depth in SIGMA OF THE TIME REMAINING. 0 = OFF.
+        #
+        # The tick floor above is a per-symbol correction (BNB's median trigger
+        # is ONE tick) and is a no-op on BTC. This is the signal-to-noise test
+        # it cannot make: a crossing of z ~ 0 is a coin flip at ANY horizon,
+        # because the diffusion still to come decides the round -- and the arm
+        # pays ~0.6 for it, so it loses by construction.
+        #
+        # `sigma_now` is sigma_1m, so the diffusion left is sigma_1m*sqrt(tau/60)
+        # and z is unitless. See config.cross_min_depth_sigma for the two
+        # independent measurements (51 real fills; 1,645 rounds of true strikes)
+        # that put the coin-flip/signal boundary at z ~ 0.4.
+        min_sig = self._ck("min_depth_sigma", r)
+        if not train and min_sig > 0 and sigma_now > 0 and tau > 0:
+            z = depth_sigma(spot_now, r.strike, sigma_now, tau)
+            if z < min_sig:
+                self._cross_refuse(
+                    r, side,
+                    f"crossing is {z:.2f} sigma deep ({depth_bps:.2f} bps, "
+                    f"tau {tau:.0f}s), floor is {min_sig:.2f}",
                     tau=tau, spot=spot_now, sigma=sigma_now)
                 return
         if not train and depth_bps > self._ck("max_depth_bps", r):
