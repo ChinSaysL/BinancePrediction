@@ -1328,10 +1328,21 @@ class Bot:
             iv = implied_sigma(up.price, spot, r.strike, tau)
         except (TypeError, ValueError):
             iv = None
-        log.info("OPEN %s %s stake=$%.2f @%.3f | %s | mkt_iv=%s realised=%.5f "
-                 "| ev/$ gate->fill %+.4f -> %s",
-                 r.slug, fill.side, fill.stake, fill.filled_px, sig,
-                 f"{iv:.5f}" if iv else "n/a", sigma, sig.ev_per_dollar,
+        # Tag the arm and stop inventing an EV for it. The Train arm has no model
+        # valuation -- its trigger is the underlying's move off the strike -- so
+        # its synthetic Signal carries fair == quote == the ask and this line
+        # printed `edge=+0.000 hurdle=0.000 ev/$=+0.0000` on every Train fill: a
+        # fabricated zero, the same class of lie as the -1.0 sentinel. All 658
+        # OPEN lines were indistinguishable between the two arms. No tool parses
+        # this line (checked), so the prefix is safe to extend.
+        arm = ("TRAIN" if str(getattr(sig, "reason", "")).startswith("train")
+               else "CROSS")
+        log.info("OPEN %s %s %s stake=$%.2f @%.3f | %s | mkt_iv=%s realised=%.5f "
+                 "| ev/$ gate->fill %s -> %s",
+                 arm, r.slug, fill.side, fill.stake, fill.filled_px, sig,
+                 f"{iv:.5f}" if iv else "n/a", sigma,
+                 f"{sig.ev_per_dollar:+.4f}"
+                 if (sig.ev_valid and arm == "CROSS") else "n/a",
                  f"{ev_at_fill:+.4f}" if ev_at_fill is not None else "n/a")
 
     async def _impulse_tick(self) -> None:
