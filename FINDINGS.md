@@ -12592,3 +12592,87 @@ ALSO EXPOSED BY THE CORRECTED REPLAY, and worth more than the exit ever was: the
 
 That is 207 entries — 24% of the cohort — taken on evidence that does not pay.
 Not shipped here; it is an entry change and wants its own measurement.
+
+### ⭐ THE MARGIN FLOOR 0.25 -> 0.50: the re-opening the record asked for (2026-09-18)
+
+`config.cross_min_margin_bps` closed this argument with "n is 42-69 either way,
+so neither value is quotable as fitted... **Do not re-open the floor on this
+table; it needs a sample that can separate 42 entries from 69**." That verdict
+was right for its sample, and the sample changed: every earlier ranking was at
+tau **[5,60]**, and `cross_max_tau_s` went 60 -> 180 the same day. The cohort is
+now 854 entries over 3,176 settled rounds.
+
+**THE UNIT WAS CHECKED BEFORE THE VALUE WAS SWEPT** (`tools/pm_margin_unit.py`),
+because a flat bps floor across a window that now spans 5-180 s is the same
+shape as the gate this file turned OFF the same day ("range-so-far is a fixed
+bps count of a quantity whose expected size grows with the time elapsed"). The
+suspicion was WRONG and the data says so: the paying threshold is FLAT in tau --
+the sign flips at 0.5 bps in every band independently --
+
+    tau [ 30, 60)  [0.25,0.5) -0.1327  ->  [0.5,1) +0.1546
+    tau [ 60,120)  [0.25,0.5) -0.0435  ->  [0.5,1) +0.0763
+    tau [120,180)  [0.25,0.5) -0.0368  ->  [0.5,1) +0.0475
+
+-- and matched on entry count the flat bps floor BEATS the scale-free
+`z = |m|/(sigma*sqrt(resid))` everywhere (keep-50% +0.0946 vs +0.0759; keep-10%
++0.2341 vs +0.1236). The gate is the right object; only the value was wrong.
+(`z` does carry a better day-clustered t at every cut, which is the one thing
+that would justify revisiting the unit later.)
+
+**THE SWEEP** (`tools/pm_floor_sweep.py`, tau [5,180], repo PASS bar):
+
+    floor  n     per-share  total    t     day-t  halves          verdict
+    0.00  1002   +0.0407   +40.79  +2.58  +1.68  +.0393/+.0422   fail
+    0.25   854   +0.0594   +50.76  +3.48  +2.13  +.0620/+.0569   PASS  <- was
+    0.50   741   +0.0863   +63.95  +4.75  +2.08  +.1023/+.0703   PASS  <- IS
+    0.75   600   +0.0893   +53.56  +4.40  +2.28  +.0935/+.0850   PASS
+    1.00   473   +0.1002   +47.38  +4.36  +2.21  +.1242/+.0762   PASS
+    2.00   193   +0.1627   +31.41  +4.38  +4.67  +.2259/+.1003   PASS
+
+**THE NUISANCE TEST IS WHAT DECIDED IT**, because the cross-look FLIP is exactly
+what refused 0.50 last time. On this window the flip is gone -- 0.50's halves at
+look 2.0 are +0.1022/+0.0710, both positive, where at [5,60] they were -0.0245:
+
+    floor 0.50 vs 0.25:  look1.0 +0.0269/sh   look2.0 +0.0217/sh   AGREE
+    floor 0.75 vs 0.25:  look1.0 +0.0298      look2.0 +0.0100      AGREE
+    floor 1.00 vs 0.25:  look1.0 +0.0407      look2.0 -0.0092      FLIPS
+
+1.00 is the unstable one now. 0.50 PASSES at both looks, AGREEs, and carries the
+most money of any floor at either look.
+
+**AND THE LIVE FILLS AGREE ON 0.50 WHILE REFUTING EVERYTHING ABOVE IT.** 89
+settled fills with a reconstructable margin:
+
+    |m| [0.00,0.25) n= 5  total  -3.502  per-share -0.1466
+    |m| [0.25,0.50) n=20  total  -6.028  per-share -0.1346   <- REFUSED NOW
+    |m| [0.50,1.00) n=20  total  +6.721  per-share +0.1761
+    |m| [1.00,2.00) n=22  total  +2.160  per-share +0.0486
+    |m| [2.00,99.0) n=22  total -10.367  per-share -0.1788   <- the tape says +0.16
+
+    floor 0.25 keeps n=84 total -7.514 | 0.50 keeps n=64 total -1.486
+    floor 0.75 keeps n=57 total -5.639 | 1.00 keeps n=44 total -8.207
+
+⛔ WHY THE TOP END DIVERGES, measured rather than guessed: entry slippage against
+the ask the replay books RISES WITH THE MARGIN, because a big margin IS a big
+fast move and the venue reprices before the FAK lands:
+
+    |m| [0.50,1.00)  slip mean +0.0045  p90 +0.0440  (live .544 tape .540)
+    |m| [1.00,2.00)  slip mean +0.0214  p90 +0.1090  (live .540 tape .518)
+    |m| [2.00,99.0)  slip mean +0.0545  p90 +0.3010  (live .542 tape .487)
+
+5.5c/share at |m|>=2 exceeds the edge the tape measures there, so **the sweep's
+monotonicity above ~1 bps is an artifact of unmodelled slippage**, and 0.50 --
+the lowest-slippage bucket -- is where the two sources meet. Pinned by
+`test_the_floor_is_not_raised_past_where_the_live_fills_agree`.
+
+HONEST BOUNDS: 89 of 200 settled fills have a reconstructable margin (the rest
+are rounds the quote tape does not cover, which is a selection risk that is NOT
+controlled), the live buckets are n=20-22, and the live record is NEGATIVE at
+every floor -- 0.50 is the least-bad (-1.486) and the only one near breakeven,
+not a proven winner. KILL CRITERION: the [0.50,1.00) cohort at or below 0 per
+share over ~60 live fills.
+
+⛔ `CROSS_MIN_MARGIN_BPS=0.25` IS PINNED IN THE SERVER `.env` AND SHADOWS THE
+DEFAULT. Changing config.py alone is a no-op -- the same trap that kept the
+refuted range gate binding for a day. Set `CROSS_MIN_MARGIN_BPS=0.50` there and
+restart. NOT DONE HERE: the live `.env` was not edited.

@@ -43,7 +43,26 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 def test_the_floor_defaults_to_the_value_that_survives_both_halves():
-    assert Settings().cross_min_margin_bps == 0.25
+    """0.25 -> 0.50 on 2026-09-18, once the tau window tripled and gave the
+    sweep the sample the old note said it needed (68 entries -> 854).
+
+    0.50 PASSES the repo's full bar at the shipped look AND at look 2.0, and
+    AGREEs across the two -- the cross-look FLIP is what refused it when it was
+    ranked at tau [5,60] on n=42. It also carries the most money of any floor
+    (+63.95), the sign flips at 0.5 bps in every tau band independently, and the
+    live fills put the refused [0.25,0.50) bucket at -6.028 over 20 fills.
+    See config.cross_min_margin_bps for the tables and the kill criterion."""
+    assert Settings().cross_min_margin_bps == 0.50
+
+
+def test_the_floor_is_not_raised_past_where_the_live_fills_agree():
+    """⛔ The tape is MONOTONE toward a higher floor and the live record is
+    not: entry slippage rises with the margin (a big margin is a big fast move,
+    and the venue reprices before the FAK lands), so |m|>=2 bps costs 5.5c/share
+    against the ask the replay books and turns the tape's best cell into the
+    live record's worst (-0.1788/share on n=22). A future sweep that "improves"
+    this on the tape alone is reading that artifact."""
+    assert Settings().cross_min_margin_bps <= 1.0
 
 
 def test_the_gate_reads_the_SIGNAL_not_the_spot():
@@ -68,9 +87,21 @@ def test_the_gate_is_before_the_entry_is_committed():
 
 def test_the_revert_is_stated_and_the_measurement_rides_with_it():
     cfg = (ROOT / "btcpredict" / "config.py").read_text()
-    assert "CROSS_MIN_MARGIN_BPS=1.0" in cfg
+    assert "CROSS_MIN_MARGIN_BPS=0.50" in cfg, "the .env line to set"
+    assert "Revert = 0.25 in both places" in cfg
     assert "MEASURED ON THE FC COHORT" in cfg
     assert "0.0766/-0.0646" in cfg, "the weak half must be quoted, not hidden"
+
+
+def test_the_env_shadowing_is_called_out_where_the_value_lives():
+    """⛔ `.env` SHADOWS this default, and editing config.py alone is a no-op.
+    That is how the refuted range gate stayed live for a day; the note must say
+    so beside the value, not somewhere else in the file."""
+    cfg = (ROOT / "btcpredict" / "config.py").read_text()
+    i = cfg.index("cross_min_margin_bps: float")
+    block = cfg[max(0, i - 7000):i]
+    assert "SHADOWS" in block or "shadows" in block
+    assert ".env" in block
 
 
 def test_the_sweep_that_chose_the_value_is_quoted_in_the_config():
