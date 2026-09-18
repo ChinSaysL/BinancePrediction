@@ -80,30 +80,40 @@ def scan(pre, entry, look_s, hold_s, tau_min):
 
 def walk(pre, entry, *, look_s, hold_s, tau_min, confirm_s,
          floor, giveback, tau_gate, draw):
-    """Fire the exit under one rule spec. Returns the exit dict or None."""
+    """Fire the exit under one rule spec. Returns the exit dict or None.
+
+    ⛔ ARM ON THE EVENT, CONFIRM ON THE STATE. `crossed_side` reports a
+    CROSSING, so a SUSTAINED flip -- the case the rule exists for -- gives
+    exactly ONE reading. Live btc-updown-5m-1789750800 armed at 17:02:12 and
+    then sat on the Down side for the rest of the round while the Up token went
+    0.64 -> 0.07. A fire that needs a second crossing can only act on an
+    OSCILLATING signal. The SIGN of the margin is the state, so no extra lookup
+    is needed: `m > 0` is Up.
+    """
     held = entry["side"]
     other = "Down" if held == "Up" else "Up"
     m0 = abs(entry["margin"])            # the margin we ENTERED on
     armed = None
     for ts, tau, side, m, px in scan(pre, entry, look_s, hold_s, tau_min):
         if tau_gate is not None and tau < tau_gate:
-            break                        # too late to act, and it only gets later
-        if side == held and abs(m) >= floor:
-            armed = None                 # genuinely back on our side
+            break                        # too late, and it only gets later
+        side_now = "Up" if m > 0 else "Down"
+        past = (floor <= 0) or (abs(m) >= floor)
+        if side_now == held and past:
+            armed = None                 # back on our side: the flip died
             continue
-        if side != other:
+        if armed is None:
+            if side == other and past:   # only a CROSSING arms it
+                armed = ts
             continue
-        if abs(m) < floor:
-            continue
-        # GIVEBACK: the move that justified the entry must be undone by k x it.
+        if side_now == held or not past:
+            continue                     # not flipped now: wait, do not disarm
+        # GIVEBACK: the move that justified the entry must be undone k-fold.
         if giveback is not None and m0 > 0 and abs(m) < giveback * m0:
             continue
         # DRAW: only cut a position that is already losing on the book.
-        if draw is not None:
-            if px is None or px > entry["ask"] - draw:
-                continue
-        if armed is None:
-            armed = ts
+        if draw is not None and (px is None or px > entry["ask"] - draw):
+            continue
         if confirm_s <= 0 or (ts - armed) / 1000.0 >= confirm_s:
             if px is None:
                 continue

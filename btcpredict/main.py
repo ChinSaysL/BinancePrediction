@@ -4478,50 +4478,46 @@ class Bot:
         #   The round refused to OPEN four times on a move it then CLOSED on.
         #   eth-updown-5m-1789742700 did the same in 4.30 s. Both are the
         #   4 s floor of the old gate, hit exactly.
+        # ⛔ ARM ON THE EVENT, CONFIRM ON THE STATE. `crossed_side` reports a
+        # CROSSING, and a SUSTAINED flip produces exactly ONE of them -- so a
+        # fire rule that lives inside the "this tick is a crossing into the
+        # other side" branch can only ever fire on an OSCILLATING signal, which
+        # is the opposite of what the rule is for.
+        #   LIVE 2026-09-18, btc-updown-5m-1789750800 Up entered 17:02:09 @0.640:
+        #     17:02:12 tau 167  FLIP to Down (m -0.60)  ARMED
+        #     ...one opposite reading, ever; the spot sat Down for the rest of
+        #     the round (-1.45, -6.77, -8.70, -2.70, -5.22 bps) and the Up token
+        #     went 0.64 -> 0.07 while the watcher waited for a second crossing.
+        # This is the trap this file already records ("a crossing is an event,
+        # so a second one 3 s later may simply never come"). The confirmation is
+        # therefore a STATE question -- is the signal STILL past the level on
+        # the other side -- and only the ARMING is an event.
         now_side = crossed_side(list(sig_ticks), level, self._ck("look_s", r),
                                 hold_s=self._ck("hold_s", r))
-        # THE FLIP'S OWN MARGIN, the same gate and the same number the entry
-        # uses on itself. It makes the band symmetric: we bought `floor` bps
-        # past the level on our side, so we leave `floor` bps past it on the
-        # other, and the round trip has to cover 2 x floor rather than 0.
+        sig_px = sig_ticks[-1][1]
+        # THE STATE, independent of any crossing: which side of the level the
+        # signal sits on now, and whether it is past the floor the ENTRY had to
+        # clear. Same gate, same number -- see the hysteresis note above.
         floor = self._ck("min_margin_bps", r)
-        margin_ok = True
-        if floor > 0 and level and now_side is not None and sig_ticks:
-            sig_px = sig_ticks[-1][1]
-            margin_ok = abs(1e4 * (sig_px - level) / level) >= floor
-        if now_side == held:
+        margin = (1e4 * (sig_px - level) / level) if level else 0.0
+        side_now = "Up" if sig_px > level else "Down"
+        past_floor = (floor <= 0) or (abs(margin) >= floor)
+        if side_now == held and past_floor:
             # BACK ON OUR SIDE, CONVINCINGLY: the flip died, so the latch goes.
-            # This is NOT the same event as a quiet tick, and conflating the two
-            # is what the note below is about -- one is "no reading", the other
-            # is "the reading reversed".
-            if margin_ok:
-                w["flip_ms"] = None
-            return False
-        if now_side is None:
-            # ⛔ DO NOT DISARM HERE, AND THIS IS A MEASURED BUG FIX.
-            # `crossed_side` reports a CROSSING EVENT, not a state: the tick
-            # AFTER a crossing -- with the spot still sitting on that side --
-            # returns None, not that side. Clearing the latch on None therefore
-            # made the flip impossible to hold for `confirm_s`, and the lock
-            # never came off:
-            #   LIVE 2026-09-18 12:52, round -1789735800, THREE positions:
-            #   eth armed 12:52:25, again 12:52:33, again 12:53:03 (the repeated
-            #   arming IS the clearing), btc 12:52:26, bnb 12:52:51, xrp 12:53:04
-            #   -- six arms, ZERO exits, while the positions went to the bell.
-            return False
-        if not margin_ok:
-            # On the level, not past it. The latch is LEFT ALONE: a flip that is
+            # A wobble that does not clear the floor leaves it alone -- a flip
             # still building is not a flip that died.
+            w["flip_ms"] = None
             return False
-        # THE CONFIRMATION RUNS FROM THE FLIP, NOT FROM THE ENTRY. `flip_ms`
-        # was stamped here and never read: the gate compared against
-        # `entry_ms + 1000`, so `cross_exit_confirm_s` did not mean "the flip
-        # persisted 3 s" -- it meant "wait 4 s after the BUY, then leave on the
-        # first opposite tick". That is why every live exit fired at 4.3-4.4 s
-        # on the nose. The tests passed because they assert `flip_ms` is SET.
         if w.get("flip_ms") is None:
-            w["flip_ms"] = now_ms
-            return False          # arm now; the earliest fire is confirm_s away
+            # NOT ARMED YET, and only a genuine CROSSING into the other side
+            # arms it (with the entry's own `hold_s` applied, so a lone print is
+            # not a flip). Arming is the event; everything after is state.
+            if now_side is not None and now_side != held and past_floor:
+                w["flip_ms"] = now_ms
+            return False
+        # ---- ARMED. Fire when the flip has PERSISTED, not when it re-crosses.
+        if side_now == held or not past_floor:
+            return False          # not flipped right now: wait, do not disarm
         confirm_ms = int(settings.cross_exit_confirm_s * 1000)
         if now_ms - int(w["flip_ms"]) < confirm_ms:
             return False

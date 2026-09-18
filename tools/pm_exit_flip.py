@@ -139,18 +139,22 @@ def walk(pre: dict, entry: dict, *, confirm_s: float, look_s: float,
             continue
         side = base.crossed_side(src_[max(0, j - tail):j], level, look_s,
                                  hold_s=hold_s)
-        if side == held:
+        # ⛔ ARM ON THE EVENT, CONFIRM ON THE STATE -- a SUSTAINED flip gives
+        # exactly one crossing, so a fire needing a second one can only act on
+        # an oscillating signal (live btc-updown-5m-1789750800: armed 17:02:12,
+        # sat Down all round, the Up token went 0.64 -> 0.07, never sold).
+        m = 1e4 * (src_[j - 1][1] - level) / level if level else 0.0
+        side_now = "Up" if m > 0 else "Down"
+        past = (floor_bps <= 0) or (abs(m) >= floor_bps)
+        if side_now == held and past:
             armed_ms = None           # back on our side: the flip died
             continue
-        if side != other:
-            continue                  # no reading: expected, do not disarm
-        # THE FLIP'S OWN MARGIN, the gate the entry applies to itself.
-        if floor_bps > 0 and level:
-            sig_px = src_[j - 1][1]
-            if abs(1e4 * (sig_px - level) / level) < floor_bps:
-                continue              # on the level, not past it
         if armed_ms is None:
-            armed_ms = ts
+            if side == other and past:    # only a CROSSING arms it
+                armed_ms = ts
+            continue
+        if side_now == held or not past:
+            continue                  # not flipped now: wait, do not disarm
         if confirm_s <= 0 or (ts - armed_ms) / 1000.0 >= confirm_s:
             return _px(held, ts, float(tau), up_ask, dn_ask, entry, end_ms)
     return None

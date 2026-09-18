@@ -178,18 +178,23 @@ def _tape(side: str, level: float = 100.0, n: int = 3):
     return [(t, px_other), (t + 1500, px_side), (t + 2000, px_side)], px_side
 
 
-def _quiet(level: float = 100.0):
-    """A tape `crossed_side` reads as NO CROSSING -- every tick on one side.
+def _quiet(level: float = 100.0, side: str = "Down"):
+    """A tape with NO CROSSING -- every tick already settled on `side`.
 
-    This is what "the reading goes quiet" actually looks like. It is NOT the
-    same object as `_tape(held_side)`, which is a real re-crossing BACK to the
-    side we hold; the exit treats the two differently on purpose (one leaves
-    the latch alone, the other kills it), and conflating them is the bug that
-    made the first version arm six times and sell nothing.
+    ⛔ THIS IS THE SHAPE OF A SUSTAINED FLIP, and it is the case the exit
+    exists for. `crossed_side` reports a crossing EVENT, so once the signal has
+    moved to the other side and STAYED there it returns None forever: the live
+    btc-updown-5m-1789750800 had exactly ONE opposite reading and then sat
+    there while the position went 0.64 -> 0.07. A fire rule that needs a second
+    crossing can never act on it, which is why the confirmation is a STATE
+    question and only the arming is an event.
+
+    `side` is the side the signal SITS on, so `_quiet(side="Down")` while
+    holding Up is "the flip is still on" and `_quiet(side="Up")` is "it died".
     """
     t = 1_000_000
-    hi = level + 0.5
-    return [(t, hi), (t + 1500, hi), (t + 2000, hi)], hi
+    px = (level + 0.5) if side == "Up" else (level - 0.5)
+    return [(t, px), (t + 1500, px), (t + 2000, px)], px
 
 
 def _run(b, r, sig_side, level=100.0):
@@ -200,8 +205,8 @@ def _run(b, r, sig_side, level=100.0):
     return asyncio.run(b._cross_exit_check(r, level, ticks))
 
 
-def _quiet_run(b, r, level=100.0):
-    ticks, _ = _quiet(level)
+def _quiet_run(b, r, level=100.0, side="Down"):
+    ticks, _ = _quiet(level, side)
     b._cross_signal = lambda r, t, tau: (ticks, "spot")
     return asyncio.run(b._cross_exit_check(r, level, ticks))
 
@@ -273,14 +278,16 @@ class TestTheFlipMustPersist:
         arm_ms = b._exit_watch[SLUG]["flip_ms"]
         assert arm_ms is not None, "the first opposite reading arms it"
         for _ in range(4):
-            _quiet_run(b, r)                      # the reading goes quiet
+            _quiet_run(b, r)          # no new crossing; the signal SITS on Down
         assert b._exit_watch[SLUG]["flip_ms"] == arm_ms, (
-            "a non-reading must not clear the arming")
+            "a sustained flip produces no further crossing EVENT -- that must "
+            "not clear the arming")
         assert b.broker.calls == []
-        # ...and an opposite reading AFTER the flip has persisted fires it.
-        # (`flip_ms` is aged rather than slept: the rule is time-since-FLIP.)
+        # ...and it fires on a QUIET tick once the flip has persisted, with no
+        # second crossing ever arriving. This is the live btc-1789750800 case.
         b._exit_watch[SLUG]["flip_ms"] -= 10_000
-        assert _run(b, r, "Down") is True
+        assert _quiet_run(b, r) is True, (
+            "a sustained flip must sell without a second crossing event")
         assert len(b.broker.calls) == 1
     def test_a_persistent_flip_sells_once(self, monkeypatch):
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
@@ -783,14 +790,19 @@ class TestTheTauGateIsTheEdge:
     """
 
     def test_the_gate_defaults_to_the_measured_value(self):
+        """60.0 was RETRACTED: the sweep that chose it ran on a walk() that
+        could only fire on oscillating signals. 8.0 has its own reason (the
+        book goes one-sided at the bell). See config.cross_exit_min_tau_s."""
         from btcpredict.config import Settings
-        assert Settings().cross_exit_min_tau_s == 60.0
+        assert Settings().cross_exit_min_tau_s == 8.0
 
     def test_a_flip_inside_the_gate_does_not_sell(self, monkeypatch):
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
                             True)
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_min_tau_s",
+                            60.0)
         b = _bot(monkeypatch=monkeypatch)
-        r = _round(tau_s=45.0)                # inside the 60 s gate
+        r = _round(tau_s=45.0)                # inside the gate
         for _ in range(4):
             assert _run(b, r, "Down") is False
         assert b.broker.calls == [], (
@@ -818,3 +830,64 @@ class TestTheTauGateIsTheEdge:
         assert "cross_exit_min_margin" not in src, (
             "a separate exit floor was measured and refused; see "
             "config.cross_exit_min_tau_s")
+
+
+class TestASustainedFlipSells:
+    """⛔ THE LIVE REGRESSION THIS CLASS EXISTS FOR (btc-updown-5m-1789750800).
+
+        ENTRY 17:02:09 Up @0.640 (margin +1.508 bps)
+        17:02:12 tau 167  FLIP to Down (m -0.60)  ARMED
+        ...one opposite reading, EVER. The spot sat on the Down side for the
+        rest of the round (-1.45, -6.77, -8.70, -2.70, -5.22 bps) and the Up
+        token went 0.64 -> 0.07 while the watcher waited for a second crossing.
+
+    `crossed_side` is an EVENT detector, so a SUSTAINED flip -- the exact case
+    the exit exists for -- produces exactly ONE reading. A fire rule that lives
+    inside the "this tick is a crossing into the other side" branch can only
+    fire on an OSCILLATING signal. The confirmation is therefore a STATE
+    question; only the arming is an event.
+    """
+
+    def _armed(self, monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
+                            True)
+        b = _bot(monkeypatch=monkeypatch)
+        assert _run(b, _round(), "Down") is False          # the crossing arms
+        assert b._exit_watch[SLUG]["flip_ms"] is not None
+        return b
+
+    def test_it_fires_with_no_second_crossing(self, monkeypatch):
+        b = self._armed(monkeypatch)
+        b._exit_watch[SLUG]["flip_ms"] -= 10_000           # the flip persisted
+        assert _quiet_run(b, _round(), side="Down") is True
+        assert len(b.broker.calls) == 1
+
+    def test_it_does_not_fire_before_the_window(self, monkeypatch):
+        b = self._armed(monkeypatch)
+        for _ in range(5):
+            assert _quiet_run(b, _round(), side="Down") is False
+        assert b.broker.calls == [], "confirm_s has not run yet"
+
+    def test_the_signal_coming_back_disarms_it(self, monkeypatch):
+        b = self._armed(monkeypatch)
+        assert _quiet_run(b, _round(), side="Up") is False  # back on our side
+        assert b._exit_watch[SLUG]["flip_ms"] is None, (
+            "the signal sits on the side we hold: the flip is over")
+        b._exit_watch[SLUG]["flip_ms"] = None
+        for _ in range(4):
+            _quiet_run(b, _round(), side="Down")
+        assert b.broker.calls == [], (
+            "a disarmed watcher needs a fresh CROSSING to re-arm, not a state")
+
+    def test_the_fire_check_is_not_inside_the_crossing_branch(self):
+        """Structural, because the bug is invisible in any single-tick test:
+        the fire must not be reachable only when this tick is a crossing."""
+        src = (ROOT / "btcpredict" / "main.py").read_text()
+        i = src.index("async def _cross_exit_check")
+        j = src.index("def _confirm_pending_sale", i)
+        body = src[i:j]
+        assert "side_now" in body, "the exit must compute the STATE"
+        # the arming is the only place `now_side` (the EVENT) may gate
+        after = body[body.index("if w.get(\"flip_ms\") is None:"):]
+        assert "now_side" not in after.split("# ---- ARMED")[-1], (
+            "the fire path must not depend on a fresh crossing event")

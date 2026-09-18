@@ -12890,3 +12890,72 @@ precisely where the replay's fill model fails -- it books the trigger-instant
 ask while the venue has already repriced. The replay therefore systematically
 OVERVALUES the cohort the live record likes least. That is one defect with two
 symptoms, not two independent findings.
+
+### ⛔⭐ THE EXIT COULD NOT SELL A SUSTAINED FLIP — MY BUG, AND IT INVERTS THE VERDICT (2026-09-18)
+
+Operator: "why did the sell not execute on the latest btc trade?"
+
+    btc-updown-5m-1789750800  ENTRY 17:02:09 Up @0.640 (margin +1.508 bps)
+      17:02:12 tau 167  FLIP to Down (m -0.60)  ARMED
+      opposite readings total: 1   fired: NO
+    the spot then sat on the Down side for the whole round (-1.45, -6.77, -8.70,
+    -2.70, -5.22 bps) and the Up token went 0.64 -> 0.07. Never sold.
+
+**THE DEFECT.** `crossed_side` is an EVENT detector, so a SUSTAINED flip -- the
+exact case the exit exists for -- produces exactly ONE reading. The fire check
+sat inside the `now_side == other` branch, so firing required a SECOND crossing
+event `confirm_s` after the first. **The rule could therefore only ever sell an
+OSCILLATING signal, never a sustained one.** This file already records the trap
+("a crossing is an event, so a second one 3 s later may simply never come"); the
+previous author avoided it by clocking from the ENTRY. Moving the clock to the
+FLIP reintroduced it, and I did not notice.
+
+**THE FIX: ARM ON THE EVENT, CONFIRM ON THE STATE.** Only the arming is a
+crossing; the confirmation asks whether the signal is STILL past the level on
+the other side. Pinned by `TestASustainedFlipSells`, including a structural test
+that the fire path cannot depend on a fresh crossing.
+
+**⛔ IT INVALIDATES THE EXIT SWEEP AND INVERTS TWO OF ITS CONCLUSIONS.**
+`pm_exit_flip.py` and `pm_exit_explore.py` had the identical shape, so every
+exit number in this file before now was measured on a rule that fired ~10% as
+often as it should. Same grid, corrected (748 -> 762 entries):
+
+                                  BEFORE (buggy)            AFTER (state)
+    B flip, floor=entry      28 exits +0.0032 x1.56    267 exits -0.0012 x0.98
+    E tau>=60                21 exits +0.0045 x2.23    232 exits +0.0032 x1.05
+    C exit floor 3.0 bps      2 exits -0.0005 x0.02     39 exits +0.0052 x2.32
+    C exit floor 5.0 bps      0 exits                   17 exits +0.0029 x inf
+
+Two retractions:
+  * **"an exit floor higher than the entry's is actively harmful"** (x0.66 /
+    x0.37 / x0.02) is WRONG. With the fix it is the best discriminator on the
+    tape: floor 3.0 gives x2.32 and floor 5.0 cuts 17 losers and ZERO winners.
+  * **the tau>=60 gate is not supported.** It was the only survivor of 24 rules
+    on the buggy sweep; corrected it is x1.05, a coin flip.
+
+**AND THE LIVE FILLS INVERT THE HEADLINE VERDICT** (101 settled fills):
+
+    HELD to the bell                    -15.337
+    floor=entry, no tau gate            -10.977  (+4.361) 31 exits 24L/7W x1.47
+    floor=entry, tau>=60 (as shipped)   -11.433  (+3.904) 29 exits 22L/7W x1.42
+    exit floor 3.0                      -15.679  (-0.342)  4 exits x0.77
+    exit floor 5.0                      -16.605  (-1.268)  2 exits x0.19
+
+**The exit is worth +4.361 on the live record, not the ~0 I reported.** My
+"keep it off, it is neutral" recommendation was an artifact of the broken rule;
+the operator's decision to enable it was the better call. And the tape's new
+favourites (exit floor 3-5 bps) are NEGATIVE live on n=2-4 -- the same
+tape/live inversion as everywhere else today, and the reason nothing further
+is being shipped off the tape alone.
+
+SHIPPED: the state-confirmation fix, and `cross_exit_min_tau_s` 60 -> **8.0**
+(both config and the `.env` pin; backup `-pre-statefix`). 8.0 is restored
+because the 60 justification was RETRACTED, not because 60 was disproved --
+8.0 carries its own reason (the book is one-sided at the bell), and live puts
+the gate at -0.457 over 2 exits, which is noise either way.
+
+LESSON, and it is the third instance today: a rule that fires far less often
+than expected is a BUG HYPOTHESIS, not a finding about the market. "Confirming
+a flip for 3 s almost never happens" should have been read as "my confirmation
+cannot see a persistent state", exactly as "the exit banks the entry price"
+should have been read as a pricing bug and not an edge.
