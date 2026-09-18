@@ -12022,3 +12022,573 @@ If the concern is real it is a RISK question, not a direction one: BTC-Down plus
 two alt-Ups in one round is one correlated bet placed three times. That is what
 `cross_max_open_stake_pct` exists for, and it is the lever to measure -- not a
 side filter.
+
+## eth-updown-5m RE-ENABLED: the table that cut it was measured on the OLD signal and the OLD window (2026-09-18)
+
+`cross_disabled_families` was set to `"eth-updown-5m"` earlier the same day, as an
+OPERATOR risk decision recorded in `config.py`: over every settled PM-era round,
+first crossing in tau [5,60], no band and no floor,
+`tools/pm_family_signal_check.py` gave eth **n=38, hit 63.2%, be-ask 0.645,
+edge -1.4pp** while every other family's trigger was worth 6-22pp MORE than its
+price -- a fee paid for a coin flip, and an override of the repo's own cut rule
+(eth's halves were -6.6/+3.9, i.e. it FAILED the both-halves test).
+
+Both inputs of that table had moved underneath it by the evening:
+
+1. **The `fc` wire was wrong when the table was taken.** `twap_forecast` averaged
+   `[ts-60, ts]` instead of the paid window's printed part `[bell-60, ts]`. Re-run
+   on the corrected wire at the SAME tau [5,60], eth reads n=40, hit 60.0%,
+   be-ask 0.647, edge **-4.7pp** -- WORSE. The fix did not rescue eth.
+2. **The arm stopped trading tau [5,60].** The window moved to [5,180] and was
+   re-validated the same day. In the window the arm DOES trade:
+
+       eth-5m  n=170  hit 64.7%  be-ask 0.546  edge +10.1pp  +0.0941/sh
+               t +2.46  halves +8.9/+11.3  med|m| 0.58bps
+               btc +9.2pp | xrp +8.8pp | bnb +8.2pp | sol +4.1pp | doge +4.2pp
+
+   and it REPEATS: by day +21.8/+7.0/+12.3pp, by side Up +12.2pp / Down +8.5pp.
+   Arithmetic (not a bucket): 40 triggers at -0.0525 = -$2.10; 170 at +0.0941 ~
+   +$16.0, so the 130 EARLIER first-crossings pay ~ +0.139/share.
+   The money replay agrees (`pm_cross_replay.py --by-family --tau-lo 5 --tau-hi
+   180`, 0.5 bps floor): **eth n=113 ask 0.520 win 70.8% total +$19.33, t +3.89,
+   day-t +2.88, halves +0.2070/+0.1358 -- the LARGEST 5m family** (btc +13.49,
+   sol +11.12, bnb +10.60, xrp +10.28, doge +6.50).
+
+The "fee on a coin flip" objection still describes something real -- eth's LATE,
+LOW-MARGIN crossings -- which is exactly what the floor removes: `|m|` 0-1bps is
++5.3pp (n=118, t +1.05) while 1-2bps is +23.1pp (n=27) and 3+bps +23.7pp. And in
+the traded window BOTH halves are positive, so the override the disable rested on
+is gone.
+
+**The venue-ask risk is MEASURED, and it points the right way.** The replays
+above pay the RECORDED ask, so the open question was what eth's fills really
+pay. eth-5m has **zero PM-era fills** (and none under this rule chain), but it
+has **43 real fills from before the era** (09-14 19:24 -> 09-16 15:06) at
+0.42-0.89 under the old cross arm, and their `filled_px - requested_px` is
+**mean -0.0054, median +0.0005, max +0.0265** (n=43; only 1 worse than +0.02,
+5 better than -0.02). So a fill lands at or below the price asked for, on
+average -- the xrp case (a venue ask 0.1600 ABOVE our ladder) is the tail, not
+the shape. Caveat that remains: those fills are a different era, band
+(0.42-0.89 vs our 0.10-0.65) and execution path, so they bound the risk rather
+than remove it.
+
+**Kill criterion:** eth-5m live fills at
+<= 0 per share over ~50 entries -> put the prefix back. Revert is
+`cross_disabled_families: str = "eth-updown-5m"`.
+
+Shipped 2026-09-18 10:18 UTC; first live round armed at 10:18:38 and the kline
+level fallback fired on it immediately (`level recovered from the 1s klines:
+2512.539500`), i.e. the new family is exercising the new recovery path.
+
+## A cross-family entry cap inside one window: MEASURED AND REFUTED (2026-09-18)
+
+The prompt was two consecutive bad windows: 11:15 took three same-side Downs
+(btc/doge/sol) and settled **-$3.12**; 11:20 took four entries across four
+families (xrp/D +0.79, doge/U -1.03, sol/U -1.03, btc/U -1.03) for **-$2.30**.
+Six losses in seven entries, 3-4 of them correlated.
+
+**No gate misbehaved.** Every fill was at or below the 0.65 ceiling, each entry
+passed the 0.25 bps floor on its own, and `cross_max_per_round = 1` correctly
+refused the later crossings in each family (`slot already used this round (1/1)`
+for doge/sol/xrp in that same window). The xrp Down came in 10 s BEFORE the
+three Ups -- the arm held both sides of one 5-minute print, which is legal per
+family and unguarded across families.
+
+**The scope defect is real:** `cross_max_round_stake_mult` keys
+`_round_stake[r.slug]`, so nine families per window mean nine independent
+budgets. Its own comment claimed "THE ROUND is one bet ... the round's CUMULATIVE
+stake is the risk unit". It is also INERT as shipped -- `cross_max_per_round = 1`
+refuses a family's second entry before the mult is ever read. And
+`cross_max_open_stake_pct` (the genuinely account-wide lever, default 0.30) reads
+**0 = OFF** because `/root/BinancePrediction/.env` pins `CROSS_MAX_OPEN_STAKE_PCT=0`.
+So nothing bounds cross-family concurrency.
+
+**On the live sample the stacking looked monotone-bad** (64 PM-era fills, 47
+windows, net -$2.54):
+
+    per-entry by window-k   1:+0.0295   2:+0.0056   3:-0.1112   4:-0.5750
+    same-side position      #1 -0.0004   #2 -0.0435   #3 -0.5347
+    cap 2/window   -> drops n=6  worth -$2.31   (record becomes -$0.22)
+    same side <=1  -> drops n=12 worth -$2.49   (record becomes -$0.05)
+
+**The replay over the whole era reverses it** (`tools/pm_window_cap.py`, 763
+entries, 299 windows, shipped chain, grouped by `rounds.end_ms`):
+
+    per-entry by window-k   1:+0.1199  2:+0.0237  3:+0.0211  4:+0.0461
+                            5:+0.1815  6:+0.1640  7:+0.5517  8:+0.0330
+    same-side position      #1 +0.0418  #2 +0.1154  #3 +0.0531  #4 +0.2564
+                            #5 +0.2194
+    all-one-side windows    n=335  +0.1799/sh  tot +60.26
+    mixed-side windows      n=334  -0.0274/sh  tot  -9.16
+
+    base (no cap)          n=763 per +0.0817 tot +62.37 t +4.57 day-t +3.51
+    cap 1 per window       n=299      +0.0432     +12.92 t +1.52 day-t +1.53
+    cap 2 per window       n=504      +0.0593     +29.87 t +2.70 day-t +2.36
+    cap 3 per window       n=640      +0.0734     +46.98 t +3.77 day-t +3.13
+    same side <=1/window   n=396      +0.0417     +16.53 t +1.67 day-t +2.02
+
+Every cap's dropped cohort is POSITIVE (+0.1066 / +0.1255 / +0.1251 / +0.1249
+per share) and every cap LOWERS the day-clustered t. **The stacking is not the
+leak -- it is where the edge is.** k=5 windows alone carry a third of the total,
+and a window's 2nd-4th same-side entries beat its first. Mechanism: a crossing
+that is simultaneous across the complex is ONE real macro move, not the same coin
+flipped k times.
+
+The one implementable "opposite side" variant was measured too -- an entry
+against a side already open in the same window: **n=97, +0.0372/sh** (positive),
+and skipping it drops day-t 3.51 -> 2.49. Also rejected.
+
+**Conclusion: no concurrency cap.** The 64-fill live sample that motivated it was
+two days of variance, and the two windows it rested on were killed by the move.
+If tail protection is wanted, the lever is `cross_max_open_stake_pct` (stake as a
+fraction of bankroll, currently pinned to 0 in the live `.env` against a 0.30
+code default) -- and the replay cannot price it, because the tape carries no
+bankroll. `_open_cross_stake` reads the ledger, so the live record is its
+measurement. Shipped: the scope fact, the numbers and the refutation are now
+recorded beside both knobs, with `TestTheWindowCapIsRefuted` pinning that the
+accumulator stays per family. No behaviour changed.
+
+## EXIT-ON-FLIP: if the forecast turns, leave — strongly positive on the tape, and the "no sell" belief may be stale (2026-09-18)
+
+THE IDEA (operator): we bought because the trigger said Up. If it later says Down,
+the reason we bought is gone, so sell rather than hold a position whose thesis
+died. `tools/pm_exit_flip.py` prices that on every entry the shipped chain takes
+(766-768 entries, PM era, `look_s 1.0`, floor 0.25, tau [5,180]).
+
+WHAT HAPPENS. **62.9% of entries see the signal turn against them before the
+bell**, and the median flip is **1.0 s after the entry** (p10 = p90 = 1.0 s):
+
+    P(win | flipped)      42.2%
+    P(win | not flipped)  94.4%
+    exit price implied    median 0.5400   (1 - other_ask, the complement identity)
+    seconds of round left at the flip: median 143 s
+
+    A hold to settlement (base)             per-share +0.0773  tot  +59.34  t +4.32  day-t +3.34  halves +0.0652/+0.0894  drop1 +0.1019
+    B exit at the first flip [483 exits]                 +0.1372      +105.35  t+13.69  day-t+10.37  halves +0.1485/+0.1259  drop1 +0.1215
+    C exit if the flip holds 3 s [439]                   +0.1434      +110.10  t+13.40  day-t+15.39  halves +0.1427/+0.1440  drop1 +0.1406
+    C exit if the flip holds 10 s [368]                  +0.1434      +110.10  t+11.95  day-t +7.84  halves +0.1434/+0.1433  drop1 +0.1443
+    D exit only when the exit price is under entry [277] +0.0909       +69.85  t +6.41  day-t +4.92  halves +0.0935/+0.0884  drop1 +0.0897
+    F exit only if the flip lands before tau 120 [162]   +0.1022       +78.52  t +6.49  day-t +3.47
+
+Confirming the flip (3/5/10 s) is as good or better than acting on the first
+print, so the effect is not "sell at the bottom of the wobble at t+1".
+
+**IT IS NOT JUST THE MARGIN-FLOOR COHORT**, which was the first suspicion (the
+flip is 1 s old and the live floor admits a crossing worth 0.25 bps):
+
+    |m| 0.25-0.50 bps  n=185  flip 70.3%  hold -0.0419/sh  P(win|flip) 33.1%
+    |m| 0.50-1.00 bps  n=283  flip 65.7%  hold +0.0788/sh  P(win|flip) 48.9%
+    |m| 1.00-2.00 bps  n=197  flip 63.5%  hold +0.0672/sh  P(win|flip) 39.2%
+    |m| 2.00-99.0 bps  n=103  flip 40.8%  hold +0.3063/sh  P(win|flip) 50.0%
+
+    floor 1.0 bps alone (earlier replay)   +0.1389/sh  t +5.61  day-t +3.85
+    floor 1.0 bps + this exit             +0.2083/sh  t+12.21  day-t+15.68  drop1 +0.1804
+
+The exit adds ~+0.07/sh ON TOP of the floor, in every floor tested (0.5/1.0/2.0).
+(Only the 0.25-0.5 bps bucket is negative on hold, so the floor is worth a
+separate look: the LIVE value is 0.25 while the replay labels 1.0 as "ships".)
+
+**THE VENUE CAN PROBABLY DO IT, and `config.py` says otherwise.** The note by the
+locked-loss guard -- "it cannot be undone (this venue has no sell, only buy)" --
+is inherited from the PREVIOUS venue, where the old unwind path came back with 37
+`no SELL quote` errors before being deleted as dead code. The live integration is
+Polymarket, and the installed SDK (`polymarket-client 0.10.0`,
+`clients/async_secure.py:2535`) overloads `place_market_order` with
+`side: Literal["SELL"]`, taking **`shares`** and a **`min_price`** floor. Every
+order path in this repo passes `side="BUY"` (broker.py 579/1004/1617) -- the sell
+is unwritten, not unavailable. Precedent that the shape is real: `book.py` parses
+`SELL` rows into the ask ladder, and `feeds/prediction_book.py` records that
+"Buying Down consumes the Up BID queue (a Down buy is an Up sell)".
+
+CAVEATS THAT BOUND THIS, all of them material:
+  * the exit price is MODELLED as `1 - other_ask` (the complementary-token
+    identity). The real exit is the book's own BID. One live shadow-book line
+    shows the gap: venue Up `0.5600/0.5700` with our Down ask at `0.4500` ->
+    `1 - 0.45 = 0.55` against a real 0.56, i.e. **~1c per share of model error**
+    on a +0.06/sh effect.
+  * a FAK sell with `min_price` can simply NOT FILL. The model assumes every exit
+    fills at 1 - other_ask; a fill rate below ~100% scales the benefit down
+    roughly linearly, and at 50% the floor-1.0 variant is still positive.
+  * a sold position must not be settled as held: `settle_due`, the guard's open
+    positions, `_open_cross_stake` (it reads `fills`/`settlements`) and the
+    reserved-slot accounting all assume the fill is held to the bell.
+  * the 1-second median flip means this is largely "the crossing did not
+    persist". That is the SAME phenomenon as the refuted `cross_hold_s` test --
+    which failed because it repays a repriced ask for the privilege of waiting,
+    while this keeps the entry price and pays the spread instead. The two are not
+    contradictory, but the tape has now been wrong about this direction twice, so
+    the live fill rate is the measurement that matters.
+
+### BUILT (2026-09-18, shipped with the flag OFF)
+
+    btcpredict/venues/polymarket/broker.py   sell_fak() -- the first sell path
+                                             in this repo (SELL + shares +
+                                             min_price, FAK)
+    btcpredict/main.py                       _book_fill registers a held cross
+                                             position; _cross_exit_check runs
+                                             BEFORE the per-round cap (a held
+                                             round already has max_per_round
+                                             spent, so a watcher after it never
+                                             sees the tick); _cross_exit_execute
+                                             sells and closes the fill
+    btcpredict/config.py                     cross_exit_enabled (False),
+                                             _confirm_s (3.0), _min_tau_s (8.0),
+                                             _slip (0.03), _max_per_position (1)
+    tests/test_cross_exit_flip.py            14 tests, 1608 total green
+
+Three details worth keeping:
+  * **THE SALE IS A SETTLEMENT ROW** for the entry's fill. That one write is what
+    makes every consumer agree with no new concept: `_open_cross_stake` counts
+    fills with no settlements row (so exposure stops counting it), and
+    `settle_due` iterates `open_fills` (so it can never pay the position out a
+    second time against the winner). A part-sale SPLITS the fill so no row ever
+    represents shares that no longer exist.
+  * **THE CONFIRMATION IS THE POSITION SIZE, NOT `_trades_since`.** That reader
+    sums every trade for the token with NO side filter over a rolling minute --
+    and this exit fires about a second after the entry, so confirming that way
+    would read our own BUY back as the sale and book a phantom exit.
+  * `min_px` is the only risk bound on the order, so it is derived from a bid we
+    can read; NO FRESH BID IS A REFUSAL, never a guess. An UNVERIFIED sale halts
+    the watcher (a second sell from there would be a naked short).
+
+ENABLE ONLY AFTER A REAL SELL HAS FILLED: `cross_exit_enabled=true` in the
+server `.env` + restart. Until then the arm behaves exactly as before.
+
+### ⛔ THE EXIT SHIPPED BROKEN: `crossed_side` is an EVENT, not a STATE (2026-09-18 12:52)
+
+The mechanism armed SIX times across three positions and sold NOTHING, while
+every one of them rode to the bell:
+
+    12:52:25 eth Up: trigger now reads Down at tau 154s -- armed
+    12:52:26 btc Up: trigger now reads Down at tau 153s -- armed
+    12:52:33 eth Up: trigger now reads Down at tau 146s -- armed   <- AGAIN
+    12:52:51 bnb Down: trigger now reads Up at tau 128s -- armed
+    12:53:03 eth Up: trigger now reads Down at tau 116s -- armed   <- AGAIN
+    12:53:04 xrp Up: trigger now reads Down at tau 115s -- armed
+    counts: armed=6  exit=0  sell=0
+
+The repeated arming on ONE position is the fingerprint. `crossed_side` reports a
+CROSSING EVENT between the newest tick and the one `look_s` older -- so the tick
+AFTER a crossing, with the spot still sitting on that side, returns **None**, not
+that side. The live watcher treated that None as "the flip died" and cleared the
+latch (`w["flip_ms"] = None`), so a flip could never be held for `confirm_s`.
+The rule that was MEASURED is the replay's: arm on the first opposite reading,
+then fire on ANY LATER opposite reading at least `confirm_s` old -- intervening
+non-readings are expected. Fixed in `_cross_exit_check` + pinned by
+`test_a_flip_that_goes_quiet_still_fires`.
+
+WHAT IT COST, round -1789735800 (four positions, one window). The market's own
+terminal prices: btc/eth/bnb/sol/doge all settled DOWN, xrp UP -- so the three
+Up positions lost and the xrp Up won, exactly as the operator reported. Exiting
+at each arm's bid would have given:
+
+    eth Up   arm 12:52:25  exit 0.5400 -> -0.128   instead of -1.029
+    btc Up   arm 12:52:26  exit 0.4900 -> -0.264   instead of -1.027
+    bnb Down arm 12:52:51  exit 0.5300 -> -0.146   instead of -1.029
+    xrp Up   arm 12:53:04  exit 0.9400 -> +0.437   instead of +0.530 (gave up 9c)
+
+    round net: about -2.56 held, against about -0.10 with the exit.
+
+So the bug cost ~$2.46 on that one round, and FIVE of the six armed readings were
+on positions that went on to lose -- the flip was right and the order never left.
+Note the xrp arm fired while the market had that side at 0.94: the flip is not
+always right, and on a position already winning it costs the spread.
+
+NOT a settlement bug (checked, because the ledger had booked nothing): the venue
+reports `umaResolutionStatus='not_listed'` for that round, while the two earlier
+rounds return `'resolved'`. Resolution lags the bell by minutes; `settle_due`
+skips a round with no winner and retries, so the P&L lands on its own.
+
+### SELL-SIDE AUDIT (2026-09-18, after the armed-but-never-sold bug)
+
+Adversarial re-read of every path the exit can take, not a re-read of the happy
+one. Three defects found and fixed; all three are now pinned by tests.
+
+1. **A FAILED POSITION READBACK WOULD HAVE BOOKED A PHANTOM SALE.** `_position_size`
+   answers **0.0 for an unreadable position** (documented, and correct for its
+   original caller -- `settle()` asks "is the token held", where 0 and "cannot
+   read" lead to the same conservative action). In the sell path the two lead to
+   OPPOSITE actions: `sold = held - left` with `left = 0.0` from a FAILED read
+   reads as "the whole position sold", so the broker would report a completed
+   sale, the caller would book a settlement row, release the slot and drop the
+   fill -- while the shares are still on-chain, unmanaged and outside every cap,
+   and the round can never be settled for them because `open_fills` no longer
+   holds the fill. That is the 2026-09-17 incident ("an unreadable readback is
+   not an unfilled order") in reverse.
+   FIX: `_position_size_checked()` returns **None** when the read fails. The sell
+   body refuses to size against an unknown holding, and a failed AFTER-read is
+   reported as `unverified` (halt), never as a sale. `_position_size` stays a
+   thin 0.0-equivalent wrapper for `settle()`.
+
+2. **THE SALE WAS SIZED FROM OUR LEDGER, NOT THE VENUE.** `shares=held` used the
+   fill's booked size; if that overstates the holding (an entry booked at its
+   ceiling size when unverified, or a partial entry fill), a FAK for the larger
+   number fills only what exists and `sold = held - left` then reports a sale
+   LARGER than happened. FIX: read the position first and sell
+   `min(booked, actual)`, logging the size-down.
+
+3. **A PARTIAL SALE RELEASED A GUARD SLOT IT STILL NEEDED.** `guard.on_settle`
+   releases the slot, and the exit called it unconditionally -- so after a
+   partial sale the remainder was still open while the arm believed it had freed
+   the room, letting it open another position against its own concurrency and
+   exposure bounds. FIX: re-claim via `guard.on_open` when the position is not
+   fully closed (the P&L half of `on_settle` is still wanted, which is why this
+   is a re-claim rather than a skipped call).
+
+4. **A RESTART LEFT EVERY LIVE POSITION UNWATCHED.** `_exit_watch` is memory, and
+   only `_book_fill` registered -- so a restart mid-round silently un-protected
+   the positions already open (observed: two fills booked 33 s before the flag
+   was enabled rode to the bell). FIX: `_arm_exit_watch()` is now the single
+   construction site, called from `_book_fill` AND from
+   `_restore_open_positions`, which restores `entry_ms` from the fill row so a
+   restart does not reset the watcher's clock.
+
+WHAT THE AUDIT COULD NOT FIX (stated, not hidden):
+* **the live sell fill rate is still unmeasured** -- no flip has been sold yet;
+* **`settlements.won` on an exited position means "the SALE was profitable", not
+  "the round was won"**, because at exit time the round's outcome is unknowable.
+  An exited position is distinguishable by `settlements.ts_ms < rounds.end_ms`
+  (a normal settlement is written after the bell), and by its missing `redeem`;
+* depth at the bid is unmeasured (the venue reports qty 1 at every level), so a
+  partial fill is modelled but untested; a partial sale SPLITS the fill row.
+
+### ⛔ THE VOLATILITY GATE KEEPS THE WORSE HALF (2026-09-18, turned off)
+
+`cross_max_round_range_bps` was the cross arm's only REGIME filter (the sigma
+gate and `min_edge` are both off at 0.0) and every number behind it came from a
+population the arm no longer trades: `tools/pm_range_gate_sweep.py` ranks at
+tau 5-60, while the arm's window was tripled to tau 180 the same day.
+
+`tools/pm_gate_ablation.py` re-asks it on the SHIPPED chain -- the bot's own
+`crossed_side`, `twap_reference`, `twap_forecast` and `_round_range_bps`
+arithmetic, `depth_in_ticks` and `passes_depth_floor`, 3,101 settled PM-era
+rounds, one entry per round, n=826 -- with every gate's own inputs stamped on the
+entry it decides, so a gate can be priced by the cohort it REFUSES:
+
+    range gate KEEPS    n=416 win 56.2% +0.0180/sh t +0.73 day-t +1.11
+                          halves +0.0285/+0.0074  worst-day -0.0115
+    range gate REFUSES  n=408 win 65.4% +0.1191/sh t +4.93 day-t +4.93
+                          halves +0.0991/+0.1392  worst-day +0.0958
+
+The refusals win on every statistic, including the two this repo requires -- both
+halves agree, and it is the KEPT set that carries a negative worst day. Turning
+the gate off is +$48.6 on that cohort, the sweep is monotone toward off, and the
+shipped per-family values (7.8-21.1) were its worst row (`range <= 8` n=90
++0.0389 t 0.73 ... `SHIPPED` n=416 +0.0180 t 0.73).
+
+WHY -- the config's own prediction coming true ("range-so-far is a fixed bps
+count of a quantity whose expected size grows with the time already elapsed"):
+
+    tau 0-60     8-12 +0.3723 | 12-16 -0.0439 | 16-20 -0.2266 | 20-30 -0.0927
+    tau 60-120  12-16 +0.0443 | 16-20 +0.0368 | 20-30 +0.1667 | 30-50 +0.1787
+    tau 120+    12-16 -0.0308 | 16-20 +0.0886 | 20-30 +0.1587 | 50+   +0.2110
+
+The tau<60 row reproduces the original measurement exactly (wide travel = the
+round reverses); from 60 s on the sign flips and RISES with travel. The gate is
+right in a band that now holds 5% of the entries and backwards in the 64% at
+tau>120. The scale-free replacement does not rescue it either:
+`range / (sigma*sqrt(elapsed))` is flat from 0.6 to 2.0 (+0.0653..+0.0674 over
+n=733..808), so the ratio carries no information.
+
+WHAT SHIPPED: 0.0 in `config.py` plus the live pin in `.env` -- the LOAD-BEARING
+one, because `.env` had `cross_max_round_range_bps=20.0` in lowercase, which both
+shadowed the config's 12.0 and was the last place the gate existed. The five
+per-family overrides in `cross_overrides` were removed too: they are read through
+`cross_knob`, so leaving them would have kept the refuted gate binding on exactly
+the five families that fire most. The combination, tick floor untouched:
+
+    SHIPPED (range + ticks)    n=216 +0.0665 t +1.94 day-t +2.21
+    range OFF + ticks SHIPPED  n=505 +0.0995 t +4.46 day-t +3.59
+                                 halves +0.1004/+0.0985 worst +0.0817
+
+2.3x the entries, +50% per share -- and it is the SHIPPED row that fails this
+repo's t>=2 bar (1.94) while its replacement clears it at 4.46. This continues
+what the `.env`'s own 2026-09-17 relax already saw from live decisions (refused
+n=480 +0.760/$1 vs ordered n=56 +0.026/$1).
+
+THE GATES THAT ARE STILL NECESSARY, measured the same way:
+  * tick floor -- the one that earns. Refused +0.0193 (n=320, t 0.70); kept
+    +0.0990 (n=504, t 4.43, day-t 3.57, worst +0.0817). It binds only where it
+    was overridden (doge 104/119, sol 111/138, xrp 105/132; btc/eth/bnb 0).
+    Raising the global 1 -> 2 adds nothing (+0.0996 vs +0.0995): leave it.
+  * margin floor 0.25 -- keep. The 145 entries it refuses are +0.0235; removing
+    it drags the cohort +0.0677 -> +0.0459.
+  * depth ceiling -- FLAGGED, not acted on. The 7 entries past 5.0 bps are worth
+    +0.5086 each (ask 0.334, win 85.7%) and the sweep agrees (OFF +0.0677 vs
+    <=5 +0.0572), but n=7. Live now runs 8.0 (the 2026-09-17 relax); untouched.
+  * `book holds only $X (wanted $1.00)` -- neither a strategy gate nor
+    relaxable: it is `fillable < min_order_usdt`, i.e. the whole visible ask side
+    holding less than the venue's own $1 minimum. It is 253 of the 351 refusals
+    in the 13:07-14:05 dry spell, against 16 for the volatility gate.
+
+UNMODELLED, stated: `_round_range_bps` reads `self._ticks`, appended once per
+TICK, and the poll now runs at a median 58 ms (p90 102 ms), so the live measure
+is DENSER than the 1 Hz `quotes` series these values were fitted on
+(`pm_range_gate_sweep.py` says so itself). A denser sampler reports a wider
+max-min, so live refusals were MORE frequent than the replay's -- that bias runs
+with this change, not against it.
+
+KILL CRITERION, stated before the fact: the newly admitted class is late-tau /
+wide-range (n~390 of the 408 refusals, all at tau>=60) and the entry rate should
+go ~72/day -> ~168/day on that cohort. That class at or below 0 per share over
+~100 live fills means the venue had already repriced what the tape says it had
+not -- restore 20.0, or the per-family values named in the config record.
+
+ALSO FOUND, LARGER, NOT ACTED ON: the price band. Widening [0.10,0.65) to
+[0.10,1.01] gives 994 entries at +0.0792 (t 5.11), and the 170 entries it ADDS
+are +0.1416/sh at 82.9% win (t 4.62, day-t 16.95). But `cross_max_fill_px = 0.65`
+was set from 43 settled LIVE fills (the arm makes money in ONE band, 0.55-0.65;
+the 0.65-0.75 bucket lost 15c/$ on n=13) and this repo's rule is that live fills
+outrank the tape -- the more so here, where the replay cannot model the sweep
+premium at exactly those prices. Keep the ceiling; re-measure as fills accrue.
+
+### ⭐ THE FIRST LIVE EXIT: THE SELL WORKED, THE BOOKING DID NOT (2026-09-18)
+
+`eth-updown-5m-1789741800 Up`, entered 14:33:36 at 0.53 (1.8868 sh, $1.00), exited
+14:34:03. The mechanism that had failed twice today fired on its own, first time,
+27 seconds after the entry:
+
+    14:34:01 pm sell eth-updown-5m-1789741800 Up: sizing down 1.88679 -> 1.8867
+             shares to what the venue holds
+    14:34:03 pm SELL 0x3963ba.. status matched ack 488 ms
+    14:34:03 cross exit eth-updown-5m-1789741800: sell UNVERIFIED (unverified)
+             -- watcher halted for this position
+
+**IT SOLD.** The venue's own trade aggregate (137.1001 sh, vwap 0.026818) less our
+entry (1.88679 @ 0.53) and the operator's unrelated manual buy on the same token
+(133.3401 @ 0.015) implies our sale at **0.35864** -- and the 1 Hz tape shows the
+Up BID at **0.3600** at 14:34:00 and again at 14:34:06. Two independent sources,
+same number. The venue position for that token now holds the operator's shares
+only, which is the third confirmation that ours are gone.
+
+    sold 1.8867 sh @ 0.35864 -> proceeds $0.6463 vs cost $1.0329 -> -0.3866
+    holding to the bell                      (that round's Up LOST)  -> -1.03
+
+So the exit saved **~$0.64** on its first live outing, and the flip was right.
+
+WHAT FAILED IS THE CONFIRMATION, NOT THE SALE. 0.7 s after the ack the venue's
+position list still showed 1.8867 of 1.8867 -- this repo already measured that lag
+at **3.5 s** (2026-09-12: "the position list was empty at 3.5s -> a real fill was
+declared unverifiable and thrown away"). `sell_fak`'s after-read uses
+`_confirm`'s budget (2.5 s), so the rule "an unseen sale is not a sale" turned a
+completed sale into UNVERIFIED and wrote NOTHING: no settlement row, the watcher
+halted for the position, and `open_fills` kept the fill.
+
+CONSEQUENCE, and what was done: `settle_due` would have settled that fill against
+the winner -- reading the venue position, seeing the operator's 133.34 shares on
+the same token, concluding "still held", and booking **-1.03** instead of -0.39.
+The exit row was therefore booked by hand from the two measurements above
+(`settlements` fill_id 948, won=0, payout 0.6463, pnl -0.3866, ts 14:34:03) and the
+bot restarted so its in-memory `open_fills` drops it. One row, verified once.
+
+⛔ AND A NEW HAZARD, from the operator's manual buy: **every verification
+primitive in this broker is TOKEN-level and assumes the bot is the only actor.**
+`_trades_since` sums every trade for the token with NO side filter (it is also
+how the sale price above had to be derived), `_position_size_checked` reads the
+aggregate (so "do we still hold it" now answers YES on 133 shares that are not
+ours), and the redeem sweep claims by token. Manual trades on a token the bot
+holds will corrupt the confirmation, the "still held" test and possibly the
+redeem. Either do not trade the bot's tokens by hand, or the broker needs a
+foreign-shares offset.
+
+HOW TO FIX THE CONFIRMATION (not yet shipped): give the sell's after-read a
+budget that outlasts the venue's own lag (the entry path already polls 6x0.6 s for
+exactly this reason), and distinguish "the position did not change" from "the read
+failed" -- the first is a no-fill, the second is unknown, and only the second
+should halt.
+
+### ⛔ THE EXIT HAD NO HYSTERESIS BAND — IT CUT WINNERS. FIXED (2026-09-18, late)
+
+The operator's report was "every single sell executed seconds after the buy;
+either the buy is wrongly placed or the sell triggers too quickly". Both, and
+they are the same defect.
+
+**THE ENTRY AND THE EXIT WERE THE SAME DETECTOR WITH DIFFERENT GATES.** The
+entry (`main.py`, the `_cross_tick` chain) runs
+
+    side = crossed_side(sig_ticks, level, look_s, hold_s=self._ck("hold_s", r))
+    floor = self._ck("min_margin_bps", r)        # 0.25 bps live
+    if abs(1e4 * (sig_px - level) / level) < floor: refuse
+
+while `_cross_exit_check` ran `crossed_side(sig_ticks, level, look_s)` — no
+`hold_s`, **no margin floor** — and fired. So the buy threshold sat at
+`level + 0.25 bps` and the sell threshold at `level + 0.00`. `crossed_side`
+fires on the FIRST tick past the level, so by construction every entry starts
+life sitting on the level, and any tick back across closed it. On BTC at 80,915
+that 0.25 bps is **$2**: every position was opened $2 above a trapdoor of zero
+width.
+
+THE LIVE PROOF, `sol-updown-5m-1789743000`, consecutive lines:
+
+    14:52:35  not taken: only -0.20 bps of its own margin past twap60, floor 0.25
+    14:52:36 / 14:52:42 / 14:52:43   the same refusal, four in all
+    14:53:20.626  OPEN CROSS sol-updown-5m-1789743000 Down stake=$1.00 @0.540
+    14:53:25.064  pm sell sol-updown-5m-1789743000 Down       <- 4.44 s later
+
+The round refused to OPEN four times on a move it then CLOSED on.
+`eth-updown-5m-1789742700` did the same in 4.30 s.
+
+**AND `confirm_s` NEVER RAN.** `flip_ms` was stamped and never read: the gate was
+`now_ms - (entry_ms + 1000) < confirm_ms`, so "confirm 3 s" meant "wait 4 s after
+the BUY, then leave on the first opposite tick". 4.30 s and 4.44 s are that floor
+hit exactly. The tests passed because they assert `flip_ms` is SET.
+
+**THE REPLAY THAT BLESSED IT HAD THE SAME OMISSIONS PLUS A PRICING BUG.**
+`pm_exit_flip.py:walk()` latched `cand` on the FIRST TICK AFTER THE ENTRY (the
+`if side != other: if cand is None` branch) and never advanced it, so every
+variant booked the exit at ~the entry price. The published "median flip 1.0 s,
+p10 = p90 = 1.0 s" is the 1 Hz tape's spacing, not a property of the flip. It also
+called `crossed_side` with no `hold_s` and applied no margin floor, while
+`pm_cross_replay.pick` (the ENTRY) applies both — an ungated exit scored against
+a gated entry. `walk_legacy` is kept beside the corrected `walk` for the A/B:
+
+    legacy   (booked at entry+1s, ungated)  +0.1343/sh t+13.44  [505 exits]
+       entry -> exit lag: median   1.0s p10   1.0 p90   1.0   <- the artifact
+    corrected (priced where it fires, gated) +0.0599/sh t +3.52 [6 exits]
+       entry -> exit lag: median  99.8s p10  46.6 p90 125.7
+    hold to settlement (base)                +0.0594/sh t +3.48
+
+Honest flip statistics: **52.6%** of entries flip (not 62.9%), median **17.3 s**
+(p10 3.0, p90 57.4), P(win|flip) 37.0% vs 85.2%.
+
+**SCORED ON THE 200 REAL FILLS** — `tools/pm_exit_live_recheck.py`, the rule
+applied to the trades the bot actually took rather than to a cohort it re-picks:
+
+    HELD to the bell (counterfactual)   total -11.071  per-fill -0.1244  t -1.23
+    SHIPPED exit (entry clock, ungated) total -17.743  per-fill -0.1994  t -2.66
+    FIXED   exit (flip clock, gated)    total -11.138  per-fill -0.1251  t -1.27
+    LEDGER (what actually happened)     total -11.016
+
+The shipped rule cost **-$6.67 against doing nothing**, and the mechanism is
+exactly the operator's report:
+
+    43 exits -- 23 on LOSING positions, saving     +17.380
+                20 on WINNING positions, giving up -24.051
+
+It cut winners nearly as often as losers, and a winner cut at the level gives up
+the whole payout. On 09-18 alone the rule turns -3.371 into -7.881 (40 exits: 21
+losers +16.373, 19 winners -20.882).
+
+THE FIX (shipped): `_cross_exit_check` now runs the entry's own chain —
+`hold_s` passed to `crossed_side`, `min_margin_bps` applied to the flip — and
+`confirm_s` is clocked from `flip_ms`. A reading back on the held side kills the
+latch (a genuine reversal); a *quiet* tick still does not (`crossed_side` is an
+event detector — that distinction is the 12:52 regression and is now two separate
+branches rather than one). Pinned by `TestTheHysteresisBand` and
+`TestTheConfirmationRunsFromTheFlip`, 35 tests in the file, 1636 green.
+
+WHAT THE FIX DOES **NOT** DO, stated plainly: it gives back the -6.67, it does
+not make the exit pay. Fixed is -11.138 against -11.071 for holding, and every
+(confirm_s, floor) cell swept on the live fills is neutral at best — the positive
+ones are n=2-5 exits. `cross_exit_enabled` therefore **stays FALSE**.
+
+ALSO EXPOSED BY THE CORRECTED REPLAY, and worth more than the exit ever was: the
+**entry** margin floor is too low. The bucket the live 0.25 admits is a loser.
+
+    |m| 0.25-0.50 bps  n=207  flip 61.4%  hold -0.0348/sh   <- NEGATIVE
+    |m| 0.50-1.00 bps  n=317  flip 51.4%  hold +0.0592/sh
+    |m| 1.00-2.00 bps  n=214  flip 53.3%  hold +0.0570/sh
+    |m| 2.00-99.0 bps  n=116  flip 38.8%  hold +0.2327/sh
+
+That is 207 entries — 24% of the cohort — taken on evidence that does not pay.
+Not shipped here; it is an entry change and wants its own measurement.

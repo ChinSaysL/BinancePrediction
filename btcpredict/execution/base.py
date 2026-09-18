@@ -29,6 +29,11 @@ class Fill:
     # so such a fill is provisional: settle() re-verifies and may void it.
     unverified: bool = False
     unverified_checks: int = 0
+    # An order that reached the venue but whose result is not visible YET.
+    # Distinct from `unverified`, which means "we do not know": a pending sale
+    # is one we placed and can still confirm, so the caller keeps the position
+    # watched and confirms LATER instead of halting it into limbo.
+    pending: bool = False
 
     @property
     def max_payout(self) -> float:

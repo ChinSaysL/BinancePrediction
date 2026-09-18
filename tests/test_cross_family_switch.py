@@ -1,22 +1,33 @@
 """The per-family TRADE switch: recorded, not traded.
 
-WHAT THIS EXISTS FOR. `MARKETS` decides what is RECORDED and `CROSS_TRADED`
+WHY IT EXISTS. `MARKETS` decides what is RECORDED and `CROSS_TRADED`
 decides what may RISK MONEY; they were the same set until `cross_disabled_families`
 narrowed the second one. A family that fails `cross_traded()` must keep its
 rounds, its quote tape and its websocket book -- exactly the state the three
 never-traded families have always been in -- so nothing is lost and re-enabling
 is one edit.
 
-WHY eth-updown-5m IS OFF (2026-09-18, operator decision on a measured zero):
-over every settled PM-era round, first crossing in tau [5,60], no band and no
-floor (`tools/pm_family_signal_check.py`):
-    bnb-5m +21.9pp | btc-5m +14.1pp | sol-5m +12.9pp | xrp-5m +11.2pp
-    doge-5m +5.8pp | eth-5m -1.4pp (hit 63.2% against a break-even ask of 0.645)
-Every other family's trigger is worth 6-22pp more than the book charges; eth's is
-worth less than its price, so every entry pays the taker fee for a coin flip.
-This DELIBERATELY overrides the repo's own cut rule (eth's halves are -6.6/+3.9,
-so it fails the both-halves test and its money sample is 13-16 entries): it is a
-risk decision about paying fees on a zero-edge family, recorded as such.
+eth-updown-5m WAS the disabled family for part of 2026-09-18 and was taken off
+the same day, so the switch currently disables NOTHING. It went on because every
+settled PM-era round, first crossing in tau [5,60], no band and no floor
+(`tools/pm_family_signal_check.py`) gave it -1.4pp against a break-even ask of
+0.645 while every other family's trigger was worth 6-22pp more than its price --
+a fee paid for a coin flip, and an explicit OPERATOR risk decision, since it
+overrode the repo's both-halves cut rule (eth's halves were -6.6/+3.9).
+
+It came off because both inputs of that table changed underneath it: the fc
+wire it was measured on averaged the WRONG WINDOW (`[ts-60, ts]` instead of
+`[bell-60, ts]`), and the arm stopped trading tau [5,60] when the window moved
+to [5,180]. In the window the arm does trade, eth is n=170 hit 64.7%
+be-ask 0.546 edge +10.1pp, per-share +0.0941, t +2.46, halves +8.9/+11.3,
+repeating by day and by side -- and at tau [5,60] on the fixed wire it is still
+-4.7pp, which is why the WINDOW, not the fix, is what moved. The replay makes
+it the largest 5m family at the 0.5 bps floor (n=113, +$19.33, t +3.89).
+
+What is NOT measured: eth has never been live-FILLED, so its venue ask is
+untested (the xrp case showed one 0.16 above our ladder) and the replay pays the
+recorded ask. Kill criterion: eth-5m live fills at <= 0/share over ~50 entries
+puts the prefix back.
 """
 from __future__ import annotations
 
@@ -28,16 +39,27 @@ from btcpredict.config import (CROSS_TRADED, Settings, cross_disabled,
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
-def test_eth_5m_is_the_disabled_family_by_default():
-    assert Settings().cross_disabled_families == "eth-updown-5m"
+def test_nothing_is_disabled_by_default():
+    """The switch is live and set to off-nothing as of 2026-09-18 evening."""
+    assert Settings().cross_disabled_families == ""
+    assert cross_disabled() == frozenset()
 
 
-def test_the_switch_flips_exactly_one_family():
+def test_the_switch_still_flips_exactly_one_family(monkeypatch):
+    """The mechanism the eth-5m episode exercised must keep working."""
+    import btcpredict.config as cfg
+    monkeypatch.setattr(cfg.settings, "cross_disabled_families",
+                        "eth-updown-5m")
     assert cross_traded("eth-updown-5m") is False
-    # eth-15m measured +9.7pp on n=5 and is deliberately left ON
+    # eth-15m measured +9.7pp on n=5 and was never disabled
     assert cross_traded("eth-updown-15m") is True
     for fam in ("btc-updown-5m", "sol-updown-5m", "xrp-updown-5m",
                 "doge-updown-5m", "bnb-updown-5m"):
+        assert cross_traded(fam) is True, fam
+
+
+def test_eth_5m_is_traded_by_default():
+    for fam in ("eth-updown-5m", "eth-updown-15m"):
         assert cross_traded(fam) is True, fam
 
 
@@ -83,3 +105,7 @@ def test_the_decision_and_its_revert_are_recorded_where_the_knob_is():
         "an override of the repo's cut rule must say so"
     assert "+21.9pp" in cfg and "-1.4pp" in cfg, \
         "the family table that decided it must ride with the knob"
+    assert "+10.1pp" in cfg and "+$19.33" in cfg, \
+        "the re-measurement that undid it must ride there too"
+    assert "KILL CRITERION" in cfg, \
+        "a risk decision needs a number that ends it"

@@ -175,3 +175,70 @@ class TestTheAlarmsSurvive:
         body = _flat("run")
         assert "if q[-1] >= _SLOW_TICK_MS: log.warning(*cad) else: log.debug(*cad)" \
             in body, body[-1200:]
+
+
+class TestTheRefusalMustNameWhatRefused:
+    """The liquidity refusals logged on EVERY tick, and named the wrong thing.
+
+    MEASURED 2026-09-18: 731 lines in one afternoon reading
+
+        cross eth-updown-5m-... Up not taken: book holds only $0.00 (wanted
+        $0.00)
+
+    at ~20/second while a trigger was live. The cause was the SECOND number on
+    the line: `stake_for_fraction` returns 0 below
+    `min_stake / FLOOR_MAX_BANKROLL_FRACTION` ($4.00 for a $1 floor), so on a
+    $2.19 bankroll the SIZING refused and the book was never asked -- a zero
+    stake makes `sweep()` return (0.0, 0.0) whatever is resting. Two diagnoses
+    were written off that line before anyone read the stake.
+    """
+
+    def test_the_stake_is_checked_before_the_book(self) -> None:
+        body = _flat("_cross_tick")
+        assert body.index("stake under the venue minimum") < \
+            body.index("book holds under the venue minimum"), \
+            "a zero stake sweeps to zero on ANY book: the book check must " \
+            "not run first, or the line blames the wrong input"
+
+    def test_no_liquidity_refusal_logs_on_every_tick(self) -> None:
+        """`_cross_refuse` dedupes per (round, reason); a bare log.info does
+        not, and the tick clock re-detects one crossing for `look_s`."""
+        body = _flat("_cross_tick")
+        for gone in ('log.info("cross %s %s not taken: book holds only',
+                     'log.info("cross %s %s not taken: sweep price'):
+            assert gone not in body, gone
+
+    def test_the_numbers_ride_as_detail_which_prints_once(self) -> None:
+        """The reason is the dedupe KEY, so the numbers cannot go in it -- and
+        they are the only place the sizing arithmetic is visible in the log."""
+        import inspect
+        p = inspect.signature(m.Bot._cross_refuse).parameters
+        assert "detail" in p and p["detail"].default == ""
+        body = " ".join(inspect.getsource(m.Bot._cross_refuse).split())
+        assert 'f"{reason} ({detail})" if detail else reason' in body, body[:400]
+
+    def test_the_fraction_floor_is_where_the_arm_went_silent(self) -> None:
+        """The arithmetic of the incident, pinned: a $1 floor with the floor
+        capped at 0.25 of the bankroll means the arm cannot size at all under
+        $4 -- whatever the gates or the book say."""
+        from btcpredict.edge.signal import stake_for_fraction
+        kw = dict(fraction=0.0224, min_stake=1.0, cap=1.0,
+                  floor_to_minimum=True)
+        assert stake_for_fraction(2.1983, **kw) == 0.0, "the live bankroll"
+        assert stake_for_fraction(4.2606, **kw) == 1.0, "the ledger that day"
+        assert stake_for_fraction(3.99, **kw) == 0.0
+        assert stake_for_fraction(4.01, **kw) == 1.0
+
+    def test_the_arms_flat_stake_is_the_CROSS_prefixed_knob(self) -> None:
+        """`_ck("stake_usdt")` reads `cross_stake_usdt`, NOT the global
+        `stake_usdt` (7.0 live, cut to $1 by the cap). Reading the global would
+        pin the arm to a flat dollar size and hide the fraction rule that
+        actually decides it -- the confusion that cost two wrong diagnoses."""
+        import types
+
+        from btcpredict.config import settings as s
+        assert s.cross_stake_usdt is None
+        b = m.Bot.__new__(m.Bot)
+        b._round = types.SimpleNamespace(slug="btc-updown-5m-1")
+        assert b._ck("stake_usdt") == s.cross_stake_usdt
+        assert s.stake_usdt != s.cross_stake_usdt, "the two names are the trap"

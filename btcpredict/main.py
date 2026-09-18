@@ -29,7 +29,8 @@ from btcpredict.edge.impulse import impulse_bps, impulse_side
 from btcpredict.config import (CROSS_TRADED, MARKETS, SYMBOL_BY_PREFIX,
                                TRAIN_P_WIN, cross_knob, cross_traded,
                                market_prefix, settings)
-from btcpredict.edge.signal import (FeeModel, Signal, evaluate,
+from btcpredict.edge.signal import (FLOOR_MAX_BANKROLL_FRACTION, FeeModel,
+                                    Signal, evaluate,
                                     evaluate_hybrid, expected_value,
                                     fee_rate_for_price, impulse_price_refusal,
                                     kelly_stake, limit_post_px, take_limit_px,
@@ -1228,6 +1229,20 @@ class Bot:
             self.open_fills[row["id"]] = (row["slug"], fill)
             reserved, pool = pool_for_mode(row["mode"])
             self.guard.on_open(row["slug"], reserved=reserved, pool=pool)
+            # EXIT-ON-FLIP COVERAGE ACROSS A RESTART. `_exit_watch` is memory,
+            # so without this every position that is live when the process
+            # restarts goes to the bell unwatched -- observed 2026-09-18, when
+            # two fills booked 33 s before the flag was enabled rode to the
+            # bell unprotected. `entry_ms` is the ORIGINAL fill time, so the
+            # watcher's own clock is not reset by a restart.
+            if row["mode"] == "cross":
+                self._arm_exit_watch(
+                    fid=row["id"], slug=row["slug"], side=row["side"],
+                    token=row["token_id"], shares=row["shares"],
+                    stake=row["stake"], fee=row["fee_paid"],
+                    entry_ms=row["ts_ms"], did=row["decision_id"],
+                    px=row["filled_px"], req=row["requested_px"],
+                    oid=row["order_id"])
         if rows:
             log.info("restored %d unsettled position(s): %s",
                      len(rows), ", ".join(r["slug"] for r in rows))
@@ -2184,6 +2199,24 @@ class Bot:
             "ev_at_fill": ev_at_fill,
         })
         self.open_fills[fid] = (r.slug, fill)
+        # EXIT-ON-FLIP: remember what this position IS, so the watcher can sell
+        # it if the trigger that opened it turns (config.cross_exit_enabled).
+        # Keyed by SLUG because that is what a tick has; the fid rides along so
+        # the sale can close exactly this fill.
+        #
+        # Cross arm only, live only, and only when the broker can actually
+        # sell: `sell_fak` is new, so a paper broker or an older one must
+        # simply not get a watcher rather than fail at the first flip.
+        if (mode or self.broker.mode) == "cross":
+            # All the guards live in `_arm_exit_watch`, so the booking path and
+            # the restart-restore path cannot drift apart (the audit found they
+            # had: a restart left every live position unwatched).
+            self._arm_exit_watch(
+                fid=fid, slug=r.slug, side=fill.side,
+                token=token or getattr(fill, "token_id", None),
+                shares=fill.shares, stake=fill.stake, fee=fill.fee_paid,
+                entry_ms=fill.ts_ms, did=did, px=fill.filled_px,
+                req=fill.requested_px, oid=fill.order_id)
         # implied_sigma inverts P(up), so it must always be fed the Up quote --
         # passing the chosen side's quote breaks the inversion when that side is
         # Down. A missing Up quote must not take down the tick after the fill
@@ -2873,7 +2906,8 @@ class Bot:
 
     def _cross_refuse(self, r, side, reason: str, *, tau: float = 0.0,
                       spot=None, stake: float = 0.0, sigma=None,
-                      arm: str | None = None) -> None:
+                      arm: str | None = None,
+                      detail: str = "") -> None:
         """Record a cross trigger that was DETECTED and then refused.
 
         Two problems this fixes, both found on 2026-09-14 while reconstructing
@@ -2921,7 +2955,8 @@ class Bot:
         # that can name the arm outright should pass it, not rely on the text.
         if arm is None:
             arm = "train" if "train" in (reason or "") else "cross"
-        log.info("%s %s %s not taken: %s", arm, r.slug, side, reason)
+        log.info("%s %s %s not taken: %s", arm, r.slug, side,
+                 f"{reason} ({detail})" if detail else reason)
         # Record what the book showed at the refusal. A refusal is the only
         # clean read of "the venue had not repriced yet" that arrives without
         # an order, and the row used to carry quote=None -- which threw that
@@ -3275,6 +3310,13 @@ class Bot:
         # round travelled" is about the round's own prices, not the level.
         level, level_src = self._cross_level(r)
         if level is None:
+            return
+        # EXIT-ON-FLIP RUNS HERE, BEFORE THE PER-ROUND CAP. While we hold a
+        # position `_cross_fired[slug]` already equals max_per_round, so the cap
+        # returns on the next line -- a watcher placed after it would never see
+        # the tick that has to decide the exit. It is a no-op unless the flag is
+        # on AND this round's fill was registered (see `_book_fill`).
+        if await self._cross_exit_check(r, level, ticks):
             return
         # Entries already taken in THIS round. `max_per_round` is the cap.
         #
@@ -3926,6 +3968,35 @@ class Bot:
             stake = round(stake * self._ck("stake_mult", r), 2)
             if settings.stake_cap_usdt > 0:      # 0 = no cap, see config
                 stake = min(stake, settings.stake_cap_usdt)
+        # ---- A STAKE THAT CANNOT REACH THE VENUE MINIMUM IS A SKIP, AND THE
+        # SIZING REFUSED IT -- NOT THE BOOK. -------------------------------
+        # This has to come BEFORE the book-depth check below, because a zero
+        # stake makes `sweep()` return (0.0, 0.0) whatever the book holds, and
+        # the old order then logged
+        #
+        #     cross eth-updown-5m-... Up not taken: book holds only $0.00
+        #     (wanted $0.00)
+        #
+        # MEASURED 2026-09-18: **731 of those in one afternoon**, ~20/second
+        # while a trigger was live, and every one named the book when the cause
+        # was the OTHER number on the same line. Two diagnoses were written off
+        # that line (a thin book, then the gates) before anyone read the stake.
+        # `stake_for_fraction` returns 0 below `min_stake /
+        # FLOOR_MAX_BANKROLL_FRACTION` -- $4.00 for a $1 floor -- so on the live
+        # $2.19 bankroll EVERY trigger lands here, and the arm cannot trade at
+        # all until the account is back above it. `stake_usdt` per market is the
+        # flat-stake escape hatch; see config.cross_stake_usdt.
+        if stake < settings.min_order_usdt:
+            self._cross_refuse(
+                r, side, "stake under the venue minimum",
+                tau=tau, spot=spot_now, stake=stake, sigma=sigma_now,
+                detail=f"stake ${stake:.2f} < ${settings.min_order_usdt:.2f}; "
+                       f"bankroll ${self.bankroll:.2f} at "
+                       f"{settings.sizing_mode} sizing "
+                       f"({settings.stake_fraction:.4f} x bankroll; the floor "
+                       f"stops under "
+                       f"${settings.min_order_usdt / FLOOR_MAX_BANKROLL_FRACTION:.2f})")
+            return
         # The probe gets NO special sizing: it is the arm's normal order
         # (formula, tilt, caps), so what it measures is what a gate raise
         # would actually trade. Only the daily count is probe-specific.
@@ -3942,8 +4013,15 @@ class Bot:
         if top is not None:
             sweep_px, fillable = top.sweep(side, stake)
             if fillable < settings.min_order_usdt or sweep_px <= 0:
-                log.info("cross %s %s not taken: book holds only $%.2f "
-                         "(wanted $%.2f)", r.slug, side, fillable, stake)
+                # CONSTANT reason, numbers in `detail`: the book moves every
+                # tick and the REASON is the dedupe key, so numbers in the
+                # reason make a new line per tick -- the trap this file records
+                # twice. `_cross_refuse` prints the detail on the round's first
+                # occurrence and collapses the rest.
+                self._cross_refuse(
+                    r, side, "book holds under the venue minimum",
+                    tau=tau, spot=spot_now, stake=stake, sigma=sigma_now,
+                    detail=f"book holds ${fillable:.2f}, wanted ${stake:.2f}")
                 return
             if fillable < stake:
                 log.info("cross %s %s: sizing down $%.2f -> $%.2f (book depth)",
@@ -3955,24 +4033,42 @@ class Bot:
             # sweep price outside it is a trade the measurement never blessed.
             if not (self._ck("min_price", r) <= sweep_px
                     <= self._ck("max_price", r)):
-                log.info("cross %s %s not taken: sweep price %.3f for $%.2f "
-                         "is outside %.2f-%.2f (touch was %.3f)", r.slug, side,
-                         sweep_px, stake, self._ck("min_price", r),
-                         self._ck("max_price", r), ask)
+                self._cross_refuse(
+                    r, side, "sweep price outside the band",
+                    tau=tau, spot=spot_now, stake=stake, sigma=sigma_now,
+                    detail=f"sweep {sweep_px:.3f} for ${stake:.2f}, band "
+                           f"{self._ck('min_price', r):.2f}-"
+                           f"{self._ck('max_price', r):.2f}, touch {ask:.3f}")
                 return
             if sweep_px > ask + 1e-9:
                 log.info("cross %s %s: $%.2f sweeps to %.3f (touch %.3f, "
                          "+%.3f)", r.slug, side, stake, sweep_px, ask,
                          sweep_px - ask)
             ask = sweep_px
-        if stake < settings.min_order_usdt or self.bankroll < stake:
+        if self.bankroll < stake:
+            # Silent before, and the one path that could reach here without the
+            # book block above is a missing websocket book -- so an unfunded
+            # arm and a blind one both vanished without a row. Constant reason.
+            self._cross_refuse(
+                r, side, "bankroll under the stake",
+                tau=tau, spot=spot_now, stake=stake, sigma=sigma_now,
+                detail=f"bankroll ${self.bankroll:.2f} < stake ${stake:.2f}")
             return
-        # THE ROUND is one bet: with the reversal guard on, every entry in a
-        # round is the same side of the same round and settles on ONE oracle
-        # print. So the round's CUMULATIVE stake is the risk unit, not the
-        # order's. See config.cross_max_round_stake_mult -- without this a
-        # 4-entry round put 26.9% of bankroll on a single print, 1.17x full
-        # Kelly, against a per-entry posture of 0.29x.
+        # THE ROUND STAKE CAP IS PER FAMILY, NOT PER WINDOW. Its name and the
+        # original note said "the round is one bet ... the round's CUMULATIVE
+        # stake is the risk unit" -- true inside one market, FALSE across the
+        # nine the arm trades: this accumulator is `[r.slug]`, and
+        # `btc-updown-5m-...` and `sol-updown-5m-...` in the same 5-minute
+        # window are different keys, so a slot can hold nine independent budgets.
+        # Live 2026-09-18 11:20 spent $4 in one window across four families
+        # against a $2 intent and settled -$2.30.
+        #
+        # Keying it on `rounds.end_ms` to make a true window cap was replayed on
+        # the whole PM era and is NEGATIVE -- see config.cross_max_round_stake_mult
+        # for the table (+$62.37 -> +$12.92 at cap 1/window, t 4.57 -> 1.52), and
+        # do not "fix" the scope without re-reading it: the stacking is where the
+        # edge is. It is also inert today, because `cross_max_per_round = 1`
+        # refuses a family's second entry before this is ever read.
         rmult = settings.cross_max_round_stake_mult
         if rmult > 0:
             spent = (getattr(self, "_round_stake", None) or {}).get(r.slug, 0.0)
@@ -4275,6 +4371,320 @@ class Bot:
             tasks = self._order_tasks = set()
         tasks.add(task)
         task.add_done_callback(tasks.discard)
+
+    def _arm_exit_watch(self, *, fid, slug, side, token, shares, stake, fee,
+                        entry_ms, did=None, px=None, req=None,
+                        oid=None) -> bool:
+        """Register a held cross position with the exit watcher.
+
+        ONE construction site, called from `_book_fill` AND from
+        `_restore_open_positions`. The audit that produced this helper found the
+        restart path had no registration at all, so a restart mid-round silently
+        left every live position unprotected to the bell (observed 2026-09-18).
+
+        The guards live here rather than at the call sites: `cross_exit_enabled`
+        is read at call time so flipping it needs no rebuild, and a broker that
+        cannot sell must simply get no watcher instead of failing at the first
+        flip.
+        """
+        if not (settings.cross_exit_enabled
+                and getattr(self.broker, "mode", None) == "live"
+                and hasattr(self.broker, "sell_fak")):
+            return False
+        if not token or not shares or float(shares) <= 0.0:
+            # No token means the position could never be sold, and zero shares
+            # means there is nothing to sell: either would only produce one
+            # refusal line per tick.
+            return False
+        watch = getattr(self, "_exit_watch", None)
+        if not isinstance(watch, dict):
+            watch = self._exit_watch = {}
+        watch[slug] = {
+            "fid": fid, "side": side, "token": token,
+            "shares": float(shares), "stake": float(stake or 0.0),
+            "fee": float(fee or 0.0), "entry_ms": int(entry_ms or 0),
+            # Carried so a PARTIAL sale can split the fill without a store
+            # lookup the DB layer does not offer.
+            "did": did, "px": px, "req": req, "oid": oid,
+            "flip_ms": None, "done": 0, "halted": False,
+        }
+        return True
+
+    async def _cross_exit_check(self, r, level, ticks) -> bool:
+        """Sell the position when the SAME trigger that opened it reads the
+        other side. Returns True when this tick was spent on the exit.
+
+        MEASURED, `tools/pm_exit_flip.py`, 766-768 PM-era entries: the trigger
+        turns on **62.9% of entries, median 1.0 s after the entry**, and the
+        turn is violently informative -- P(win | turned) 42.2% against 94.4%
+        for the rest. Exiting into the bid there takes the cohort from +0.0773
+        to +0.1372 per share (t +4.32 -> +13.69), and it is not the floor
+        cohort in disguise (+0.1389 -> +0.2083 with a 1.0 bps floor).
+
+        The flip must PERSIST `cross_exit_confirm_s` before we leave; 3/5/10 s
+        all measured as good or better than acting on the first print, so the
+        window is a whipsaw guard rather than a fitted parameter.
+        """
+        if not settings.cross_exit_enabled:
+            return False
+        watch = getattr(self, "_exit_watch", None)
+        if not watch:
+            return False
+        w = watch.get(r.slug)
+        if w is None or w.get("halted"):
+            return False
+        # ---- A SALE WE PLACED BUT COULD NOT SEE YET IS CONFIRMED HERE --------
+        # This MUST come before the `done` check below: a pending sale has
+        # already spent the position's one order (`cross_exit_max_per_position`),
+        # so that check would pop the watch and the confirmation could never
+        # run -- which is exactly how four live exits ended up unbooked while
+        # `settle_due` later booked the round result in their place.
+        if w.get("pending"):
+            got = self._confirm_pending_sale(r, w)
+            if got is not None:
+                await self._cross_exit_execute(r, w, tau=0.0,
+                                               sig_name="confirm",
+                                               confirmed=got)
+            return True
+        if w.get("done", 0) >= settings.cross_exit_max_per_position:
+            watch.pop(r.slug, None)
+            return False
+        if w["fid"] not in getattr(self, "open_fills", {}):
+            # Closed by the normal settlement path (or voided): nothing to sell.
+            watch.pop(r.slug, None)
+            return False
+        now_ms = int(time.time() * 1000)
+        tau = (int(r.end_ms or 0) - now_ms) / 1000.0
+        if tau <= settings.cross_exit_min_tau_s:
+            return False          # the book goes one-sided at the bell
+        sig_ticks, sig_name = self._cross_signal(r, ticks, tau)
+        if not sig_ticks:
+            return False
+        held = w["side"]
+        # ⭐ THE EXIT RUNS THE ENTRY'S CHAIN, NOT A WEAKER ONE. Until
+        # 2026-09-18 this called `crossed_side` with no `hold_s` and applied no
+        # margin floor, while the entry applies BOTH -- so the arm refused to
+        # OPEN on evidence it was happy to CLOSE on. There was no hysteresis
+        # band at all: the buy threshold sat at `level + floor` and the sell
+        # threshold at `level + 0.00`, i.e. every position was opened `floor`
+        # bps above a trapdoor of zero width -- and `crossed_side` fires on the
+        # FIRST tick past the level, so by construction every entry starts life
+        # sitting on it.
+        #   LIVE PROOF, sol-updown-5m-1789743000, consecutive log lines:
+        #     14:52:35 not taken: only -0.20 bps of its own margin, floor 0.25
+        #     14:52:36 / 14:52:42 / 14:52:43  the same refusal, four in all
+        #     14:53:20.626 OPEN CROSS sol ... Down @0.540
+        #     14:53:25.064 pm sell sol ... Down          <- 4.44 s later
+        #   The round refused to OPEN four times on a move it then CLOSED on.
+        #   eth-updown-5m-1789742700 did the same in 4.30 s. Both are the
+        #   4 s floor of the old gate, hit exactly.
+        now_side = crossed_side(list(sig_ticks), level, self._ck("look_s", r),
+                                hold_s=self._ck("hold_s", r))
+        # THE FLIP'S OWN MARGIN, the same gate and the same number the entry
+        # uses on itself. It makes the band symmetric: we bought `floor` bps
+        # past the level on our side, so we leave `floor` bps past it on the
+        # other, and the round trip has to cover 2 x floor rather than 0.
+        floor = self._ck("min_margin_bps", r)
+        margin_ok = True
+        if floor > 0 and level and now_side is not None and sig_ticks:
+            sig_px = sig_ticks[-1][1]
+            margin_ok = abs(1e4 * (sig_px - level) / level) >= floor
+        if now_side == held:
+            # BACK ON OUR SIDE, CONVINCINGLY: the flip died, so the latch goes.
+            # This is NOT the same event as a quiet tick, and conflating the two
+            # is what the note below is about -- one is "no reading", the other
+            # is "the reading reversed".
+            if margin_ok:
+                w["flip_ms"] = None
+            return False
+        if now_side is None:
+            # ⛔ DO NOT DISARM HERE, AND THIS IS A MEASURED BUG FIX.
+            # `crossed_side` reports a CROSSING EVENT, not a state: the tick
+            # AFTER a crossing -- with the spot still sitting on that side --
+            # returns None, not that side. Clearing the latch on None therefore
+            # made the flip impossible to hold for `confirm_s`, and the lock
+            # never came off:
+            #   LIVE 2026-09-18 12:52, round -1789735800, THREE positions:
+            #   eth armed 12:52:25, again 12:52:33, again 12:53:03 (the repeated
+            #   arming IS the clearing), btc 12:52:26, bnb 12:52:51, xrp 12:53:04
+            #   -- six arms, ZERO exits, while the positions went to the bell.
+            return False
+        if not margin_ok:
+            # On the level, not past it. The latch is LEFT ALONE: a flip that is
+            # still building is not a flip that died.
+            return False
+        # THE CONFIRMATION RUNS FROM THE FLIP, NOT FROM THE ENTRY. `flip_ms`
+        # was stamped here and never read: the gate compared against
+        # `entry_ms + 1000`, so `cross_exit_confirm_s` did not mean "the flip
+        # persisted 3 s" -- it meant "wait 4 s after the BUY, then leave on the
+        # first opposite tick". That is why every live exit fired at 4.3-4.4 s
+        # on the nose. The tests passed because they assert `flip_ms` is SET.
+        if w.get("flip_ms") is None:
+            w["flip_ms"] = now_ms
+            return False          # arm now; the earliest fire is confirm_s away
+        confirm_ms = int(settings.cross_exit_confirm_s * 1000)
+        if now_ms - int(w["flip_ms"]) < confirm_ms:
+            return False
+        await self._cross_exit_execute(r, w, tau=tau, sig_name=sig_name)
+        return True
+
+    def _confirm_pending_sale(self, r, w) -> tuple | None:
+        """Did a sale we PLACED land? `(sold, px, fee)` or None (ask again).
+
+        The venue's position list lags a fill in both directions and by more
+        than one confirm budget covers (measured 2026-09-18: 0 shares 4 s after
+        a confirmed buy; `still 1.8867 of 1.8867` 0.7 s after a matched sell).
+        So a sale that could not be confirmed in the moment is confirmed later
+        rather than the position being halted into limbo.
+        """
+        fn = getattr(self.broker, "confirm_sale", None)
+        if fn is None:
+            w.pop("pending", None)     # a broker that cannot answer: stop asking
+            return None
+        since, floor = w["pending"]
+        try:
+            got = fn(token_id=w["token"], shares=float(w["shares"]),
+                     since_ts=float(since), fallback_px=float(floor or 0.0))
+        except Exception as exc:                              # noqa: BLE001
+            log.warning("cross exit %s: sale confirmation failed (%s)",
+                        r.slug, exc)
+            return None
+        if not got or float(got[0]) <= 0.0:
+            return None
+        return got
+
+    async def _cross_exit_execute(self, r, w, *, tau, sig_name,
+                                  confirmed: tuple | None = None) -> None:
+        """Sell `w`'s position and close it in the ledger.
+
+        THE SALE IS BOOKED AS A SETTLEMENT ROW for the entry's fill, and that
+        one write is what makes every consumer agree without a new concept:
+          * `_open_cross_stake` drops it (it counts fills with NO settlements
+            row), so exposure stops counting a position that is gone;
+          * `settle_due` can never pay it out against the round's winner --
+            it iterates `open_fills`, and this fill leaves that dict here;
+          * `pnl`/`bankroll`/the guard move exactly as a normal settlement
+            moves them, because this is the same sequence `settle_due` runs.
+        A PARTIAL sale splits the fill: the sold fraction settles against the
+        original row and the remainder becomes a new open fill, so no fill row
+        ever represents shares that no longer exist.
+        """
+        slug, fid, held = r.slug, w["fid"], w["side"]
+        # ⛔ THE BROKER DERIVES THE FLOOR FROM ITS OWN BID -- the arm must NOT.
+        # It used to read `self._wsb` (the arm's websocket book) and refuse the
+        # exit when that book was unreadable:
+        #   LIVE 13:08:51 `cross btc-updown-5m-1789736700 Down not taken: exit:
+        #   no fresh bid to sell into` -- the watcher FIRED and the position
+        #   still rode to the bell.
+        # `PmBroker.book` IS the live PM feed, and `Touch.bid` is the authoritative
+        # side of the touch. One book, one source of truth: the only refusal left
+        # is the venue's own "nothing to take".
+        fill = None
+        if confirmed is None:
+            fill = await self.broker.sell_fak(
+                slug=slug, side=held, token_id=w["token"],
+                shares=w["shares"], slip=settings.cross_exit_slip)
+        if confirmed is not None:
+            # A sale placed on an earlier tick and confirmed LATE by
+            # `confirm_sale`: book it here with the venue's own numbers. NO
+            # second order is sent -- the position spent its one order when it
+            # went pending (`cross_exit_max_per_position`).
+            sold, px, fee = (float(confirmed[0]), float(confirmed[1]),
+                             float(confirmed[2] or 0.0))
+            if px <= 0.0 and w.get("pending"):
+                px = float(w["pending"][1] or 0.0)   # the floor: a lower bound
+            w.pop("pending", None)
+            log.info("cross exit %s: sale confirmed late -- booking %g sh @ "
+                     "%.4f", slug, sold, px)
+        elif fill is None:
+            # A FAK kill is a no-fill, not an error: try again next tick.
+            log.info("cross exit %s: sell did not fill (%s) -- retrying next "
+                     "tick", slug, getattr(self.broker, "last_failure", "?"))
+            return
+        elif getattr(fill, "pending", False):
+            # ⛔ PLACED BUT NOT YET VISIBLE -- AND THIS IS NOT A HALT. The
+            # order is spent (so it counts against the one-per-position rail),
+            # the position STAYS WATCHED, and `confirm_sale` closes it on a
+            # later tick when the venue catches up. Halting here is what left
+            # four live sales unbooked today, with `settle_due` then booking the
+            # round's result in their place.
+            w["pending"] = (time.time(), float(fill.requested_px or 0.0))
+            w["done"] = w.get("done", 0) + 1
+            log.info("cross exit %s: sale PLACED, confirmation pending (%s) -- "
+                     "position stays watched, no second order", slug,
+                     getattr(self.broker, "last_failure", "?"))
+            return
+        elif getattr(fill, "unverified", False) or not fill.shares:
+            # UNKNOWN STATE IS THE ONE THING TO STOP ON: the venue may have
+            # sold the position, so a second sell from here would be a naked
+            # short. Halt the watcher and leave the fill where it is.
+            w["halted"] = True
+            log.warning("cross exit %s: sell UNVERIFIED (%s) -- watcher halted "
+                        "for this position", slug,
+                        getattr(self.broker, "last_failure", "?"))
+            return
+        if confirmed is None:
+            sold = float(fill.shares)
+            px = float(fill.filled_px)
+            fee = float(fill.fee_paid or 0.0)
+        frac = min(1.0, sold / w["shares"]) if w["shares"] else 1.0
+        # Captured BEFORE any split mutates the watch dict: these are the legs
+        # of THIS sale, and `pnl.add`/the ledger must see them, not the stake
+        # that is left on the book.
+        stake_leg = w["stake"] * frac
+        fee_leg = w["fee"] * frac
+        cost = stake_leg + fee_leg
+        proceeds = sold * px - fee
+        pnl = proceeds - cost
+        won = pnl > 0
+        now_ms = int(self.broker._now() * 1000) if hasattr(
+            self.broker, "_now") else int(time.time() * 1000)
+        mode = self._fill_mode(fid)
+        if frac < 0.999:
+            # Split: the remainder stays a real, open position on its own row.
+            left = w["shares"] - sold
+            rs = w["stake"] * (left / w["shares"]) if w["shares"] else 0.0
+            rf = w["fee"] * (left / w["shares"]) if w["shares"] else 0.0
+            new_fid = self.store.insert("fills", {
+                "decision_id": w.get("did"), "slug": slug,
+                "ts_ms": w.get("entry_ms") or now_ms, "mode": mode,
+                "side": held, "requested_px": w.get("req"),
+                "filled_px": w.get("px"), "shares": left,
+                "stake": rs, "fee_paid": rf,
+                "order_id": w.get("oid"),
+                "raw": f"exit split: {sold:g} of {w['shares']:g} sold",
+                "token_id": w["token"], "ev_at_fill": None,
+            })
+            self.open_fills[new_fid] = (slug, self.open_fills[fid][1])
+            w["fid"], w["shares"], w["stake"], w["fee"] = (
+                new_fid, left, rs, rf)
+        self.store.insert("settlements", {
+            "fill_id": fid, "slug": slug, "ts_ms": now_ms,
+            "won": int(won), "payout": proceeds, "pnl": pnl,
+            "mode": mode, "void": 0,
+        })
+        reserved, pool = pool_for_mode(mode)
+        self.guard.on_settle(slug, pnl, reserved=reserved, pool=pool)
+        fully_closed = frac >= 0.999 or w["shares"] <= 1e-9
+        if not fully_closed:
+            # ⛔ `on_settle` RELEASES the slot, AND A PARTIAL SALE MUST NOT.
+            # The remainder is still open, so releasing here lets the arm open
+            # another position against a concurrency/exposure bound it believes
+            # it has freed. The P&L half of `on_settle` is still wanted (the
+            # daily-loss and streak logic must see the realised loss), which is
+            # why this is a re-claim rather than a skipped call.
+            self.guard.on_open(slug, reserved=reserved, pool=pool)
+        self.pnl.add(pnl, stake_leg, fee_leg + fee, won)
+        self.bankroll += pnl
+        self.open_fills.pop(fid, None)
+        w["done"] = w.get("done", 0) + 1
+        if fully_closed:
+            self._exit_watch.pop(slug, None)
+        log.info("cross EXIT %s %s: sold %g sh @ %.4f (floor %.4f) "
+                 "proceeds %+.4f pnl %+.4f at tau %.0fs (sig=%s) | running: %s",
+                 slug, held, sold, px,
+                 float(getattr(fill, "requested_px", None) or 0.0),
+                 proceeds, pnl, tau, sig_name, self.pnl)
 
     async def _cross_execute(self, *, r, sig, side, token, stake, ask,
                              ceil_side, did, up, spot, sigma, tau, wsb,

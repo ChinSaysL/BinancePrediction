@@ -2205,7 +2205,58 @@ class Settings(BaseSettings):
     # already elapsed, so the same 10 bps is a large fraction of the diffusion
     # at tau 60 and a small one at tau 207. This is why the arm now also carries
     # an edge gate (`cross_min_edge`): an edge is scale-free where a bps is not.
-    cross_max_round_range_bps: float = 12.0
+    #
+    # ---- TURNED OFF (12.0 -> 0.0) ON 2026-09-18, OWN REPLAY, SHIPPED WINDOW --
+    # REFUTED by `tools/pm_gate_ablation.py`: 3,101 settled PM-era rounds on the
+    # SHIPPED chain (fc trigger, look 1.0, tau 5-180, floor 0.25, band
+    # [0.10,0.65), one entry per round, n=826). The gate does not merely fail to
+    # filter -- it keeps the WORSE half:
+    #     range gate KEEPS    n=416 win 56.2% +0.0180/sh t +0.73 day-t +1.11
+    #                           halves +0.0285/+0.0074  worst-day -0.0115
+    #     range gate REFUSES  n=408 win 65.4% +0.1191/sh t +4.93 day-t +4.93
+    #                           halves +0.0991/+0.1392  worst-day +0.0958
+    # Every statistic favours the refusals, including the two this repo requires
+    # (both halves agree -- and it is the KEPT set that has a negative worst
+    # day). Turning it off is +$48.6 on that cohort.
+    # WHY -- and it is this block's own paragraph above, coming true. By tau:
+    #   tau 0-60   8-12 +0.3723 | 12-16 -0.0439 | 16-20 -0.2266 | 20-30 -0.0927
+    #   tau 60-120 12-16 +0.0443 | 16-20 +0.0368 | 20-30 +0.1667 | 30-50 +0.1787
+    #   tau 120+   12-16 -0.0308 | 16-20 +0.0886 | 20-30 +0.1587 | 50+ +0.2110
+    # The tau<60 row REPRODUCES the original measurement (wide travel = the round
+    # reverses); from 60 s on the sign flips and RISES with travel. So the gate
+    # is right in a band that now holds 5% of the entries and backwards in the
+    # 64% at tau>120 -- because `cross_max_tau_s` was tripled 60 -> 180 the same
+    # day, while range-so-far grows with the time elapsed. The sweep is monotone
+    # toward off and the SHIPPED values were its worst row:
+    #     range OFF n=826 +0.0677 t +3.90 day-t +2.39 worst +0.0580
+    #     <=50      n=812 +0.0649 t +3.71 | <=30 n=753 +0.0583 t +3.20
+    #     <=20      n=567 +0.0276 t +1.30 | <=12 n=247 +0.0337 t +1.04
+    #     SHIPPED   n=416 +0.0180 t +0.73 day-t +1.11 worst -0.0115
+    # The scale-free replacement does NOT rescue the idea either:
+    # range/(sigma*sqrt(elapsed)) is flat from 0.6 to 2.0 (+0.0653..+0.0674 on
+    # n=733..808), so the ratio carries no information. The fix is not a better
+    # unit -- there is no regime signal in travel at this window.
+    # THE COMBINATION THAT ACTUALLY SHIPS (the tick floor is untouched):
+    #     SHIPPED (range + ticks)    n=216 +0.0665 t +1.94 day-t +2.21
+    #     range OFF + ticks SHIPPED  n=505 +0.0995 t +4.46 day-t +3.59
+    #                                  halves +0.1004/+0.0985 worst +0.0817
+    # 2.3x the entries, +50% per share -- and the shipped row is the one that
+    # fails this repo's t>=2 bar (1.94) while its replacement clears it.
+    # ONE UNMODELLED CAVEAT: `_round_range_bps` reads `self._ticks`, appended
+    # once per TICK, and the poll now runs at a median 58 ms (p90 102 ms), so the
+    # live measure is DENSER than the 1 Hz `quotes` series these values were
+    # fitted on (`pm_range_gate_sweep.py` says so itself). A denser sampler
+    # reports a wider max-min, so live refusals were MORE frequent than the
+    # replay's -- the bias runs with this change, not against it.
+    # WHAT TO WATCH, stated before the fact: the newly admitted class is
+    # late-tau / wide-range (n~390 of the 408 refusals, all at tau>=60) and the
+    # entry rate should go ~72/day -> ~168/day on that cohort. KILL CRITERION:
+    # that class at or below 0 per share over ~100 live fills means the venue had
+    # already repriced what the tape says it had not -- put the values back.
+    # REVERT = 12.0 here plus the five per-family entries this block used to
+    # carry in `cross_overrides` (12.9 eth-5m, 7.8 bnb-5m, 13.6 btc-15m, 21.0
+    # eth-15m, 21.1 bnb-15m), then restart.
+    cross_max_round_range_bps: float = 0.0
     # MINIMUM MODEL EDGE at the trigger instant: `fair_value(spot, strike, tau,
     # sigma) - ask`, its own side. 0 = OFF (the repo's convention for a gate).
     #
@@ -2586,15 +2637,141 @@ class Settings(BaseSettings):
     # measured value is +0.0068/fill -- indistinguishable from zero.
     cross_min_depth_sigma: float = 0.0
     cross_reentry_gap_s: float = 1.0
+    # ROUND STAKE, KEYED PER FAMILY -- and a WINDOW-level version of this was
+    # MEASURED AND REFUTED (2026-09-18). Read the scope before trusting the
+    # name: the accumulator is `_round_stake[r.slug]`, so with nine families a
+    # 5-minute window holds nine independent budgets. Live 2026-09-18 11:20 took
+    # FOUR entries across four families ($4 against a $2 intent) and settled
+    # -$2.30; 11:15 took three same-side Downs and settled -$3.12. That is what
+    # the knob's own comment describes preventing. It does not.
+    #
+    # It is also INERT as shipped: `cross_max_per_round = 1` refuses the second
+    # entry of a family-round first, so `spent` is always 0 when this is read.
+    # Keep it as the backstop for the day max_per_round is raised.
+    #
+    # THE FIX ONE WOULD REACH FOR -- key it on `rounds.end_ms` so every 5m
+    # family in a slot shares one budget -- was replayed over the whole PM era
+    # (`tools/pm_window_cap.py`, 763 entries, 299 windows, shipped chain) and it
+    # is NEGATIVE:
+    #   base (no cap)          n=763 per-share +0.0817 tot +62.37 t +4.57 day-t +3.51
+    #   cap 1 per window       n=299             +0.0432     +12.92 t +1.52 day-t +1.53
+    #   cap 2 per window       n=504             +0.0593     +29.87 t +2.70 day-t +2.36
+    #   cap 3 per window       n=640             +0.0734     +46.98 t +3.77 day-t +3.13
+    #   same side <=1/window   n=396             +0.0417     +16.53 t +1.67 day-t +2.02
+    # Every dropped cohort is POSITIVE (+0.1066 / +0.1255 / +0.1251 / +0.1249
+    # per share) and every cap also LOWERS the day-clustered t. The stacking is
+    # not the leak, it is where the edge is: per-entry by entries-in-window k=1
+    # +0.1199, k=5 +0.1815 (a third of the total comes from k=5 windows alone),
+    # and the same-side stack #2/#4/#5 read +0.1154/+0.2564/+0.2194 against
+    # +0.0418 for the first entry of a window. A crossing simultaneous across
+    # the complex is ONE real macro move, not the same coin flipped k times.
+    #
+    # WHAT THE LIVE SAMPLE THAT RAISED THIS SHOWED (for the record, NOT refuted):
+    # 64 PM-era fills, per-entry EV by window-k monotone 1:+0.0295 2:+0.0056
+    # 3:-0.1112 4:-0.5750, same-side #2 -0.0435 / #3 -0.5347 -- the OPPOSITE
+    # sign to the replay. n=64 over three days against n=763; the two worst
+    # windows of the sample were 11:15 and 11:20 and both were killed by the
+    # move, not by the stacking. Two days of variance is not a signal.
+    # RE-CHECK: `/root/analysis-venv/bin/python tools/pm_window_cap.py`.
     cross_max_round_stake_mult: float = 2.0
+    # ACCOUNT-WIDE, across every family -- the limit the cross-family case actually
+    # needs, and the LIVE PROFILE OVERRIDES IT TO 0 (OFF):
+    # `CROSS_MAX_OPEN_STAKE_PCT=0` sits in `/root/BinancePrediction/.env` while
+    # this default is 0.30. With the $12.47 collateral in the account, 0.30 caps
+    # open cross stake at ~$3.74, i.e. ~3.7 one-dollar entries -- it would have
+    # refused the FOURTH entry of the 11:20 window above.
+    # Do not confuse it with a concurrency cap: the entry-COUNT caps are refuted
+    # (see `cross_max_round_stake_mult`), this one bounds STAKE as a fraction of
+    # bankroll. Turning it back on is a risk decision, and it cannot be priced
+    # from the replay (the tape carries no bankroll) -- `_open_cross_stake` reads
+    # the LEDGER, so the live record is the measurement.
     cross_max_open_stake_pct: float = 0.30
+    # EXIT-ON-FLIP: SELL the position when the SAME trigger that justified it
+    # reads the other side. Operator's idea, 2026-09-18; measured, SHIPPED, and
+    # then REFUTED ON THE LIVE RECORD the same day.
+    #
+    # ⛔ EVERY NUMBER THIS BLOCK USED TO CARRY WAS A MEASUREMENT ARTIFACT.
+    # It claimed the flip arrives "at a median of 1.0 s after the entry
+    # (p10 = p90 = 1.0 s)" and that exiting took the cohort from +0.0773 to
+    # +0.1372 per share. Both came from `tools/pm_exit_flip.py:walk()`, which
+    # latched its exit candidate on the FIRST TICK AFTER THE ENTRY -- the
+    # `if side != other: if cand is None` branch -- and never advanced it. So
+    # the exit was booked at the book ~1 s after the entry, i.e. at roughly the
+    # ENTRY PRICE, however long the rule actually took to fire. The p10 = p90 =
+    # 1.0 s is the 1 Hz tape's own spacing; it was never a property of the flip.
+    # Corrected (`walk_legacy` is kept beside `walk` for the A/B):
+    #     legacy   (booked at entry+1s, ungated)  +0.1343/sh t+13.44 [505 exits]
+    #        entry -> exit lag: median 1.0s  p10 1.0  p90 1.0    <- the artifact
+    #     corrected (priced where it fires, gated) +0.0599/sh t +3.52 [6 exits]
+    #        entry -> exit lag: median 99.8s p10 46.6 p90 125.7
+    #     hold to settlement (base)                +0.0594/sh t +3.48
+    # The honest flip statistics: 52.6% of entries flip (not 62.9%), at a median
+    # 17.3 s (p10 3.0, p90 57.4), P(win|flip) 37.0% vs 85.2%.
+    #
+    # ⛔ AND THE RULE HAD NO HYSTERESIS BAND, which is what cost the money.
+    # `_cross_exit_check` ran `crossed_side` with NO `hold_s` and applied NO
+    # margin floor, while the ENTRY applies both -- so the buy threshold sat at
+    # `level + min_margin_bps` and the sell threshold at `level + 0.00`. Since
+    # `crossed_side` fires on the FIRST tick past the level, every entry starts
+    # life sitting on it, and any tick back across closed the position.
+    #     LIVE, sol-updown-5m-1789743000, consecutive log lines:
+    #       14:52:35/36/42/43  not taken: only -0.20 bps of margin, floor 0.25
+    #       14:53:20.626       OPEN CROSS sol ... Down @0.540
+    #       14:53:25.064       pm sell sol ... Down        <- 4.44 s later
+    #     The round refused to OPEN four times on a move it then CLOSED on.
+    # `confirm_s` did not help because `flip_ms` was stamped and never read: the
+    # gate compared against `entry_ms + 1000`, so "confirm 3 s" meant "wait 4 s
+    # after the BUY, then leave on the first opposite tick". Every live exit
+    # fired at 4.30-4.44 s, the floor exactly.
+    #
+    # ⭐ SCORED ON THE 200 REAL FILLS (`tools/pm_exit_live_recheck.py`), which
+    # is the measurement that decides this -- the rule applied to the trades the
+    # bot ACTUALLY took, not to a cohort the rule re-chooses:
+    #     HELD to the bell (counterfactual)   total -11.071  per-fill -0.1244
+    #     SHIPPED exit (entry clock, ungated) total -17.743  per-fill -0.1994
+    #     FIXED   exit (flip clock, gated)    total -11.138  per-fill -0.1251
+    # The shipped rule cost **-$6.67 against doing nothing**, and the mechanism
+    # is the operator's own report ("every trade went the wrong way"):
+    #     43 exits -- 23 on LOSING positions, saving        +17.380
+    #                 20 on WINNING positions, giving up    -24.051
+    # It cut winners nearly as often as losers, and a winner cut at the level
+    # gives up the whole payout. On 09-18 alone it turns -3.371 into -7.881.
+    #
+    # WHAT SHIPPED: the hysteresis fix (the exit now runs the entry's `hold_s`
+    # and `min_margin_bps`, and `confirm_s` is clocked from the FLIP). That
+    # gives back the -6.67. It does NOT make the exit pay: the fixed rule is
+    # -11.138 against -11.071 for holding, and every (confirm, floor) cell
+    # swept on the live fills is neutral at best, with the positive ones at
+    # n=2-5 exits. So this stays FALSE until a cell clears on real fills.
+    # Re-check: `/root/analysis-venv/bin/python tools/pm_exit_live_recheck.py`
+    cross_exit_enabled: bool = False
+    # The flip must PERSIST this long before we leave. 0 exits on the first
+    # print. Measured 3/5/10 s are all as good or better than 0 (the effect is
+    # not "sell at the bottom of the wobble at t+1"), so this is a whipsaw
+    # guard, not a fitted parameter.
+    cross_exit_confirm_s: float = 3.0
+    # NEVER exit inside this many seconds of the bell: near the end the book
+    # goes one-sided ("Up 0 bids / 99 asks") and there is no bid to hit.
+    cross_exit_min_tau_s: float = 8.0
+    # The sell's price floor: `min_price` on the FAK, set this far BELOW the bid
+    # we can see. It is the only risk bound on the order -- the venue will not
+    # take less -- so it is also what the ledger books when the venue's own fill
+    # price cannot be isolated (the mirror of the entry convention, where
+    # `filled_px` is the CEILING and the stake is an upper bound: here the floor
+    # makes the proceeds a LOWER bound and the P&L conservative both ways).
+    cross_exit_slip: float = 0.03
+    # One exit per position, and only in the live book. Both are sanity rails
+    # against a watcher that fires twice on the same fill.
+    cross_exit_max_per_position: int = 1
     cross_ws_follow_all: bool = True
     cross_overrides: dict[str, dict[str, float]] = {
-        "eth-updown-5m": {"max_round_range_bps": 12.9},
-        "bnb-updown-5m": {"max_round_range_bps": 7.8},
-        "btc-updown-15m": {"max_round_range_bps": 13.6},
-        "eth-updown-15m": {"max_round_range_bps": 21.0},
-        "bnb-updown-15m": {"max_round_range_bps": 21.1},
+        # THE FIVE `max_round_range_bps` VALUES ARE GONE -- this table used to
+        # carry 12.9 / 7.8 / 13.6 / 21.0 / 21.1 for eth-5m / bnb-5m / btc-15m /
+        # eth-15m / bnb-15m. They are read through `cross_knob`, so leaving them
+        # here would have kept the refuted gate binding on exactly the five
+        # families that fire most while the global read as OFF. See
+        # `cross_max_round_range_bps` for the replay that removed them and for
+        # the revert line (the numbers are named there).
         # `tick_size` here is the SPOT price tick of the UNDERLYING, NOT the
         # 0.01 probability tick on the CLOB. The depth floor is
         # `min_depth_ticks * tick_size` and it is compared against a SPOT
@@ -2687,11 +2864,15 @@ class Settings(BaseSettings):
     # this narrows the risk). Nothing is lost, so re-enabling is one edit and
     # the counterfactual keeps accruing while it is off.
     #
-    # WHY eth-updown-5m IS HERE (2026-09-18). It is the ONE family whose trigger
-    # has no edge against the price it is charged. Measured over every settled
-    # PM-era round, first crossing in tau [5,60], NO band and NO floor
-    # (`tools/pm_family_signal_check.py`, so n is per-family triggers, not the
-    # 10-13 entries the band lets through):
+    # eth-updown-5m WAS HERE FOR PART OF 2026-09-18 and was taken off the same
+    # day. The block below is kept because the REASON it was put there is the
+    # reason it came back, and both halves of that reason were a measurement.
+    #
+    # WHY eth-updown-5m WENT ON (2026-09-18, morning). It was the ONE family
+    # whose trigger has no edge against the price it is charged. Measured over
+    # every settled PM-era round, first crossing in tau [5,60], NO band and NO
+    # floor (`tools/pm_family_signal_check.py`, so n is per-family triggers, not
+    # the 10-13 entries the band lets through):
     #     family   n   trigger hit   be-ask   edge
     #     bnb-5m  28      82.1%       0.602   +21.9pp
     #     btc-5m  37      78.4%       0.643   +14.1pp
@@ -2704,18 +2885,70 @@ class Settings(BaseSettings):
     # (1.1-2.5c per $1 at 0.45-0.65) for a coin flip. Its leak is visible inside
     # that: the 1-2 bps crossings are bought at a MEAN ASK of 0.788 for a 57%
     # shot (n=7, -$1.52, more than eth's whole -$0.94 over 38 triggers).
-    # eth-updown-15m is NOT disabled -- it is +9.7pp (n=5, tau 45-60 only).
+    # eth-updown-15m was never disabled -- it is +9.7pp (n=5, tau 45-60 only).
     #
-    # WHAT THIS DELIBERATELY OVERRIDES: by the repo's own rule a family is only
+    # WHAT THAT DELIBERATELY OVERRODE: by the repo's own rule a family is only
     # cut when its edge is negative with the SAME sign in BOTH halves. eth's
-    # halves are -6.6/+3.9, i.e. it FAILS that test, and its money sample is
-    # 13-16 entries. So this is the OPERATOR's risk decision, taken because a
-    # zero-edge family still pays a fee on every entry, and it is recorded as
-    # such rather than dressed up as a measurement.
+    # halves were -6.6/+3.9, i.e. it FAILS that test, and its money sample is
+    # 13-16 entries. So that was the OPERATOR's risk decision, taken because a
+    # zero-edge family still pays a fee on every entry, and recorded as such
+    # rather than dressed up as a measurement.
+    #
+    # WHY IT CAME BACK OFF (2026-09-18, later the same day). BOTH inputs of the
+    # table above changed underneath it:
+    #
+    #   1. THE FORECAST WIRE WAS WRONG WHEN THE TABLE WAS TAKEN. twap_forecast
+    #      averaged [ts-60, ts] instead of the paid window's printed part
+    #      [bell-60, ts] (fixed: see `cross_fc_trigger`). Re-run with the
+    #      corrected wire at the SAME tau [5,60], eth reads n=40 hit 60.0%
+    #      be-ask 0.647 edge -4.7pp -- WORSE, so the fix did not rescue eth.
+    #      What moved is the window below.
+    #   2. THE ARM STOPPED TRADING tau [5,60]. The window was extended to
+    #      [5,180] and re-validated the same day (`cross_max_tau_s`), so the
+    #      table above now measures a slice the arm only partly trades. In the
+    #      window it DOES trade, eth is positive:
+    #          eth-5m n=170 hit 64.7% be-ask 0.546 edge +10.1pp
+    #                 per-share +0.0941  t +2.46  halves +8.9/+11.3
+    #          btc-5m +9.2pp | xrp-5m +8.8pp | bnb-5m +8.2pp | sol-5m +4.1pp
+    #      and it REPEATS: by day +21.8/+7.0/+12.3pp, by side Up +12.2pp /
+    #      Down +8.5pp. Arithmetic rather than a bucket: 40 triggers at -0.0525
+    #      = -$2.10, 170 at +0.0941 ~ +$16.0, so the 130 EARLIER
+    #      first-crossings pay ~ +0.139/share.
+    #
+    # The money replay agrees and makes eth the LARGEST 5m family at the 0.5 bps
+    # floor (`pm_cross_replay.py --by-family --tau-lo 5 --tau-hi 180`):
+    #     eth n=113 ask=0.520 win=70.8% total=+$19.33 t=+3.89 day-t=+2.88
+    #         halves=+0.2070/+0.1358
+    #     then btc +13.49, sol +11.12, bnb +10.60, xrp +10.28, doge +6.50
+    # Eth is also the family the floor helps MOST, which is what defuses the
+    # original "fee on a coin flip" objection: |m| 0-1bps is +5.3pp (n=118,
+    # t +1.05) while 1-2bps is +23.1pp (n=27) and 3+bps is +23.7pp. The coin
+    # flip lives in the LATE, LOW-MARGIN crossings -- exactly the ones a 1.0 bps
+    # floor already removes -- so what is left is not the thing that was cut.
+    # And the override rationale is gone: in the traded window BOTH halves are
+    # positive, so the repo's own rule says keep.
+    #
+    # THE VENUE-ASK RISK, MEASURED RATHER THAN UNKNOWN. The replay above pays
+    # the RECORDED ask, so the question is what eth's fills actually pay. eth-5m
+    # has ZERO fills in the PM era (and zero under this rule chain), but it has
+    # 43 real fills from before it (09-14 19:24 -> 09-16 15:06), at 0.42-0.89
+    # under the old cross arm, and their `filled_px - requested_px` is:
+    #     mean -0.0054  median +0.0005  max +0.0265  n=43
+    #     worse than +0.02: 1 fill | better than -0.02: 5 fills
+    # So a fill lands AT or BELOW the price asked for, on average. The xrp case
+    # that showed a venue ask 0.1600 ABOVE our ladder is the tail, not the
+    # shape: one such print in 43 here. Caveat that remains: those fills are a
+    # different era, band (0.42-0.89 vs our 0.10-0.65) and execution path, so
+    # they bound the risk rather than remove it.
+    # KILL CRITERION: eth-5m live fills at <= 0 per share over ~50 entries ->
+    # put `eth-updown-5m` back into this string + restart.
     # REVERT: `cross_disabled_families=""` (or drop the prefix) + restart.
-    # The counterfactual to check it with, once there are ~50 more eth triggers:
-    # `/root/analysis-venv/bin/python tools/pm_family_signal_check.py`.
-    cross_disabled_families: str = "eth-updown-5m"
+    # Re-check with:
+    #   /root/analysis-venv/bin/python tools/pm_family_signal_check.py \
+    #       --tau-lo 5 --tau-hi 180
+    #   /root/analysis-venv/bin/python tools/pm_cross_replay.py --by-family \
+    #       --tau-lo 5 --tau-hi 180
+    cross_disabled_families: str = ""
     # May a cross entry take the side OPPOSITE a position already held in this
     # round? No. Buying both sides is not a hedge: with the first position sunk,
     #     EV(take) - EV(decline) = stake_B * [ (1 - p)/b - 1 ]

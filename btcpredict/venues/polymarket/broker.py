@@ -1156,6 +1156,45 @@ class PmBroker:
             fee = taker_fee(px, taker_shares, self.cfg.taker_fee_rate)
         return shares, px, fee
 
+    def _position_size_checked(self, token_id: str) -> float | None:
+        """Shares held in `token_id`, or **None when the read fails**.
+
+        ⛔ THIS EXISTS BECAUSE `_position_size` CANNOT ANSWER THIS QUESTION.
+        It returns 0.0 for an unreadable position -- documented, and right for
+        its original caller (`settle()` asks "is the token held", where 0 and
+        "cannot read" lead to the same conservative action). For a SELL they
+        lead to OPPOSITE actions, and the difference is a phantom position:
+
+            sold = held - left          with left = 0.0 from a FAILED read
+                 = held                 -> the broker reports a completed sale,
+                                           the caller books a settlement row,
+                                           releases the slot and drops the fill
+
+        The shares are still on-chain, unmanaged, outside every cap -- and the
+        round will never be settled for them because `open_fills` no longer
+        holds the fill. That is the 2026-09-17 incident in reverse ("an
+        unreadable read must never be read as an answer"), so the sell path
+        asks a question that can say "I do not know".
+        """
+        c = self._ensure_client()
+        try:
+            page = c.list_positions()
+            recs = _records(page)
+        except Exception:                                    # noqa: BLE001
+            return None
+        try:
+            for it in recs:    # `list_positions()` is a Paginator too
+                if str(_a(it, "asset_id", "token_id", default="")) != token_id:
+                    continue
+                n = float(_a(it, "current_size", "total_size", "size",
+                             default=0) or 0)
+                if n > 0:
+                    return n
+        except Exception:                                    # noqa: BLE001
+            return None
+        # A readable, complete list with no row for this token IS zero.
+        return 0.0
+
     def _position_size(self, token_id: str) -> float:
         """Total shares held in `token_id`, or 0.0 if unreadable.
 
@@ -1171,24 +1210,13 @@ class PmBroker:
         whether an unverified fill was real -- a raise there would turn "cannot
         read the position" into "the position does not exist", i.e. into voiding
         a fill the venue actually filled.
+
+        KEPT AS THE 0.0-EQUIVALENT CALL for `settle()`, and it is now a thin
+        wrapper: the sell path must ask `_position_size_checked` instead, where
+        "cannot read" and "not held" must not collapse into one answer.
         """
-        c = self._ensure_client()
-        try:
-            page = c.list_positions()
-            recs = _records(page)
-        except Exception:                                    # noqa: BLE001
-            return 0.0
-        try:
-            for it in recs:    # `list_positions()` is a Paginator too
-                if str(_a(it, "asset_id", "token_id", default="")) != token_id:
-                    continue
-                n = float(_a(it, "current_size", "total_size", "size",
-                             default=0) or 0)
-                if n > 0:
-                    return n
-        except Exception:                                    # noqa: BLE001
-            return 0.0
-        return 0.0
+        n = self._position_size_checked(token_id)
+        return 0.0 if n is None else n
 
     def _confirm(self, token_id: str, t0: float,
                  want_shares: float) -> tuple[float, float, float] | None:
@@ -1678,6 +1706,283 @@ class PmBroker:
                     fee_paid=fee, order_id=str(oid),
                     ts_ms=int(self._now() * 1000), token_id=p["token_id"],
                     raw=f"fak ack {dt_ms:.0f}ms")
+
+    async def sell_fak(self, *, slug: str, side: str, token_id: str,
+                       shares: float, min_px: float | None = None,
+                       slip: float = 0.03,
+                       quote: dict | None = None) -> Fill | None:
+        """Take the BID: sell `shares` for no less than `min_px`. FAK (IOC).
+
+        THE FIRST SELL PATH IN THIS REPO. Every other order here passes
+        `side="BUY"`; this venue's SDK has always been able to do the other
+        side (`place_market_order(side=Literal["SELL"], shares=..., min_price=)`,
+        `polymarket-client` 0.10.0, async_secure.py:2535) and the note that says
+        otherwise -- "this venue has no sell, only buy" in `config.py` -- is
+        inherited from the PREVIOUS venue, where an unwind path got 37
+        `no SELL quote` errors and was deleted as dead code.
+
+        `stake` IS THE PROCEEDS HERE, NOT AN OUTLAY: it is `shares * price`, the
+        cash coming IN. Do not hand the returned Fill to `settle()` -- that pays
+        a position out against the round's winner, and this position no longer
+        exists. The caller books the sale itself (see `Bot._cross_exit_execute`).
+
+        ⛔ THE CONFIRMATION IS THE POSITION SIZE, NOT `_trades_since`, AND THAT
+        IS THE WHOLE TRAP. `_trades_since` sums every trade for the token with
+        NO SIDE FILTER, and it is read over a rolling minute -- while this exit
+        fires a second or two after the entry. A sell confirmed that way would
+        read our own BUY back as the fill, book a phantom exit, and leave the
+        real position unaccounted. The position list has no such ambiguity: it
+        is the venue's own answer to "how much of this token do you hold", which
+        can only go DOWN when a sale happens (this arm sells a position once).
+
+        `min_px` is the only risk bound on the order and the venue will not take
+        less. When the venue's own fill price cannot be isolated, it is also what
+        gets booked -- the mirror of the entry convention, where `filled_px` is
+        the CEILING and the stake is an upper bound. Here the floor makes the
+        proceeds a LOWER bound and the P&L conservative in both directions.
+
+        ⛔ `min_px=None` MEANS "DERIVE IT FROM THIS BROKER'S OWN BID", AND THAT
+        IS THE FIX FOR A LIVE FAILURE. The caller first computed the floor from
+        the ARM's websocket book and refused the exit when that book was
+        unreadable -- `exit: no fresh bid to sell into`, live 13:08:51, with the
+        position then riding to the bell. The broker HAS a fresh book (it is the
+        live PM feed, and `Touch.bid` is the authoritative side), so the floor
+        is derived here from `t.bid - slip` and rounded UP to the tick. One
+        book, one source of truth, and the refusal that remains is the venue's
+        own "nothing to take" rather than our own read of a second book.
+        """
+        return await asyncio.to_thread(
+            self._sell_fak_sync, slug=slug, side=side, token_id=token_id,
+            shares=shares, min_px=min_px, slip=slip, quote=quote)
+
+    def _sell_fak_sync(self, *, slug: str, side: str, token_id: str,
+                       shares: float, min_px: float | None = None,
+                       slip: float = 0.03,
+                       quote: dict | None = None) -> Fill | None:
+        """`sell_fak`'s blocking body. Runs on a worker thread, under the lock
+        (see `_buy_fak_sync` for why the lock is not decoration)."""
+        with self._client_lock:
+            return self._sell_fak_body(slug=slug, side=side, token_id=token_id,
+                                       shares=shares, min_px=min_px, slip=slip,
+                                       quote=quote)
+
+    def _sell_fak_body(self, *, slug: str, side: str, token_id: str,
+                       shares: float, min_px: float | None = None,
+                       slip: float = 0.03,
+                       quote: dict | None = None) -> Fill | None:
+        """Verbatim body of `sell_fak`. Call with `_client_lock` HELD."""
+        held = float(shares or 0.0)
+        if held <= 0.0:
+            self.last_failure = "sell_no_shares"
+            self._log(f"pm sell refused {slug} {side}: no shares to sell")
+            return None
+        # ⛔ SIZE FROM THE VENUE, NOT FROM OUR OWN RECORD. `held` is what the
+        # ledger BELIEVES; the position list is what is actually there. If our
+        # figure is high (an entry booked at its ceiling size, a partial entry
+        # fill), a sell of `held` would still fill only what exists -- and
+        # `sold = held - left` would then report a LARGER sale than happened,
+        # booking proceeds for shares that were never sold.
+        # ⛔ THE LEDGER IS THE AUTHORITY FOR WHAT WE INTEND TO SELL; THE VENUE'S
+        # POSITION LIST ONLY CAPS THE SIZE -- and that is a live fix, not a
+        # preference. The list lagged a CONFIRMED buy by 60 s (2026-09-18:
+        # `pm FAK FILL ... ack 453 ms` at 14:47:03, the list still showing 0
+        # shares at 14:47:07, and 1.9607 at 14:48:07), so requiring a positive
+        # read before selling made the FAST flips unsellable -- and those are
+        # where this mechanism's value is (the replay puts the median flip 1.0 s
+        # after the entry). An order whose position we cannot see is still an
+        # order: if the shares are genuinely gone the FAK answers
+        # `fak_unfilled`, which is a no-fill and retries next tick.
+        before = self._position_size_checked(token_id)
+        shown = "unreadable" if before is None else f"{before:g}"
+        if before is not None and before > 0.0:
+            sell_shares = min(held, before)
+            if sell_shares < held - 1e-9:
+                self._log(f"pm sell {slug} {side}: sizing down {held:g} -> "
+                          f"{sell_shares:g} shares to what the venue holds")
+        else:
+            sell_shares = held
+            self._log(f"pm sell {slug} {side}: the venue shows {shown} shares "
+                      f"held; selling this fill's {held:g} (the position list "
+                      f"lags the fill -- it is a cap, not a permission)")
+        # A STALE BOOK IS A REFUSAL, not a price to sell into: the floor is
+        # derived from the bid we can SEE, and an old bid would set a floor the
+        # live market has already left behind.
+        t = self.book.best(token_id, self.cfg.max_book_age_s)
+        if t is None or t.bid <= 0:
+            self.last_failure = self.last_failure or "no_fresh_book"
+            self._log(f"pm sell refused {slug} {side}: no fresh bid "
+                      f"(the book goes one-sided near the bell)")
+            return None
+        bid = float(t.bid)
+        r = self.round_for(slug)
+        tick = (getattr(r, "tick", None) if r is not None else None) or DEFAULT_TICK
+        # ROUNDED UP, not down: the floor is a bound and rounding it down would
+        # authorise a price below the one the caller chose as its bound.
+        floor = _round_to_tick(t.bid - max(0.0, slip) if min_px is None
+                               else min_px, tick, up=True)
+        if not (0.0 < floor < bid):
+            self.last_failure = "sell_floor_above_bid"
+            self._log(f"pm sell refused {slug} {side}: floor {floor:.4f} is not "
+                      f"below the bid {bid:.4f} -- nothing to take")
+            return None
+        c = self._ensure_client()
+        try:
+            self.warm_now(token_id)
+        except Exception:                                     # noqa: BLE001
+            pass
+        calls = 0
+        t0 = time.perf_counter()
+        t0_wall = time.time()      # wall clock: `_trades_since` is epoch-based
+        try:
+            resp = c.place_market_order(
+                token_id=token_id, side="SELL", shares=sell_shares,
+                min_price=floor, order_type="FAK")
+            calls += 1
+        except Exception as exc:                              # noqa: BLE001
+            self.venue_calls = calls
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            name = type(exc).__name__
+            # A kill is a NO-FILL; anything else stays loud, because the
+            # classes this must not swallow are a schema rejection and a
+            # minimum-size rejection -- both of which are how we find out that
+            # a 1.7-share position is unsellable on this venue.
+            if "RequestRejected" in name or "Liquidity" in name:
+                self.last_failure = "fak_unfilled"
+                self._log(f"pm SELL no fill {slug} {side} {held:g} sh >= "
+                          f"{floor:.4f} (ack {dt_ms:.0f} ms): {exc}")
+            else:
+                self.last_failure = "post_failed"
+                self._log(f"pm SELL FAILED {slug} {side} after {calls} call(s) "
+                          f"({dt_ms:.0f} ms): {name} {exc}")
+            self.last_order_error = f"{name}: {exc}"
+            return None
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        self.venue_calls = calls
+        if _a(resp, "ok", default=True) is False:
+            self.last_failure = "fak_unfilled"
+            self.last_order_error = (f"{_a(resp, 'code', default='')} "
+                                     f"{_a(resp, 'message', default='')}").strip()
+            self._log(f"pm SELL no fill {slug} {side} >= {floor:.4f}: "
+                      f"{self.last_order_error} (ack {dt_ms:.0f} ms)")
+            return None
+        oid = (_a(resp, "order_id", "orderId", default="") or "")
+        status = _a(resp, "status", default=None)
+        # THE VENUE'S OWN PRICE WHEN IT VOLUNTEERS ONE, the floor otherwise (see
+        # the docstring: the floor is the lower bound, so a fallback is honest
+        # rather than optimistic).
+        px = _a(resp, "avg_price", "average_price", "price", default=None)
+        try:
+            px = float(px)
+        except (TypeError, ValueError):
+            px = 0.0
+        if not (0.0 < px < 1.0):
+            px = floor
+        deadline = t0 + self.cfg.confirm_budget_s
+        # ⛔ THE AFTER-READ MUST BE ABLE TO SAY "I DO NOT KNOW". `_position_size`
+        # answers 0.0 for a FAILED read, and downstream that is arithmetic for
+        # "the whole position sold": proceeds booked, slot released, fill
+        # dropped -- while the shares are still on-chain and now outside every
+        # cap. `_position_size_checked` returns None instead, which is treated
+        # as UNVERIFIED (halt), never as a completed sale.
+        left = None
+        while True:
+            left = self._position_size_checked(token_id)
+            if left is not None and left < sell_shares - 1e-9:
+                break
+            if left is None:
+                break
+            if time.perf_counter() >= deadline:
+                break
+            time.sleep(0.2)
+        sold = 0.0 if left is None else max(0.0, sell_shares - left)
+        if left is None or sold <= 1e-9:
+            # ---- THE VENUE'S TRADE RECORD, WHICH IS THE ONLY SOURCE THAT IS A
+            # FILL RATHER THAN A TOTAL -------------------------------------
+            # The position list is a lagging aggregate in BOTH directions, and
+            # this is the fallback that sees the sale the list has not caught
+            # up with yet. The window starts at the ORDER (`t0_wall`), NOT at
+            # the entry, so it cannot read our own buy back as the sale -- the
+            # distinction the docstring above is built on.
+            got = self._trades_since(token_id, t0_wall)
+            if got is not None and got[0] > 0 and got[0] >= sell_shares * 0.5:
+                sold = min(got[0], sell_shares)
+                if 0.0 < got[1] < 1.0:
+                    px = got[1]
+                fee = (got[2] if got[2] > 0
+                       else taker_fee(px, sold, self.cfg.taker_fee_rate))
+                self._balance_cache = None
+                self._log(f"pm SELL FILL {sold:g} {side} @ {px} ({slug}) floor "
+                          f"{floor} bid {bid} fee {fee:.4f} ack {dt_ms:.0f} ms "
+                          f"-- confirmed by the venue's trade record")
+                return Fill(slug=slug, side=side, requested_px=floor,
+                            filled_px=px, shares=sold, stake=sold * px,
+                            fee_paid=fee, order_id=str(oid),
+                            ts_ms=int(self._now() * 1000), token_id=token_id,
+                            raw=f"sell fak ack {dt_ms:.0f}ms via trades")
+            # ⛔ PENDING, NOT UNVERIFIED. The order matched at the venue (its
+            # own ack) and nothing is visible yet, so the SALE MAY HAVE
+            # HAPPENED -- but calling it unverified halted the watcher, the row
+            # was never written, and the fill then rode `settle_due` into a
+            # phantom settlement. Every one of today's four exits died here
+            # (`status matched ack ~500 ms -- UNVERIFIED, the position list
+            # still shows 1.8867 of 1.8867 shares`). Pending keeps the position
+            # watched so `confirm_sale` can close it when the venue catches up.
+            self.last_failure = "pending_confirm"
+            self._log(f"pm SELL {oid} status {status} ack {dt_ms:.0f} ms -- "
+                      f"PENDING: matched at the venue, nothing visible yet "
+                      f"(the list is behind, not silent); the watcher keeps "
+                      f"the position and confirms")
+            return Fill(slug=slug, side=side, requested_px=floor,
+                        filled_px=px, shares=0.0, stake=0.0, fee_paid=0.0,
+                        order_id=str(oid), ts_ms=int(self._now() * 1000),
+                        token_id=token_id,
+                        raw=f"sell fak ack {dt_ms:.0f}ms pending",
+                        pending=True)
+        fee = taker_fee(px, sold, self.cfg.taker_fee_rate)
+        self._balance_cache = None
+        self._log(f"pm SELL FILL {sold:g} {side} @ {px} ({slug}) floor {floor} "
+                  f"bid {bid} fee {fee:.4f} ack {dt_ms:.0f} ms")
+        return Fill(slug=slug, side=side, requested_px=floor, filled_px=px,
+                    shares=sold, stake=sold * px, fee_paid=fee,
+                    order_id=str(oid), ts_ms=int(self._now() * 1000),
+                    token_id=token_id, raw=f"sell fak ack {dt_ms:.0f}ms")
+
+    def confirm_sale(self, *, token_id: str, shares: float, since_ts: float,
+                     fallback_px: float = 0.0
+                     ) -> tuple[float, float, float] | None:
+        """Did a sale we PLACED but could not SEE actually happen?
+
+        -> `(sold_shares, price, fee)` or None (still unknown; call again).
+
+        This is the other half of the `pending` outcome. The venue's position
+        list lags a fill in BOTH directions and by more than a confirm budget
+        can cover -- measured 2026-09-18: 0 shares 4 s after a confirmed buy,
+        and `still 1.8867 of 1.8867` 0.7 s after a matched sell (the same lag
+        this repo measured at 3.5 s on 2026-09-12). So a sale that could not be
+        confirmed in the moment is confirmed HERE, later, instead of the
+        position being halted into limbo.
+
+        ORDER OF THE TWO PRIMITIVES IS DELIBERATE:
+          * the POSITION delta first, because it cannot be confused by our own
+            buy (a position can only go DOWN here -- this arm sells once);
+          * the TRADE record as the fallback, which carries the venue's REAL
+            price and fee, with the window starting at the ORDER (`since_ts`)
+            rather than at the entry -- so it cannot read our buy back as the
+            sale, which is the trap `_trades_since`'s docstring documents.
+        """
+        left = self._position_size_checked(token_id)
+        got = self._trades_since(token_id, since_ts)
+        traded = got[0] if got else 0.0
+        px = got[1] if got and 0.0 < got[1] < 1.0 else fallback_px
+        fee = got[2] if got and got[2] > 0 else 0.0
+        if left is not None and left < shares - 1e-9:
+            sold = max(0.0, shares - left)
+            if traded > 0:
+                sold = min(sold, traded) if traded < sold else sold
+            return (sold, px, fee)
+        if traded >= shares * 0.5:
+            return (min(traded, shares), px, fee)
+        return None
 
     async def buy_limit(self, *, slug: str, side: str, token_id: str,
                         limit_px: float, stake: float, wait_s: float,

@@ -1392,11 +1392,26 @@ class TestModelRoundRangeWindow:
         assert s.model_min_round_range_bps == 5.0
         assert s.model_max_round_range_bps == 12.0
 
-    def test_cross_and_model_windows_are_complementary(self):
-        """Each arm's dead zone is the other's edge -- that is the whole design."""
+    def test_the_range_gate_is_off_on_its_own_replay(self):
+        """12.0 -> 0.0 on 2026-09-18. See config.cross_max_round_range_bps.
+
+        The old assertion here was the complementarity claim ("cross owns the
+        calm end, model the moving end") -- MEASURED FALSE at the shipped tau
+        window: the gate's KEEPS were +0.0180/sh and its REFUSALS +0.1191/sh,
+        with the refusals positive in both halves and on their worst day while
+        the keeps were not. The invariant below still guards any live value (the
+        cross arm may never own a WIDER window than the model arm); 0 is OFF.
+        """
         from btcpredict.config import settings as s
-        assert s.cross_max_round_range_bps <= s.model_max_round_range_bps, \
-            "cross owns the calm end, model the moving end"
+        assert s.cross_max_round_range_bps == 0.0
+        assert s.cross_max_round_range_bps <= s.model_max_round_range_bps
+
+    def test_the_refuted_per_family_range_values_have_not_come_back(self):
+        """They are read through `cross_knob`, so a stray entry would keep the
+        refuted gate binding on that family while the global read as OFF."""
+        from btcpredict.config import settings as s
+        for prefix, ov in s.cross_overrides.items():
+            assert "max_round_range_bps" not in ov, prefix
 
 
 class TestOpenExposureCap:
@@ -1550,12 +1565,19 @@ class TestOrderingDoesNotBlockTheLoop:
 
 
 class TestTheRoundIsOneBet:
-    """With the reversal guard on, every entry in a round is the same side of
-    the same round -- they settle on ONE oracle print. Correlation is 1.000, so
-    the round's cumulative stake is the risk unit, not the order's.
+    """PER FAMILY. With the reversal guard on, every entry in a FAMILY's round is
+    the same side of the same round -- they settle on ONE oracle print, so that
+    family-round's cumulative stake is the risk unit, not the order's.
 
-    Unguarded, a 4-entry round put 26.9% of bankroll on a single print (1.17x
-    full Kelly) against a per-entry posture of 0.29x.
+    WHAT THIS IS NOT: a window cap. `_round_stake` is keyed `[r.slug]`, so the
+    nine families sharing a 5-minute window hold nine separate budgets -- live
+    2026-09-18 11:20 put $4 into one window across four families against a $2
+    intent (-$2.30) and 11:15 put three same-side Downs in one window (-$3.12).
+
+    A TRUE window cap (key on `rounds.end_ms`) was replayed over the PM era and
+    REFUTED: +$62.37 -> +$12.92 at cap 1/window, day-t +3.51 -> +1.53, with
+    every dropped cohort positive. See `TestTheWindowCapIsRefuted` and the
+    record beside `cross_max_round_stake_mult` in config.py.
     """
 
     def test_the_cap_is_cumulative_not_per_order(self):
@@ -1599,6 +1621,44 @@ class TestTheRoundIsOneBet:
         import btcpredict.main as m
         src = inspect.getsource(m.Bot._cross_tick)
         assert "_round_stake = {k: v for k, v in rs.items() if k in live}" in src
+
+
+class TestTheWindowCapIsRefuted:
+    """A SAME-WINDOW (cross-family) entry cap was measured on the whole PM era
+    and it costs money -- `tools/pm_window_cap.py`, 763 entries over 299 windows
+    under the shipped chain. It must not be re-proposed, and the implementation
+    must not drift into being one by accident.
+
+    base (no cap)         n=763  +0.0817/sh  tot +62.37  t +4.57  day-t +3.51
+    cap 1 per window      n=299  +0.0432     tot +12.92  t +1.52  day-t +1.53
+    cap 2 per window      n=504  +0.0593     tot +29.87  t +2.70  day-t +2.36
+    same side <=1/window  n=396  +0.0417     tot +16.53  t +1.67  day-t +2.02
+
+    The dropped cohorts are positive (+0.1066 / +0.1255 / +0.1249 per share):
+    the stacking is where the edge is (k=5 windows: +0.1815/entry and a third of
+    the total; same-side stack #2/#4 at +0.1154/+0.2564 against +0.0418 for a
+    window's first entry). It also contradicted the 64-fill live sample that
+    raised the question, which is why n matters here.
+    """
+
+    def test_the_accumulator_stays_keyed_per_family(self):
+        import inspect
+        import btcpredict.main as m
+        src = inspect.getsource(m.Bot._cross_tick)
+        assert "rs[r.slug] = rs.get(r.slug, 0.0) + stake" in src, (
+            "keying this on end_ms makes it a WINDOW cap, which measured "
+            "-$49.45 against the base. If it is ever changed, the record in "
+            "config.py has to change with it.")
+
+    def test_the_refutation_rides_with_both_knobs(self):
+        import pathlib
+        cfg = (pathlib.Path(__file__).resolve().parents[1]
+               / "btcpredict" / "config.py").read_text()
+        assert "pm_window_cap.py" in cfg, \
+            "the tool that measured it must be named where the knob is"
+        for frag in ("cap 1 per window", "cap 2 per window", "+0.0817",
+                     "k=5 +0.1815", "CROSS_MAX_OPEN_STAKE_PCT=0"):
+            assert frag in cfg, frag
 
 
 class TestTheLockedLossGuard:

@@ -432,16 +432,26 @@ class TestCrossRunsAcrossEveryTradedMarket:
         assert calls == [None], "an empty world must still tick the primary"
 
     def test_knobs_resolve_against_the_round_not_self_round(self):
-        """`_ck` reads the round it is handed. Reading `self._round` here would
-        price eth-updown-15m with BTC's range gate -- and since the gate is in
-        BPS while a 15m round has 3x as long to travel, BTC's 10.0 blocks 77%
-        of eth-15m's rounds against 40% of BTC's."""
+        """`_ck` reads the round it is handed, never `self._round`.
+
+        This was proven with `max_round_range_bps`, whose five per-family values
+        were REFUTED and removed on 2026-09-18 (see
+        config.cross_max_round_range_bps), so the proof moved to the two
+        per-market families of knobs that still exist. The trap is unchanged: a
+        `_ck` reading `self._round` would price sol -- one of the three families
+        whose strike is RECONSTRUCTED -- with BTC's one-tick floor, and xrp with
+        a 0.01 spot tick, which is a 78 bps floor against a 5 bps ceiling: an
+        EMPTY band, i.e. an arm that can never fire and nothing that says so.
+        """
         b = Bot.__new__(Bot)
         b._round = SimpleNamespace(slug="btc-updown-5m-1")
-        btc = b._ck("max_round_range_bps", SimpleNamespace(slug="btc-updown-5m-1"))
-        eth15 = b._ck("max_round_range_bps", SimpleNamespace(slug="eth-updown-15m-1"))
-        assert btc != eth15, "per-market overrides must actually apply"
-        assert b._ck("max_round_range_bps") == btc, "None falls back to _round"
+        sol = b._ck("min_depth_ticks", SimpleNamespace(slug="sol-updown-5m-1"))
+        btc = b._ck("min_depth_ticks", SimpleNamespace(slug="btc-updown-5m-1"))
+        assert sol != btc, "per-market overrides must actually apply"
+        assert sol == 2.0 and btc == 1.0
+        assert b._ck("min_depth_ticks") == btc, "None falls back to _round"
+        xrp = b._ck("tick_size", SimpleNamespace(slug="xrp-updown-5m-1"))
+        assert xrp == 0.0001 and b._ck("tick_size") == 0.01
 
     def test_per_round_state_survives_other_markets(self):
         """`_cross_fired` used to be pruned to the CURRENT round's slug, which
