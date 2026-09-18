@@ -12676,3 +12676,77 @@ share over ~60 live fills.
 DEFAULT. Changing config.py alone is a no-op -- the same trap that kept the
 refuted range gate binding for a day. Set `CROSS_MIN_MARGIN_BPS=0.50` there and
 restart. NOT DONE HERE: the live `.env` was not edited.
+
+### ⭐ THE EXIT, EXPLORED: 24 RULES, ONE SURVIVES — AND IT IS THE TAU GATE (2026-09-18)
+
+The exit's failure is structural: "the signal crossed back over the level" is
+SYMMETRIC information. It fires the same way on a genuine reversal and on a
+position that merely sat near the level — and by construction every entry starts
+near the level, because `crossed_side` fires on the first tick past it. So the
+question is not "should we exit" but "is there a SIDE CONDITION that separates
+the cohorts". `tools/pm_exit_explore.py` sweeps the candidates and reports the
+WINNER/LOSER SPLIT on every cell, because the aggregate hides the failure.
+
+**ONLY THE TAU GATE SURVIVES, and it survives on both samples:**
+
+    TAPE (748 entries, entry floor 0.5)      exits   cut            be
+      A hold to the bell      +0.0857/sh        --   --             --
+      B flip, tau>=8 (was)    +0.0889 (+.0032)  28   20L+6.74 8W-4.32  x1.56  8.7c
+      E flip, tau>=60         +0.0902 (+.0045)  21   16L+6.06 5W-2.72  x2.23 15.9c
+      H tau>=60 + confirm=5   +0.0909 (+.0052)  20   16L+6.01 4W-2.15  x2.80 19.3c
+
+    LIVE (95 settled fills)                  total          cut
+      hold to the bell                      -11.999          --
+      flip, tau>=8 (was)                     -9.038  ( +2.961)  7   6L+4.185 1W-1.224
+      flip, tau>=60                          -7.814  ( +4.185)  6   6L+4.185 0W+0.000
+
+Six exits live, **all six on losing positions, no winner cut**.
+
+⛔ **`be` IS THE COLUMN THAT MATTERS, NOT `total`** — and this is the general
+lesson, not a detail of this sweep. The replay prices every exit at
+`1 - other_ask`; the real fill is the BID, ~1c/share away. A cell's gain is
+spread over its exits, so it survives a degradation of `gain / n_exits`. The cell
+with the BIGGEST tape total is therefore the FRAGILE one:
+
+    confirm=0   TAPE +70.64  (best of all 24)  292 exits  be=2.2c  ratio x1.10
+    confirm=0   LIVE -15.818 against -11.999 held  --  21L+15.275, 14W-19.094
+
+It earns its tape total from VOLUME, not discrimination (x1.10 is a coin flip
+paying two spreads), and it duly INVERTS out of sample. The tau gate at be=15.9c
+does not. **Rank exit rules by the loser/winner value ratio and by `be`, never by
+total.** This is the same trap as the `walk()` artifact, one level up: a number
+that looks like edge but is really a count of how often you crossed a spread.
+
+WHY THE TAU GATE WORKS, and it is `cross_exit_min_tau_s`'s own first sentence
+generalised: inside a minute the book is one-sided ("Up 0 bids / 99 asks"), AND a
+late flip on a round that is effectively decided is noise about a settled
+question — there is no time left for the reversal to become the other side's win,
+so cutting there pays the spread to realise a loss that was going to be a win.
+
+REFUTED IN THE SAME SWEEP, recorded so nobody re-derives them:
+  * **an exit floor HIGHER than the entry's is actively harmful** — 1.0 bps gives
+    x0.66, 2.0 gives x0.37, 3.0 gives x0.02, all cutting more winner value than
+    they save. The symmetric floor (the exit reads the ENTRY's `min_margin_bps`)
+    is right, and this refutes the intuition that leaving should need a higher
+    bar than entering because it also surrenders option value.
+  * **"giveback"** — the entry's own move must be undone k-fold, the scale-free
+    version of the thesis-is-dead idea — adds nothing: 1.0x is -0.0006/sh and
+    be=1.9c, inside the fill error.
+  * **a draw-down clause** (never cut a position still up) is neutral once the
+    tau gate is in: identical on the live fills.
+  * **confirm_s is second-order**: 5.0 s is +0.0052 on tape and IDENTICAL live.
+    Left at 3.0.
+
+⛔ **AND THE PROPORTION MATTERS MORE THAN ANY OF THIS.** On the new entry floor
+the base is +0.0857/sh against +0.0594 at the old 0.25 — the ENTRY gate change
+was worth **+0.0263/share**. The best exit cell in a 24-rule sweep is
+**+0.0052/share**, a fifth of it, and it is an argmax over 24. The exit is a ~6%
+adjustment on the entry's edge, not a second source of return. Effort belongs on
+the entry.
+
+SHIPPED: `cross_exit_min_tau_s` 8.0 -> 60.0 (config default + the `.env` pin,
+backup `.env.bak-*-pre-exit-tau60`). It is a TIGHTENING — strictly fewer exits
+than the rule already running — so the downside is bounded by doing nothing.
+HONEST BOUNDS: 20 exits on tape, 6 live; 6-for-6 is p~0.08 alone. A supported
+hypothesis, not a proven edge. KILL CRITERION: any winner cut inside the first
+~20 live fires, or the loser/winner value ratio under 1.5.

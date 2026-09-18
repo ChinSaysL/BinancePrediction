@@ -2829,7 +2829,55 @@ class Settings(BaseSettings):
     cross_exit_confirm_s: float = 3.0
     # NEVER exit inside this many seconds of the bell: near the end the book
     # goes one-sided ("Up 0 bids / 99 asks") and there is no bid to hit.
-    cross_exit_min_tau_s: float = 8.0
+    #
+    # ⭐ 8.0 -> 60.0 ON 2026-09-18. THIS IS THE ONLY SIDE CONDITION THAT
+    # SEPARATES THE TWO COHORTS, and it is the whole of the exit's edge.
+    # `tools/pm_exit_explore.py` swept 24 rules for something that tells a
+    # REVERSAL from NOISE -- the exit's own margin floor, a "giveback" clause
+    # (the entry's move must be undone k-fold), a draw-down clause, confirm_s,
+    # and combinations. Only the tau gate survives, on BOTH samples:
+    #     TAPE (748 entries, entry floor 0.5)   exits  losers/winners cut   be
+    #       hold to the bell        +0.0857/sh      --                      --
+    #       flip, tau>=8 (was)      +0.0889      28   20L+6.74  8W-4.32   8.7c
+    #       flip, tau>=60           +0.0902      21   16L+6.06  5W-2.72  15.9c
+    #     LIVE (95 settled fills)              total        cut
+    #       hold to the bell                   -11.999      --
+    #       flip, tau>=8 (was)                  -9.038   7   6L+4.185 1W-1.224
+    #       flip, tau>=60                       -7.814   6   6L+4.185 0W+0.000
+    # Six exits live, ALL SIX on losing positions, no winner cut.
+    #
+    # WHY, and it is this comment's own first sentence generalised: inside a
+    # minute the book is one-sided, AND a late flip on a position the round has
+    # effectively decided is noise about a settled question -- there is no time
+    # left for the reversal to become the other side's win. Cutting there pays
+    # the spread to realise a loss that was going to be a win.
+    #
+    # ⛔ `be` IS THE COLUMN THAT MATTERS, NOT `total`. The replay prices every
+    # exit at `1 - other_ask` and the real fill is the BID, ~1c/share away. A
+    # cell's gain is spread over its exits, so it survives a degradation of
+    # gain/exits -- and the cell with the BIGGEST tape total is the FRAGILE one:
+    #     confirm=0  TAPE +70.64 (best of 24!)  292 exits  be=2.2c  ratio x1.10
+    #     confirm=0  LIVE  -15.818 vs -11.999 held -- 21L+15.275, 14W-19.094
+    # It earns its tape total from VOLUME, not discrimination (x1.10 is a coin
+    # flip), and it duly inverts out of sample. The tau gate at be=15.9c does
+    # not. Rank exit rules by `be` and by the loser/winner ratio, never by total.
+    #
+    # REFUTED IN THE SAME SWEEP, so nobody re-derives them:
+    #   * an exit floor HIGHER than the entry's is actively harmful -- 1.0 bps
+    #     gives x0.66, 2.0 gives x0.37, 3.0 gives x0.02 (it cuts more winner
+    #     value than it saves). The symmetric floor is right.
+    #   * "giveback" (the entry's own move undone k-fold) adds nothing: 1.0x is
+    #     -0.0006/sh, and at be=1.9c it is inside the fill error.
+    #   * confirm_s is second-order once the tau gate is in: 5.0 s is +0.0052
+    #     on tape and IDENTICAL on the live fills. Left at 3.0.
+    #
+    # HONEST BOUNDS: 20 exits on tape, 6 live, and the cell is an argmax over 24.
+    # 6-for-6 is p~0.08 on its own. This is a supported hypothesis, not a proven
+    # edge -- but it is a TIGHTENING (strictly fewer exits than shipped), so the
+    # downside is bounded by doing nothing. KILL CRITERION: any winner cut inside
+    # the first ~20 live fires, or the loser/winner value ratio under 1.5.
+    # Revert: CROSS_EXIT_MIN_TAU_S=8.0 + restart.
+    cross_exit_min_tau_s: float = 60.0
     # The sell's price floor: `min_price` on the FAK, set this far BELOW the bid
     # we can see. It is the only risk bound on the order -- the venue will not
     # take less -- so it is also what the ledger books when the venue's own fill

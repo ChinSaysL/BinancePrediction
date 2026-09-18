@@ -770,3 +770,51 @@ class TestTheConfirmationRunsFromTheFlip:
         assert b._exit_watch[SLUG]["flip_ms"] is None, (
             "the signal returned to the side we hold: the flip is over")
         assert b.broker.calls == []
+
+
+class TestTheTauGateIsTheEdge:
+    """⭐ The one side condition that separates losers from winners.
+
+    `tools/pm_exit_explore.py` swept 24 rules -- the exit's own margin floor, a
+    giveback clause, a draw-down clause, confirm_s and combinations. Only the
+    tau gate survives on both samples: on the tape it takes the loser/winner
+    value ratio from x1.56 to x2.23, and on the 95 live fills it cuts 6 losers
+    (+4.185) and ZERO winners, where the shipped tau=8 cut 1 winner.
+    """
+
+    def test_the_gate_defaults_to_the_measured_value(self):
+        from btcpredict.config import Settings
+        assert Settings().cross_exit_min_tau_s == 60.0
+
+    def test_a_flip_inside_the_gate_does_not_sell(self, monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
+                            True)
+        b = _bot(monkeypatch=monkeypatch)
+        r = _round(tau_s=45.0)                # inside the 60 s gate
+        for _ in range(4):
+            assert _run(b, r, "Down") is False
+        assert b.broker.calls == [], (
+            "inside a minute the book is one-sided and a late flip is noise "
+            "about a round that is already decided")
+
+    def test_a_flip_outside_the_gate_still_sells(self, monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
+                            True)
+        b = _bot(monkeypatch=monkeypatch)
+        assert _fire(b, _round(tau_s=150.0), "Down") is True
+        assert len(b.broker.calls) == 1
+
+    def test_the_exit_floor_is_not_raised_above_the_entrys(self):
+        """⛔ REFUTED, and the sweep is quoted in the config: an exit floor
+        above the entry's cuts MORE winner value than it saves (x0.66 at 1.0
+        bps, x0.37 at 2.0, x0.02 at 3.0). The band is symmetric on purpose --
+        `_cross_exit_check` reads the ENTRY's `min_margin_bps`, not a knob of
+        its own, and adding one would re-open a measured dead end."""
+        src = (ROOT / "btcpredict" / "main.py").read_text()
+        i = src.index("async def _cross_exit_check")
+        j = src.index("def _confirm_pending_sale", i)
+        body = src[i:j]
+        assert 'self._ck("min_margin_bps", r)' in body
+        assert "cross_exit_min_margin" not in src, (
+            "a separate exit floor was measured and refused; see "
+            "config.cross_exit_min_tau_s")
