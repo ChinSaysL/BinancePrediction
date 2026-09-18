@@ -13158,3 +13158,59 @@ THE RULE THIS EARNS: a config/source edit gets a line-count and symbol assertion
 in the same step that writes it (the re-apply does: it asserts the file GROWS and
 that `def cross_traded` survives), and `git add -A` on a repo with generated
 artifacts needs `git diff --stat` read before the commit, not after.
+
+### ⭐ THE REAL SHAPE OF IT: THE BOUNDARY BAND, NOT "RUNNING OUT OF TIME" (2026-09-18)
+
+Operator pushed back on the tau floor: the sol trade's pattern "happened
+countless times". Correct, and the control run changes the JUSTIFICATION for the
+floor while confirming the line.
+
+**46% OF LOSSES ARE TRADES THAT WERE ESSENTIALLY RIGHT** (146 fills, 81W/65L):
+
+    losses by final margin:  <-10 bps n=12 | -10..-5 n=12 | -5..-2 n=11
+                             -2..-1 n=5 | -1..-0.5 n=6 | -0.5..0 n=6
+    plus 13 losses where OUR OWN tape says we WON (pure feed disagreement)
+    'near miss' (<2 bps out, or on the wrong side of the feed): 30/65, -30.321
+
+**⛔ BUT THE CONTROL IS WHAT MATTERS, AND I HAD NOT RUN IT.** Scoring BOTH sides
+of the boundary, near-boundary trades are not a uniform loser -- they are a coin
+flip, EXCEPT in the innermost cell:
+
+    |final| [ 0.0, 0.5) bps  n=15  win 26.7%  total -8.981  per-share -0.2093
+    |final| [ 0.5,   1)      n=13  win 53.8%  total -0.707
+    |final| [ 1.0,   2)      n=17  win 58.8%  total +2.947
+    |final| [ 2.0,   5)      n=29  win 55.2%  total -2.775
+    |final| [ 5.0,  10)      n=33  win 54.5%  total -3.618
+    |final| [10.0, inf)      n=39  win 66.7%  total -1.475
+
+**`|final| < 0.5 bps IS THE SINGLE WORST CELL IN THE LIVE RECORD** -- 15 fills,
+-$8.98, more than the entire net loss. It is exactly the band where the two
+feeds agree only 59.2% (see the feed-residual entry), so "being right" is wrong
+40% of the time AND a spread was paid to get there. The 0.5-2 bps band, by
+contrast, is fine (53.8% / 58.8%).
+
+**AND THE BAND IS PREDICTED BY TAU:**
+
+    tau [  0, 30)  median |final| 0.35 bps  86% land in <2bps  win 16.7%
+    tau [ 30, 60)  median |final| 0.93 bps  90% land there     win 42.1%
+    tau [ 60,120)  median |final| 4.72 bps  33%                win 75.0%
+    tau [120,181)  median |final| 5.64 bps  17%                win 53.8%
+
+So the tau floor's real mechanism is NOT "it ran out of time" -- it is that a
+sub-30 entry lands ON THE COIN-FLIP BOUNDARY BY CONSTRUCTION: most of the
+settling window is already printed, and `crossed_side` fires at zero margin, so
+the final margin is small almost surely. **`cross_min_tau_s = 30` stands, on
+this reasoning rather than the feasibility one.**
+
+WHY NOT 60, re-checked: tau[30,60) lands at a median 0.93 bps -- the 53.8% band,
+not the 26.7% one -- and runs -0.076/fill against a -0.100 average, i.e. BETTER
+than average. Refusing it would be cutting an above-average cohort to make a
+negative sample look smaller, which is the artifact this file keeps catching.
+
+⛔ **WHAT IS NOT SOLVED, AND THE OPERATOR IS RIGHT ABOUT IT.** The boundary band
+is 45 of 146 fills (31%, -$6.74) and the tau floor removes only a fraction. The
+remainder sits at tau>120, where 17% still land inside it and **tau gives no
+warning** -- the median there is 5.64 bps, so the ones that land near zero do so
+unpredictably. Nothing measured today predicts them at entry. That is the
+irreducible core, it is the same object as the 3.4% feed residual, and it is
+where any further work on this belongs -- NOT on a bigger tau floor.
