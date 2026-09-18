@@ -58,10 +58,19 @@ def test_the_window_ships_the_direction_that_survives_both_halves():
 
 
 def test_only_the_upper_bound_moved():
-    """[5,180] is ONE knob. [60,180] measures the same edge with 23 fewer
-    entries, so there is no measured reason to touch the floor -- and the floor
-    is an EXECUTION bound (median decision->fill 3.7 s), not a signal one."""
-    assert Settings().cross_min_tau_s == 5.0
+    """⭐ SUPERSEDED FOR THE FLOOR (2026-09-18): it is 30.0, not 5.0.
+
+    The original reasoning -- "the floor is an EXECUTION bound (median
+    decision->fill 3.7 s), not a signal one, and there is no measured reason to
+    touch it" -- was right about the TAPE and wrong about the arm. The replay
+    takes the FIRST qualifying crossing per round, so only 38 of 806 of its
+    entries are at tau<60 and a tau floor cannot bind there. The LIVE arm puts
+    18% of its fills under tau 60, and under tau 30 they run 1 win in 7 at
+    -0.1130/share. Below 30 s more than HALF the settling window is already
+    printed and unchangeable, which is arithmetic, not a fitted cell.
+    See config.cross_min_tau_s. The UPPER bound is unchanged at 180."""
+    assert Settings().cross_min_tau_s == 30.0
+    assert Settings().cross_max_tau_s == 180.0
 
 
 def test_the_width_is_global_no_family_overrides_it():

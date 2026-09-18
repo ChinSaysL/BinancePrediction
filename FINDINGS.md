@@ -13086,3 +13086,75 @@ with the margin faster than the feed noise falls). The scale-free variant was
 also already refuted (flat bps beats `|m|/(sigma*sqrt(resid))` at every matched
 entry count). So the feed work changes no parameter -- it EXPLAINS the one
 already shipped, which is a result, not a non-result.
+
+### ⭐ THE TAU FLOOR 5 -> 30: the gate the margin floor cannot see (2026-09-18)
+
+Operator, on `sol-updown-5m-1789756200`: "instead of entering late on that same
+trade, we won't enter it at all — so we don't lose anything in the first place."
+Correct, and it identifies a gate nothing in this repo had measured.
+
+**WHY THE MARGIN FLOOR CANNOT DO IT.** `cross_min_margin_bps` asks how far the
+signal is past the level NOW. This asks what the CLOCK still allows. The payout
+is `TWAP60(bell)`, so at `tau` seconds out **`(60 - tau)` seconds of the settling
+window are already printed and unchangeable**; if they printed against us the
+remainder must average enormously the other way:
+
+    required_remaining = (60*level - printed_s*printed_mean) / tau
+
+The sol entry read an ordinary **+0.5 bps margin** and sailed through, while 28
+of its 59 window samples were locked at **-5.35 bps** -- so the remaining 31 s
+had to average **+4.83 bps**. It managed +4.86 and still lost, on feed noise.
+
+**WHY NO SWEEP EVER CAUGHT IT.** `pm_cross_replay.pick()` takes ONE entry per
+round and picks the FIRST qualifying crossing, so only **38 of 806** replay
+entries are at tau<60 and a tau floor cannot bind. The LIVE arm is different --
+restarts, the per-round cap and the gates delay the fire, so **28 of 152 fills
+(18%)** are at tau<60. `tools/pm_feasibility_gate.py` measures both and says so.
+
+**THE LIVE RECORD** (152 settled PM-era fills):
+
+    tau [  0, 30)  n=  7  total -4.679  per-share -0.1130  win 14.3%  t -1.94
+    tau [ 30, 60)  n= 21  total -1.591  per-share -0.0307  win 47.6%
+    tau [ 60,120)  n= 12  total +1.182  per-share +0.0461  win 66.7%
+    tau [120,181)  n= 84  total -7.707  per-share -0.0541
+
+    required-remaining at tau<60: median +0.40 bps, p90 +5.52, max +14.99
+    the cohort needing >=2 bps:  n=5  -0.1277/share  win 20%  t -2.26
+
+ONE WIN IN SEVEN below 30 s at ~2x the average loss per share. **The check that
+stops this being an artifact**: the whole live sample is negative, so ANY gate
+improves the total by trading less -- but tau[30,60) BEATS the ~-0.061 average,
+so the damage is specifically under 30, not "late entries" generally.
+
+WHY 30 AND NOT 60: 30 is where the locked fraction passes one half -- mechanical,
+not fitted -- and [30,60) outperforms, so a 60 floor cuts profitable entries with
+it. A 60 floor "saves" more (+6.27 vs +4.68) precisely by trading less.
+
+SHIPPED: `cross_min_tau_s` 5.0 -> 30.0 (config + the `.env` pin, backup
+`-pre-taufloor30`). It costs ~nothing on the tape (+56.18 against +56.30) and is
+a TIGHTENING. BOUNDS: n=7 refused, thin. KILL CRITERION: entry rate down >~20%,
+or tau[30,60) negative over ~40 fills.
+
+⛔ ALSO RETRACTED: `tests/test_cross_tau_window.py::test_only_the_upper_bound_moved`
+asserted the floor stays 5.0 because "there is no measured reason to touch it".
+That was right about the TAPE and wrong about the arm -- the tape structurally
+cannot see late entries. Updated, with the original reasoning kept in the
+docstring so the distinction is not lost.
+
+### ⛔ PROCESS FAILURE, RECORDED: `config.py` WAS TRUNCATED AND COMMITTED TWICE
+
+Between `001e334` and `ca4e8e1` the local `btcpredict/config.py` lost **905
+lines** (3266 -> 2361), cutting from mid-`cross_hold_s` onward and taking
+`cross_traded` with it. It was committed in `ca4e8e1` and again in `262cba1`
+because both used `git add -A` without reading the diff, and it went unnoticed
+until the next test run failed to import.
+
+WHAT SAVED IT: the truncated file was **never deployed** -- the VPS kept the
+intact 3266-line version (md5 `4de1020e...`), so the live bot was never at risk,
+and the restore was `git show 001e334:btcpredict/config.py`. An audit of every
+file touched in those two commits found nothing else shrank.
+
+THE RULE THIS EARNS: a config/source edit gets a line-count and symbol assertion
+in the same step that writes it (the re-apply does: it asserts the file GROWS and
+that `def cross_traded` survives), and `git add -A` on a repo with generated
+artifacts needs `git diff --stat` read before the commit, not after.

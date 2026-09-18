@@ -124,3 +124,25 @@ def test_the_config_says_what_the_arm_s_look_did_to_that_claim():
     assert "+0.0894" in cfg and "+0.0525" in cfg       # both floors' edges
     assert "the ranking FLIPS between the two looks" in cfg
     assert "the FLOOR is not the lever, the WINDOW is" in cfg
+
+
+def test_the_tau_floor_is_a_strategy_gate_now():
+    """⭐ 5.0 -> 30.0 (2026-09-18). Below tau=30 more than HALF the settling
+    window is already printed and unchangeable, so a crossing there needs an
+    enormous remaining move to drag the 60 s mean over. Live: 7 fills under 30 s
+    returned -4.679 at a 14.3% win rate, ~2x the average loss per share, while
+    tau[30,60) BEATS the average -- so it is not merely "trade less".
+    See config.cross_min_tau_s."""
+    from btcpredict.config import Settings
+    assert Settings().cross_min_tau_s == 30.0
+
+
+def test_the_tau_floor_carries_its_mechanical_reason():
+    """It is arithmetic, not a fitted cell: the reason must ride with the value
+    so nobody re-lowers it on a sweep that cannot see late entries."""
+    cfg = (ROOT / "btcpredict" / "config.py").read_text()
+    i = cfg.index("cross_min_tau_s: float")
+    block = cfg[max(0, i - 3000):i]
+    assert "ALREADY PRINTED" in block
+    assert "required_remaining" in block
+    assert "CROSS_MIN_TAU_S=5.0" in block, "the revert must be stated"
