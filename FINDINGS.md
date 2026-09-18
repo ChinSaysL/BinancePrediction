@@ -13214,3 +13214,75 @@ warning** -- the median there is 5.64 bps, so the ones that land near zero do so
 unpredictably. Nothing measured today predicts them at entry. That is the
 irreducible core, it is the same object as the 3.4% feed residual, and it is
 where any further work on this belongs -- NOT on a bigger tau floor.
+
+### ⭐⭐ THE LADDER ARTIFACT: ONE DEFECT EXPLAINS EVERY TAPE/LIVE INVERSION (2026-09-18)
+
+Asked to experiment with the day's recommendations and ship the best. One was
+REFUTED, one produced the strongest change of the session, and the mechanism
+behind it retires a whole class of measurements in this file.
+
+**REFUTED -- "gate the price band on the VENUE's book, not ours".** It looked
+like the biggest unshipped fix (median 7c gap, and the order prices off the
+venue while the gate reads our ladder). Measured on the 106 shadow lines that
+match a settled fill: **at the shipped 0.65 cap it refuses exactly ONE fill**
+(-$1.00). The 7c figure was across ALL shadow fires; on the ones that BECAME
+fills the median signed gap is -0.01, because the big gaps are on fires the cap
+or the FAK already refused. Wrong subset. Not shipped.
+
+**⛔ THE DEFECT THAT MATTERS: `quotes.up_ask` IS THE WEBSOCKET LADDER.**
+`main.py` (~1697) has the ws book OVERRIDE the REST poll before the row is
+written. So the recorded tape -- and therefore EVERY replay in this file --
+prices entries at the same book the gate reads, not at what we pay. And that
+book's error is a strong function of price:
+
+    ours [0.00,0.35)  ours 0.200  venue 0.368 (+0.168)  filled 0.333 (+0.133)
+    ours [0.35,0.45)  ours 0.402  venue 0.605 (+0.203)  filled 0.595 (+0.193)
+    ours [0.45,0.55)  ours 0.508  venue 0.541 (+0.033)  filled 0.522 (+0.015)
+    ours [0.55,0.65)  ours 0.583  venue 0.581 (-0.002)  filled 0.579 (-0.004)
+
+Accurate at mid prices, wildly optimistic at cheap ones. **THIS IS THE UNIFIED
+EXPLANATION** for every tape-vs-live inversion recorded today -- the |m|>=2
+cohort, the stacking, the exit's `confirm=0` cell, and the price band below.
+The replay systematically overvalues whatever cohort our ladder misprices most,
+and cheap/fast/large-margin entries are all the same cohort.
+
+**SHIPPED: `cross_min_price` 0.10 -> 0.45.** By the price actually PAID, over
+155 settled PM-era fills:
+
+    px [0.00,0.35)  n= 11  total -8.018  per-share -0.1191  win  9.1%  t -2.24
+    px [0.35,0.45)  n=  7  total -2.364  per-share -0.1381  win 28.6%
+    px [0.45,0.50)  n=  6  total +0.212  per-share +0.0164  win 50.0%
+    px [0.50,0.55)  n= 25  total +0.904                     win 52.0%
+    px [0.55,0.60)  n= 38  total -4.420                     win 50.0%
+    px [0.60,0.65)  n= 31  total +1.703                     win 64.5%
+    floor 0.45: kept n=137 total -6.063 | REFUSED n=18 total -10.382
+    band [0.45,0.65]: n=101 total -0.907
+
+**Eighteen fills below 0.45 cost -$10.38 of the -$16.44 total**, and the sub-0.35
+bucket wins NINE PERCENT. The tape says the exact opposite -- `ask [0.00,0.35)`
+is the best cell in its entire sweep (n=91, win 65.9%, **+0.4693/share**, t +9.11,
+PASS) -- because it thinks it buys at 0.20 where we pay 0.333. A 5x payoff on
+paper, 3x in fact.
+
+WHY 0.45 AND NOT 0.40: two independent lines meet there. The live P&L sign flips
+between [0.35,0.45) and [0.45,0.50), AND it is where our own book becomes
+trustworthy (+0.193 error below, +0.015 above). A gate that refuses the region
+where our price is unreliable is principled rather than fitted.
+
+MECHANISM: a cheap fill means the market prices our side far out of the money
+while the trigger says otherwise -- the paid TWAP is nowhere near crossing --
+and it is exactly there that our ladder is least able to say what we are paying.
+Wrong twice over.
+
+BOUNDS: 18 fills refused; the tape CANNOT corroborate, for the measured reason
+above, so this rests on the live record alone. That is a deliberate departure
+from this repo's usual "both sources agree" bar, justified only because the
+tape's disagreement is explained rather than outvoted. KILL CRITERION: the
+[0.45,0.55) cohort negative over ~40 fills.
+
+⛔ **WHAT THIS MEANS FOR EVERY SWEEP IN THIS FILE.** Any replay cell whose edge
+comes from CHEAP entries is suspect, because the price it books is not the price
+we pay, and the error is +17-20c there. Re-read `cross_max_fill_px`'s note (the
+0.55-0.65 band it found is in the ladder's ACCURATE region, so it survives) and
+treat the cheap-tail results accordingly. The honest fix is to record the
+VENUE's book alongside the ladder so future replays can price at both.

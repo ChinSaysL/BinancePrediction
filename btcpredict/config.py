@@ -1563,7 +1563,49 @@ class Settings(BaseSettings):
     # Reading the book fresh at trigger time would make the band honest, but it
     # costs a round trip in the one path where latency is priced, and gating on
     # the fresh price measured NO better (EV/$1 +0.1863 against +0.1890).
-    cross_min_price: float = 0.10
+    # ⭐ 0.10 -> 0.45 ON 2026-09-18. The largest single loss cohort in the live
+    # record, and the tape says the EXACT OPPOSITE for a reason now measured.
+    #
+    # LIVE (155 settled PM-era fills), by the price actually PAID:
+    #     px [0.00,0.35)  n= 11  total -8.018  per-share -0.1191  win  9.1%  t -2.24
+    #     px [0.35,0.45)  n=  7  total -2.364  per-share -0.1381  win 28.6%
+    #     px [0.45,0.50)  n=  6  total +0.212  per-share +0.0164  win 50.0%
+    #     px [0.50,0.55)  n= 25  total +0.904                     win 52.0%
+    #     px [0.55,0.60)  n= 38  total -4.420                     win 50.0%
+    #     px [0.60,0.65)  n= 31  total +1.703                     win 64.5%
+    #     floor 0.45: kept n=137 total -6.063 | REFUSED n=18 total -10.382
+    # EIGHTEEN fills below 0.45 cost -$10.38 of a -$16.44 total, and the sub-0.35
+    # bucket wins NINE PERCENT. The band [0.45,0.65] is n=101, total -0.907.
+    #
+    # ⛔ THE TAPE SAYS THE OPPOSITE AND IS WRONG, MEASURABLY. On the replay
+    # `ask [0.00,0.35)` is the BEST cell in the whole sweep -- n=91, win 65.9%,
+    # +0.4693/share, t +9.11, PASS. That is an artifact of WHICH BOOK the replay
+    # prices at. `quotes.up_ask` is the WEBSOCKET ladder (main.py ~1697: the ws
+    # book overrides the REST poll), which is the same book the gate reads --
+    # and it is accurate at mid prices and wildly optimistic at cheap ones:
+    #     ours [0.00,0.35)  ours 0.200  venue 0.368 (+0.168)  filled 0.333
+    #     ours [0.35,0.45)  ours 0.402  venue 0.605 (+0.203)  filled 0.595
+    #     ours [0.45,0.55)  ours 0.508  venue 0.541 (+0.033)  filled 0.522
+    #     ours [0.55,0.65)  ours 0.583  venue 0.581 (-0.002)  filled 0.579
+    # So the replay "buys at 0.20" (a 5x payoff) where we actually pay 0.333
+    # (3x). Its cheap-price edge is arithmetic on a price that does not exist.
+    # THIS IS THE UNIFIED EXPLANATION for every tape-vs-live inversion recorded
+    # today (the |m|>=2 cohort, the stacking, `confirm=0`, this): the replay
+    # systematically overvalues whatever cohort our ladder misprices most.
+    #
+    # WHY 0.45, and it is two independent lines meeting: the live P&L sign flips
+    # there, AND it is where our own book becomes trustworthy (+0.193 error
+    # below it, +0.015 above). A gate that refuses the region where our price is
+    # unreliable is principled, not fitted.
+    # MECHANISM, stated plainly: a cheap fill means the market prices our side
+    # far out of the money while our trigger says otherwise -- i.e. the paid
+    # TWAP is nowhere near crossing -- and it is exactly there that our ladder
+    # is least able to tell us what we are paying. Wrong twice over.
+    # BOUNDS: 18 fills refused. The tape cannot corroborate (it disagrees for
+    # the measured reason above) so this rests on the live record alone.
+    # KILL CRITERION: the [0.45,0.55) cohort turning negative over ~40 fills.
+    # Revert: CROSS_MIN_PRICE=0.10 + restart.
+    cross_min_price: float = 0.45
     # How far past the strike the cross may already be, in bps. MEASURED
     # 2026-09-13, fill-aware, by depth at the moment of the cross:
     #     0.0-0.5 bps  n=59  tot  +$9.70  $/fill +0.1644  drop1 +4.43

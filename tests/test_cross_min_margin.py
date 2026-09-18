@@ -146,3 +146,23 @@ def test_the_tau_floor_carries_its_mechanical_reason():
     assert "ALREADY PRINTED" in block
     assert "required_remaining" in block
     assert "CROSS_MIN_TAU_S=5.0" in block, "the revert must be stated"
+
+
+def test_the_price_floor_refuses_the_cheap_cohort():
+    """⭐ 0.10 -> 0.45 (2026-09-18). Eighteen live fills below 0.45 cost
+    -$10.38 of a -$16.44 total and the sub-0.35 bucket won 9.1%. The tape says
+    the opposite (its best cell) because it prices at the WS ladder, which
+    overstates cheap fills by +0.17-0.20 and mid fills by ~0. See
+    config.cross_min_price."""
+    from btcpredict.config import Settings
+    assert Settings().cross_min_price == 0.45
+
+
+def test_the_ladder_artifact_is_recorded_beside_the_floor():
+    """The floor contradicts every tape sweep, so the REASON the tape is wrong
+    must ride with it or someone will 'fix' the floor back."""
+    cfg = (ROOT / "btcpredict" / "config.py").read_text()
+    i = cfg.index("cross_min_price: float")
+    block = cfg[max(0, i - 4000):i]
+    assert "WEBSOCKET ladder" in block
+    assert "CROSS_MIN_PRICE=0.10" in block, "the revert must be stated"
