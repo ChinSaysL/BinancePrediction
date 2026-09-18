@@ -135,6 +135,22 @@ def test_every_broker_mode_query_covers_all_of_its_modes():
         f"_broker_modes(), so their fills orphan on restart and their losses "
         f"never reach the daily cap: {sorted(missing)}")
 
+    # THE SCAN ABOVE ONLY SEES `mode="literal"` ARGUMENTS, which is how the bug
+    # this test exists for survived it: the Train arm's label is BUILT --
+    # `arm_mode = "train" if train else "cross"`, then
+    # `_book_fill(..., mode=arm_mode)` -- so 'train' was never in `booked` and
+    # the tuple could omit it while this test passed. MEASURED COST: one
+    # orphaned train fill held $0.98 of the exposure budget for 26 h and locked
+    # the whole cross book out (0 orders in 2.5 h; see FINDINGS).
+    # Assert the property the regex cannot: `pool_for_mode` books the RESERVED
+    # slot for 'cross' AND 'train', and settle is the only thing that releases
+    # it -- so both labels must be restorable, or the slot (and the exposure cap
+    # that counts it) is held until the next hand-edit.
+    assert {"cross", "train"} <= live_modes, (
+        "every label pool_for_mode books into the RESERVED slot must appear "
+        "here, or its fill orphans on restart and permanently occupies the "
+        "exposure cap")
+
 
 def test_the_guard_seed_and_the_restore_use_the_same_mode_set():
     """They must not drift: one builds the loss budget, the other the exposure."""

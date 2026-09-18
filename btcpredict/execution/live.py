@@ -297,8 +297,15 @@ class LiveBroker:
             return 0.0
         return float((resp.get("summary") or {}).get("walletBalance") or 0.0)
 
-    async def equity(self) -> float:
+    async def equity(self, *, refresh: bool = False) -> float:
         """Total account value: cash + open positions + unredeemed winnings.
+
+        `refresh` is accepted and IGNORED: this read is live on every call, so
+        there is nothing to force. It exists for SIGNATURE PARITY with
+        `PmBroker.equity` -- which DOES cache and needs the flag -- because a
+        broker that mirrors the mode but not the signature passes every guard
+        and then raises TypeError on the first call (measured on `buy()`'s
+        `quote=` parameter, 2026-09-17; see `PmBroker.buy`).
 
         `walletBalance` alone is what sizing used to read, and it is the source
         of the lag `Bot._reconcile_bankroll` was written to defend against: a

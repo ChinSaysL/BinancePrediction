@@ -23,21 +23,6 @@ def norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-def moneyness_sd(S: float, K: float, tau_s: float, sigma_1m: float) -> float | None:
-    """How many sigma of the REMAINING move separate the spot from the strike?
-
-        z = |ln(S/K)| / (sigma_1m * sqrt(tau/60))
-
-    The ticket arm's `ticket_min_z` gate is built on this, and `_impulse_tick`
-    computes the same quantity inline for its sizing tilt. Returns None when it
-    cannot be computed -- callers must treat that as "no evidence", never as
-    zero, or a missing sigma silently becomes a passing gate.
-    """
-    if not S or not K or S <= 0 or K <= 0 or tau_s <= 0 or sigma_1m <= 0:
-        return None
-    return abs(math.log(S / K)) / (sigma_1m * math.sqrt(tau_s / 60.0))
-
-
 def fair_value(S: float, K: float, tau_s: float, sigma_1m: float) -> float:
     """Probability the round settles Up.
 
@@ -59,7 +44,23 @@ def fair_value(S: float, K: float, tau_s: float, sigma_1m: float) -> float:
 
 
 def moneyness_sd(S: float, K: float, tau_s: float, sigma_1m: float) -> float:
-    """Distance from the strike in standard deviations -- useful for diagnostics."""
+    """Signed distance from the strike, in sigma of the REMAINING move.
+
+        z = ln(S/K) / (sigma_1m * sqrt(tau/60))
+
+    POSITIVE when the spot is above the strike, NEGATIVE when below. Callers
+    that want a magnitude take `abs()` themselves -- main.py's four sizing call
+    sites all do, which is what keeps the inv_z tilt symmetric across sides.
+
+    THIS FUNCTION USED TO BE DEFINED TWICE IN THIS MODULE. An earlier copy
+    returned `None` when it could not be computed, and returning None was the
+    documented contract ("callers must treat that as no evidence, or a missing
+    sigma silently becomes a passing gate"). The second definition silently
+    shadowed it, so that contract was never in force -- an `is None` test would
+    have been dead code. The dead copy is gone; what remains has always been
+    what ran. It returns +/-inf instead, and a caller must handle that: it is
+    not None, it is not zero, and it compares as a number.
+    """
     if tau_s <= 0 or sigma_1m <= 0:
         return math.inf if S > K else -math.inf
     return math.log(S / K) / (sigma_1m * math.sqrt(tau_s / 60.0))

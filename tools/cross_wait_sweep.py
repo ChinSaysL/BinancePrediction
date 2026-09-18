@@ -30,7 +30,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from btcpredict.config import cross_knob, settings as S   # noqa: E402
-from btcpredict.main import crossed_side                  # noqa: E402
+from btcpredict.main import crossed_side, passes_depth_floor  # noqa: E402
 
 FEE = 200 / 1e4
 FRAC = 0.0672          # stake_fraction 0.0224 * cross_stake_mult 3.0
@@ -66,9 +66,11 @@ def collect(q, rounds, market, horizon):
             if not S.cross_allow_reversal and took and took != side:
                 continue
             dep = abs(sp[i] - K)
-            if dep < S.cross_min_depth_ticks * S.cross_tick_size - 1e-12:
+            # ONE definition of the floor, shared with the live arm -- see
+            # main.passes_depth_floor. The global tick_size is wrong per market.
+            if not passes_depth_floor(sp[i], K, market):
                 continue
-            if 1e4 * dep / K > S.cross_max_depth_bps:
+            if 1e4 * dep / K > cross_knob(market, 'max_depth_bps'):
                 continue
             seen = sp[:i + 1]
             if G > 0 and 1e4 * (np.nanmax(seen) - np.nanmin(seen)) / K > G:

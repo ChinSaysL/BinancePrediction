@@ -36,6 +36,14 @@ from btcpredict.models.momentum import MomentumModel
 from btcpredict.models.phantom import PhantomModel
 from btcpredict.models.sentiment import SentimentModel
 from btcpredict.models.sniper import SniperModel
+# The Polymarket terminal distribution's model adapter. Layered here rather
+# than in the venue package ON PURPOSE: the venue module holds primitives and
+# must not import the model layer, or importing it first creates a cycle.
+# `pricing_model=twap` has to resolve from the same registry that validates it
+# (`config.Settings._validate_pricing_model` reads `MODEL_NAMES`), so it is
+# registered like every other model: a model that exists but is not registered
+# is a config error, not a model.
+from btcpredict.models.twap import TwapModel
 
 _REGISTRY: dict[str, type[StrategyModel]] = {
     "digital": DigitalModel,
@@ -49,6 +57,7 @@ _REGISTRY: dict[str, type[StrategyModel]] = {
     "phantom": PhantomModel,
     "sniper": SniperModel,
     "btc_maker": BtcMakerModel,
+    "twap": TwapModel,
 }
 
 MODEL_NAMES = tuple(_REGISTRY)
@@ -68,4 +77,5 @@ __all__ = [
     "DigitalModel", "MomentumModel", "MeanRevModel", "SentimentModel",
     "DriftDigitalModel", "CalibratedUpModel", "CalibratedDownModel",
     "HybridModel", "PhantomModel", "SniperModel", "BtcMakerModel",
+    "TwapModel",
 ]

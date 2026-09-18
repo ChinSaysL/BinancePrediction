@@ -23,6 +23,7 @@ class FakeLiveBook:
         self.fail = fail
         self.balance_calls = 0
         self.equity_calls = 0
+        self.refresh_calls = 0
         self.redeemed = 0
 
     async def balance(self):
@@ -31,7 +32,7 @@ class FakeLiveBook:
             raise RuntimeError("venue hiccup")
         return self._balance
 
-    async def equity(self):
+    async def equity(self, *, refresh: bool = False):
         """Total account value: cash + open positions + unredeemed winnings.
 
         Deliberately DIFFERENT from balance() here, so a test cannot pass by
@@ -39,8 +40,15 @@ class FakeLiveBook:
         the account by any open position; `equity()` is `totalValue`, which the
         venue publishes as exactly
         walletBalance + positionValue + totalClaimableAmount.
+
+        `refresh` is recorded, not ignored: on the real Polymarket broker the
+        cached collateral is invalidated ONLY by spending money, so a periodic
+        reconcile that does not pass `refresh=True` reads the same stale figure
+        forever -- which is how a $5.00 deposit stayed invisible on 2026-09-17.
         """
         self.equity_calls += 1
+        if refresh:
+            self.refresh_calls += 1
         if self.fail:
             raise RuntimeError("venue hiccup")
         return self._balance + self._position_value
@@ -164,6 +172,68 @@ def test_an_idle_tick_does_not_call_the_balance_endpoint(store):
     bot = make_bot(store, book)
     asyncio.run(bot.settle_due())
     assert book.balance_calls == 0
+
+
+# --- a DEPOSIT must be visible without a restart ---------------------------
+#
+# `_refresh_bankroll` had exactly ONE caller: settle_due, on a settled fill.
+# That is a closed loop -- no trade -> nothing settles -> the bankroll is never
+# re-read -> the exposure cap keeps a stale number -> no trade -- and on the PM
+# broker it is compounded by `equity()` being served from a cache that only
+# SPENDING invalidates, so even a manual refresh returns the old figure unless
+# it is forced. Measured 2026-09-17: $5.00 deposited, bot locked out for 4 h.
+
+def test_a_deposit_is_adopted_without_any_settlement(store):
+    book = FakeLiveBook(5.5243)
+    bot = make_bot(store, book, bankroll=5.5243)
+    book._balance = 10.5243                   # the deposit lands while idle
+    asyncio.run(bot.refresh_bankroll_if_stale())
+    assert bot.bankroll == pytest.approx(10.5243)
+    assert book.equity_calls == 1
+    assert bot.open_fills == {}, "no settlement is needed to see the deposit"
+
+
+def test_the_clocked_read_FORCES_the_venue(store):
+    """A periodic read that hits the cache is the bug, not the fix."""
+    book = FakeLiveBook(5.5243)
+    bot = make_bot(store, book, bankroll=5.5243)
+    book._balance = 10.5243
+    asyncio.run(bot.refresh_bankroll_if_stale())
+    assert book.refresh_calls == 1, (
+        "equity() must be called with refresh=True, or the PM broker serves "
+        "the cached collateral and a deposit stays invisible forever")
+
+
+def test_the_clocked_read_is_rate_limited(store):
+    book = FakeLiveBook(20.0)
+    bot = make_bot(store, book)
+    for _ in range(3):
+        asyncio.run(bot.refresh_bankroll_if_stale())
+    assert book.equity_calls == 1, "one read per _BANKROLL_REFRESH_S"
+
+
+def test_the_clocked_read_is_a_noop_outside_live(store):
+    book = FakeLiveBook(500.0)
+    bot = make_bot(store, book)
+    bot.mode = "paper"
+    asyncio.run(bot.refresh_bankroll_if_stale())
+    assert bot.bankroll == pytest.approx(76.0)
+    assert book.equity_calls == 0
+
+
+def test_the_clocked_read_tolerates_a_bot_without_a_book(store):
+    bot = make_bot(store, FakeLiveBook(80.0))
+    del bot.book
+    asyncio.run(bot.refresh_bankroll_if_stale())     # must not raise
+    assert bot.bankroll == pytest.approx(76.0)
+
+
+def test_the_clock_is_actually_wired_into_the_poll_loop():
+    """An unwired driver is the original bug with extra steps."""
+    src = (Path(__file__).resolve().parents[1]
+           / "btcpredict" / "main.py").read_text()
+    assert "await self.refresh_bankroll_if_stale()" in src, (
+        "the clock must be called from run(), not merely defined")
 
 
 # --- the venue's balance LAGS a settlement ----------------------------------

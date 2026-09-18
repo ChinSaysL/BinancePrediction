@@ -52,6 +52,19 @@ class ModelContext:
     # Down side has never seen its own market price; a model that wants to
     # anchor on it needs this.
     quote_down: float | None = None
+    # POLYMARKET ONLY. The realised part of the settlement WINDOW's integral,
+    # `J = integral ln(S_u/K) du` over [window_open, now], in LOG-SECONDS.
+    #
+    # Polymarket settles on a TWAP, so the round's average so far is a state
+    # variable the point rule has no concept of -- and near the bell it is the
+    # ONLY thing that matters (the answer is the sign of `J`). None means
+    # "not supplied", which `TwapModel` reads as "the window has traded at the
+    # current level"; the model says so in its `reason`, so a fill priced off
+    # that assumption is distinguishable from one priced off the tape.
+    #
+    # Units are deliberate: an integral, not an average over an unstated
+    # window. See `venues/polymarket/pricing.py::window_log_integral`.
+    window_log_int: float | None = None
 
     def __post_init__(self) -> None:
         if self.volumes is None:
@@ -193,7 +206,8 @@ class PriceHistory:
     def ctx(self, *, price: float | None = None, strike: float | None = None,
             tau_s: float | None = None, sigma_1m: float | None = None,
             quote_up: float | None = None,
-            quote_down: float | None = None) -> ModelContext:
+            quote_down: float | None = None,
+            window_log_int: float | None = None) -> ModelContext:
         cur = price if price and price > 0 else self._current
         closes = [b[1] for b in self._bars]
         if cur is not None:
@@ -208,4 +222,5 @@ class PriceHistory:
             sigma_1m=sigma_1m,
             quote_up=quote_up,
             quote_down=quote_down,
+            window_log_int=window_log_int,
         )

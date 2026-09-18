@@ -32,7 +32,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from btcpredict.config import cross_knob, settings as S   # noqa: E402
-from btcpredict.main import crossed_side                  # noqa: E402
+from btcpredict.main import crossed_side, passes_depth_floor  # noqa: E402
 
 FEE = 0.0169
 FRAC = 0.0672
@@ -75,10 +75,15 @@ def triggers(q, rounds, market, hold, block_s):
                 continue
             if n >= S.cross_max_per_round or (took and took != side):
                 continue
+            # The floor and its tolerance come from ONE definition shared with
+            # the live arm. Reading `S.cross_min_depth_ticks * S.cross_tick_size`
+            # here replayed a floor the bot does not have: the global 0.01 is
+            # wrong per market, and on xrp/doge it puts the floor ABOVE the
+            # ceiling, i.e. an empty band the arm can never fire in.
             dep = abs(sp[i] - K)
-            if dep < S.cross_min_depth_ticks * S.cross_tick_size - 1e-12:
+            if not passes_depth_floor(sp[i], K, market):
                 continue
-            if 1e4 * dep / K > S.cross_max_depth_bps:
+            if 1e4 * dep / K > cross_knob(market, "max_depth_bps"):
                 continue
             rng = 1e4 * (np.nanmax(sp[:i + 1]) - np.nanmin(sp[:i + 1])) / K
             if G > 0 and rng > G:
@@ -132,9 +137,9 @@ def flip_guard(q, rounds, market, hold, block_s):
             if n >= S.cross_max_per_round or (took and took != side):
                 continue
             dep = abs(sp[i] - K)
-            if dep < S.cross_min_depth_ticks * S.cross_tick_size - 1e-12:
+            if not passes_depth_floor(sp[i], K, market):
                 continue
-            if 1e4 * dep / K > S.cross_max_depth_bps:
+            if 1e4 * dep / K > cross_knob(market, "max_depth_bps"):
                 continue
             rng = 1e4 * (np.nanmax(sp[:i + 1]) - np.nanmin(sp[:i + 1])) / K
             if G > 0 and rng > G:

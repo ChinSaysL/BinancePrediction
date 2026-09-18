@@ -66,13 +66,54 @@ MARKETS = [
     ("btc-updown-15m", "BTCUSDT", 900),
     ("eth-updown-15m", "ETHUSDT", 900),
     ("bnb-updown-15m", "BNBUSDT", 900),
+    # Added 2026-09-16 on the per-symbol train sweep -- one symbol per run,
+    # because `--symbol A,B,C` POOLS them and a pooled run cannot rank. All
+    # three clear the four-check battery on 2-3x BTC's sample:
+    #   SOL  n=1366 win 89.3%  halves 89.1/89.6  drop-best 89.2  be-ask 0.876
+    #   XRP  n=1504 win 87.8%  halves 87.7/88.0  drop-best 87.7  be-ask 0.862
+    #   DOGE n=1635 win 86.9%  halves 88.4/85.3  drop-best 86.6  be-ask 0.852
+    # The SIGNAL generalises. Their ASK is what was NOT measured -- the sweep
+    # never sees the venue's price, and the arm earns (win - ask - fee). The EV
+    # ceiling is what bounds that, and it now uses each family's OWN win rate
+    # (see TRAIN_P_WIN) rather than BTC's, which would overpay DOGE by ~4.7c.
+    ("sol-updown-5m", "SOLUSDT", 300),
+    ("xrp-updown-5m", "XRPUSDT", 300),
+    ("doge-updown-5m", "DOGEUSDT", 300),
 ]
+
+#: Measured train win rate PER SYMBOL, from `tools/pm_train_sweep.py` run one
+#: symbol at a time (PM tail-60 rule, thr 15bps, tau >= 60), 2026-08-31..09-14.
+#: This is a MEASUREMENT, not a knob. A missing entry falls back to
+#: `settings.train_p_win`, which is BTC's number -- correct for BTC and LOOSE
+#: for anything with a lower win rate, so add an entry before activating a
+#: family. Why it matters: the ceiling at margin 0.03 is 0.876 at p=0.914 but
+#: only 0.829 at p=0.869, so one shared number would overpay DOGE by 4.7c.
+#: HYPE is absent deliberately: HYPEUSDT 404s on Binance spot, so there is no
+#: reference price for the strike or the model -- not tradeable here at all.
+TRAIN_P_WIN = {"btc": 0.914, "sol": 0.893, "xrp": 0.878, "doge": 0.869}
 
 # Families the CROSS arm may order in. Everything not listed here is recorded
 # only. Kept separate from MARKETS so widening the tape and widening the risk
 # stay two different edits -- removing that separation is how the daily loss cap
 # was once bypassed.
 CROSS_TRADED = frozenset(p for p, _, _ in MARKETS)
+
+#: prefix -> Binance symbol, for keying any per-symbol buffer off a round.
+#:
+#: THE SLUG IS THE GROUND TRUTH, NOT `r.symbol`. The venue's round objects are
+#: built by one `PmMarketFeed` whose `symbol` argument defaults to BTCUSDT, and
+#: nothing constructs it per family -- so EVERY family's round comes back
+#: stamped "BTCUSDT". Measured 2026-09-16: `to_round(pm, symbol=PmRoundSource().
+#: symbol)` on the btc, eth AND bnb slugs all returned 'BTCUSDT'.
+#:
+#: Anyone who looked up a per-symbol buffer by `r.symbol` therefore read BTC's
+#: ticks for every family. Live at 21:59:34 this printed
+#:   "cross bnb-updown-5m-... Down not taken: round already moved 1109.7bps"
+#: on a round that had moved 9.4bps: `_round_range_bps` had taken BTC's $80.00
+#: range and divided it by BNB's 720.925 strike (1e4*80.00/720.925 = 1109.7,
+#: and 1e4*80.00/2405.835 = 332.5 = the eth message in the same second). Both
+#: arms refused, so the added families could not trade at all.
+SYMBOL_BY_PREFIX = {p: s for p, s, _ in MARKETS}
 
 
 class Settings(BaseSettings):
@@ -92,6 +133,80 @@ class Settings(BaseSettings):
 
     # --- mode --------------------------------------------------------------
     trading_mode: Literal["record", "paper", "live"] = "record"
+
+    # --- venue -------------------------------------------------------------
+    # Which venue the arms place orders on. BOTH list the SAME
+    # `btc-updown-5m-<unix>` market -- same 5-minute boundary, same Up/Down
+    # outcomes, same Chainlink BTC/USD family -- but they are NOT the same bet:
+    #
+    #   binance     resolves on a POINT snapshot (endPrice vs startPrice,
+    #               measured 0.02 bps from the instantaneous close)
+    #   polymarket  resolves on a 60 s TWAP vs the range's opening price
+    #               (btc-5m-twap-60), variance sigma^2*T/3 -- 1.73x less
+    #               dispersed than the point rule
+    #
+    # Measured disagreement between the two over 48 settled rounds: 10.4%.
+    # Every calibration cell fitted on the point rule is INVALID under the
+    # TWAP rule, so switching this without re-pricing the model is not a
+    # venue change, it is a strategy change. Defaults to the incumbent.
+    venue: Literal["binance", "polymarket"] = "binance"
+
+    # Polymarket: the family we trade. The slug builder can produce nothing
+    # else, which is what makes "BTC only" structural rather than a policy.
+    pm_series: str = "btc-updown-5m"
+    # Polymarket: refuse to price off a book older than this. Fails CLOSED --
+    # a frozen feed that prices every order off a dead book is worse than no
+    # price at all.
+    pm_max_book_age_s: float = 2.0
+    # Polymarket: how far past the ask we reach. The tick is 0.01, so this is
+    # really "one or two ticks"; the fill ceiling is what bounds us.
+    pm_slippage: float = 0.02
+    # Polymarket: the lowest price an ENTRY may be quoted at, on the ask or on
+    # the limit. 0.05 is not tuned, it is a REFUSAL bound: a contract under 5c
+    # says the other side is worth 95c+, which none of the measured cells
+    # covers -- and because the share count is `ceil(stake / limit)`, a price
+    # at the venue's 0.01 floor multiplies the position 100x. Both happened on
+    # 2026-09-16 (500 shares at 1c, $5.00 stake, lost); see
+    # `broker.DEFAULT_MIN_ENTRY_PX`.
+    pm_min_entry_px: float = 0.05
+    # Polymarket: how long to wait for the venue to show the position before a
+    # fill is marked UNVERIFIED. The POST returns 200 + an order id BEFORE the
+    # outcome exists, so the ack alone is never proof of a fill.
+    pm_confirm_budget_s: float = 2.5
+    # How the Polymarket MARKET path takes liquidity.
+    #   "limit" - sign locally, post, let any remainder REST (261 ms median)
+    #   "fak"   - Fill-And-Kill == IOC: atomic take, remainder KILLED (414 ms)
+    # A resting remainder is filled only when the market comes to us, which is
+    # the adverse selection measured on this arm's predecessor (maker fills won
+    # 41% at limits 0.6-0.7, EV -0.30/$1). FAK removes that, and costs +153 ms
+    # against a horizon that is ALREADY the binding constraint (250 ms
+    # profitable at every cap, 500 ms negative at every cap). Not a free
+    # upgrade: it ships OFF and is A/B'd on its own fills.
+    pm_order_type: Literal["limit", "fak"] = "limit"
+    # Polymarket: collateral is pUSD (6 decimals), NOT USDC.e/USDC. A zero
+    # USDC.e balance says nothing about a Polymarket balance.
+    pm_collateral_decimals: int = 6
+
+    # --- Polymarket credentials -------------------------------------------
+    # THESE MUST BE SETTINGS, NOT `os.environ` READS.
+    #
+    # pydantic-settings loads `.env` into this object; it does NOT export those
+    # names into the process environment. The service is started by systemd
+    # with only `PYTHONUNBUFFERED=1`, so any code doing
+    # `os.environ["POLYMARKET_PRIVATE_KEY"]` sees NOTHING while the value sits
+    # in `.env` the whole time. That mistake cost a crash-restart loop: the
+    # venue gate said "private key missing", live mode refused to start, and
+    # systemd restarted it every 10 s.
+    #
+    # `POLYMARKET_API_KEY/_SECRET/_PASSPHRASE` alone are L2 credentials and
+    # CANNOT sign an order -- see `registry.pm_credentials_present`.
+    polymarket_private_key: str = ""
+    polymarket_funder_address: str = ""
+    polymarket_api_key: str = ""
+    polymarket_api_secret: str = ""
+    polymarket_passphrase: str = ""
+    polymarket_relayer_api: str = ""
+    polymarket_relayer_address: str = ""
 
     # --- sizing ------------------------------------------------------------
     # "edge": the weakest accepted signal (edge == min_edge) is staked at
@@ -115,7 +230,15 @@ class Settings(BaseSettings):
     # payoff asymmetry in, roughly doubles recorded PnL for ~35% more
     # drawdown. Kept on "edge" until the live sample says otherwise.
     sizing_metric: Literal["edge", "ev"] = "edge"
-    min_stake_usdt: float = 5.0
+    # The venue's floor, in DOLLARS. Binance's wrapper takes $1; Polymarket's
+    # CLOB carries `minimum_order_size = 5` -- SHARES, confirmed on both gamma
+    # (`orderMinSize`) and the CLOB market record (`minimum_order_size`), so the
+    # dollar floor it implies is 5 x price: $1.00 at 0.20, $2.90 at 0.58,
+    # $4.50 at 0.90. A $1 SIZING floor is still right -- the broker rounds the
+    # share count UP to the venue minimum, so the order is always placeable --
+    # but the REALISED stake is the venue's, not this number. Do not read this
+    # as "the bot risks $1".
+    min_stake_usdt: float = 1.0
     max_stake_usdt: float = 20.0
     # sizing_mode="fraction" knobs. 4% of bankroll, chosen on DRAWDOWN rather
     # than return: the old $5-10 band risked 9.0% of a $75 account per trade,
@@ -823,6 +946,294 @@ class Settings(BaseSettings):
     # the order goes out before the venue reprices -- the measured ask falls
     # 0.690 -> 0.644 as the look shortens, and that is the whole margin.
     cross_look_s: float = 1.0
+    # HOW LONG THE CROSSED SIDE MUST HOLD before it counts as a crossing.
+    #
+    # ⛔ WHAT THIS STOPS. `look_s = 1.0` requires only that the newest tick is on
+    # the other side of the level from the tick 1 s earlier, and past tau=60 the
+    # fc signal IS the spot, so ONE PRINT is the whole trigger. MEASURED
+    # 2026-09-18 on `btc-updown-5m-1789711500`: the spot sat at 77552.85 for
+    # 25 s, printed 77560.04 for a single second (+0.33 bps over the level), and
+    # was 77554.01 five seconds later. The venue repriced TO the print
+    # (0.51/0.50 -> 0.60/0.41), so the FAK filled at 0.600 for a book that was
+    # 0.41 by the time the tape reverted; the round finished -4.60 bps against
+    # the level and cost -$1.05.
+    #
+    # The knob is the trailing run of the newest tick's side, measured back to
+    # the last tick on the other side: the crossing must be at least `hold_s`
+    # old AND still standing, and at most `hold_s + look_s` old so a sustained
+    # cross is not refused for being stale by the time it is proven.
+    # 0 restores the old rule exactly (its own code path -- a dense oscillating
+    # tape must not change meaning under a zero knob).
+    #
+    # ⛔ MEASURED, AND REFUTED: THE HOLD IS NOT SHIPPED. `tools/pm_hold_sweep.py`
+    # over the whole Polymarket record (2,441 rounds, the shipped rule chain,
+    # one entry/round, floor 0.25, band 0.10-0.65, tau 5-180):
+    #
+    #   hold   n    win     ask    per-share   total    t     day-t   halves
+    #    0s   594  62.6%  0.523   +0.0870    +51.67  +4.31  +3.09  +0.069/+0.105
+    #    1s   443  59.1%  0.560   +0.0150     +6.64  +0.64  +1.38  +0.005/+0.025
+    #    2s   429  55.2%  0.570   -0.0342    -14.65  -1.42  +0.21  -0.019/-0.049
+    #    3s   433  57.3%  0.570   -0.0138     -5.96  -0.58  +0.94  -0.023/-0.005
+    #    5s   409  54.5%  0.571   -0.0426    -17.40  -1.72  +0.48  -0.030/-0.055
+    #    8s   371  53.6%  0.567   -0.0476    -17.64  -1.85  +0.09  -0.026/-0.069
+    #
+    # Monotone, and the entries a hold REMOVES score about **+0.40/share**: the
+    # subset is (594*0.0870 - 429*(-0.0342))/165. Waiting does not filter noise,
+    # it buys the venue's repricing -- the ask rises 0.523 -> 0.570 while the hit
+    # rate FALLS 62.6% -> 55.2%. The undershoot after the FIRST print is what
+    # this arm is paid for (see the ceiling note above), so the 2026-09-18
+    # `btc-updown-5m-1789711500` loss was the cost of the mechanism and not a
+    # defect in it. The knob stays as the measured artifact, at 0.
+    # Revert/keep: CROSS_HOLD_S=0 (the default).
+    cross_hold_s: float = 0.0
+    # MEASURE THE CROSSING AGAINST THE LEVEL THE VENUE PAYS ON. ON.
+    #
+    # The trigger above finds WHICH SIDE the spot crossed into; this decides
+    # WHICH LEVEL it crossed. They are different objects and the arm had them
+    # the same:
+    #
+    #   we compare      spot                     vs  `r.strike`  (a POINT)
+    #   the venue pays  TWAP60(secs to the bell) vs  TWAP60(60s to the open)
+    #
+    # Polymarket's resolution source for these markets is
+    # `data.chain.link/streams/<sym>-usd-twap-60s-streams` and its config is
+    # `{id: btc-5m-twap-60, twapLookbackSeconds: 60}`, so BOTH ends of the
+    # comparison are one 60 s average of the underlying -- the stream's value at
+    # the bell against the same stream's value at the open. `r.strike` is the
+    # SPOT AT THE OPEN INSTANT (correctly so; see `_pm_strike_backfill`), which
+    # is a single print of the level the venue AVERAGES.
+    #
+    # MEASURED on the live DB, 1,509 settled Polymarket-era rounds with a
+    # recorded strike, family keyed on the SLUG PREFIX (never `rounds.symbol`:
+    # pre-fix rows stamp BTCUSDT on every family). Both candidate levels, same
+    # rounds, same feed, one comparison each:
+    #
+    #     fin_TWAP >= TWAP60(open)   1420/1509 = 94.1%   <- the venue's own label
+    #     fin_TWAP >= `r.strike`     1344/1509 = 89.1%   <- what the arm trades
+    #     paired: 92 rounds where only the TWAP rule is right, 16 the other way
+    #             McNemar z = +7.31 on 108 discordant pairs
+    #
+    # and the offset it corrects, `TWAP60(open) - r.strike`, is UNBIASED but
+    # +-3-4 bps WIDE: median +0.00, mean -0.17, p10 -3.85, p90 +3.18, more than
+    # 2 bps on 40% of rounds (doge 52%, xrp 52%, sol 47%, eth 44%, btc 32%,
+    # bnb 30%). The arm's own floor is ONE TICK -- 0.0013 bps on BTC, 1.2 on
+    # DOGE -- so on 4 rounds in 10 the level it measures against is wrong by
+    # more than the whole depth band, and roughly 1 round in 10 is decided by a
+    # level it never measured.
+    #
+    # THE THREE LIVE LOSSES OF 2026-09-17 ARE ALL IN THAT COHORT (PM-era fills
+    # 873/874/875, btc + 2x xrp):
+    #   874 btc Up 19:04  crossed `strike` by +0.53 bps while TWAP60(open) sat
+    #       +1.55 bps ABOVE it, i.e. the entry was still 1.02 bps BELOW the real
+    #       level; the round's own TWAP finished 1.2 bps under it and went Down.
+    #       This fix does not take that trade: spot was under the reference
+    #       before and after the move, so there is no crossing to take.
+    #   875 xrp Up 19:14  did clear the reference (+0.62 bps) and lost by
+    #       0.44 bps = 0.0057 cents. Nothing selects that one away.
+    #   873 xrp Down 13:19  -1.61 bps under the reference; a coin flip.
+    #
+    # ⛔ THIS DOES NOT RE-OPEN "the strike should be a TWAP". `_pm_strike_backfill`
+    # rejected a 60 s average AS THE STRIKE, correctly: measured against the
+    # wrapper's own oracle `variantData.startPrice` it is off 1.42-2.13 bps mean
+    # / 8-10 bps p99, against 0.042-0.114 bps for the spot at T-1. That question
+    # is "what is the STRIKE"; this one is "what LEVEL does the payout compare
+    # to". A wrong answer to the first corrupts the pricing of every round; this
+    # changes only the level the crossing and its depth band are read against.
+    # `r.strike` is left untouched everywhere it means the round's start price
+    # (the stored row, the pricing model, the train arm's distance, the
+    # round-range gate).
+    #
+    # WHEN THE TAPE CANNOT COVER THE WINDOW -- a process that booted after the
+    # open, a tape that stalled, a round first seen before it opened -- the
+    # level now comes from Binance's 1 s KLINES, which are retrospective, and
+    # `r.strike` only when no kline answer can arrive at all.
+    #
+    # ⛔ THE OLD FALLBACK TO `r.strike` COST A REAL TRADE, MEASURED 2026-09-18.
+    # A restart at 05:49:35 (a deploy) put the round opening at 05:50:00 on the
+    # strike for its whole 5 minutes, because its reference minute
+    # [05:49:00, 05:50:00) is partly pre-boot:
+    #     strike (spot at the open instant)  752.095
+    #     LEVEL  (60 s mean at the open)     752.5447   +5.98 bps away
+    #     `bnb-updown-5m-1789710600` Up fired on `fc 752.13 vs strike 752.10`
+    #         = +0.47 bps  -> clears the 0.25 bps floor
+    #         against the LEVEL: -5.51 bps -> THE FLOOR REFUSES IT
+    #     market: 0.26/0.76 at the open, 0.22/0.80 at the entry, 0.01/1.00 at
+    #         tau 43. BNB had dropped ~6 bps INTO the open, so the point sat
+    #         under the mean of the minute before it. Settled Down. -$1.05.
+    #
+    # The note that used to sit here claimed the fallback "is exactly the
+    # behaviour that shipped before this existed, so it is never a new risk".
+    # It IS a new risk: it swaps a 60 s MEAN for a POINT, and the two differ by
+    # more than the 0.25 bps floor on ~40% of rounds. Blast radius of a restart
+    # is one round per family (the rounds already open at boot) -- the only
+    # window in which the tape cannot bracket an open.
+    #
+    # The source actually used rides in the trigger's `reason` and the fire line
+    # (`ref=twap60` / `ref=kline60` / `ref=strike`), and the case where neither
+    # source could answer is a WARNING naming the strike, so the split is
+    # measurable from the DB rather than assumed.
+    #
+    # ⛔ AND THE KLINE READ IS THE SAME STATISTIC, NOT A SUBSTITUTE FOR IT.
+    # Measured over 34 recent btc/eth/bnb 5m rounds where BOTH windows are
+    # complete, the 1 s kline mean against the tape mean differs by median
+    # +0.007 bps, range -0.21..+0.16, 34/34 inside 0.5 bps -- one sample per
+    # second either way, on the same underlying. On `bnb-updown-5m-1789710600`
+    # itself the kline window (60 of 60 bars) gives 752.4772 against a strike
+    # of 752.095 ARRIVED AT +5.10 bps the other way, so the arm's 752.13
+    # forecast is -4.61 bps against the level and the entry is refused.
+    # Revert = CROSS_REF_TWAP=false + restart (back to `r.strike` everywhere).
+    cross_ref_twap: bool = True
+
+    # WHICH VARIABLE THE CROSSING IS READ ON: the SPOT (shipped) or the venue's
+    # own statistic, the projected 60 s mean (`fc`).
+    #
+    # WHY. The payout is `TWAP60(bell) >= TWAP60(open)`, so money is decided by
+    # a 60 s MEAN -- and `cross_ref_twap` already fixed WHICH LEVEL that mean is
+    # compared against. The remaining hole is the SIGNAL: `crossed_side` fires
+    # on the point spot, and inside this arm's own window (tau 5-60 s) that spot
+    # is between 67% and 92% averaged away by the time the round ends. Measured
+    # live: `bnb-updown-5m-1789680600`, spot crossed the reference by +1.63 bps
+    # at tau 19 s, we paid 0.26, the MEAN never crossed, and the venue's book
+    # had said 0.01-0.04 for the 44 s before we bought.
+    #
+    # MEASURED (tools/pm_twap_trigger_check.py, live DB, PM era only, first
+    # crossing, one entry per round, tau 5-60):
+    #     SPOT cross (what ships)  n=154  ask=0.468  win 51.3%  per-share +0.0382
+    #                              t +1.37  day-t +12.06  halves +0.0587/+0.0178
+    #     FC   cross (this knob)   n=105  ask=0.548  win 60.0%  per-share +0.0453
+    #                              t +1.17  day-t  +5.08  halves +0.0839/+0.0074
+    # Per-share BETTER on both halves, days 2/2 -- and 49 of 154 entries drop, so
+    # at a fixed $1 stake the TOTAL is lower (5.89 -> 4.76 on that sample). Read
+    # that as the price: this is a RISK change that removes a family by
+    # construction, not an edge claim. Do NOT sell it as more money.
+    #
+    # ⛔ SPLIT BY FAMILY (`--by-family`, same run, same rounds) THE POOLED GAIN
+    # DOES NOT REPEAT. Six families, n=13-31 each, and only BTC clears |t|=2:
+    #     btc-5m   SPOT +0.1220 (t+2.06)   FC +0.2612 (t+2.99, halves +0.26/+0.26)
+    #     bnb-5m   SPOT +0.0336 (t+0.43)   FC -0.0201 (t-0.29, days 0/2)  <-- the
+    #     eth-5m   SPOT -0.0340 (t-0.58)   FC -0.0598 (t-0.70)            <-- two
+    #     doge-5m  SPOT -0.0351            FC +0.0280                     <-- that
+    #     sol-5m   SPOT +0.0206            FC +0.0317                     <-- lost
+    #     xrp-5m   SPOT +0.1038            FC +0.0562                     <-- first
+    # The pooled +0.0453 is ONE coin's, and on the two families that matter most
+    # here the forecast cohort is NEGATIVE inside the noise. Carving those two
+    # out on n=21/20 at t=-0.3 would be fitting the noise, not reading it -- the
+    # repo's own 5th check. What the split settles: NOT a demonstrated general
+    # improvement. What it does not touch: the MECHANISM (the venue pays on the
+    # 60 s mean) and the spot-cross/mean-did-not family it stops by construction.
+    # The per-coin question needs a longer sample than 2 days. Re-run the split
+    # before quoting the pooled number.
+    #
+    # NOT the filter form. Keeping the spot trigger and dropping the ticks where
+    # the forecast disagrees measured WORSE (5.89 -> 4.31), and both sides of the
+    # disagreement cohort are negative when priced (tau 1: fcst -0.0032 t -3.16,
+    # spot -0.0075 t -6.00) because the MARKET already prices the mean.
+    #
+    # THE SIGNAL ACTUALLY USED rides in the trigger's `reason` and the fire line
+    # (`sig=fc` / `sig=spot`), so the two cohorts are separable in the DB rather
+    # than assumed. Revert = CROSS_FC_TRIGGER=false + restart.
+    #
+    # ⭐ DEFAULT ON since 2026-09-17 22:02 UTC, and NOT only in the VPS `.env`.
+    # The fix has to survive a `make config PROFILE=` switch and an `.env`
+    # restore, because the profiles under configs/ do not all set it -- as an
+    # env-only default this protection was ONE profile away from silently
+    # disappearing, and the arm it protects loses real money when it does.
+    # ⛔ STILL FALLS BACK TO THE SPOT on a partial poll tape (a boot inside the
+    # last 60 s), logged once per round with `sig=spot` on the trigger -- the
+    # same judgement `_cross_level` already ships for the level, so the arm
+    # stays in ONE legacy mode rather than half of each. A build that failed
+    # closed here was backed out: it is an unmeasured change in money terms and
+    # its only live effect is the post-restart window.
+    #
+    # ⛔ AND THE PROJECTION ITSELF WAS AVERAGING THE WRONG WINDOW (fixed
+    # 2026-09-18). `TWAP60(bell)` averages `[bell - 60 s, bell]`, so at `ts` the
+    # PRINTED part of it is `[bell - 60 s, ts]` -- a FIXED left edge and a moving
+    # right one. `twap_forecast` averaged `[ts - 60 s, ts]` instead: the whole
+    # trailing minute at every tau, so at tau=30 it averaged 30 seconds the paid
+    # window will never contain, and at tau=5 it averaged 55 of them. The two
+    # windows are the same number only at tau=0 and at tau>=60 (where both are
+    # the spot), and the arm spends its whole life in between.
+    #
+    # MEASURED over 400,079 (round, second) forecasts of the REALIZED
+    # `TWAP60(bell)` off the same tape (`tools/pm_fc_formula_check.py`), MAE in
+    # bps:
+    #     tau          old     fixed        tau          old     fixed
+    #     [ 0,10)     0.155    0.042        [30,40)     0.990    0.812
+    #     [10,20)     0.431    0.182        [40,50)     1.307    1.235
+    #     [20,30)     0.689    0.437        [50,60)     1.844    1.843
+    # and IDENTICAL at tau >= 60 (max |old - fixed| = 0.0). Better at every tau
+    # in BOTH halves, and the strategy agrees where it differs -- tau 5-60, same
+    # rounds, `tools/pm_cross_replay.py --tau-lo 5 --tau-hi 60`:
+    #     fc, no floor   n=122  win 54.1%  per-share +0.0517  day-t +1.77  halves +0.076/+0.028
+    #     FIXED,         n=112  win 58.0%  per-share +0.0787  day-t +4.32  halves +0.076/+0.081
+    #     fc + 0.5 bps   n= 48  win 58.3%  per-share +0.0788  day-t +1.89
+    #     FIXED, + 0.5   n= 45  win 62.2%  per-share +0.0902  day-t +2.15  halves +0.074/+0.106
+    # (the per-share t is 1.2-1.7 there, so the small-sample claim is "same
+    # direction, no significance of its own"; the 400k-forecast MAE table is
+    # what carries the change). Revert = restore the `ts - look_s` window in
+    # `twap_forecast`; there is no env knob for it, deliberately.
+    cross_fc_trigger: bool = True
+
+    # ⭐ HOW FAR PAST THE LEVEL THE TRIGGER'S OWN VARIABLE MUST BE, IN BPS.
+    # `crossed_side` fires on the FIRST tick past the level, so every entry is by
+    # construction a ZERO-MARGIN entry -- the 0-1 bps bucket is not a tail, it is
+    # 76% of all entries, and it is the weak one.
+    # MEASURED on the live record (`tools/pm_twap_trigger_check.py`, fc entries,
+    # tau 5-60, one entry per round, n=149 -- section "THE FC ENTRY'S OWN MARGIN"):
+    #     |fc-level|  0-1 bps  n=113  ask=0.552  win 56.6%  +0.0054/sh
+    #                              halves +0.0766/-0.0646   <- the weak bucket
+    #                1-2 bps  n= 21  ask=0.535  win 71.4%  +0.1715/sh
+    #                              halves +0.2247/+0.1231
+    #                2-3 bps  n=  9  ask=0.584  win 77.8%  +0.1886/sh
+    #                              halves +0.2259/+0.1588
+    # That measurement shipped 1.0 as "the bucket boundary". A FULL SWEEP over
+    # the whole PM-era record (`tools/pm_param_sweep.py`, 2,246 rounds, one
+    # entry/round, taker at the recorded ask) then showed 1.0 was NOT robust:
+    #     floor   n   ask   win    per-share  total   day-t  halves
+    #     0.00  113  .472  47.8%   -0.0097   -1.10   -0.03  +0.030/-0.048
+    #     0.25   68  .489  55.9%   +0.0538   +3.66   +1.43  +0.027/+0.068  <- ships
+    #     0.50   43  .485  55.8%   +0.0574   +2.47   +1.42  +0.037/+0.077
+    #     0.75   25  .484  52.0%   +0.0203   +0.51   +1.03  +0.003/+0.036
+    #     1.00   19  .489  52.6%   +0.0206   +0.39   +0.27  -0.046/+0.081
+    #     1.50    9  .464  66.7%   +0.1858   +1.67   +3.17  +0.064/+0.283
+    #     2.00    5  .506  60.0%   +0.0767   +0.38   +0.90  -0.012/+0.136
+    # THE WIN RATE IS NOT THE TARGET: it rises with the floor by construction
+    # (1.5 bps wins 66.7% on n=9) because the venue's ask rises with it -- the
+    # repo already measured "100.000% accuracy, ask 1.000". Re-running the SAME
+    # sweep on each half separately is what decided it:
+    #     half 1  0.00 +0.0363 | 0.25 +0.0270 | 0.50 -0.0245 | 1.00 -0.3451 | 1.50 -0.1673
+    #     half 2  0.00 -0.0402 | 0.25 +0.0675 | 0.50 +0.0929 | 1.00 +0.1512 | 1.50 +0.3624
+    # 0.25 IS THE ONLY FLOOR POSITIVE IN BOTH HALVES; the whole 0.5+ range is a
+    # second-half effect, and 1.0 -- which shipped on n=36 from a different level
+    # definition -- is the WORST row in the first half. 0.25 also beats 1.0 on
+    # total money (+$3.66 vs +$0.39) and on entries (68 vs 19 over three days),
+    # and it still refuses what the live losses had: the two losing fires were
+    # priced at a 0.00 bps margin, the two winners at 2.0 and 3.1 bps.
+    # THE LEVEL DEFINITION MATTERS, so re-measure rather than re-quoting: the
+    # n=149 table above used K, the sweep uses the trailing-60 s mean.
+    # ⛔ RE-RUN AT THE SHIPPED LOOK (1.0, not the tools' stale 2.0 default:
+    # `pm_param_sweep.py` ranked on `--look-s 2.0` while the arm runs
+    # `cross_look_s = 1.0`), AND THE "ONLY 0.25 SURVIVES THE HALVES" CLAIM DOES
+    # NOT REPLICATE. The floor's ranking at the arm's own look (2,306 rounds):
+    #     fc floor    n   per-share   total    t     day-t   halves
+    #     0.00      111   +0.0504    +5.60  +1.10  +1.16   +0.088/+0.014
+    #     0.25       69   +0.0525    +3.62  +0.85  +1.40   -0.001/+0.104  <- SHIPPED
+    #     0.50       42   +0.0894    +3.75  +1.12  +1.69   +0.076/+0.103
+    #     1.00       16   +0.0671    +1.07  +0.47  +3.06   +0.004/+0.130
+    # and the per-half re-run puts 0.50 above 0.25 in BOTH halves (+0.1304 vs
+    # +0.0550, then +0.0665 vs +0.0510). 0.25 STAYS ANYWAY, for the repo's own
+    # reason: the ranking FLIPS between the two looks (at 2.0 the same 0.50 row is
+    # -0.0245 in the first half and 0.25 is the only positive one), and a nuisance
+    # parameter does not get to decide a knob -- see user memory
+    # `backtest-artifacts.md` #7. n is 42-69 either way, so neither value is
+    # quotable as fitted. What this DOES establish is the opposite of what the 2.0
+    # table suggested: the FLOOR is not the lever, the WINDOW is (see
+    # `cross_max_tau_s`), and at the shipped look even 0.00 is positive in both
+    # halves.
+    # MEASURED ON THE FC COHORT. Applied to whatever signal is in use, so with
+    # `CROSS_FC_TRIGGER=false` set this to 0 as well to get the spot arm's old
+    # behaviour exactly. Revert = CROSS_MIN_MARGIN_BPS=1.0 + restart.
+    cross_min_margin_bps: float = 0.25
 
     # THE AUDIT THESE TWO COME FROM (2026-09-14). Every cross knob, one method:
     #     config                    n  growth add  growth rev  day-t  drop-best
@@ -878,7 +1289,101 @@ class Settings(BaseSettings):
     # is what cut the latency. If the fill rate at tau 5-10 comes in materially
     # below the 69% seen elsewhere, this goes back to 10.
     cross_min_tau_s: float = 5.0
-    cross_max_tau_s: float = 60.0
+    # ⭐ANSWERED 2026-09-18: 60 IS NOT THE BEST WINDOW, AND THE SHIPPED ONE
+    # FAILS THIS REPO'S OWN BATTERY. The question was opened by
+    # `pm_param_sweep.py` measuring tau [60,120] at +$11.18 against +$0.39 for
+    # the shipped [5,60] on the same 2,246 rounds -- a 28x difference on one
+    # knob, which is not a number to leave lying around. It was NOT shipped
+    # because (a) its day-clustered t was negative and (b) past tau=60 the
+    # projection `((60-tau)*mean + tau*spot)/60` has a NEGATIVE weight -- at
+    # tau=120 it is `2*spot - mean`, an extrapolation of a quantity the venue
+    # computes as a plain average. So the +$11.18 looked like a momentum signal
+    # wearing the venue's rule's clothes.
+    # THAT SUSPICION IS NOW REFUTED BY DIRECT MEASUREMENT. `tools/pm_tau_window.py`
+    # (2,282 rounds, one entry/round, floor 0.25 bps, taker at the recorded ask)
+    # runs the SAME sweep with both signals -- `fc` (the shipped projection) and
+    # `fc60` (`fc` while tau<=60, the SPOT past that, which is the unbiased
+    # minimum-variance forecast of a martingale's future 60 s mean) -- so the two
+    # differ ONLY in the tau>60 value:
+    #     [60,120] extrapolating +0.0789/sh vs honest +0.0801/sh -> the
+    #     extrapolation is worth -0.0012/sh, i.e. NOTHING (every window 0.0000
+    #     to 0.0012). The wide window's edge is real, not an artifact of the
+    #     formula. The formula should still be `fc60` (it is the correct object,
+    #     and it costs nothing), but it is not what decides the window.
+    # THE WINDOW SWEEP, honest signal, [PASS] = pooled t>=2 AND day-clustered
+    # t>=2 AND both halves positive AND drop-best-day positive:
+    #     window     n   win   ask   per-share  total   t    day-t  halves      drop  verdict
+    #     [ 5, 60]  69 56.5% .488  +0.0612   +4.22 +1.01 +1.51  -0.017/+0.137 +0.056 FAIL <- SHIPPED
+    #     [ 5, 90] 172 55.2% .505  +0.0309   +5.31 +0.80 -0.44  -0.006/+0.068 +0.028 FAIL
+    #     [ 5,120] 330 62.1% .522  +0.0831  +27.42 +3.06 +0.61  +0.063/+0.103 +0.055 FAIL
+    #     [ 5,180] 574 61.3% .526  +0.0710  +40.76 +3.42 +2.82  +0.047/+0.095 +0.065 PASS
+    #     [ 5,300] 1194 57.6% .522 +0.0376  +44.92 +2.62 +3.10  +0.024/+0.051 +0.035 PASS
+    #     [30,120] 325 61.8% .523  +0.0786  +25.56 +2.88 +0.59  +0.058/+0.099 +0.051 FAIL
+    #     [60,120] 297 62.3% .526  +0.0801  +23.80 +2.81 +0.28  +0.060/+0.100 +0.054 FAIL
+    #     [60,180] 551 61.5% .527  +0.0719  +39.63 +3.39 +2.99  +0.043/+0.101 +0.067 PASS
+    #     [60,300] 1182 57.7% .521 +0.0387  +45.73 +2.67 +3.11  +0.026/+0.051 +0.036 PASS
+    #     [120,300] 1094 57.8% .523 +0.0380  +41.59 +2.52 +2.60 +0.041/+0.035 +0.034 PASS
+    # READ IT AS A DIRECTION, NOT AN OPTIMUM (the repo's own rule): the edge
+    # plateaus over EVERY upper bound >= 180 and [5,60]'s first half is
+    # NEGATIVE (-0.0173), so the last-minute window the arm ships is the worst
+    # of the tested family, not a tuned one. [5,120] and [60,120] show the
+    # highest per-share but die on the day-clustered check -- the same half-2
+    # effect that made the first answer wrong. [5,180] is the smallest change
+    # that passes (ONE knob) and [60,180] measures the same edge with 23 fewer
+    # entries, so `cross_min_tau_s` does not need to move.
+    # WHAT IT COSTS AND WHAT IS NOT MODELLED: entries go from 69 to 574 over the
+    # same three days (~8x), each still $1 and still one per round, so the change
+    # is one of TURNOVER, not of per-trade risk. The replay pays the recorded ask
+    # with no sweep premium and no FAK miss rate, and the live `max_round_range_bps`
+    # gate is NOT applied -- it refuses a round that has already moved far, which
+    # binds on LATE entries, so its omission flatters the shipped window rather
+    # than the wide ones. The 15m families would enter up to 3 minutes before the
+    # bell instead of 1. Three days of data.
+    # RE-RUN AT THE SHIPPED LOOK. That table was produced at `--look-s 2.0`, which
+    # was the LITERAL default of all four PM tools while the arm runs
+    # `cross_look_s = 1.0` -- i.e. it ranked a crossing rule the bot does not run
+    # (`crossed_side` compares a different pair of samples at 1 s than at 2 s).
+    # The default is now `pm_cross_replay.shipped_look_s()`, and the whole sweep
+    # was re-run at 1.0 (2,288 rounds, honest signal):
+    #     [ 5, 60]   68 57.4% .495 +0.0619   +4.21 +1.00 +1.51 -0.001/+0.124 FAIL
+    #     [ 5,120]  316 61.4% .519 +0.0783  +24.75 +2.83 -0.01 +0.040/+0.117 FAIL
+    #     [ 5,180]  556 61.3% .522 +0.0744  +41.38 +3.54 +3.00 +0.058/+0.091 PASS
+    #     [ 5,300] 1164 58.1% .519 +0.0452  +52.56 +3.10 +3.75 +0.038/+0.052 PASS
+    #     [60,180]  530 61.5% .524 +0.0749  +39.69 +3.48 +3.18 +0.060/+0.090 PASS
+    # THE VERDICTS REPLICATE EXACTLY: every upper bound >= 180 passes, the shipped
+    # 60 fails, [5,120] still dies on the day-clustered check, and the
+    # extrapolation is still worth <= 0.0013/share. The window is therefore not an
+    # artifact of the look either -- which is the one thing the 2.0 table could not
+    # answer, because the arm does not run a 2 s look.
+    # SHIPPED 2026-09-18 ON THE OPERATOR'S APPROVAL -- the risk decision the
+    # paragraph above left open. 60 -> 180: the arm may enter up to three minutes
+    # before the bell instead of one, on a population 8x larger PER THE REPLAY
+    # (69 -> 574 entries over the same three days, each still $1 and still one
+    # entry per round, so this is a change of TURNOVER and not of per-trade
+    # risk). The signal does NOT change: `twap_forecast` already returns the SPOT
+    # past tau=60 (see its docstring), which is `fc60` -- the honest object the
+    # window was measured on, and the same one `honest_fc` substitutes in
+    # `tools/pm_cross_replay.py`.
+    # WHAT TO WATCH, stated before the fact: the extra entries are LATE ones, and
+    # the live `cross_max_round_range_bps` gate -- the one gate the replay cannot
+    # apply, because the recorded tape has no book -- is exactly the gate that
+    # refuses rounds that have already moved far. So the realized entry count
+    # should come in BELOW 574, and that shortfall measures the range gate, not
+    # this change. Kill criteria: the tau 60-180 cohort at or below 0 per share
+    # over ~150 entries puts this back to 60.
+    # Revert = `CROSS_MAX_TAU_S=60.0` (the shipped value until today) + restart.
+    #
+    # RE-RUN 2026-09-18 ON THE CORRECTED FORECAST. `twap_forecast` had been
+    # averaging the wrong window (see `cross_fc_trigger`), and this window was
+    # ranked on that signal, so the sweep was repeated on the fixed one: same
+    # verdicts, BETTER numbers -- [5,180] n=603 win 63.2% +0.0914/sh total
+    # +55.13 t +4.59 day-t +3.27 halves +0.080/+0.103 drop-best +0.0872 PASS,
+    # [60,180] n=574 +0.0890 t +4.35 day-t +3.24 PASS, while [5,60] still fails
+    # on day-clustered t (+1.79) exactly as before. So the choice of 180 is not
+    # an artifact of the formula bug -- it survives its correction, and
+    # `pm_tau_window.py`'s "honest" and "shipped" sections are now identical
+    # line for line.
+    cross_max_tau_s: float = 180.0
     # RAISED 0.50 -> 0.70 on 2026-09-13. Re-measured by price bucket on live
     # data, one entry per round, priced at the trigger ask:
     #     ask 0.02-0.30  n= 8  win 75.0%  edge +61.1  tot $+64.37
@@ -902,6 +1407,24 @@ class Settings(BaseSettings):
     # and the fill rate goes 85% -> 99% because almost nothing lands above the
     # limit. 0.95 is inside the noise of it on totals and buys a worse trade:
     # at 0.95 one wrong call costs nineteen wins.
+    # 0.90 STANDS. Raised to 0.99 and reverted the same day (2026-09-17) after
+    # reading back the recorded evidence, which is unanimous and points the
+    # OTHER way -- cheaper caps are better:
+    #   tools/pm_cross_sweep.py, 360 cells, btc/5m 274 rounds, lag 300ms:
+    #     max_px  0.45 +0.3882 | 0.55 +0.1817 | 0.65 +0.1166 | 0.75 +0.1171
+    #             0.90 +0.0944   <- MONOTONE, and 0 cells reach |t| >= 2
+    #   tools/btc5m_cross.py, 11 days, 1s coherent window, n=292:
+    #     0.65-0.80 win 77.4% be 73.8% EV +0.0478 day-t +0.48
+    #     0.80-1.01 win 90.0% be 87.6% EV +0.0297 day-t +0.72   <- nothing
+    #   the LIVE Binance ledger (110 decided fills):
+    #     0.65-1.01 n=68 win 75.0% paid 0.8088 be 81.3%  <- where the money went
+    # So above ~0.80 the market prices the crossing almost exactly right and the
+    # arm pays the difference. The 2026-09-17 calibration agrees (0.98 -0.0290,
+    # 0.99 -0.0523) and the pooled +0.0108 that looked favourable is z 1.35, i.e.
+    # inside its own error bar. Do not raise this to "make it trade":
+    # cross_max_fill_px (0.65) caps the payment anyway, so a looser band here
+    # only burns venue calls and the daily attempt budget on orders that cannot
+    # fill.
     cross_max_price: float = 0.90
     # 0.10, not 0.02: the 0.02-0.10 slice adds fills worth almost nothing and
     # drags the average. Raising the floor was +$1.44 on its own with no cost
@@ -1143,6 +1666,28 @@ class Settings(BaseSettings):
     # RAISED 0.25 -> 0.40 with cross_limit_buffer_inv: at inv 0.30 a cheap ask
     # wants 0.30*(1-0.2) = 0.24, and the old cap would have clipped exactly the
     # cheap-ask cell where the reprice is largest (median +0.340).
+    #
+    # PROVENANCE WARNING (2026-09-17). The `cross_limit_buffer=0.02` the LIVE
+    # box runs comes from a canary dated 2026-09-15 -- the BINANCE venue, since
+    # the Polymarket flip is 2026-09-16 (see the first PM-era note in
+    # execution/live.py). That n=386 canary therefore does NOT measure this
+    # venue, and neither does the "live Binance ledger (110 decided fills)"
+    # quoted under cross_max_price. Do not cite either as Polymarket evidence.
+    #
+    # What DOES support a tight buffer here, measured on Polymarket:
+    #   * the EDGE is in the fire quote only: buying a completed crossing at
+    #     the displayed ask is +0.026..+0.042 a share, at every depth through
+    #     the strike, both halves positive (4,246 settled rounds, quotes joined
+    #     to winners, one entry per round).
+    #   * the REPRICE at our own ~0.44s send is a median +0.115, p90 +0.260
+    #     (24 live paired triggers, `cross fine` at 50ms resolution; p90 +0.590
+    #     for fire asks under 0.30). The reprice is 3-4x the whole edge, so a
+    #     buffer big enough to fill THROUGH it converts +0.03 into about -0.08.
+    # So on this venue the tight end is the right end, for a reason independent
+    # of the Binance number: chase the reprice and you pay more than the trade
+    # is worth. `pm_cross_sweep.py` (Polymarket tape, 274 rounds, lag 300ms)
+    # agrees on the direction -- max_px 0.45 +0.3882 | 0.55 +0.1817 |
+    # 0.65 +0.1166 | 0.90 +0.0944, monotone, though no cell reaches |t| >= 2.
     cross_limit_buffer: float = 0.25
     # SUPERSEDED 2026-09-14 by cross_limit_buffer_inv. Kept only so an
     # existing cross_overrides entry naming it does not KeyError; nothing
@@ -1371,6 +1916,80 @@ class Settings(BaseSettings):
     # it matters. Applied to BOTH paths: it caps the LIMIT ceiling and the
     # MARKET `max_px`, so neither instrument can buy outside the band.
     cross_max_fill_px: float = 0.65
+    # ---- the SAME bound expressed RELATIVE to the ask we actually saw ----
+    # `cross_max_fill_px` and the `ask + buffer` ceiling are both ABSOLUTE, so
+    # the allowance they give is REGRESSIVE in the ask: 1.5x at 0.50, 3.0x at
+    # 0.10. The cheap end is exactly where a stale trigger ask is most likely --
+    # and where the relative overpay is largest.
+    #
+    # MEASURED LIVE 2026-09-17, `sol-updown-5m-1789649400`: trigger ask 0.100,
+    # ceiling 0.28, FILL 0.200 -- 2.0x the only ask we ever saw -- on a round
+    # that resolved against us. Two candles later `doge-updown-5m-1789649700`
+    # paid 0.46 against a 0.61 ask (0.75x).
+    #
+    # SWEPT on the 8-day spring corpus (tools/pm_range_gate_corpus.py --sweep
+    # cap; 122 triggers, band [0.10,0.65], entry lag 500 ms). Cap = k x the ask
+    # seen AT THE TRIGGER; a capped trigger is DROPPED, not repriced (repricing
+    # is the maker-path artefact in backtest-artifacts.md):
+    #
+    #     k     n    dropped   win     EV/sh     halves
+    #    1.00   77     45     55.8%   +0.1850   flip
+    #    1.50  114      8     53.5%   +0.1506   +0.180/+0.122
+    #    2.00  118      4     52.5%   +0.1430   +0.160/+0.126
+    #    off   121      1     53.7%   +0.1583   +0.150/+0.166
+    #
+    # SO THIS IS NOT AN EV LEVER -- from 1.25 to off the EV is flat within 0.01
+    # and the halves disagree. k=1.0 has the best EV/trade and the best win rate
+    # but drops 37% of triggers to buy it, and those triggers were net POSITIVE,
+    # so its total PnL is WORSE (+14.3 vs +19.2 on 121).
+    # 1.5 is the near-free cell: it bounds the 2.0x class, costs 8 of 122
+    # triggers and 0.0077 EV/sh, and still allows the 0.75x fill above. It is a
+    # RISK bound, not an edge -- do not quote it as an improvement.
+    #
+    # ⚠️ SHIPPED **OFF** (0), and the reason is the total, not the average.
+    # At 1.5 it drops 8 of 122 triggers and moves total PnL +19.15 -> +17.17,
+    # i.e. it pays ~10% of the arm's money to buy a bound. Worse, it does not
+    # prevent the loss it was built for: `sol-updown-5m-1789649400` lost its
+    # whole $1 stake either way -- a cheaper fill only shrinks the PAYOUT on a
+    # win, and the round resolved against the arm. So the trade is real and
+    # unfavourable; the evidence for taking it does not exist yet.
+    # It also contradicts a MEASURED rule the buffer was inverted to satisfy:
+    # a cheap ask means the venue has not repriced a fresh cross yet, so the
+    # book is about to run furthest there (all nine live cancellations had a
+    # decided ask of 0.14-0.57). Turning this on bids LEAST where the arm has
+    # measured that it needs the most, and pays for the privilege.
+    # Switch to 1.5 only if a bounded worst-case overpay is worth ~10% of PnL.
+    # 0 disables it and keeps the pure `ask + buf` ceiling.
+    cross_max_fill_multiple: float = 0.0
+    # ⭐ THE TAKE PRICE IS BUILT FROM THE VENUE'S OWN BOOK, NOT OUR LADDER
+    # (shipped 2026-09-18). The arm decides on `Touch.sweep()` of its ws book and
+    # then builds the FAK limit from that same number -- so when the ws ladder
+    # carries a level the venue does not have, the limit is below the ask that
+    # actually exists and the FAK cannot match. MEASURED on the 75 live order
+    # attempts of 09-16..09-18: of the 20 NO-FILLs whose shadow probe caught the
+    # venue's book, **17 had a venue ask above our 0.65 cap** while we had
+    # decided at ~0.60, and the mean (venue ask - our limit) was **+0.155**. The
+    # clearest:
+    #     `shadow book xrp-updown-5m-1789704600 Down: venue 0.3200/0.6900 |
+    #      ours 0.3200/0.4200` -> decided 0.42, limit 0.54, "no orders found"
+    # i.e. our `sweep()` read 0.42 at the same instant the venue's book read
+    # 0.69. The miss was ARITHMETIC, not latency.
+    # ON: the take path re-reads `GET /book?token_id=` (read-only, the same call
+    # the shadow probe makes) and re-runs the ceiling arithmetic on THAT ask --
+    # `cross_max_price`, the inverse buffer, `cross_max_fill_multiple`, then the
+    # fill cap. The bands, the margin floor and the caps are unchanged, so this
+    # can only refuse a trade or price it correctly; it cannot enlarge one. When
+    # the venue book is above the cap the order is now REFUSED WITH A DECISION
+    # ROW instead of burning a FAK round-trip, and an unreadable venue book
+    # falls back to the old base, logged. It applies to the TAKER branch, which
+    # is the one the cross arm uses (`pm_order_type=fak`); the post-only LIMIT
+    # branch is unchanged.
+    # WHAT IT DOES NOT CHANGE: the retry. A `fak_unfilled` now re-prices and
+    # re-sends inside the EXISTING attempt loop, bounded by `order_max_attempts`
+    # (3 sends per decision), `order_retry_delay_s`, the `order_min_tau_s` floor
+    # and the venue-position re-read that makes doubling impossible.
+    # Revert = `CROSS_VENUE_TAKE=false` + restart (old base, one less REST call).
+    cross_venue_take: bool = True
     # ---- TRAIN entry trigger: DISTANCE from the strike, not a crossing ----
     # Explicitly an OVERRIDE of three of the arm's gates, taken as a risk
     # decision by the operator on 2026-09-15. The strike IS the round's open, so
@@ -1389,7 +2008,41 @@ class Settings(BaseSettings):
     # the continuation premium is spent in the first seconds.
     # NOT reconciled with the n=321 coherent-favourite result (-0.0221 at the
     # ask), and 76% of these fires sit on rounds the range gate refuses.
+    # ⛔ PROVENANCE CORRECTED 2026-09-18 BY THE OPERATOR: that table is
+    # BINANCE-ERA (pre-2026-09-16 flip). It does NOT transfer to Polymarket and
+    # must not be cited as Polymarket evidence for this trigger -- the same
+    # mistake the `cross_limit_buffer` canary made (see the `.env`). The PM-era
+    # record for the train trigger is **n=2 fills on $2.00 = -$0.72**
+    # (xrp-5m 09-17, one win one loss), i.e. nothing at all. RE-MEASURE on the PM
+    # tape before this is enabled on the strength of the numbers above.
     cross_train_enabled: bool = False
+    # ---- GATE PARITY WITH THE CROSS ARM (audited 2026-09-16) -------------
+    # The TRAIN trigger is NOT a separate arm: it sets `train = True` and falls
+    # through into the cross arm's ordering path, skipping only the gates
+    # wrapped in `if not train`. Read this before changing any `if not train`
+    # line, and see tests/test_arm_parity.py, which freezes the lists below.
+    #
+    # SHARED (both arms, verified by reading the path): max_per_round,
+    # max_per_day, the reentry gap, min/max_price, stake_usdt/stake_mult,
+    # cross_max_round_stake_mult, cross_max_open_positions,
+    # cross_max_open_stake_pct, the reserved slot, cross_allow_reversal and
+    # cross_skip_opposite_to_main. The risk bounds are genuinely shared.
+    #
+    # BYPASSED ON PURPOSE, each with a measurement behind it: the tau window
+    # (the trigger deliberately lives OUTSIDE 5-60s), max_depth_bps,
+    # max_round_range_bps, and the fill cap (cross_max_fill_px 0.65 would
+    # forbid a 0.75-0.88 entry outright, so the train arm uses
+    # cross_train_max_fill_px instead).
+    #
+    # BYPASSED WITHOUT THIS COMMENT SAYING SO -- previously undocumented, found
+    # by the 2026-09-16 audit. They do not fire today, but turning any of them
+    # on does NOT reach the train arm:
+    #   cross_flip_block_s   (0.0, off)  -> the whipsaw guard is cross-only
+    #   cross_min_depth_ticks (1.0, ON)  -> train may quote a level with no
+    #                                       depth at the touch
+    #   cross_min_depth_sigma (0.0, off)
+    # If the whipsaw guard or the depth floor is ever turned on, decide
+    # explicitly whether train should honour it; the arm inherits neither.
     cross_train_min_tau_s: float = 60.0
     # TAU CEILING. Added 2026-09-15 by the sweep, and TURNED OFF THE SAME HOUR.
     # I read the joint table's `t>=180` column as a CEILING when it is MIN_TAU,
@@ -1402,6 +2055,20 @@ class Settings(BaseSettings):
     cross_train_max_tau_s: float = 0.0
     cross_train_bps: float = 15.0
     cross_train_max_ask: float = 0.890
+    # THE DYNAMIC EV CEILING (2026-09-16). `cross_train_max_ask` is a
+    # hand-picked price; this states the same bound in the unit the arm earns
+    # in -- the most we may pay for a MEASURED win rate once the fee is charged
+    # AT that price. Solved, not approximated (see `broker.ev_ceiling`).
+    #
+    # train_p_win is a MEASUREMENT from `tools/pm_train_sweep.py`, not a knob:
+    # PM tail-60 rule, thr 15bps, tau >= 60, all families, n=2397 -> win 91.4%,
+    # halves 92.1/90.8, drop-best 91.2, be-ask 0.898. Re-run the sweep before
+    # moving it; never quote an optimum you have not re-measured.
+    # At these values the gate goes 0.890 -> 0.876, i.e. 1.4c TIGHTER, and the
+    # static value stays as a backstop (`entry_ceiling` takes the min).
+    train_p_win: float = 0.914
+    #: How much edge to leave on the table at that win rate.
+    ev_ceiling_margin: float = 0.03
     cross_train_bound: float = 0.015
     cross_train_max_fill_px: float = 0.90
     # EVENT ANCHOR. The train condition is a LEVEL (|spot-strike| >= 10bps);
@@ -1523,7 +2190,51 @@ class Settings(BaseSettings):
     # CAVEAT: day-t at <=10 is 1.72, under this repo's t=2 bar (<=8 is 2.07).
     # It ships on the growth result being consistent across two independent
     # slippage models, not on the day-t. Revisit at ~30 more fills.
-    cross_max_round_range_bps: float = 10.0
+    # RAISED 10.0 -> 12.0 on 2026-09-17. The gate was refusing EVERY live
+    # trigger (`round already moved 10.2bps, gate is 10.0`) while sitting in the
+    # middle of its own POSITIVE bin: the table above bins 8-12 at +0.052 and
+    # 12-20 at -0.324, so a cut at 10.0 discards the upper half of a bin
+    # measured positive while buying no extra distance from the negative one.
+    # The growth table agrees (<=12 is 0.2347/0.3376 against <=10 0.2473/0.3463,
+    # which that block already calls "not knife-edge"). 8, 12 and 20 are the
+    # measured bin edges; 10.0 was an interpolation between two of them.
+    #
+    # Why the gate binds live but did not in the measurement: the sample above
+    # is tau 5-60s, and the live trigger window runs to tau ~207s. Range-so-far
+    # is a fixed bps count of a quantity whose expected size grows with the time
+    # already elapsed, so the same 10 bps is a large fraction of the diffusion
+    # at tau 60 and a small one at tau 207. This is why the arm now also carries
+    # an edge gate (`cross_min_edge`): an edge is scale-free where a bps is not.
+    cross_max_round_range_bps: float = 12.0
+    # MINIMUM MODEL EDGE at the trigger instant: `fair_value(spot, strike, tau,
+    # sigma) - ask`, its own side. 0 = OFF (the repo's convention for a gate).
+    #
+    # SHIPPED AT 0.0 (OFF) on 2026-09-17, deliberately, because the fair it
+    # would compare against is the WRONG DISTRIBUTION for this venue.
+    #
+    # `fair_value` is the POINT-snapshot digital. Polymarket does not settle on
+    # a point: it settles on the 60s TAIL TWAP `mean(close[T-60:T]) >= K`
+    # (89.9% fit to gamma's own winners, 286 rounds, vs 83.9% for the point
+    # rule -- see the repo note on the resolution rule). Terminal variance is
+    # therefore sigma^2*60/3, which is 5x less dispersed than a whole-range
+    # TWAP and ~2.7x less than the point rule at tau 150s. The two rules agree
+    # to +0.4pp at >=15bps, but they diverge most NEAR the strike -- and the
+    # cross arm is the arm that sits AT the strike (`cross_max_depth_bps` 5.0,
+    # typically under 0.5bps). So a point-rule fair understates how decided the
+    # round is, exactly in the arm's operating region, and a gate built on it
+    # would refuse the crossings it exists to take.
+    #
+    # The fix is not a different number here, it is a PM terminal distribution
+    # in `btcpredict/venues/polymarket/pricing.py` -- the file the venue layout
+    # has always reserved for it and which still does not exist. Turn this on
+    # once that fair exists, not before.
+    #
+    # The TRAIN arm does not apply it. That arm's economic gate is
+    # `entry_ceiling(cross_train_max_ask, TRAIN_P_WIN[sym], ev_ceiling_margin)`
+    # -- already a model-derived ceiling -- so applying this one too would price
+    # the same decision twice and the tighter would silently become the rule.
+    # See tests/test_arm_parity.py's BYPASSED_ON_PURPOSE.
+    cross_min_edge: float = 0.0
     # PER-MARKET overrides, {slug prefix: {knob-without-the-cross_-prefix: value}}.
     # Read through cross_knob() so an unset market falls back to the global
     # above and the live BTC config cannot drift by accident. Set from .env as
@@ -1770,6 +2481,45 @@ class Settings(BaseSettings):
     #
     # Cost of the old value, in the frequency this arm is short of: it refused
     # 42.9% of bnb crossings and 23.3% of eth's, against 3.6% of btc's.
+    #
+    # ⛔ THIS KNOB IS IN TICKS, SO THE FLOOR IT PRODUCES IS IN BPS OF A
+    # SYMBOL-DEPENDENT PRICE. That has now been mis-derived three times: it
+    # left xrp/doge inert for their whole life (tick_size table below), and on
+    # 2026-09-17 DOGE's 0.00001 tick was read as "0.12 bps" when it is 1.23 --
+    # a 10x understatement, because the division is tick/spot and not spot/
+    # tick. The floors this setting actually produces:
+    #
+    #     family  spot      tick        1 tick     2 ticks
+    #     btc     76300     0.01        0.001 bps  0.003 bps
+    #     eth      2450     0.01        0.04  bps  0.08  bps
+    #     bnb       726     0.01        0.14  bps  0.28  bps
+    #     sol       100.5   0.01        0.99  bps  1.99  bps
+    #     xrp         1.30  0.0001      0.77  bps  1.54  bps
+    #     doge        0.0813 0.00001    1.23  bps  2.46  bps
+    #
+    # THE SUB-BPS FAMILIES ARE NOT ONE CASE, AND THE DIFFERENCE IS THE STRIKE.
+    # btc/eth/bnb take the wrapper's exact `variantData.startPrice`, so a
+    # 0.001 bps floor is correct there -- they can resolve a crossing to the
+    # cent. sol/xrp/doge have no such source (Binance's prediction feed lists
+    # btc/eth/bnb only), so their strike is RECONSTRUCTED from the spot tape,
+    # and the only accuracy bound that exists for that reconstruction is the
+    # 0.042/0.091/0.114 bps mean and **p99 < 1 bp** measured over 5,635
+    # btc/eth/bnb rounds (main.py `_pm_strike_backfill`).
+    #
+    # ONE tick on those three is 0.77-1.23 bps, i.e. the ENTIRE crossing sits
+    # inside one error bar of the level it is measured against -- the sign of
+    # the crossing, which is what the arm trades, is then not resolvable. So
+    # `cross_overrides` sets `min_depth_ticks: 2.0` on exactly those three, and
+    # the test pins that. It is a BOUND (the p99 of a measurement), not a value
+    # fitted from a sweep, which is why it is the same 2 on all three.
+    #
+    # Counter-evidence on record, deliberately not buried: the 5.0-tick floor
+    # was swept and REJECTED on 2026-09-15 because shallow crossings are
+    # CHEAPER than deep ones (edge +0.2311 below the floor vs +0.1771 above).
+    # That sweep ran on btc/eth/bnb -- all three with an EXACT strike -- so it
+    # priced "shallow", which is a different question from "shallower than the
+    # level can be measured". If this is re-measured on sol/xrp/doge, the
+    # cheap-ask effect is the thing to beat.
     cross_min_depth_ticks: float = 1.0
     # Venue price increment per symbol, used only by the floor above.
     cross_tick_size: float = 0.01
@@ -1845,6 +2595,43 @@ class Settings(BaseSettings):
         "btc-updown-15m": {"max_round_range_bps": 13.6},
         "eth-updown-15m": {"max_round_range_bps": 21.0},
         "bnb-updown-15m": {"max_round_range_bps": 21.1},
+        # `tick_size` here is the SPOT price tick of the UNDERLYING, NOT the
+        # 0.01 probability tick on the CLOB. The depth floor is
+        # `min_depth_ticks * tick_size` and it is compared against a SPOT
+        # difference, while the ceiling (`max_depth_bps`) is in bps of spot.
+        #
+        # MEASURED, 2026-09-16: a single global 0.01 made that floor a
+        # per-symbol error of the order of the symbol's price. In bps:
+        #     btc  76000 ->    0.0013   (floor effectively off, as intended)
+        #     eth   2500 ->    0.04
+        #     bnb    726 ->    0.14     (this is the case the comment above
+        #                                cross_min_depth_ticks was written for)
+        #     sol    200 ->    0.50
+        #     xrp   1.28 ->   78.0     <- ABOVE the 5.0 ceiling
+        #     doge  0.08 -> 1250.0     <- ABOVE the 5.0 ceiling
+        # A floor above the ceiling is an EMPTY band, so the arm refused every
+        # crossing those two families ever produced -- inert, and silently so,
+        # because a refusal is not an error. Neither family had ever traded.
+        # ⛔ TWO TICKS, NOT ONE, ON THE THREE FAMILIES WHOSE STRIKE IS
+        # RECONSTRUCTED. See `cross_min_depth_ticks` for the derivation: one
+        # tick here is 0.99 / 0.77 / 1.23 bps of spot against a strike that is
+        # only known to p99 < 1 bp, so a one-tick crossing is inside its own
+        # error bar. Two ticks is the smallest floor that clears it.
+        #
+        # This is a BOUND and is deliberately identical on all three rather
+        # than swept per family -- three identical cells fitted separately
+        # would read as a choice, the same trap `cross_limit_buffer` fell into
+        # (0.25/0.35/0.50 all measuring one cell because the min() always took
+        # the flat branch).
+        #
+        # Risk: this refuses the shallowest crossings on these families, and
+        # the 2026-09-15 sweep found shallow crossings have the better EDGE
+        # because they are cheaper. That sweep did not cover these three. If
+        # the arm's fires get too rare, revert to 1.0 here -- nothing else
+        # depends on the value.
+        "sol-updown-5m": {"min_depth_ticks": 2.0},
+        "xrp-updown-5m": {"tick_size": 0.0001, "min_depth_ticks": 2.0},
+        "doge-updown-5m": {"tick_size": 0.00001, "min_depth_ticks": 2.0},
     }
     # Entries per ROUND. Consecutive crosses alternate sides by construction, so
     # a choppy round is naturally hedged rather than doubled. MEASURED, taking
@@ -1893,6 +2680,42 @@ class Settings(BaseSettings):
     # only stops doubling inside one. Revert to 5 if repeats ever measure
     # positive on live fills.
     cross_max_per_round: int = 1
+    # FAMILIES THE CROSS ARM MAY NOT ORDER IN -- comma-separated prefixes, the
+    # same keys `cross_overrides` uses. A disabled family keeps its ROUNDS, its
+    # QUOTE TAPE and its websocket book: it is exactly the state the three
+    # never-traded families have always been in (MARKETS widens the tape,
+    # this narrows the risk). Nothing is lost, so re-enabling is one edit and
+    # the counterfactual keeps accruing while it is off.
+    #
+    # WHY eth-updown-5m IS HERE (2026-09-18). It is the ONE family whose trigger
+    # has no edge against the price it is charged. Measured over every settled
+    # PM-era round, first crossing in tau [5,60], NO band and NO floor
+    # (`tools/pm_family_signal_check.py`, so n is per-family triggers, not the
+    # 10-13 entries the band lets through):
+    #     family   n   trigger hit   be-ask   edge
+    #     bnb-5m  28      82.1%       0.602   +21.9pp
+    #     btc-5m  37      78.4%       0.643   +14.1pp
+    #     sol-5m  25      76.0%       0.631   +12.9pp
+    #     xrp-5m  32      71.9%       0.607   +11.2pp
+    #     doge-5m 27      66.7%       0.609    +5.8pp
+    #     eth-5m  38      63.2%       0.645    -1.4pp   <- this one
+    # Every other family's trigger is worth 6-22 pp more than the book charges;
+    # eth's is worth LESS than its price, i.e. every entry pays the taker fee
+    # (1.1-2.5c per $1 at 0.45-0.65) for a coin flip. Its leak is visible inside
+    # that: the 1-2 bps crossings are bought at a MEAN ASK of 0.788 for a 57%
+    # shot (n=7, -$1.52, more than eth's whole -$0.94 over 38 triggers).
+    # eth-updown-15m is NOT disabled -- it is +9.7pp (n=5, tau 45-60 only).
+    #
+    # WHAT THIS DELIBERATELY OVERRIDES: by the repo's own rule a family is only
+    # cut when its edge is negative with the SAME sign in BOTH halves. eth's
+    # halves are -6.6/+3.9, i.e. it FAILS that test, and its money sample is
+    # 13-16 entries. So this is the OPERATOR's risk decision, taken because a
+    # zero-edge family still pays a fee on every entry, and it is recorded as
+    # such rather than dressed up as a measurement.
+    # REVERT: `cross_disabled_families=""` (or drop the prefix) + restart.
+    # The counterfactual to check it with, once there are ~50 more eth triggers:
+    # `/root/analysis-venv/bin/python tools/pm_family_signal_check.py`.
+    cross_disabled_families: str = "eth-updown-5m"
     # May a cross entry take the side OPPOSITE a position already held in this
     # round? No. Buying both sides is not a hedge: with the first position sunk,
     #     EV(take) - EV(decline) = stake_B * [ (1 - p)/b - 1 ]
@@ -2084,6 +2907,30 @@ def cross_knob(prefix: str | None, name: str):
         if ov is not None and name in ov:
             return ov[name]
     return getattr(settings, f"cross_{name}")
+
+
+def cross_disabled() -> frozenset[str]:
+    """The families named in `cross_disabled_families`, parsed once.
+
+    Parsed rather than stored as a set so the knob stays a plain .env string:
+    pydantic would want JSON for a set and a typo would then fail at import
+    instead of at the arm.
+    """
+    raw = settings.cross_disabled_families or ""
+    return frozenset(p.strip() for p in raw.split(",") if p.strip())
+
+
+def cross_traded(prefix: str | None) -> bool:
+    """May the cross arm ORDER in this family, or is it recorded only?
+
+    This is the single place `MARKETS` (the tape) is narrowed to the families
+    that may risk money. `_record` passes it as `trade=`; a family that fails
+    it still records its rounds and quotes and still has its book followed, it
+    just never builds the per-market context the arm fires from.
+    """
+    if not prefix or prefix not in CROSS_TRADED:
+        return False
+    return prefix not in cross_disabled()
 
 
 def market_prefix(slug: str | None) -> str | None:

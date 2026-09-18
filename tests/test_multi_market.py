@@ -92,21 +92,54 @@ class TestWsBookFollowsEveryMarket:
         b._record = _noop_record
         return b
 
-    def test_only_the_traded_market_is_subscribed(self):
-        """Subscribing all six cost 3-4x the decision cadence (1.00s -> 4.15s
-        median), and a slower poll is what makes a real crossing invisible."""
+    def test_every_cached_family_is_subscribed(self):
+        """The family set must come from the ROUND CACHE, not from `_mkt`.
+
+        The old list was built from `_mkt`, and `_mkt` is filled BY `_record`,
+        which needs the BOOK this socket provides -- a closed loop. Measured
+        2026-09-17: `pm book ws connected (12 assets)` = 6 families, sol/xrp/doge
+        `not live` for hours, every trigger on them refused as `no ask on the
+        book` with nothing logged as an error. Subscribing all nine costs
+        message volume, and that is now monitored (`poll_ms`, the backlog guard)
+        rather than assumed -- so the switch governs it, not this default.
+        """
         found = {p: SimpleNamespace(market_id=100 + i, slug=f"{p}-1")
                  for i, (p, _, _) in enumerate(MARKETS)}
         follows = []
         asyncio.run(self._bot(found, follows).tick())
-        assert follows == [[100]], "only MARKETS[0] may be followed"
+        assert len(follows[0]) == len(MARKETS)
+        assert {r.slug for r in follows[0]} == {f"{p}-1" for p, _, _ in MARKETS}
 
-    def test_a_missing_primary_id_subscribes_nothing(self):
+    def test_follow_all_off_subscribes_only_the_primary(self, monkeypatch):
+        """The switch is the escape hatch if the poll degrades (1.00s -> 4.15s
+        median was measured with six families followed on the old sweep)."""
+        monkeypatch.setattr(settings, "cross_ws_follow_all", False)
+        found = {p: SimpleNamespace(market_id=100 + i, slug=f"{p}-1")
+                 for i, (p, _, _) in enumerate(MARKETS)}
+        follows = []
+        asyncio.run(self._bot(found, follows).tick())
+        assert [r.slug for r in follows[0]] == ["btc-updown-5m-1"]
+
+    def test_a_round_with_no_market_id_is_still_followed(self):
+        """Polymarket rounds carry NO marketId: the arms address them by slug
+        and the venue by token id. The old `if r.market_id` guard therefore
+        built a permanently EMPTY follow list on that venue, so the socket was
+        never subscribed and the feed was read by nothing. The FAMILY set is
+        what bounds the subscription, never the wrapper's id."""
         found = {"btc-updown-5m": SimpleNamespace(market_id=None, slug="a"),
                  "eth-updown-5m": SimpleNamespace(market_id=9, slug="b")}
         follows = []
         asyncio.run(self._bot(found, follows).tick())
-        assert follows == [], "a non-primary id must never be followed"
+        assert {r.slug for r in follows[0]} == {"a", "b"}
+
+    def test_what_follow_gets_is_a_round_not_an_id(self):
+        """Both book classes accept a Round -- the one argument that means the
+        same thing on a venue keyed by an integer id and one keyed by slug."""
+        found = {"btc-updown-5m": SimpleNamespace(market_id=100, slug="a")}
+        follows = []
+        asyncio.run(self._bot(found, follows).tick())
+        assert isinstance(follows[0][0], SimpleNamespace)
+        assert getattr(follows[0][0], "slug", None) == "a"
 
     def test_nothing_live_means_no_handshake(self):
         follows = []
@@ -216,7 +249,12 @@ class TestRoundsAreCachedUntilTheyRoll:
                 await t
         asyncio.run(go())
         assert asked[0] == [MARKETS[0][0]], "the primary is fetched inline"
-        assert len(asked[1]) == len(MARKETS) - 1, "the rest off the poll path"
+        swept = {p for call in asked for p in call}
+        assert swept == {p for p, _, _ in MARKETS}, (
+            "every family is swept, one prefix per call -- a single call for "
+            "all of them couples their outcomes, so one family whose round is "
+            "not listed leaves the rest uncached (all 3 of xrp/sol/doge were "
+            "dead this way with 0 quotes/hour)")
 
     def test_the_deep_sweep_never_blocks_the_poll(self):
         """The whole point: a rolled family must not stall the decision loop."""
@@ -263,8 +301,10 @@ class TestRoundsAreCachedUntilTheyRoll:
             if t is not None and not t.done():
                 await t
         asyncio.run(go())
-        assert len(asked[-1]) == len(MARKETS) - 1, (
+        assert len(asked[-1]) == 1, (
             "once a round has rolled its family must be swept again")
+        assert asked[-1] == [p for p, _, _ in MARKETS if p != MARKETS[0][0]][-1] \
+            or asked[-1][0] in [p for p, _, _ in MARKETS if p != MARKETS[0][0]]
 
     def test_a_round_without_a_strike_is_never_cached(self):
         """A strikeless round cannot be traded and must not pin the cache."""
@@ -283,7 +323,11 @@ class TestRoundsAreCachedUntilTheyRoll:
             if t is not None and not t.done():
                 await t
         asyncio.run(go())
-        assert len(asked[-1]) == len(MARKETS) - 1
+        swept = {p for call in asked for p in call}
+        assert swept == {p for p, _, _ in MARKETS}, (
+            "every family must be swept, one prefix per call")
+        assert all(len(call) == 1 for call in asked[1:]), \
+            "non-primary sweeps are per-prefix so one miss cannot block the rest"
 
 
 def _capture(prefixes, sink, rounds):

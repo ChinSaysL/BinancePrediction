@@ -26,7 +26,8 @@ import aiohttp
 
 from btcpredict.calibration.report import PnLSummary
 from btcpredict.edge.impulse import impulse_bps, impulse_side
-from btcpredict.config import (CROSS_TRADED, MARKETS, cross_knob,
+from btcpredict.config import (CROSS_TRADED, MARKETS, SYMBOL_BY_PREFIX,
+                               TRAIN_P_WIN, cross_knob, cross_traded,
                                market_prefix, settings)
 from btcpredict.edge.signal import (FeeModel, Signal, evaluate,
                                     evaluate_hybrid, expected_value,
@@ -38,6 +39,10 @@ from btcpredict.edge.signal import (FeeModel, Signal, evaluate,
 from btcpredict.execution.base import Fill
 from btcpredict.execution.live import RETRYABLE_FAILURES, LiveBroker
 from btcpredict.execution.paper import PaperBroker
+from btcpredict.venues import registry
+from btcpredict.venues.polymarket.broker import entry_ceiling
+from btcpredict.venues.polymarket.pricing import (TWAP_LOOKBACK_S,
+                                                  window_log_integral)
 from btcpredict.feeds.binance_spot import SpotFeed, fetch_klines
 from btcpredict.feeds.prediction_book import PredictionBook
 from btcpredict.feeds.market_feed import MarketFeed, Round
@@ -48,6 +53,104 @@ from btcpredict.risk.guards import RiskGuard
 from btcpredict.store.db import Store
 
 log = logging.getLogger("btcpredict")
+
+
+def _report_task_failure(task) -> None:
+    """Log a fire-and-forget task's exception instead of losing it.
+
+    An un-awaited `asyncio.Task` that raises prints NOTHING: the exception just
+    sits on the task. The first version of the warm metadata prefetch raised
+    `AttributeError` for thirteen minutes of live trading and the only symptom
+    was silence -- which reads exactly like "the warm is not needed".
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.warning("background task failed: %s: %s", type(exc).__name__, exc)
+
+
+def _queue_warm_tokens(owner, toks) -> list[str]:
+    """Add a family's tokens to the pending warm set; return the batch to send.
+
+    ⛔ THE QUEUE IS THE FIX, SO IT IS A FUNCTION RATHER THAN THREE LINES INSIDE
+    `_record` -- the defect it replaces was invisible and the property that
+    matters (a family cannot be starved out of the queue) is directly testable
+    here and would not be inline.
+
+    WHY IT EXISTS. `_record` runs for every family in `MARKETS` order and
+    `MARKETS[0]` is the PRIMARY. The dispatch used to be
+    `if toks and (task is None or task.done())` against ONE shared
+    `self._warm_task`: the primary re-dispatched on every sweep, so the task was
+    never `done()` when the next family was checked, and the other eight were
+    skipped forever. MEASURED live 2026-09-17 -- the `warm` counter moves +2 per
+    5-minute rollover (18, 18, 18, 18, 20, 22, 22, 22, 22, 24, 26) against 18
+    tokens a round, and two tokens a round is one family's round.
+
+    Returns [] while a warm is in flight; the tokens stay in the set and go out
+    with the next batch. Nothing is ever dropped, which is the property the old
+    gate lacked.
+
+    `getattr`/`isinstance` guards rather than bare attributes: fixtures build a
+    Bot via `__new__`, which skips `__init__` -- the trap this file already hit
+    twice (see `_cross_fired`).
+    """
+    pend = getattr(owner, "_warm_pending", None)
+    if not isinstance(pend, set):
+        pend = owner._warm_pending = set()
+    pend.update(toks or ())
+    task = getattr(owner, "_warm_task", None)
+    if not pend or (task is not None and not task.done()):
+        return []
+    batch = sorted(pend)
+    pend.clear()
+    return batch
+
+
+# See `_log_warm_done`: the pre-resolve success line is INFO once per process and
+# DEBUG after that. Process-wide rather than per-Bot because `_log_warm_done` is a
+# done-callback and is handed only the task.
+_WARM_LOGGED: bool = False
+
+
+def _log_warm_done(task) -> None:
+    """Say how many tokens the pre-resolve put in the SDK's cache, when > 0.
+
+    `warm()` returns the count it RESOLVED, and 0 means "all already warm" --
+    the steady state -- so this is silent then rather than a line per sweep.
+
+    It exists because the failure it replaces was invisible in exactly the way
+    `_report_task_failure`'s docstring describes: nothing errored, and the
+    `warm` counter climbing by a couple each round read as "working" when it
+    was ONE family out of nine (see the `_warm_pending` note in `_record`).
+    A number in the log is what turns that from an inference into a fact.
+
+    Never raises: it is a done-callback, and an exception raised here would be
+    lost the same way the warm's own was.
+
+    INFO ONCE, THEN DEBUG. The pre-resolve runs for ~18 tokens at every 5-minute
+    rollover (9 families x 2 sides), so left at INFO this SUCCESS line was
+    MEASURED at **220 of the ~1,600 lines in a 3-hour live.log window** -- the
+    largest single source of noise in the file, and every one of the 220 said
+    "working". The first is worth keeping at INFO: it is the line that proves the
+    queue fix actually ran, which is the one thing that was invisible before. The
+    running total stays visible as `warm N` on the once-a-minute liveness line.
+    """
+    global _WARM_LOGGED
+    try:
+        if task.cancelled() or task.exception() is not None:
+            return                     # _report_task_failure reports that one
+        n = task.result() or 0
+        if not n:
+            return
+        if _WARM_LOGGED:
+            log.debug("pm order metadata: pre-resolved %d token(s)", n)
+        else:
+            _WARM_LOGGED = True
+            log.info("pm order metadata: pre-resolved %d token(s); orders on "
+                     "every family should now pay no lookup", n)
+    except Exception:                  # noqa: BLE001
+        pass
 
 # How many consecutive venue reads must disagree with the bankroll ledger before
 # the venue's figure is believed over our own accounting. One or two is the
@@ -62,6 +165,59 @@ PROBE_MODE = "probe"
 # stays immediate; this only has to catch what that one missed.
 _CLAIM_SWEEP_S = 180.0
 
+# How often wallet equity is re-read EVEN WHEN NOTHING SETTLES (see
+# Bot.refresh_bankroll_if_stale). 60 s, so a deposit is live within a minute.
+# Cheap because the PM broker's `equity()` is cached and only SPENDING
+# invalidates that cache -- this clock is the one thing that forces a real read
+# (~260 ms, in the same phase window as the claim sweep measured at 273 ms).
+_BANKROLL_REFRESH_S = 60.0
+
+# ⛔ WHEN ONE TICK IN 120 TAKES TEN SECONDS, NAME THE PHASE, DO NOT THEORISE.
+# `poll cadence` has reported `median 34ms p90 50ms max 11964ms` -- a single
+# outlier tick per window -- in every window since the log began at 20:15 on
+# 09-16. Four explanations were ruled out by MEASUREMENT before this went in:
+#   the host          4 vCPU, load 0.41, the bot at 18% of one core
+#   a blocked loop    the WS drain EMPTIES its queue (139-421 frames against a
+#                     512 cap), so the reader task ran throughout any stall
+#   Store.counts()    18 ms warm, timed against the live 502 MB DB
+#   the lag itself    the ~120 ms floor is venue DELIVERY latency, measured in
+#                     book.py by changing only the backlog cap
+# What is left is one of the four phases in `Bot.run`, three of which touch the
+# network, and the only honest way to pick one is to have the slow tick say
+# which it was. It did, on its very first fire (2026-09-17 09:38:38):
+#     slow tick 8.39s: tick 32ms | backfill 8084ms | settle 0ms | claims 273ms
+#                      | after 0ms
+# `settlement backfill` was the answer, and it is now DISPATCHED rather than
+# awaited (see the call site), so this line should not name it again: a
+# `backfill` mark that is no longer ~0ms means someone put the await back.
+# `t0`/`elapsed` deliberately EXCLUDE `_idle`, so a tick that is merely waiting
+# on the feed or the clock can never appear here.
+# 2 s is far above the 43 ms median and above the 384 ms max of a clean window,
+# so this fires on a stall and not on ordinary jitter.
+_SLOW_TICK_MS = 2_000.0
+
+
+def _phase_breakdown(t0: float, marks: list[tuple[str, float]],
+                     end: float) -> str:
+    """`tick 43ms | settle 9021ms | after 2ms` -- which phase ate the tick.
+
+    Each phase's cost is the gap to the NEXT mark, not to the tick's start, so
+    the numbers are exclusive and sum to the tick. An empty `marks` means the
+    tick raised before completing a single phase, which is itself the answer
+    (a hang inside `tick()`), so it is said rather than reported as a gap from
+    `t0` that would read as if some later phase were to blame.
+    """
+    if not marks:
+        return "no phase completed (tick raised or hung) in %.2fs" % (end - t0)
+    prev, parts = t0, []
+    for name, at in marks:
+        parts.append("%s %.0fms" % (name, (at - prev) * 1000.0))
+        prev = at
+    # Everything after the last completed phase: the `stats` block when it is
+    # due, nothing when it is not. `after` is honest about both.
+    parts.append("after %.0fms" % ((end - prev) * 1000.0))
+    return " | ".join(parts)
+
 # A MARKET attempt needs the round open only long enough to place and execute
 # (~1-2s); its order/history verdict may land after the bell. `order_min_tau_s`
 # was written for what a RETRY spans with the 9s status budget, which is the
@@ -69,6 +225,16 @@ _CLAIM_SWEEP_S = 180.0
 # processes fills into the close (live fills are booked with 0.0-0.6s of round
 # left). For market orders the retry floor is this instead; see _place_order.
 _MARKET_RETRY_TAU_FLOOR_S = 3.0
+
+# How stale the nearest spot tick may be, before the round's OPEN, for
+# `_pm_strike_backfill` to accept it as that round's strike. It is a SAFETY
+# bound, not an accuracy target: on a live websocket the newest tick is 10-50 ms
+# old (BTC bookTicker runs 33-114 updates/s), so this only ever fires when the
+# tape has stalled or the process booted after the round opened -- and both of
+# those must produce NO strike rather than a price from the wrong minute. The
+# error from being `d` seconds early is ~sigma_1m*sqrt(d/60): 0.1-0.2 bps at a
+# tick's lag, ~1.8 bps for a whole 2 s at a volatile coin's 10 bps/min.
+_PM_STRIKE_TICK_TOL_MS = 2_000
 
 # Quote warm-up for the cross arm (see Bot._prefetch_cross_quote): refresh at
 # most this often while a family is in its tradeable window, and consume the
@@ -159,8 +325,117 @@ def arm_of(sig) -> str:
             else "CROSS")
 
 
+def pm_take_via_fak(settings, broker, limit_ceiling) -> bool:
+    """True when a Polymarket TAKE arm must skip `buy_limit` and go to `buy_fak`.
+
+    `PmBroker.buy_limit` posts with `post_only=True` -- a MAKER order. A take arm
+    cannot use it. A post-only order is REJECTED whenever its limit reaches the
+    ask ("invalid post-only order: order crosses book", logged live), and when it
+    does not reach the ask it RESTS and waits for the market to come back to it.
+    Measured on the two orders that got through after the stake-cap fix
+    (2026-09-17 03:44, eth-updown-15m and eth-updown-5m): `limit post ... 0.84`
+    against a quote of 0.8227 -> POST accepted, the order rested, and it expired
+    unfilled after 6053 ms while the SAME round's fine trace read 0.970 five
+    milliseconds after the fire and 0.99 by the end. Both arms' cells are priced
+    AT THE ASK (`tools/pm_ask_at_trigger.py`: what pays is win - ask - fee), so on
+    Polymarket they have to TAKE.
+
+    `buy()` IS the taker path, and with `pm_order_type = "fak"` it routes to
+    `buy_fak()`: FAK == IOC, atomic, remainder KILLED, so no leftover order is
+    left resting as bait. It costs +153 ms measured (414 vs 261 ms) against a
+    horizon that is already binding, so it is opt-in -- and this returns True only
+    when all three hold: the knob says "fak", the broker HAS `buy_fak`
+    (Polymarket; the Binance wrapper rejects IOC outright with -1102 and has no
+    such method), and the caller is a TAKE arm (`limit_ceiling` is set by the
+    cross/train path and is None for the model arm, whose limit is a real resting
+    bid).
+
+    WHAT IT DOES NOT FIX: a ceiling that is already stale. In the 03:44 orders the
+    ceiling (0.84) sat BELOW the venue's ask by the time the POST landed, so a FAK
+    would also have come back `fak_unfilled`. This makes the order sendable; it
+    does not make it fill.
+    """
+    if limit_ceiling is None:
+        return False
+    if not hasattr(broker, "buy_fak"):
+        return False
+    return str(getattr(settings, "pm_order_type", "limit")).lower() == "fak"
+
+
+async def venue_top(token: str):
+    """The VENUE's own top of book for one token, or None. NEVER raises.
+
+    `GET /book?token_id=` is READ-ONLY and it is the only source in this process
+    that can disagree with our own ladder -- which is what makes it the right
+    base for a take price. MEASURED 2026-09-18: `sweep()` read 0.42 for a Down
+    token while the venue's own book read 0.69 AT THE SAME INSTANT, the limit
+    went out at 0.54 off the 0.42, and the FAK answered "no orders found to
+    match". Our ws book had a phantom level the venue did not have.
+
+    Same call the shadow probe makes (`Bot._shadow_quote`), same timeouts, and
+    deliberately NOT shared with it: a probe that cannot report its own absence
+    is not a measurement, so it keeps its own failure line rather than this one
+    swallowing the difference between "no book" and "the read failed".
+
+    Returns None on any failure -- the caller falls back to its old base and logs
+    it, because an unreadable venue book is not a reason to refuse a trade the
+    arm's own gates already approved.
+
+    ⛔ TIGHTER TIMEOUTS THAN THE PROBE'S. The probe sits on a task of its own and
+    can afford 3/4 s; this one is INSIDE the order path, where a hung connect
+    would push the order towards the bell. Measured: a book fetch is 50-300 ms,
+    so 2 s is generous -- and with the entry floor (`order_min_tau_s`, 5 s) it
+    keeps the worst case (2 s fetch + ~0.7 s FAK) inside the round with margin.
+    """
+    try:
+        import aiohttp
+
+        from btcpredict.venues.polymarket.book import PmBook
+        to = aiohttp.ClientTimeout(total=None, connect=2.0, sock_read=2.0)
+        async with aiohttp.ClientSession(timeout=to) as s:
+            return await PmBook.fetch_top(s, token)
+    except Exception as exc:                                  # noqa: BLE001
+        log.warning("venue book fetch failed (%s): %s: %s", token[:14],
+                    type(exc).__name__, exc)
+        return None
+
+
+def ws_follow_rounds(round_cache, mkt, primary, follow_all) -> list:
+    """The rounds the book socket must subscribe to.
+
+    ⛔ NOT `_mkt`. `_mkt` is filled BY `_record`, and `_record` needs a BOOK;
+    the book arrives from this very socket. Subscribing from `_mkt` closes that
+    loop on itself -- a family that is not priced can never be subscribed, and a
+    family that is never subscribed can never be priced. MEASURED 2026-09-17:
+    `pm book ws connected (12 assets)` = 6 families (btc/eth/bnb x 5m/15m), and
+    sol/xrp/doge sat at `not live` for hours with every one of their triggers
+    refused as `no ask on the book` -- an ABSENCE, so nothing logged it as an
+    error and the log looked like "the market is quiet".
+
+    `round_cache` is the family set that exists BEFORE any book does -- it is
+    what the once-a-minute liveness line already reports as "9/9 cached" -- so it
+    is the source that breaks the loop. `PmBookView.follow` expands a Round into
+    its two token ids itself (up first), so every cached family is subsumed by
+    one socket.
+
+    Order: every cached round when `follow_all`; else the priced rounds filtered
+    to the primary family; else the primary's cached round; else [] (which
+    `follow` treats as "leave the subscription alone").
+    """
+    if follow_all:
+        rs = [r for r in (round_cache or {}).values() if r is not None]
+        if rs:
+            return rs
+    rs = [c["round"] for _pfx, c in (mkt or {}).items()
+          if c.get("round") is not None and (follow_all or _pfx == primary)]
+    if rs:
+        return rs
+    r0 = (round_cache or {}).get(primary)
+    return [r0] if r0 is not None else []
+
+
 def crossed_side(ticks, strike: float, look_s: float,
-                 slack_s: float = 2.0) -> str | None:
+                 slack_s: float = 2.0, hold_s: float = 0.0) -> str | None:
     """Which side did the spot just cross INTO, or None if it did not.
 
     `ticks` is chronological (ts_ms, price). Returns "Up"/"Down" when the newest
@@ -170,6 +445,23 @@ def crossed_side(ticks, strike: float, look_s: float,
     The reference tick must not be STALER than look_s + slack: an old crossing
     is not a fresh one, and the venue has had time to reprice it. Same guard
     `impulse_bps` applies for the same reason.
+
+    `hold_s` IS THE PERSISTENCE REQUIREMENT, and it exists because ONE PRINT is
+    not a crossing. MEASURED 2026-09-18 on `btc-updown-5m-1789711500`: the spot
+    sat at 77552.85 for 25 s, printed **77560.04 for a single second** (+0.33 bps
+    over the level, and past tau=60 `fc` IS the spot, so that print was the whole
+    signal), and was back under the level 5 s later. The venue repriced to the
+    print -- 0.51/0.50 -> 0.60/0.41 -- so the FAK paid 0.600 for a book that was
+    0.41 five seconds later, and the round finished -4.60 bps against the level.
+    The old rule's only freshness requirement was look_s = 1.0 s, so a lone wick
+    was enough.
+
+    With `hold_s > 0` the side must have been HELD for at least that long --
+    the trailing run of the newest tick's side, measured back to the last tick
+    on the other side -- and the crossing may then be at most `hold_s + look_s`
+    old, so a sustained cross is not refused for being stale by the time it is
+    proven. `hold_s = 0` keeps the original path verbatim (a dense oscillating
+    tape must not change meaning under a zero knob).
     """
     if not ticks or strike is None or strike <= 0:
         return None
@@ -177,15 +469,297 @@ def crossed_side(ticks, strike: float, look_s: float,
     if not px_now or px_now <= 0:
         return None
     side_now = "Up" if px_now > strike else "Down"
-    target = ts_now - int(look_s * 1000)
-    oldest = ts_now - int((look_s + slack_s) * 1000)
+    if hold_s <= 0:
+        target = ts_now - int(look_s * 1000)
+        oldest = ts_now - int((look_s + slack_s) * 1000)
+        for ts, px in reversed(ticks[:-1]):
+            if ts > target:
+                continue
+            if not px or px <= 0 or ts < oldest:
+                return None
+            return (side_now
+                    if ("Up" if px > strike else "Down") != side_now else None)
+        return None
+    # THE TRAILING RUN of `side_now`, back to the last tick on the other side.
+    run_start = ts_now               # the newest tick alone is a run of zero
+    other_ts = None
     for ts, px in reversed(ticks[:-1]):
-        if ts > target:
+        if not px or px <= 0:
             continue
-        if not px or px <= 0 or ts < oldest:
-            return None
-        return side_now if ("Up" if px > strike else "Down") != side_now else None
+        if ("Up" if px > strike else "Down") == side_now:
+            run_start = ts
+            continue
+        other_ts = ts
+        break
+    held_ms = ts_now - int(run_start)
+    if held_ms < int(hold_s * 1000.0):
+        return None                  # a print, not a crossing: it did not hold
+    if held_ms > int((hold_s + look_s) * 1000.0):
+        return None                  # held, but the crossing is no longer fresh
+    if other_ts is None:
+        return None                  # the tape starts inside the run
+    if run_start - other_ts > int(slack_s * 1000.0):
+        return None                  # a gap, not a measured transition
+    return side_now
     return None
+
+
+#: Tolerance for the tick-depth floor, IN TICKS. See `passes_depth_floor`.
+DEPTH_TICKS_EPS = 1e-6
+
+#: The window Polymarket's payout rule averages: `{twapLookbackSeconds: 60}` on
+#: the `chainlink-<sym>-usd-twap-60s` stream. See config.cross_ref_twap.
+TWAP_REF_LOOKBACK_S = 60.0
+
+#: How far the tape may miss the window's OPEN and its CLOSE and still be
+#: averaged. Both are bounds on a MEASUREMENT, not accuracy targets: the
+#: reference is a 60 s mean, so a sample missing off one end shifts the mean by
+#: (gap/60) x (the price move over that gap) -- ~0.2 bps for a 2 s gap on a
+#: 5 bps/minute coin. Wider than this and the window is not the window.
+TWAP_REF_EDGE_TOL_MS = 2_000
+TWAP_REF_LAST_TOL_MS = 3_000
+
+#: Fewest samples the window must hold. At the live spot rates (33-114
+#: updates/s) a full 60 s window holds thousands; at the 1 Hz poll cadence it
+#: holds ~60. Below this the tape does not describe a 60 s average at all.
+TWAP_REF_MIN_N = 4
+
+#: Attempts at reading the reference window off the 1 s KLINES when the spot
+#: tape cannot cover it (a process that booted after the open). Three, one per
+#: poll: the read is a single small REST call and the round lasts minutes, so
+#: the budget is about surviving a transient failure rather than about cost.
+#: After it, `_cross_level` uses `r.strike` and says so at WARNING -- measured
+#: 2026-09-18 to be a real risk, not the "no new risk" the old note claimed.
+CROSS_LEVEL_KLINE_TRIES = 3
+
+#: How long after a CLAIM a spent-slot tick is still reporting THAT entry rather
+#: than a second crossing. `_cross_fired` is stamped with the claim, before the
+#: order, so the next tick evaluating the same crossing finds the slot spent.
+#: MEASURED 2026-09-18 over the Polymarket era, each cap row against its round's
+#: own `cross into` row (n=40): 35 within 1.43 s, one at 5.5 s, and the three
+#: genuinely later crossings at 10.4 / 23.8 / 41.6 s. The band 5.5-10.4 s is
+#: EMPTY, so this is a separator rather than a fitted value -- anything in it
+#: gives the same answer. Only the RECORD is suppressed; the cap itself is
+#: unchanged, and the entry being reported still has its own `cross into` row.
+CROSS_DUP_TICK_MS = 7_000
+
+
+def twap_reference(ticks, start_ms: int,
+                   look_s: float = TWAP_REF_LOOKBACK_S) -> float | None:
+    """The level Polymarket settles against, from the spot tape: or None.
+
+    The payout rule for these markets is the `chainlink-<sym>-usd-twap-60s`
+    stream compared at the bell against the SAME stream at the open, so the
+    level is the trailing `look_s` mean of the underlying AT THE OPEN -- not the
+    spot at the open instant, which is what `r.strike` holds. Measured on 1,509
+    live Polymarket rounds this reproduces the venue's own winner 94.1% against
+    89.1% for the point (McNemar z +7.31); see config.cross_ref_twap for the
+    tables and for why this does not contradict `_pm_strike_backfill`.
+
+    `ticks` is chronological (ts_ms, price), the same tape `crossed_side` reads.
+    FAILS CLOSED TO NONE -- on a window the tape does not bracket, on too few
+    samples, on a non-positive price, and on a `start_ms` that has not happened
+    yet (a pre-open round has no reference; the level is not a forecast). The
+    caller falls back to `r.strike`, which is the behaviour that shipped before
+    this existed, so an unavailable reference is never a NEW risk.
+
+    A mean of the window's SAMPLE prices, not a time-weighted integral: the
+    venue streams a 60 s TWAP that updates ~1/s, so the two agree to the
+    sampling, and the tape is irregular enough that a plain mean is the honest
+    reading of "what did it say on average" rather than a re-weighting the
+    venue does not do.
+    """
+    if not ticks or start_ms is None:
+        return None
+    now_ms = int(time.time() * 1000)
+    if int(start_ms) > now_ms:
+        return None
+    lo = int(start_ms) - int(look_s * 1000.0)
+    hi = int(start_ms)
+    px: list[float] = []
+    first = last = None
+    # Newest-first is the cheap direction: the window is at the END of the tape.
+    for ts, p in reversed(ticks):
+        ts = int(ts)
+        if ts >= hi:
+            continue
+        if ts < lo:
+            break
+        if not p or p <= 0:
+            continue
+        px.append(float(p))
+        # `last` is the NEWEST sample inside the window and this loop walks
+        # newest-first, so it is taken ONCE. Assigning it every pass leaves the
+        # OLDEST tick in it, which makes `hi - last` the whole window and
+        # refuses every round -- the first version of this did exactly that.
+        if last is None:
+            last = ts
+        if first is None or ts < first:
+            first = ts
+    if len(px) < TWAP_REF_MIN_N or first is None or last is None:
+        return None
+    if (first - lo) > TWAP_REF_EDGE_TOL_MS:
+        return None                     # the window's open is not covered
+    if (hi - last) > TWAP_REF_LAST_TOL_MS:
+        return None                     # the tape stopped before the open
+    return sum(px) / len(px)
+
+
+def twap_forecast(ticks, tau_now_s: float,
+                  look_s: float = TWAP_REF_LOOKBACK_S,
+                  now_ms: int | None = None
+                  ) -> list[tuple[int, float]] | None:
+    """The tape as the VENUE'S OWN STATISTIC: the projected 60 s mean, per tick.
+
+    WHY THE ARM NEEDS THIS. The payout is `TWAP60(at the bell) >= TWAP60(at the
+    open)`, so the variable that decides money is a 60 s MEAN. `crossed_side`
+    fires when the SPOT crosses the level, and inside the arm's own tau window
+    (5-60 s) that spot is largely about to be averaged away:
+
+        forecast(ts) = ((look_s - tau) * mean(spot over [ts-look_s, ts])
+                        + tau * spot) / look_s
+
+    At tau = 20 s the settlement window is 67% printed, at tau = 5 s it is 92%.
+    Feeding these values to `crossed_side` in place of the spot makes the
+    trigger fire on the number the venue pays on -- the fix for the loss family
+    "the spot crossed, the mean never did". See config.cross_fc_trigger for the
+    measured head-to-head and for what it costs.
+
+    `tau_now_s` is the round's tau NOW; each tick's own tau is that plus the
+    tick's age, because the tape is chronological. Before the settlement window
+    has started (tau > look_s) there is no printed part to project FROM, so the
+    value is the spot itself: zero-variance and unbiased for a martingale's
+    future 60 s mean, and the SAME object `honest_fc` substitutes in
+    `tools/pm_cross_replay.py`.
+
+    That branch is not decoration as of 2026-09-18: `cross_max_tau_s` went
+    60 -> 180, so the arm now ACTS in tau 60-180, where this returns the spot.
+
+    ⛔ THE WINDOW. `TWAP60(bell)` averages `[bell - 60 s, bell]`, so at `ts` the
+    PRINTED part of it is `[bell - 60 s, ts]` -- a FIXED left edge and a moving
+    right one. This function used to average `[ts - 60 s, ts]` instead: the
+    whole trailing minute at every tau, so at tau=30 it averaged 30 seconds the
+    paid window will never contain, and at tau=5 it averaged 55 of them.
+    MEASURED over 400,079 (round, second) forecasts
+    (`tools/pm_fc_formula_check.py`), MAE in bps against the REALIZED
+    `TWAP60(bell)` computed from the same tape:
+
+        tau          code    fixed        tau          code    fixed
+        [ 0,10)     0.155    0.042        [30,40)     0.990    0.812
+        [10,20)     0.431    0.182        [40,50)     1.307    1.235
+        [20,30)     0.689    0.437        [50,60)     1.844    1.843
+
+    and the two are IDENTICAL at tau >= 60 (verified: max |code - fixed| = 0.0),
+    where the branch below returns the spot. The strategy agrees at the taus the
+    arm trades: at tau 5-60 the fixed window wins 58.0% against 54.1% and
+    +0.0787 against +0.0517 per share on the same rounds, day-clustered t +4.32
+    against +1.77. A 30 s mean and a 60 s mean are the same number only at
+    tau=0, and the arm spends its whole life at tau > 0.
+
+    `now_ms` defaults to the wall clock. It exists for the REPLAY tools, which
+    project a historical tape: passing the round's newest sample's `ts_ms` and
+    its `tau_s` reproduces each tick's own tau exactly -- `tau(now) + age` is
+    `(end - ts)/1000` again -- so a backtest cannot compute a different number
+    from the one the live arm computes.
+
+    Returns None when the tape cannot describe a 60 s mean -- too few samples,
+    or a newest sample staler than `TWAP_REF_LAST_TOL_MS`. The CALLER falls back
+    to the spot, which is the behaviour that shipped before this existed, so an
+    unavailable forecast is never a new risk.
+    """
+    if not ticks or tau_now_s is None:
+        return None
+    now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    px_all = [(int(ts), float(p)) for ts, p in ticks if p and float(p) > 0]
+    if len(px_all) < TWAP_REF_MIN_N:
+        return None
+    # THE PAID WINDOW'S OPEN, a fixed instant: `bell - look_s`. See the ⛔ above
+    # -- this was `ts - look_s`, which is the wrong window at every tau > 0.
+    window_open_ms = (int(now_ms + float(tau_now_s) * 1000.0)
+                      - int(look_s * 1000.0))
+    lo_idx = 0
+    roll = 0.0
+    out: list[tuple[int, float]] = []
+    for i, (ts, p) in enumerate(px_all):
+        roll += p
+        # TWO POINTERS, so the whole tape costs O(n). The left edge only ever
+        # moves right, so each sample enters and leaves the sum once.
+        while lo_idx <= i and px_all[lo_idx][0] < window_open_ms:
+            roll -= px_all[lo_idx][1]
+            lo_idx += 1
+        n = i - lo_idx + 1
+        tau = max(0.0, float(tau_now_s) + (now_ms - ts) / 1000.0)
+        if tau >= look_s:
+            # NOTHING IS PRINTED YET: a martingale's future 60 s mean is the
+            # spot, and the window above holds samples from BEFORE this tick
+            # that the paid window will not contain.
+            out.append((ts, p))
+            continue
+        # COVERAGE, the same guard `twap_reference` applies: the printed part of
+        # the window has to BE on the tape. A tape that starts 38 s into it (a
+        # fixture, or a stalled feed) would otherwise average 2 samples and call
+        # the result a 40 s mean. When it is not covered the spot is the honest
+        # answer -- at tau just under the boundary the weight on the mean is
+        # (look_s - tau)/look_s < 5%, so this is also the continuous choice.
+        if (n < TWAP_REF_MIN_N
+                or px_all[lo_idx][0] - window_open_ms > TWAP_REF_EDGE_TOL_MS):
+            out.append((ts, p))
+            continue
+        mean = roll / n
+        out.append((ts, ((look_s - tau) * mean + tau * p) / look_s))
+    if not out:
+        return None
+    if (now_ms - out[-1][0]) > TWAP_REF_LAST_TOL_MS:
+        return None                     # the tape stopped: no fresh reading
+    return out
+
+
+def depth_in_ticks(spot: float, strike: float, market: str | None) -> float:
+    """How far through the strike the spot is, in TICKS of THIS market's spot.
+
+    THE single definition of that conversion, shared by the live arm
+    (`Bot._cross_tick`) and by every tool that replays the gate. It has to be
+    shared, because `cross_tick_size` is the EXCHANGE tick of the UNDERLYING and
+    not the 0.01 probability tick on the CLOB, and it is overridable PER MARKET
+    (XRP 0.0001, DOGE 0.00001). A caller that reads the global setting instead
+    of `cross_knob` prices those families off a floor that swamps their ceiling
+    -- an EMPTY band, in which the arm can never fire and nothing says so. That
+    is exactly how xrp and doge sat inert for their whole lives; see
+    config.cross_min_depth_ticks and tests/test_depth_band_per_family.py.
+    """
+    tick = cross_knob(market, "tick_size") or 0.01
+    return abs(spot - strike) / tick
+
+
+def passes_depth_floor(spot: float, strike: float, market: str | None,
+                       floor_ticks: float | None = None) -> bool:
+    """Is the crossing at least `min_depth_ticks` ticks through the strike?
+
+    STRICTLY shallower is refused, so a depth exactly ON the floor passes --
+    the tolerance exists to make the boundary land on the intended side, and it
+    is why the tolerance must be in TICKS.
+
+    A fixed absolute epsilon cannot do this job. `abs(spot - strike)` is a
+    difference of two doubles, so its error is the ULP of a number of the SPOT's
+    size: 1.46e-11 at BTC's ~7.6e4. The `- 1e-12` this replaces was 14x SMALLER
+    than that, so it refused crossings sitting exactly on the floor. MEASURED
+    LIVE: 3 of 154 floor refusals, each logging
+
+        only 1 tick(s) through the strike, floor is 1
+
+    i.e. refusing a crossing while stating its depth equals the floor. Dividing
+    by the tick first makes the error scale-free -- 1e-6 ticks clears BTC's
+    1.5e-9, XRP's 2.2e-12 and DOGE's 5e-12 by three orders of magnitude.
+
+    `floor_ticks` overrides the market's configured floor. It exists for sweeps
+    that RANK values rather than apply them (`tools/cross_15m_calibrate.py`);
+    nothing in the live path passes it.
+    """
+    if floor_ticks is None:
+        floor_ticks = cross_knob(market, "min_depth_ticks") or 0.0
+    if floor_ticks <= 0:
+        return True
+    return depth_in_ticks(spot, strike, market) >= floor_ticks - DEPTH_TICKS_EPS
 
 
 def maker_limit_px(fair_side: float, quote: float | None,
@@ -221,11 +795,43 @@ def sec_into_candle(now_ms: int) -> int:
     return (now_ms // 1000) % 60
 
 
+def symbol_for_round(r) -> str:
+    """The underlying a round is ABOUT, resolved from its SLUG.
+
+    Never `r.symbol`: the venue builds every family's round through one
+    `PmMarketFeed` whose `symbol` defaults to BTCUSDT, so eth/bnb/sol rounds all
+    arrive stamped "BTCUSDT" (measured 2026-09-16 -- see SYMBOL_BY_PREFIX in
+    config). A per-symbol lookup keyed on `r.symbol` silently reads BTC's data
+    for every family, which is what turned a 9.4bps BNB round into "already
+    moved 1109.7bps" and refused it.
+
+    Falls back to `r.symbol` only when the slug names a family that is not in
+    MARKETS, so fixtures and single-market tests keep working.
+    """
+    sym = SYMBOL_BY_PREFIX.get(market_prefix(getattr(r, "slug", "") or ""))
+    return sym or getattr(r, "symbol", "") or ""
+
+
+def _stamp_symbol(r, prefix: str):
+    """Fix up `r.symbol` as the round enters the cache.
+
+    `symbol_for_round` is the guard the arms read, but a wrong `r.symbol` also
+    reaches the DB (`rounds.symbol`) and any future reader, so it is corrected
+    at the source too. Both cache-fill sites go through here rather than
+    relying on the arms remembering to use the helper.
+    """
+    want = SYMBOL_BY_PREFIX.get(prefix)
+    if want and getattr(r, "symbol", None) != want:
+        with contextlib.suppress(Exception):       # frozen/slots fixtures
+            r.symbol = want
+    return r
+
+
 def round_row(r: Round) -> dict:
     up, down = r.up, r.down
     return {
         "slug": r.slug, "market_topic_id": r.market_topic_id, "market_id": r.market_id,
-        "condition_id": r.condition_id, "symbol": r.symbol,
+        "condition_id": r.condition_id, "symbol": symbol_for_round(r),
         "start_ms": r.start_ms, "end_ms": r.end_ms,
         "strike": r.strike, "end_price": r.end_price,
         "fee_rate_bps": r.fee_rate_bps,
@@ -278,6 +884,16 @@ class Bot:
         # --resume deliberately clears a persisted halt (fresh daily budget).
         self.resume_guard = False
         self.broker = None
+        # Polymarket-only holders; left None on the Binance path so the venue
+        # can be checked without a hasattr.
+        self._pm_book = None
+        self._pm_book_task = None
+        self._pm_broker = None
+        #: The `PredictionBook`-shaped view over `_pm_book`. This is what the
+        #: arms actually read through (`self.ws_book`).
+        self._pm_view = None
+        #: Slugs already handed to the broker's per-round cache.
+        self._pm_seen: set[str] = set()
         # Read-only client for the authenticated order book. Available in every
         # mode, so paper trading prices against the same book as live.
         self.book: LiveBroker | None = None
@@ -296,6 +912,7 @@ class Bot:
         # sweep_claims). 0.0, so the first tick after a restart picks up any
         # claim a crash or a venue rejection left stranded.
         self._last_claim_sweep = 0.0
+        self._last_bankroll_refresh = 0.0
         self.bankroll = settings.bankroll_usdt
         # -- fast impulse path (see _impulse_tick) --------------------------
         # The current round and the last executable asks seen for it, refreshed
@@ -311,6 +928,21 @@ class Bot:
         # The side already taken in a round, so a later crossing cannot buy the
         # opposite one. See config.cross_allow_reversal.
         self._cross_side: dict[str, str] = {}
+        # The LEVEL each round's crossing is measured against, memoised per
+        # slug as (level, source). Computed once per round from the spot tape
+        # (see `_cross_level`), because the window it averages is entirely in
+        # the past by the time the arm looks -- and because re-deriving it on
+        # the websocket clock would rescan a 40,000-tick tape per family per
+        # tick. See config.cross_ref_twap.
+        self._cross_ref: dict[str, tuple[float, str]] = {}
+        # How many 1 s KLINE reads have been started for a slug whose level the
+        # TAPE cannot supply (a restart), so a round that cannot be measured is
+        # retried a bounded number of times and then priced off `r.strike` with
+        # a warning. See `_cross_level` for why that order matters.
+        self._cross_kline: dict[str, int] = {}
+        # The in-flight reads themselves, slug -> task, so a second tick cannot
+        # pile another REST call onto a family that is already waiting.
+        self._cross_kline_tasks: dict[str, object] = {}
         # Warm quotes for the cross arm's NEXT crossing (see
         # _prefetch_cross_quote): token -> (monotonic_ts, stake, quote).
         self._quote_pre: dict[str, tuple[float, float, dict]] = {}
@@ -370,7 +1002,12 @@ class Bot:
             log.info("per-side gate: Down=%s Up=%s",
                      self.model.name, self.up_model.name)
 
-        if settings.has_credentials:
+        venue = registry.normalise(getattr(settings, "venue", "binance"))
+        if venue == "polymarket":
+            # Polymarket is a SECOND VENUE, not a second strategy: the arms,
+            # gates and sizing are unchanged. See _setup_polymarket().
+            await self._setup_polymarket()
+        elif settings.has_credentials:
             book = LiveBroker(self.session, settings.binance_api_key,
                               settings.binance_api_secret,
                               slippage_bps=settings.slippage_bps)
@@ -450,7 +1087,26 @@ class Bot:
         # lets a restart trade past the daily cap. 'maker' was already reachable
         # via impulse_execution and already exposed to this; it is listed now
         # because stale_maker_enabled makes the maker path routine.
-        return (("live", "double", "maker", "stale_maker", "cross", "impulse")
+        #
+        # 'train' was exactly that omission, and it cost a live deadlock --
+        # no trigger is activated by listing it, the LABEL is what is missing.
+        # MEASURED 2026-09-16 15:37 -> 2026-09-17 17:2x: the Train arm's fill on
+        # btc-updown-5m-1789572900 ($0.98, Up) was orphaned by a restart inside
+        # its settlement window. It is the only fill in the ledger with no
+        # `settlements` row, and the three queries disagreed about it --
+        # `pool_for_mode` books 'train' into the RESERVED slot and
+        # `_open_cross_stake` sums `mode IN ('cross','train')`, while this tuple
+        # omitted it, so `_restore_open_positions` never replayed it and
+        # `settle_due` could never write its settlement. The $0.98 therefore
+        # counted against `cross_max_open_stake_pct` FOREVER: on the $5.52
+        # collateral 0.98 + 1.00 > 0.30 * 5.52 = $1.66, so every crossing in
+        # every family was refused and the arm placed ZERO orders for 2.5 h.
+        # The label is BUILT (`arm_mode = "train" if train else "cross"`), not
+        # passed as a literal, which is why the source-scanning invariant test
+        # that exists to catch this could not see it -- that test now asserts
+        # the reserved-pool labels directly.
+        return (("live", "double", "maker", "stale_maker", "cross", "train",
+                 "impulse")
                 if self.broker.mode == "live"
                 else ("paper", "impulse", "maker"))
 
@@ -671,7 +1327,7 @@ class Bot:
         found = await self.market.rounds_by_prefixes([primary])
         for pfx, rr in found.items():
             if rr:
-                cache[pfx] = rr
+                cache[pfx] = _stamp_symbol(rr, pfx)
         # Everything else is refreshed OFF the poll. `rounds_by_prefixes` stops
         # paging only once every requested prefix is found, and a quiet family
         # sinks through the day (bnb-updown-5m at offset 1450 -- 30 pages,
@@ -719,7 +1375,7 @@ class Bot:
             r = cache.get(prefix)
             if r:
                 await self._record(r, sym,
-                                   trade=(prefix in CROSS_TRADED),
+                                   trade=cross_traded(prefix),
                                    primary=(prefix == primary))
         # The websocket book follows EVERY market, not just the traded one. The
         # recorded-only families had no book at all (the REST fetch in _record
@@ -754,16 +1410,64 @@ class Bot:
             # other half of that 4.15s; and `poll_ms` below reports the cadence
             # continuously, so this is monitored rather than assumed. If it
             # degrades, `cross_ws_follow_all` turns it off without a deploy.
-            ids = [c["round"].market_id
-                   for pfx, c in (getattr(self, "_mkt", None) or {}).items()
-                   if c.get("round") is not None and c["round"].market_id
-                   and (settings.cross_ws_follow_all or pfx == primary)]
-            if not ids:
-                r0 = cache.get(primary)
-                if r0 is not None and r0.market_id:
-                    ids = [r0.market_id]
-            if ids:
-                wsb.follow(ids)
+            # ROUNDS, not market ids. The wrapper addresses a market by an
+            # integer id; Polymarket addresses `btc-updown-5m-<ts>` by its own
+            # slug, and its two outcomes have SEPARATE books. Both book classes
+            # accept a Round, which is the one argument that means the same
+            # thing on either venue -- and on Polymarket `market_id` is None,
+            # so an id-based list was always EMPTY and `follow` was never
+            # called: the socket connected, ingested ~680 messages/s and was
+            # read by nothing.
+            rs = ws_follow_rounds(cache, getattr(self, "_mkt", None), primary,
+                                  settings.cross_ws_follow_all)
+            if rs:
+                wsb.follow(rs)
+                # The subscription IS the difference between a family that can
+                # be priced and one that cannot, and its failure mode is SILENCE:
+                # `_tokens` returns [] for a round with no token ids and `follow`
+                # then ignores it, while every arm on that family refuses with
+                # `no ask on the book` and the log reads as "the market is
+                # quiet". Print the counts so "18 assets" (9 families x 2) is
+                # verifiable rather than assumed.
+                tok_of = getattr(wsb, "_tokens", None)
+                toks = sum(len(tok_of(r)) for r in rs) if tok_of else 2 * len(rs)
+                if tok_of is not None and toks != 2 * len(rs):
+                    log.warning("ws follow: %d round(s) -> %d token(s); a round "
+                                "with no token ids cannot be priced",
+                                len(rs), toks)
+        # LIVENESS, once a minute. A family that is not in `_mkt` gets no
+        # quote, no book and no decision, and every one of those is an ABSENCE
+        # -- so a whole family can be dead for hours with nothing in the log.
+        # Measured 2026-09-17: xrp/sol/doge each had 0 quotes in an hour while
+        # the log said only "no trades". This line makes the per-family state a
+        # number rather than an inference.
+        self._liveness_next = getattr(self, "_liveness_next", 0.0)
+        if now_s >= self._liveness_next:
+            self._liveness_next = now_s + 60.0
+            live = sorted((getattr(self, "_mkt", None) or {}).keys())
+            cached = sorted(cache.keys())
+            # `warm` counts order-metadata cache misses actually fetched (see
+            # `PmBroker.warm`). SUCCESS IS SILENT there by design, so without
+            # this number the warm's presence is an inference from a log line
+            # that only appears on failure -- the same blindness that hid the
+            # dead first version.
+            warm = getattr(getattr(self, "_pm_broker", None), "warm_calls", None)
+            miss = [p for p, _, _ in MARKETS if p not in cached]
+            dead = [p for p, _, _ in MARKETS if p not in live]
+            # WARNING when a family is missing, DEBUG when all nine are fine.
+            # The line exists for the FAILURE case: a family that is not in
+            # `_mkt` gets no quote, no book and no decision, and every one of
+            # those is an ABSENCE, so a whole family can be dead for hours with
+            # nothing in the log. Healthy it only repeats itself -- measured 135
+            # of the ~1,600 lines in a 3-hour window, all of them "no change".
+            pat = ("families: %d/%d cached, %d live | missing cache: %s | "
+                   "not live: %s | warm %s")
+            fargs = (len(cached), len(MARKETS), len(live), miss or "-",
+                     dead or "-", "n/a" if warm is None else warm)
+            if miss or dead:
+                log.warning(pat, *fargs)
+            else:
+                log.debug(pat, *fargs)
         # AFTER the subscription, not before. The arm refuses off-primary
         # without a fresh websocket book, so evaluating first would spend the
         # poll in which a newly-appeared family could have traded -- and on a
@@ -771,22 +1475,141 @@ class Bot:
         await self._cross_all()
 
     async def _refresh_rounds(self, prefixes: list[str]) -> None:
-        """Re-sweep rolled families off the poll's critical path."""
-        try:
-            found = await self.market.rounds_by_prefixes(prefixes)
-        except Exception as e:                              # pragma: no cover
-            log.warning("round refresh failed (%s: %s)", type(e).__name__, e)
-            return
+        """Re-sweep rolled families off the poll's critical path.
+
+        ONE PREFIX PER CALL, DELIBERATELY. `rounds_by_prefixes` pages until
+        every requested prefix has been found, so a single call for all eight
+        non-primary families makes their outcomes COUPLED: one family whose
+        round is not in the listing (or is buried past the page cap) consumes
+        the whole page budget and the rest never land in the cache.
+
+        MEASURED, 2026-09-17: sol-updown-5m, xrp-updown-5m and doge-updown-5m
+        had rounds rows in the database for every round and **ZERO quotes over
+        the preceding hour**, while btc/eth/bnb had ~6,250 each. A family with
+        no cache entry is never passed to `_record`, so it gets no quote, no
+        `_mkt` entry, no websocket book, and no decision -- and because a
+        refusal is not an error, nothing said so. `pm book ws connected (12
+        assets)` = 6 markets = btc/eth/bnb only, which is the same fact seen
+        from the other end. Per-prefix calls make each family's success
+        independent of the others'.
+
+        The misses are then REPORTED. This class of failure was invisible for
+        hours because the only symptom was an absence.
+        """
         cache = getattr(self, "_round_cache", None)
         if cache is None:
             cache = self._round_cache = {}
-        for pfx, r in found.items():
+        missing: list[str] = []
+        for pfx in prefixes:
+            try:
+                found = await self.market.rounds_by_prefixes([pfx])
+            except Exception as e:                          # noqa: BLE001
+                log.warning("round refresh failed for %s (%s: %s)",
+                            pfx, type(e).__name__, e)
+                missing.append(pfx)
+                continue
+            r = found.get(pfx)
             if r:
-                cache[pfx] = r
+                cache[pfx] = _stamp_symbol(r, pfx)
+            else:
+                missing.append(pfx)
+        if missing:
+            # Not necessarily fatal on its own -- a family can legitimately have
+            # no round listed between rounds -- but if a prefix is here on every
+            # sweep it is DEAD, and that is what this line is for.
+            log.warning("round refresh: no round for %s (%d/%d cached)",
+                        ", ".join(missing), len(cache), len(MARKETS))
 
     async def _record(self, r, symbol: str, *, trade: bool,
                       primary: bool = False) -> None:
         self.store.upsert_round(round_row(r))
+        # Keep the venue broker's per-round cache on the LIVE round. Cheap and
+        # idempotent -- a set membership test once a slug is known -- and it is
+        # what makes a roll survivable, because booting only remembers the
+        # rounds that happened to be live at that moment. Guarded by the broker
+        # rather than inside, so the Binance path pays nothing.
+        if getattr(self, "_pm_broker", None) is not None:
+            self._pm_remember(r)
+            # WARM THE ORDER METADATA, OFF THE CRITICAL PATH.
+            #
+            # MEASURED 2026-09-17: a live FAK took 918-947 ms, and the httpx log
+            # shows ~490 ms of that is two GETs the SDK does before the POST --
+            # `GET /markets-by-token/<tok>` (253 ms) then `GET /clob-markets/
+            # <cond>` (238 ms). Those are its order-metadata cache resolving the
+            # market for a token. It caches (`_conditions` forever, `_markets`
+            # 600 s) but keyed by TOKEN/CONDITION, and a token IS a round side,
+            # so every order is a cold lookup. Meanwhile the book moves 1-4c in
+            # that window: five of six live FAKs came back `no orders found to
+            # match`, one of them missing by a single cent.
+            #
+            # In a THREAD (the client is blocking) so the decision loop never
+            # stalls on it. A round is registered within seconds of opening and
+            # the arms fire at tau <= 300 s, so the cache is warm long before
+            # the first order of that round.
+            try:
+                # `up.token_id` / `down.token_id` is EXACTLY how the order gets
+                # its token (see `_order`: `token = up.token_id if sig.side ==
+                # "Up" else down.token_id`). The first version of this called
+                # `r.token("Up")`, a method a PM round does not have; the
+                # AttributeError was swallowed below, so the warm never ran ONCE
+                # in 13 minutes of live trading. Warm those ids, not a guess.
+                up_r, down_r = r.up, r.down
+                toks = [t for t in (up_r.token_id if up_r else None,
+                                    down_r.token_id if down_r else None) if t]
+            except Exception as exc:                          # noqa: BLE001
+                # Loud, but ONCE per process: this is on the poll path and must
+                # never break the loop, yet a silent swallow is what hid the
+                # defect above.
+                if not getattr(self, "_warm_gripe", False):
+                    self._warm_gripe = True
+                    log.warning("pm warm: cannot read round tokens (%s %s); "
+                                "orders will pay their own lookups",
+                                type(exc).__name__, exc)
+                toks = []
+            # ⛔ A SINGLE SHARED TASK STARVED EIGHT OF THE NINE FAMILIES, and
+            # that was the whole of the order path's latency.
+            #
+            # This used to be `if toks and (task is None or task.done())`
+            # against ONE `self._warm_task`. `_record` runs for every family in
+            # `MARKETS` order, and `MARKETS[0]` is the PRIMARY -- so the primary
+            # re-dispatched its own task on every sweep, the task was therefore
+            # never `done()` by the time the next family was checked, and every
+            # other family was skipped for the life of the process.
+            #
+            # MEASURED live, 2026-09-17: the `warm` counter moves +2 per
+            # 5-minute rollover (18, 18, 18, 18, 20, 22, 22, 22, 22, 24, 26)
+            # against 18 tokens a round. Two tokens a round is not a rate, it is
+            # ONE family's round -- the primary's.
+            #
+            # The cost was the entire gap this arm has been chasing. Counting
+            # the httpx lines between `take via FAK` and the FAK ack over 16
+            # live attempts:
+            #     13 paid BOTH metadata GETs -> decision->ack median  963 ms
+            #      3 paid NEITHER            -> decision->ack median  442 ms
+            # At 963 ms the venue's price is gone -- the shadow probe read the
+            # real venue book 0.06-0.28 ABOVE our own at every fire -- so the
+            # FAK comes back `no orders found to match`, and the fills it does
+            # get are the ones where the book did not move, which is the
+            # adverse selection in the fill record.
+            #
+            # ACCUMULATE, THEN DRAIN -- see `_queue_warm_tokens`, which holds
+            # the measurement and the starvation it removes. Every family adds
+            # its tokens on every sweep and one task drains the set; it is
+            # still ONE task and ONE thread at a time, so the SDK client is
+            # driven exactly as before.
+            batch = _queue_warm_tokens(self, toks)
+            if batch:
+                br = self._pm_broker
+                t = asyncio.create_task(asyncio.to_thread(br.warm, batch))
+                # NOTHING AWAITS THIS TASK, so an exception inside the warm
+                # would be swallowed for the life of the process -- which is
+                # exactly how the first version's AttributeError stayed
+                # invisible. Report it once, from the task itself.
+                t.add_done_callback(_report_task_failure)
+                # ...and say how many it resolved, so coverage is a NUMBER in
+                # the log rather than something inferred from the counter.
+                t.add_done_callback(_log_warm_done)
+                self._warm_task = t
         feed = self.spots[symbol]
         vol = self.vols[symbol]
         # self.spot / self.vol are the PRIMARY's and are set once. They used to
@@ -801,7 +1624,7 @@ class Bot:
         now_ms = int(time.time() * 1000)
         tau = r.tau_s(now_ms)
         up, down = r.up, r.down
-        if not up or not down or r.strike is None:
+        if not up or not down:
             return
 
         spot = feed.price
@@ -844,7 +1667,7 @@ class Bot:
             # families get a real ask here instead of None. Nothing downstream
             # of this is reached for them -- _record returns on `not trade`
             # before any order path -- so this widens the TAPE, not the risk.
-            top = wsb.best(r.market_id, settings.ws_book_max_age_s)
+            top = wsb.best(r, settings.ws_book_max_age_s)
             if top is not None:
                 # Measured while it trades, so the value of this feed is a
                 # number in the log rather than an argument.
@@ -870,9 +1693,12 @@ class Bot:
         # nothing, and stamps `book_age_ms` so a replay can filter to whatever
         # freshness it wants. It cannot reach an order: the trading paths do
         # their own `wsb.best(..., ws_book_max_age_s)` lookups.
-        if (wsb is not None and r.market_id and up_ask is None
+        # `r.market_id` used to gate this, which silently disabled the stale
+        # fill on Polymarket -- where a round carries no market id at all.
+        # Whether a book exists is `wsb.best`'s answer, not the caller's.
+        if (wsb is not None and up_ask is None
                 and settings.ws_book_record_max_age_s > 0):
-            stale = wsb.best(r.market_id, settings.ws_book_record_max_age_s)
+            stale = wsb.best(r, settings.ws_book_record_max_age_s)
             if stale is not None:
                 up_bid, up_ask = stale.up_bid, stale.up_ask
                 down_bid, down_ask = stale.down_bid, stale.down_ask
@@ -895,6 +1721,23 @@ class Bot:
             "down_bid": down_bid, "down_ask": down_ask,
             "fee_rate_bps": r.fee_rate_bps,
         })
+
+        # A round with no strike is TELEMETRY ONLY, and stops here.
+        #
+        # It has no reference price, so every gate below -- the cross arm (via
+        # `_mkt`), the model, the impulse path and the double arm -- would be
+        # reasoning about a level this market was never settled against. A
+        # wrong reference is STRICTLY worse than none, because the arms gate on
+        # `strike is None` in the first place.
+        #
+        # So the quote and the spot are written and nothing else runs. That is
+        # what makes the round-notice lag and the open spot measurable for sol,
+        # xrp and doge: previously they returned BEFORE the insert, so the tape
+        # held no row for them at all and the starvation could not be diagnosed
+        # from recorded data (measured 2026-09-17: 1,233,073 quote rows, all of
+        # them btc/eth/bnb, zero for the other three families).
+        if r.strike is None:
+            return
 
         if self.mode == "record" or not trade or spot is None or tau <= 0:
             return
@@ -1003,7 +1846,8 @@ class Bot:
         if sig is None:
             pred = self.model.predict(hist.ctx(
                 price=spot, strike=r.strike, tau_s=tau, sigma_1m=sigma,
-                quote_up=buy_up, quote_down=buy_down))
+                quote_up=buy_up, quote_down=buy_down,
+                window_log_int=self._pm_window_log_int(r, symbol, tau)))
             if not pred.emitted or not (0.0 < pred.p_up < 1.0):
                 log.debug("model %s holds on %s: %s", self.model.name, r.slug,
                           pred.reason)
@@ -1016,7 +1860,8 @@ class Bot:
             if self.up_model is not None:
                 pred_up = self.up_model.predict(hist.ctx(
                     price=spot, strike=r.strike, tau_s=tau, sigma_1m=sigma,
-                    quote_up=buy_up, quote_down=buy_down))
+                    quote_up=buy_up, quote_down=buy_down,
+                    window_log_int=self._pm_window_log_int(r, symbol, tau)))
                 if pred_up.emitted and 0.0 < pred_up.p_up < 1.0:
                     up_fair = pred_up.p_up
             sig_kw = dict(
@@ -1574,9 +2419,12 @@ class Bot:
     def _round_range_bps(self, r) -> float | None:
         """How far this round has travelled, open -> now, in bps of the strike.
 
-        Read from `self._ticks`, NOT `feed.ticks`: the feed deque is 4000 ticks,
-        which at BTC's live ~114/s is 35 seconds and does not span a 5-minute
-        round. `self._ticks` is appended once per poll and holds 2400 samples.
+        Read from `self._ticks`, NOT `feed.ticks`. The feed deque's SPAN is a
+        burst rate, not a duration: 40,000 updates is ~5 minutes at BTC's live
+        ~114/s and ~35 seconds if a burst triples that, so how far back it
+        reaches is not something this gate can rely on. `self._ticks` is
+        appended once per poll and holds 2400 samples, so its span is fixed by
+        the poll cadence.
 
         Returns None when there is not enough history to judge -- callers must
         treat that as "no opinion" and NOT as a refusal, or a cold start would
@@ -1584,11 +2432,317 @@ class Bot:
         """
         if not r or not getattr(r, "strike", None):
             return None
-        buf = (getattr(self, "_ticks", None) or {}).get(getattr(r, "symbol", "")) or []
+        buf = (getattr(self, "_ticks", None) or {}).get(symbol_for_round(r)) or []
         seen = [px for t_ms, px in buf if t_ms >= r.start_ms and px > 0]
         if len(seen) < 2:
             return None
         return 1e4 * (max(seen) - min(seen)) / r.strike
+
+    def _cross_level(self, r) -> tuple[float | None, str]:
+        """(level, source) the cross arm measures its crossing AGAINST.
+
+        NOT `r.strike`, and that is the fix. `r.strike` is the spot at the open
+        INSTANT; the venue pays on `TWAP60(at the bell) >= TWAP60(at the open)`,
+        so the level to compare a crossing to is the 60 s mean at the boundary.
+        Measured on 1,509 live Polymarket rounds that mean reproduces the
+        venue's own winner 94.1% against 89.1% for the point (McNemar z +7.31
+        on 92-vs-16 discordant rounds) and it differs from `r.strike` by more
+        than 2 bps on 40% of rounds -- a band the arm's whole tick floor sits
+        inside. See config.cross_ref_twap for the tables.
+
+        Read from `self._ticks`, NOT `feed.ticks`, for the reason
+        `_round_range_bps` states: the feed deque's span is a BURST RATE rather
+        than a duration, while `self._ticks` is appended once per poll and holds
+        2400 samples -- 40 minutes, so it brackets the 60 s reference window of
+        every round the process has been alive for.
+
+        Memoised per slug. The window is entirely in the past by the time the arm
+        looks, so the answer is final and re-deriving it on the websocket clock
+        would rescan the buffer per family per tick. Two cases are NOT cached:
+        a round that has not opened yet (its reference does not exist, and
+        caching `r.strike` for it would freeze today's behaviour onto the round
+        the fix is for), and a fallback that may yet be superseded by the tape.
+
+        WHEN THE TAPE CANNOT COVER THE WINDOW -- a process that booted after
+        the open, a stalled tape, an unknown family -- the level is read from
+        Binance's 1 s klines instead, which are retrospective (see
+        `_cross_level_kline`). `r.strike` is used only when no kline answer can
+        arrive at all, and that case is a WARNING naming the strike that was
+        used. The old note here said the fallback "is exactly the behaviour that
+        shipped before this existed, so it is never a new risk", and on
+        2026-09-18 that claim cost a real entry $1.05 -- the measurement is on
+        the code below, and it is not a new risk but a swapped estimator.
+        """
+        strike = getattr(r, "strike", None)
+        if not self._ck("ref_twap", r):
+            return strike, "strike"
+        slug = getattr(r, "slug", None)
+        cache = getattr(self, "_cross_ref", None)
+        if not isinstance(cache, dict):
+            cache = self._cross_ref = {}
+        hit = cache.get(slug)
+        if hit is not None:
+            return hit
+        start_ms = int(getattr(r, "start_ms", 0) or 0)
+        if not start_ms or start_ms > int(time.time() * 1000):
+            # PRE-OPEN. A round that has not started has no reference window,
+            # and this is the one case that must not be cached.
+            return strike, "strike"
+        buf = (getattr(self, "_ticks", None) or {}).get(symbol_for_round(r)) or []
+        ref = twap_reference(buf, start_ms)
+        if ref is not None:
+            cache[slug] = (ref, "twap60")
+            return cache[slug]
+        # THE TAPE CANNOT COVER THE WINDOW -- a process that booted after the
+        # open (the round's reference minute is partly pre-boot), a stalled
+        # tape, an unknown family.
+        #
+        # ⛔ THIS USED TO GO STRAIGHT TO `r.strike`, AND THAT IS WHAT LOST
+        # `bnb-updown-5m-1789710600` ON 2026-09-18. A restart at 05:49:35 (a
+        # deploy) put the round that opened at 05:50:00 on the strike -- 752.095,
+        # the SPOT AT THE OPEN INSTANT -- while the LEVEL was 752.5447, +5.98
+        # bps away: BNB had dropped ~6 bps INTO the open, so the point sat under
+        # the mean of the minute before it. The arm fired on `fc 752.13 vs
+        # strike 752.10` = +0.47 bps, which clears the 0.25 bps floor; read
+        # against the level it is -5.51 bps, i.e. THE FLOOR REFUSES IT. The
+        # venue settled Down and the market had said so from the first tick
+        # (0.26/0.76 at the open, 0.22/0.80 at the entry, 0.01/1.00 at tau 43).
+        # One entry, -$1.05, on a rule every gate in this arm exists to block.
+        #
+        # The note that used to sit here -- "the fallback is exactly what
+        # shipped before this existed, so it is never a new risk" -- is FALSE,
+        # and false in the way that does not raise: it swaps a 60 s MEAN for a
+        # POINT, and the two differ by more than the 0.25 bps floor on ~40% of
+        # rounds.
+        #
+        # Binance's 1 s klines are RETROSPECTIVE, so unlike the tape they can
+        # still answer for a round whose reference minute predates this process
+        # -- the same REST source `_pm_strike_backfill_kline` already recovers a
+        # strike from. While that read is out this returns None, and
+        # `_cross_tick` returns on None: THE ROUND IS NOT TRADED for the poll the
+        # answer takes, rather than being priced off a level that cannot be
+        # measured. `r.strike` stays the answer, as today, only when no kline
+        # answer can ever arrive (no session, no running loop, an unknown
+        # symbol) or after `CROSS_LEVEL_KLINE_TRIES` attempts have failed -- and
+        # that case names the strike it used, at WARNING, once per round.
+        kline = getattr(self, "_cross_kline", None)
+        if not isinstance(kline, dict):
+            kline = self._cross_kline = {}
+        tries = kline.get(slug, 0)
+        answer = ("impossible" if tries >= CROSS_LEVEL_KLINE_TRIES
+                  else self._ensure_cross_level_kline(r, start_ms))
+        if answer != "impossible":
+            if answer == "started":
+                kline[slug] = tries + 1
+                if tries == 0:
+                    log.info(
+                        "cross %s: no 60s reference on the tape -- reading the "
+                        "level off the 1s klines (the round opened before this "
+                        "process started); no entry until it lands", slug)
+            return None, "kline-pending"
+        cache[slug] = (strike, "strike")
+        seen = getattr(self, "_cross_nolevel", None)
+        if not isinstance(seen, set):
+            seen = self._cross_nolevel = set()
+        if slug not in seen:
+            if len(seen) > 400:
+                seen.clear()
+            seen.add(slug)
+            log.warning(
+                "cross %s: NO LEVEL -- the tape cannot cover the reference "
+                "window and the 1s kline read did not land (see "
+                "_cross_level_kline), so this round is priced off the strike "
+                "%.6f. That is a POINT, not the 60 s mean the venue pays: on "
+                "bnb-updown-5m-1789710600 the two were 5.98 bps apart and the "
+                "difference was a -$1.05 entry on 2026-09-18", slug,
+                strike or 0.0)
+        return cache[slug]
+
+    def _ensure_cross_level_kline(self, r, start_ms: int) -> str:
+        """Start (or find) the 1 s kline read of this round's LEVEL.
+
+        'started'    -- a task is now out; the answer lands within a poll.
+        'inflight'   -- one is already out; do not pile another REST call on it.
+        'impossible' -- no session (fixtures build Bot via __new__), no running
+                        loop (a sync caller), no slug, or no symbol: nothing is
+                        coming, so the caller falls back to `r.strike`.
+
+        A TASK rather than an inline await because `_cross_level` is
+        SYNCHRONOUS: it is called once per family per tick and `_cross_tick`
+        needs its answer before it can evaluate anything. That is what lets the
+        tick fail closed for one poll instead of blocking the poll loop on a
+        REST call -- and it is why every fixture-built Bot (no session) keeps
+        the pre-change behaviour rather than timeouting a test.
+        """
+        if getattr(self, "session", None) is None:
+            return "impossible"
+        slug = getattr(r, "slug", None)
+        if not slug:
+            return "impossible"
+        if SYMBOL_BY_PREFIX.get(market_prefix(slug) or "") is None:
+            return "impossible"
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:                    # a sync caller: no task exists
+            return "impossible"
+        tasks = getattr(self, "_cross_kline_tasks", None)
+        if not isinstance(tasks, dict):
+            tasks = self._cross_kline_tasks = {}
+        live = tasks.get(slug)
+        if live is not None and not live.done():
+            return "inflight"
+        task = loop.create_task(self._cross_level_kline(r, start_ms))
+        tasks[slug] = task
+        task.add_done_callback(lambda _t, s=slug: tasks.pop(s, None))
+        return "started"
+
+    async def _cross_level_kline(self, r,
+                                 start_ms: int | None = None,
+                                 ) -> float | None:
+        """This round's LEVEL off Binance's 1 s klines -- after a RESTART.
+
+        ⛔ THE HOLE THIS CLOSES. `twap_reference` averages `self._ticks`, a
+        deque appended once per poll, so a process that started after the round
+        opened has no sample from the round's reference minute and the arm fell
+        back to `r.strike`. MEASURED 2026-09-18 on `bnb-updown-5m-1789710600`:
+        strike 752.095 against a LEVEL of 752.5447, +5.98 bps, inside a floor of
+        0.25 bps -- a -$1.05 entry on a rule the arm's own gates refuse (the
+        full measurement is in `_cross_level`). A REST kline does not care when
+        this process started.
+
+        The window is `[start - 60 s, start)`, one bar per second, and the
+        answer is the mean of their CLOSES. That is the same statistic
+        `twap_reference` computes from the tape -- a plain mean of the samples
+        in the window, one sample per second either way, rather than a
+        re-weighting the venue does not do -- and it is the one the venue
+        settles on (`chainlink-<sym>-usd-twap-60s`).
+
+        FAILS CLOSED, and harder than the strike's version, because here the
+        average IS the quantity the arm needs rather than a way to estimate a
+        point: the bar at the open (`openTime == start_ms`, which covers the
+        second AFTER the open and belongs to the next comparison) is EXCLUDED,
+        and the window must be COMPLETE -- 60 of 60 bars. A missing second is
+        not repaired by scaling the mean up, and this number is compared
+        against a 0.25 bps floor.
+
+        Note the asymmetry with `_pm_strike_backfill_kline`, which reads the 1 s
+        close at `start_ms - 1000`: a 60 s window average is a BAD STRIKE
+        (1.4-2.1 bps mean error) and a GOOD LEVEL. Same source, different
+        quantity -- do not unify them.
+
+        One caveat no source removes: the venue reads Chainlink, this reads
+        Binance, and that gap is the +-3-4 bps already documented under
+        `config.cross_ref_twap`. This closes a 6 bps BIAS, not that noise.
+        """
+        slug = getattr(r, "slug", None)
+        if start_ms is None:
+            start_ms = int(getattr(r, "start_ms", 0) or 0)
+        level = None
+        try:
+            level = await self._fetch_cross_level_kline(slug, start_ms)
+        except Exception as exc:                                   # noqa: BLE001
+            log.warning("cross level kline read failed for %s: %s: %s",
+                        slug, type(exc).__name__, exc)
+        if level is None:
+            return None
+        cache = getattr(self, "_cross_ref", None)
+        if not isinstance(cache, dict):
+            cache = self._cross_ref = {}
+        # Written BEFORE anything the tick reads: `_cross_level` treats a cache
+        # hit as the final answer, so the flag and the value cannot disagree.
+        cache[slug] = (level, "kline60")
+        log.info("cross %s: level recovered from the 1s klines: %.6f (the 60 s "
+                 "mean at the open; the spot tape could not reach the window)",
+                 slug, level)
+        return level
+
+    async def _fetch_cross_level_kline(self, slug, start_ms: int,
+                                       ) -> float | None:
+        """The 60 s mean at the open from 1 s bars, or None if not printable.
+
+        Split out from `_cross_level_kline` so a test can answer it without a
+        session; the window rule and the fail-closed reason are on that method.
+        """
+        symbol = SYMBOL_BY_PREFIX.get(market_prefix(slug or "") or "")
+        if not symbol or not start_ms:
+            return None
+        if start_ms > int(time.time() * 1000):
+            return None                     # no window exists yet, not a forecast
+        look_ms = int(TWAP_REF_LOOKBACK_S * 1000.0)
+        lo, hi = start_ms - look_ms, start_ms
+        # +2: the 60 bars in the window, plus the bar AT the open (excluded by
+        # the filter below) in case `endTime` is exclusive at the far end.
+        bars = await fetch_klines(self.session, "1s",
+                                  int(TWAP_REF_LOOKBACK_S) + 2,
+                                  symbol=symbol, end_ms=hi)
+        px: dict[int, float] = {}
+        for b in bars or ():
+            try:
+                ot = int(b[0])
+                close = float(b[4])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if lo <= ot < hi and close > 0:
+                px[ot] = close      # keyed: a duplicated bar counts ONCE
+        want = int(TWAP_REF_LOOKBACK_S)
+        if len(px) < want:
+            log.info("cross level kline for %s: %d of %d bars in the window "
+                     "-- no level from this source (a 60 s mean that is missing "
+                     "a minute is not a 60 s mean)", slug, len(px), want)
+            return None
+        return sum(px.values()) / len(px)
+
+    def _cross_signal(self, r, ticks, tau_now_s: float):
+        """(tape, name) the cross arm measures its CROSSING on.
+
+        `spot` -- the feed's own point tape -- is what shipped, and it is the
+        variable the venue averages away: the payout is
+        `TWAP60(bell) >= TWAP60(open)`, so a spot crossing 20 s from the bell is
+        two thirds of a done deal that has not happened yet. With `fc` the tape
+        fed to `crossed_side` is the projected 60 s mean instead, read from
+        `self._ticks` -- the 1 Hz poll tape whose span is fixed by the poll
+        cadence, for the reason `_round_range_bps` gives about the feed deque.
+
+        MEASURED (tools/pm_twap_trigger_check.py, PM era, tau 5-60, one entry
+        per round): per-share +0.0382 on 154 entries for the spot against
+        +0.0453 on 105 for the forecast -- better per share, and 32% fewer
+        entries, so the TOTAL at a fixed stake is lower. It is a RISK change:
+        what it removes by construction is the family where the spot crosses
+        and the mean it is about to be averaged into never does. See
+        config.cross_fc_trigger.
+
+        FALLS BACK TO THE SPOT, logged once per round, when the poll tape cannot
+        describe the window (a boot inside the last 60 s). That fallback is
+        what shipped before this existed and it is the SAME judgement
+        `_cross_level` already ships for the LEVEL, so a partial tape leaves the
+        arm in one coherent legacy mode -- old level, old signal -- rather than
+        half of each. It is NOT silent: the trigger carries `sig=spot`, so the
+        fallback cohort is separable from `sig=fc` in `decisions` and the fire
+        line.
+
+        ⛔ A first version FAILED CLOSED here (no forecast -> no trade) and was
+        backed out: 10 fixtures seed exactly this partial tape, and refusing is
+        an unmeasured change in money terms whose only live effect is the
+        post-restart window. If it is ever wanted, it needs its own measurement
+        and its own fixtures, not a ride on this one.
+        """
+        if not self._ck("fc_trigger", r):
+            return ticks, "spot"
+        buf = (getattr(self, "_ticks", None) or {}).get(symbol_for_round(r)) or []
+        fc = twap_forecast(buf, tau_now_s)
+        if fc is None:
+            seen = getattr(self, "_cross_fc_dbg", None)
+            if not isinstance(seen, set):
+                seen = self._cross_fc_dbg = set()
+            if len(seen) > 400:
+                seen.clear()
+            if getattr(r, "slug", None) not in seen:
+                seen.add(getattr(r, "slug", None))
+                log.info("cross %s: no 60s forecast on the tape, firing on the "
+                         "spot (sig=spot -- the older behaviour)",
+                         getattr(r, "slug", "?"))
+            return ticks, "spot"
+        return fc, "fc"
 
     def _train_is_fresh(self, r, thr_bps: float) -> bool:
         """Did the spot cross `thr_bps` from the strike JUST NOW?
@@ -1612,8 +2766,7 @@ class Bot:
         win_ms = int(self._ck("train_fresh_s", r) * 1000)
         if win_ms <= 0:
             return False
-        buf = (getattr(self, "_ticks", None) or {}).get(
-            getattr(r, "symbol", "")) or []
+        buf = (getattr(self, "_ticks", None) or {}).get(symbol_for_round(r)) or []
         now = int(time.time() * 1000)
         recent = [(t, px) for t, px in buf if t >= now - win_ms and px > 0]
         if not recent:
@@ -1653,8 +2806,7 @@ class Bot:
         """
         if not r.strike or thr_bps <= 0:
             return None
-        buf = (getattr(self, "_ticks", None) or {}).get(
-            getattr(r, "symbol", "")) or []
+        buf = (getattr(self, "_ticks", None) or {}).get(symbol_for_round(r)) or []
         if not buf:
             return None
         now = int(time.time() * 1000)
@@ -1780,7 +2932,7 @@ class Bot:
         with contextlib.suppress(Exception):
             wsb = getattr(self, "ws_book", None)
             if wsb is not None:
-                top = wsb.best(r.market_id, settings.ws_book_max_age_s)
+                top = wsb.best(r, settings.ws_book_max_age_s)
                 quote = top.ask(side) if top is not None else None
         self._schedule_cross_meter(r, side, "refuse", label=arm)
         with contextlib.suppress(Exception):
@@ -1850,7 +3002,7 @@ class Bot:
                          0.45, 0.50, 0.60, 0.75, 1.00):
                 await asyncio.sleep(mark - prev)
                 prev = mark
-                top = wsb.best(r.market_id, settings.ws_book_max_age_s)
+                top = wsb.best(r, settings.ws_book_max_age_s)
                 q = top.ask(side) if top is not None else None
                 txt = "n/a" if q is None else f"{q:.3f}"
                 fine.append(f"{int(round(mark * 100)):02d}={txt}")
@@ -1943,7 +3095,7 @@ class Bot:
         if not token:
             return None
         wsb = getattr(self, "ws_book", None)
-        top = (wsb.best(r.market_id, settings.ws_book_max_age_s)
+        top = (wsb.best(r, settings.ws_book_max_age_s)
                if wsb is not None else None)
         ask = top.ask(side) if top is not None else None
         if ask is None or ask <= 0:
@@ -2088,7 +3240,41 @@ class Bot:
         if not self._ck("enabled", r):
             return
         ticks = getattr(feed, "ticks", None)
-        if r is None or not ticks or r.strike is None:
+        if r is None or not ticks:
+            return
+        if r.strike is None:
+            # ⛔ A ROUND WITH NO STRIKE IS UNFIREABLE, AND IT USED TO BE SILENT.
+            # Every gate below reads `r.strike`, so this is not "no crossing"
+            # -- it is "this family cannot be evaluated at all" -- and it was
+            # the only thing in this file that could disable a whole round with
+            # no line to grep. MEASURED 2026-09-17: `sol-updown-5m-1789642800`
+            # (open 11:00:00, across the 10:59:43 -> 11:00:01 restart) sat with
+            # `strike IS NULL` for its entire life, and the log showed nothing
+            # for that round at all -- indistinguishable from a quiet market.
+            #
+            # Once per slug, not per tick: this runs on the poll loop.
+            seen = getattr(self, "_no_strike_seen", None)
+            if not isinstance(seen, set):
+                seen = self._no_strike_seen = set()
+            if r.slug not in seen:
+                if len(seen) > 400:
+                    seen.clear()
+                seen.add(r.slug)
+                log.warning("cross %s cannot be evaluated for the whole "
+                            "round: no strike (see _pm_strike_backfill_kline "
+                            "-- the round opened before this process started)",
+                            r.slug)
+            return
+        # THE LEVEL THIS ROUND'S CROSSING IS MEASURED AGAINST, resolved ONCE
+        # here and used by every depth gate below. It is the 60 s mean at the
+        # open -- what the venue pays on -- and NOT `r.strike`, which is the
+        # spot at the open instant. See config.cross_ref_twap and
+        # `_cross_level`. `train` deliberately keeps `r.strike`: its threshold
+        # is >= 15 bps, four times the +-4 bps this level moves by, so the
+        # change would be noise there while the range gate's "how far has this
+        # round travelled" is about the round's own prices, not the level.
+        level, level_src = self._cross_level(r)
+        if level is None:
             return
         # Entries already taken in THIS round. `max_per_round` is the cap.
         #
@@ -2113,8 +3299,8 @@ class Bot:
         # replay that priced neither the box nor the concentration.
         #
         # The cap also costs almost nothing, which is the measurement that
-        # settles it. `cross_max_tau_s=60` already confines this arm to the last
-        # 60s, and over 2,119 settled btc-5m rounds (1s klines, true strikes):
+        # settles it. `cross_max_tau_s` confines this arm to a slice of the
+        # round, and over 2,119 settled btc-5m rounds (1s klines, true strikes):
         #
         #   first crossing in tau 5-60   n=354   win 69.8%   med z 0.113
         #   first crossing in tau 60-300 n=2119  win 51.8%   med z 0.000
@@ -2123,6 +3309,19 @@ class Bot:
         #   hold more than one (median 0). So max_per_round=1 is not spending a
         #   ticket on noise -- it spends it in the window whose first crossing
         #   wins 69.8%, and there is usually only one to spend it on.
+        #
+        # THE 51.8% ROW IS NOT THE LATE COHORT THIS ARM NOW TRADES. Since
+        # 2026-09-18 `cross_max_tau_s` is 180, so the one slot can be spent in
+        # tau 60-180 -- and that row is UNGATED: every crossing, with no margin
+        # floor and no price band, wins 51.8% there. The entries the arm would
+        # actually take in tau 60-180 (floor 0.25 bps, ask <= 0.65, one per
+        # round) measure +0.0719 per share over 551 on the Polymarket tape
+        # (`tools/pm_tau_window.py`; table in config.cross_max_tau_s). The gate
+        # chain separates those two populations, not the tau -- so do not quote
+        # this row as a veto on the wide window. What DOES rise with the wider
+        # window is the cost of this cap: crossings in tau 60-180 that arrive
+        # after the slot is spent are dropped, and `_cross_refuse` records each
+        # one as a decision row so that population can be priced directly.
         #
         # Do not raise this cap on the strength of the old note. Re-measure if it
         # is ever revisited: `_cross_refuse` now records each cap-blocked
@@ -2134,6 +3333,8 @@ class Bot:
         # skips __init__ (the same trap `_cross_refused` hit on 2026-09-14).
         if not isinstance(getattr(self, "_cross_side", None), dict):
             self._cross_side = {}
+        if not isinstance(getattr(self, "_cross_ref", None), dict):
+            self._cross_ref = {}
         if self._cross_fired.get(r.slug, 0) >= self._ck("max_per_round", r):
             # SILENT BY DEFAULT, and that is a BIAS, not merely a gap. A
             # slot-blocked tick used to return before anything was logged OR
@@ -2161,8 +3362,34 @@ class Bot:
             # Only recorded when `crossed_side` still resolves a side: a tick
             # with no crossing would have returned at the trigger anyway, and
             # recording it would invent rows for rounds that never crossed.
-            blocked = crossed_side(list(ticks), r.strike, self._ck("look_s", r))
-            if blocked is not None:
+            blocked = crossed_side(list(ticks), level, self._ck("look_s", r),
+                                   hold_s=self._ck("hold_s", r))
+            # ⛔ NOT A SECOND CROSSING: THE TICK THAT ARRIVES WHILE THE ENTRY IT
+            # MATCHES IS GOING OUT. `_cross_fired` is stamped WITH the claim,
+            # before the order, so the very next tick evaluating the SAME
+            # crossing finds the slot spent and used to log "crossing DROPPED,
+            # priced for the counterfactual only" and write a decision row for a
+            # crossing that WAS entered. MEASURED 2026-09-18 against each round's
+            # own `cross into` row: of the 40 rows this branch had written, 35
+            # sat within 1.43 s of the entry, 1 at 5.5 s, and only 3 were
+            # genuinely later crossings (10.4 / 23.8 / 41.6 s), plus 1 round that
+            # never entered at all -- so 87.5% of the population the
+            # counterfactual is priced from described entries that were TAKEN,
+            # and any "should the cap be raised" reading of it is biased the
+            # wrong way. That is the entire reason the row exists.
+            #
+            # The live shape: `btc-updown-5m-1789710900`, where this line
+            # printed 6 ms after the fire and the order lines that followed
+            # belonged to that same fire.
+            #
+            # The duplicate is not made SILENT: the `cross into` row for the
+            # entry it is reporting IS the record of it, and it is written once.
+            lm = getattr(self, "_cross_last_ms", None)
+            claimed = lm.get(r.slug) if isinstance(lm, dict) else None
+            duplicate = (claimed is not None
+                         and int(time.time() * 1000) - claimed
+                         <= CROSS_DUP_TICK_MS)
+            if blocked is not None and not duplicate:
                 self._cross_refuse(
                     r, blocked,
                     f"slot already used this round "
@@ -2178,8 +3405,28 @@ class Bot:
         # it had already fired and the per-round cap would never bind.
         live = {c["round"].slug for c in (getattr(self, "_mkt", None) or {}).values()
                 if c.get("round") is not None} | {r.slug}
-        self._cross_fired = {k: v for k, v in self._cross_fired.items() if k in live}
-        self._cross_side = {k: v for k, v in self._cross_side.items() if k in live}
+        # `getattr`, not attribute access. These two live only in `__init__`,
+        # and this method is reached from the trigger loop -- which is entered
+        # by a Bot that has already been constructed -- but NOT only that way:
+        # the impulse trigger can run against a partially-built Bot and the
+        # result is `AttributeError: 'Bot' object has no attribute
+        # '_cross_fired'`, raised inside the trigger loop's `except Exception`
+        # and therefore logged as a generic "impulse trigger failed" once per
+        # tick while the cross arm silently does nothing. The rest of this file
+        # already guards these two attributes by hand (`isinstance(..., dict)`
+        # above, `getattr` below); this is the one unguarded read.
+        self._cross_fired = {k: v for k, v in
+                             getattr(self, "_cross_fired", {}).items()
+                             if k in live}
+        self._cross_side = {k: v for k, v in
+                            getattr(self, "_cross_side", {}).items()
+                            if k in live}
+        self._cross_ref = {k: v for k, v in
+                           getattr(self, "_cross_ref", {}).items()
+                           if k in live}
+        self._cross_kline = {k: v for k, v in
+                             getattr(self, "_cross_kline", {}).items()
+                             if k in live}
         now_ms = int(time.time() * 1000)
         tau = r.tau_s(now_ms)
         # ---- TRAIN TRIGGER (config.cross_train_*) --------------------------
@@ -2289,8 +3536,41 @@ class Bot:
         cap_per_day = self._ck("max_per_day", r)
         if cap_per_day > 0 and self._cross_count >= cap_per_day:
             return
+        # THE VARIABLE THE CROSSING IS READ ON. `spot` is the point price;
+        # `fc` is the venue's own statistic, the projected 60 s mean it pays on.
+        # `sig_name`/`sig_px` ride into the fire line and the trigger's reason,
+        # so the two cohorts are separable in the DB rather than assumed -- the
+        # same idiom `ref=twap60` uses for the level.
+        sig_name, sig_px = "spot", getattr(feed, "price", None)
         if not train:
-            side = crossed_side(list(ticks), r.strike, self._ck("look_s", r))
+            sig_ticks, sig_name = self._cross_signal(r, ticks, tau)
+            sig_px = sig_ticks[-1][1] if sig_ticks else sig_px
+            side = crossed_side(list(sig_ticks), level, self._ck("look_s", r),
+                                hold_s=self._ck("hold_s", r))
+            # ⭐ THE TRIGGER'S OWN MARGIN, not the spot's. `crossed_side` fires on
+            # the FIRST tick past the level, so every entry is BY CONSTRUCTION a
+            # zero-margin entry -- and that is the weak cohort. Measured on the
+            # live record (tools/pm_twap_trigger_check.py, fc entries, tau 5-60,
+            # n=149, one per round): |fc-level| 0-1 bps wins 56.6% for +0.0054/sh
+            # with halves +0.0766/-0.0646, while 1-2 bps wins 71.4% for +0.1715
+            # (halves +0.2247/+0.1231) and 2-3 bps 77.8% for +0.1886. 76% of all
+            # entries sit in the 0-1 bucket, and a floor there raises the TOTAL
+            # as well as the per-share. The live fires of 09-17/18 are the same
+            # shape: three of four sat at 0.00 bps and lost, the winner at 2.0.
+            # The DEPTH floor below still reads the spot, so this is the only
+            # gate that measures the variable the trigger actually uses.
+            # See config.cross_min_margin_bps.
+            floor = self._ck("min_margin_bps", r)
+            if side is not None and floor > 0 and level:
+                margin = 1e4 * (sig_px - level) / level
+                if abs(margin) < floor:
+                    self._cross_refuse(
+                        r, side,
+                        f"only {margin:+.2f} bps of its own margin past "
+                        f"{level_src} at tau {tau:.0f}s, floor is {floor:.2f} "
+                        f"(sig={sig_name})",
+                        tau=tau, spot=getattr(feed, "price", None))
+                    return
         if side is None:
             # No crossing this tick: keep a quote WARM for the side the next
             # crossing would buy (see _prefetch_cross_quote). This is the
@@ -2376,18 +3656,46 @@ class Bot:
         sigma_now = (ctx.get("sigma") if ctx else getattr(self, "_sigma", 0.0))
         if not sigma_now:
             sigma_now = getattr(self, "_sigma", 0.0) or 0.0
-        depth_bps = 1e4 * abs(spot_now - r.strike) / r.strike if r.strike else 1e9
+        # DEPTH IS MEASURED FROM `level`, NOT FROM `r.strike`. The number this
+        # gate exists to bound is "how far has the spot moved past the level the
+        # round is paid on", and the strike is not that level -- see
+        # config.cross_ref_twap. `level` is `r.strike` on any round whose 60 s
+        # reference the tape could not bracket, so this is the old behaviour
+        # exactly where the new number is unavailable.
+        depth_bps = 1e4 * abs(spot_now - level) / level if level else 1e9
         # MINIMUM depth, in TICKS. bps is the wrong unit for a floor: the same
         # $0.01 is 0.0013 bps on BTC and 0.1377 on BNB, so BNB's median trigger
         # was ONE tick -- the last decimal flipping. See config.
         min_ticks = self._ck("min_depth_ticks", r)
         if not train and min_ticks > 0:
-            tick = self._ck("tick_size", r) or 0.01
-            if abs(spot_now - r.strike) < min_ticks * tick - 1e-12:
+            # THE COMPARISON AND ITS TOLERANCE BOTH LIVE IN `passes_depth_floor`,
+            # IN TICKS. Do not re-inline it: the tools replay this gate and a
+            # copy here is how they drifted apart (they read the GLOBAL
+            # tick_size, which is an empty band on xrp/doge).
+            #
+            # The old form was `abs(spot_now - r.strike) < min_ticks * tick
+            # - 1e-12`. `abs(...)` is a difference of two doubles, so its error
+            # is the ULP of a number of the spot's size -- 1.46e-11 at BTC's
+            # ~7.6e4, which is 14x the epsilon that was supposed to absorb it.
+            # So it refused a crossing sitting exactly ON the floor: 3 of 154
+            # recorded refusals, each logging "only 1 tick(s) through the
+            # strike, floor is 1" (2026-09-16 06:19 / 20:34 / 23:39, btc-5m).
+            # Spot 75996.005 against strike 75996.015 reproduces it exactly.
+            #
+            # The point is NOT to admit sub-tick crossings -- it is that the
+            # same economic state must not be admitted or refused according to
+            # which way two floats happened to round.
+            mk = market_prefix(getattr(r, "slug", None))
+            if not passes_depth_floor(spot_now, level, mk):
                 self._cross_refuse(
                     r, side,
-                    f"only {abs(spot_now - r.strike) / tick:.0f} tick(s) through "
-                    f"the strike, floor is {min_ticks:.0f}",
+                    # 2 decimals, because the spot feed quotes a MID on a
+                    # half-tick grid, so the real depths here are 0 / 0.5 / 1.0
+                    # and "%0f" printed the first two alike as `0 tick(s)` --
+                    # which reads exactly like the gate refusing a crossing it
+                    # should have taken.
+                    f"only {depth_in_ticks(spot_now, level, mk):.2f} tick(s) "
+                    f"through the {level_src} reference, floor is {min_ticks:g}",
                     tau=tau, spot=spot_now, sigma=sigma_now)
                 return
         # MINIMUM depth in SIGMA OF THE TIME REMAINING. 0 = OFF.
@@ -2404,7 +3712,7 @@ class Bot:
         # that put the coin-flip/signal boundary at z ~ 0.4.
         min_sig = self._ck("min_depth_sigma", r)
         if not train and min_sig > 0 and sigma_now > 0 and tau > 0:
-            z = depth_sigma(spot_now, r.strike, sigma_now, tau)
+            z = depth_sigma(spot_now, level, sigma_now, tau)
             if z < min_sig:
                 self._cross_refuse(
                     r, side,
@@ -2414,7 +3722,8 @@ class Bot:
                 return
         if not train and depth_bps > self._ck("max_depth_bps", r):
             self._cross_refuse(r, side,
-                               f"{depth_bps:.2f}bps through the strike, gate is "
+                               f"{depth_bps:.2f}bps through the {level_src} "
+                               f"reference, gate is "
                                f"{self._ck('max_depth_bps'):.2f}",
                                tau=tau, spot=spot_now, sigma=sigma_now)
             return
@@ -2422,10 +3731,11 @@ class Bot:
         # has swung wide is one where a late crossing reverses again; a calm
         # one is where it sticks (see config.cross_max_round_range_bps).
         #
-        # Read from `self._ticks`, NOT `feed.ticks`: the feed's deque is 4000
-        # ticks, which at BTC's live ~114/s is 35 seconds -- it does not span a
-        # 5-minute round. `self._ticks` is appended once per poll and holds
-        # 2400 samples, so it does.
+        # Read from `self._ticks`, NOT `feed.ticks`. The feed deque's span is a
+        # BURST RATE rather than a duration (40,000 updates is ~5 minutes at
+        # BTC's ~114/s, but far less in a burst), while `self._ticks` is
+        # appended once per poll and holds 2400 samples, so its span is fixed
+        # by the poll cadence and does span a 5-minute round.
         rng_gate = self._ck("max_round_range_bps", r)
         probe = False
         if not train and rng_gate > 0:
@@ -2435,10 +3745,20 @@ class Bot:
                     if self._probe_fires(r):
                         probe = True        # flag-off experiment; see config
                     else:
+                        # ⛔ TWO DECIMALS AND THE MARGIN, BECAUSE ONE IS NOT A
+                        # DIAGNOSIS. The comparison is exact; the LINE was not.
+                        # MEASURED 2026-09-17: this gate logged
+                        #     round already moved 13.6bps, gate is 13.6
+                        # for a true 13.6086 against a 13.6000 gate. The two
+                        # numbers printed IDENTICAL, so a correct refusal read
+                        # as an impossible one and was reported as a bug. Naming
+                        # the excess makes the line answer its own question at
+                        # any magnitude -- no precision choice can, when the
+                        # margin is smaller than the last printed digit.
                         self._cross_refuse(
                             r, side,
-                            f"round already moved {rng_bps:.1f}bps, gate is "
-                            f"{rng_gate:.1f}",
+                            f"round already moved {rng_bps:.2f}bps, gate is "
+                            f"{rng_gate:.2f} (+{rng_bps - rng_gate:.3f} over)",
                             tau=tau, spot=spot_now, sigma=sigma_now)
                         return
         # The price that binds is the order's own quote; this is band sanity on
@@ -2450,7 +3770,7 @@ class Bot:
         # was added for -- and the venue completes 66% of its post-cross
         # repricing inside that one second.
         wsb = getattr(self, "ws_book", None)
-        top = (wsb.best(r.market_id, settings.ws_book_max_age_s)
+        top = (wsb.best(r, settings.ws_book_max_age_s)
                if wsb is not None else None)
         if top is not None:
             ask = top.ask(side)
@@ -2489,15 +3809,68 @@ class Bot:
             self._cross_refuse(r, side, "no fresh websocket book off-primary",
                                tau=tau, spot=spot_now, sigma=sigma_now)
             return
-        if ask is None or not (self._ck("min_price", r) <= ask
-                               <= self._ck("max_price", r)):
+        # A NON-POSITIVE ask is a MISSING INPUT, not a price outside the band.
+        # MEASURED, 2026-09-17: the refusal census over the Polymarket era
+        # contained `ask 0.000 outside [0.10,0.90]` -- twice. 0.000 is what an
+        # absent book/ask is spelled as downstream, so the gate above (`ask is
+        # None`) never fired and a missing price was reported as a price that
+        # was too low. That is the same class of error as the stale-display
+        # price: it makes a missing measurement look like a measurement. The
+        # two cases need different names because they need different fixes --
+        # "outside the band" says the market disagrees with us, "no ask" says we
+        # cannot see the market at all.
+        if ask is None or not ask > 0:
+            self._cross_refuse(r, side, "no ask on the book",
+                               tau=tau, spot=spot_now, sigma=sigma_now)
+            return
+        if not (self._ck("min_price", r) <= ask
+                <= self._ck("max_price", r)):
             self._cross_refuse(
                 r, side,
-                ("no ask on the book" if ask is None else
-                 f"ask {ask:.3f} outside [{self._ck('min_price'):.2f},"
-                 f"{self._ck('max_price'):.2f}]"),
+                f"ask {ask:.3f} outside [{self._ck('min_price'):.2f},"
+                f"{self._ck('max_price'):.2f}]",
                 tau=tau, spot=spot_now)
             return
+        # MODEL-EDGE GATE. This is the arm's economic constraint; the band
+        # above is a sanity bound.
+        #
+        # The arm previously had only an ask band, which cannot say "cheap" --
+        # it can only say "not too expensive". MEASURED 2026-09-17 over 1,246
+        # triggers (8 days, one entry per round): the venue's ask at the
+        # trigger instant is calibrated to within about a cent (pooled ask
+        # 0.8909 against a 0.9090 win rate, z 1.35, not significant; ask 0.88
+        # -> 93.3%, 0.94 -> 95.8%, 0.99 -> 93.8%). On a book like that a band
+        # cannot be tuned into an edge, because there is no mispricing in the
+        # band to find. The edge has to come from OUR fair disagreeing with the
+        # quote, which is what `fair_value` prices -- the same closed form the
+        # `digital` model uses, priced at THIS family's sigma (`sigma_now`, not
+        # the primary's) and the time left.
+        #
+        # An unpriceable edge SKIPS this gate rather than becoming a refusal.
+        # The arm has always been able to run without sigma -- the depth floors
+        # switch themselves off when it is missing (`min_depth_sigma` requires
+        # `sigma_now > 0` to fire) -- so turning a missing input into a refusal
+        # here would quietly re-close the arm through a door it has never used.
+        # The band above still applies in that case: this gate can only ever
+        # remove entries, never add them.
+        if not train and sigma_now > 0 and tau > 0:
+            fair_p = fair_value(spot_now, r.strike, tau, sigma_now)
+            if side == "Down":
+                fair_p = 1.0 - fair_p
+            edge = fair_p - ask
+            emin = self._ck("min_edge", r)
+            # 0 = OFF, this repo's convention for every gate knob (see
+            # `cross_max_fill_px`, `max_depth_bps`). It has to mean OFF rather
+            # than "off except for the sign": a NEGATIVE edge is the whole point
+            # of being able to switch it off, and `edge < 0.0` would keep
+            # refusing quotes while the knob reads off.
+            if emin > 0 and edge < emin:
+                # CONSTANT reason: `_cross_refuse` dedupes per (round, reason),
+                # and putting the edge in the text makes a new row every tick --
+                # the per-tick-refusal trap this file already records.
+                self._cross_refuse(r, side, f"edge under the {emin:.3f} gate",
+                                   tau=tau, spot=spot_now, sigma=sigma_now)
+                return
         # TRAIN price gate. Placed HERE, after `ask` is FINAL, not on the
         # websocket branch: inside `if top is not None` it was skipped entirely
         # whenever the ws book was stale and the primary fell back to `asks`,
@@ -2506,7 +3879,17 @@ class Bot:
         # with the ask in the text every distinct cent made a new row (7 rows for
         # one round on 2026-09-15, the per-tick-refusal trap this file records).
         if train:
-            tmax = self._ck("train_max_ask", r)
+            # The static knob TIGHTENED by the dynamic EV ceiling. The ceiling
+            # uses THIS FAMILY's measured win rate -- one shared number is
+            # BTC's, and at margin 0.03 that is 0.876 against DOGE's 0.829, so
+            # a global value would overpay the cheaper families by ~4.7c.
+            # `min()` lives inside `entry_ceiling`, so this can only ever
+            # refuse more, and the refusal line prints whichever value bound.
+            sym = (market_prefix(getattr(r, "slug", "") or "") or ""
+                   ).split("-")[0]
+            tmax = entry_ceiling(self._ck("train_max_ask", r),
+                                 TRAIN_P_WIN.get(sym) or settings.train_p_win,
+                                 settings.ev_ceiling_margin)
             if tmax > 0 and ask > tmax:
                 self._cross_refuse(
                     r, side, f"train ask above the gate {tmax:.3f}",
@@ -2758,21 +4141,34 @@ class Bot:
         # The label has to carry the TRIGGER. A train fire logged as "CROSS"
         # reads as the cross arm violating its own 5-60s tau gate -- it did at
         # tau 820s on 2026-09-15 21:01, and that is exactly how it was misread.
-        log.info("%s %s %s %s_px=%.3f (spot %.2f vs strike %.2f, tau %.0fs) "
+        # THE SIGNAL'S NAME AND VALUE, not a hardcoded "spot": with `fc_trigger`
+        # on, this line reads `fc 734.560 vs twap60 734.550` -- the number the
+        # crossing was actually measured on, which is what a cohort split needs.
+        # With the flag off the text is byte-identical to what it always was.
+        log.info("%s %s %s %s_px=%.3f (%s %.2f vs %s %.2f, tau %.0fs) "
                  "stake=$%.2f -> %d today%s",
-                 "TRAIN" if train else "CROSS", r.slug, side, src, ask, spot,
-                 r.strike, tau, stake, self._cross_count,
+                 "TRAIN" if train else "CROSS", r.slug, side, src, ask,
+                 sig_name, sig_px,
+                 "strike" if train else level_src, r.strike if train else level,
+                 tau, stake, self._cross_count,
                  (" D=%dms" % train_age_ms) if train_age_ms is not None else "")
         # `run` goes into the reason so every trigger carries the number the
         # gate decision will be made on, recoverable from the decisions table.
         run_txt = "" if book_run is None else f" run{book_run:+.3f}"
+        # THE LEVEL'S SOURCE rides with it, for the same reason: a trigger priced
+        # off `r.strike` (the tape could not bracket the 60 s reference) is the
+        # OLD behaviour, and a cohort split by ref= is how that is audited
+        # rather than assumed. See config.cross_ref_twap.
+        ref_txt = (f" ref={'strike' if train else level_src}"
+                   f" sig={sig_name}")
         # Same idiom, same reason: the number the gate decided on rides in the
         # reason so it is recoverable from `decisions` with no reconstruction.
         age_txt = "" if train_age_ms is None else f" D={train_age_ms}ms"
         kind = ("train into" if train
                 else ("cross probe" if probe else "cross into"))
         sig = Signal(side, ask, ask, 0.0, 0.0, 0.0, True,
-                     f"{kind} {side} @{ask:.3f} tau{tau:.0f}s{run_txt}{age_txt}")
+                     f"{kind} {side} @{ask:.3f} tau{tau:.0f}s{run_txt}{ref_txt}"
+                     f"{age_txt}")
         did = self.store.insert("decisions", {
             "slug": r.slug, "ts_ms": now_ms, "tau_s": tau, "side": side,
             "fair": ask, "quote": ask, "edge": 0.0, "hurdle": 0.0,
@@ -2829,6 +4225,18 @@ class Bot:
             buf = max(0.01, min(self._ck("limit_buffer", r),
                                 self._ck("limit_buffer_inv", r) * (1.0 - ask)))
             ceil_side = min(self._ck("max_price", r), round(ask + buf, 2))
+            # ...and the same bound expressed RELATIVE to the ask we saw.
+            # `ask + buf` is an ABSOLUTE allowance, so it is regressive in the
+            # ask: 0.10 + 0.18 = 2.8x at an ask of 0.10, 0.60 + 0.20 = 1.3x at
+            # 0.60. Live 2026-09-17 `sol-updown-5m-1789649400` saw an ask of
+            # 0.100, carried a ceiling of 0.28, and FILLED AT 0.200 -- 2.0x the
+            # only price we ever saw -- on a round that resolved against us.
+            # Swept on the 8-day corpus (see config.cross_max_fill_multiple):
+            # capping at 1.5x costs 8 of 122 triggers and 0.0077 EV/sh, so it is
+            # a risk bound rather than an edge. 0 restores the old ceiling.
+            mult = self._ck("max_fill_multiple", r)
+            if mult and mult > 0:
+                ceil_side = min(ceil_side, math.floor(ask * mult * 100) / 100)
         # INSTRUMENTATION. Three explanations for the gate->fill gap have now
         # been wrong: a stale gate (the websocket made it fresh and the gap
         # stayed), order latency (get_quote round-trips measure 43ms), and
@@ -2892,22 +4300,97 @@ class Bot:
         try:
             t_send = time.monotonic()
             book_at_send = ask
-            # SHADOW QUOTE, log-only: the order below carries the WARM quote,
-            # and the venue anchors the FOK bound to that quote's price. A
-            # fresh quote fetched NOW answers the counterfactual the catch
-            # question needs -- "would a current reference have been
-            # accepted?" -- concurrently with the POST, read-only, and it can
-            # never touch the order itself.
-            self._spawn_shadow_quote(r.slug, side, token, stake, ceil_side)
+            # OUR two numbers at send time, both from our own book: `ask` is
+            # `Touch.sweep()` (the decision, the size, the gate, the ledger and
+            # the CEILING all come from it) and `touch_at_send` is `Touch.ask`.
+            # They are handed to the shadow probe so the log can say which of
+            # them the VENUE agrees with.
+            top_send = (wsb.best(r, settings.ws_book_max_age_s)
+                        if wsb is not None else None)
+            touch_at_send = top_send.ask(side) if top_send is not None else None
+            # BOTH SIDES OF THE SAME ROUND, because one number cannot tell LAG
+            # from A SWAPPED SIDE. Measured 2026-09-17 the venue read 0.82/0.83
+            # while our Up read 0.57/0.58, and 12 s later 0.75/0.78 against
+            # 0.56/0.60 -- a CONSTANT ~0.7 ratio. A book that is merely old
+            # drifts; a book that is the WRONG SIDE keeps a fixed relationship.
+            # With the other side logged, the two are one subtraction apart:
+            # if ours(Down) is the venue's Up, the sides are swapped; if ours
+            # and the venue agree on DOWN but not on UP, one token is stale.
+            other = "Down" if side == "Up" else "Up"
+            other_at_send = (top_send.ask(other) if top_send is not None
+                             else None)
+            # TWO SHAPES REACH HERE. On this venue `wsb.best` hands back a
+            # `BookTop` whose bid/ask are METHODS (`bid(side)`, `ask(side)`); the
+            # Binance wrapper's `BookTop` is the same. `Touch` is the only thing
+            # here whose bid/ask are ATTRIBUTES. Reading `top_send.bid` blind
+            # raised AttributeError inside the fire path (caught by
+            # `tests/test_cross_arm.py::TestTheWebsocketBook`), so both shapes
+            # are handled explicitly and a missing field degrades to None.
+            ours_bid = ours_size = ours_age = None
+            ours_token_lag = None
+            if top_send is not None:
+                b = getattr(top_send, "bid", None)
+                ours_bid = b(side) if callable(b) else b
+                size = getattr(top_send, "ask_size", None)
+                ours_size = size if not callable(size) else None
+                age = getattr(top_send, "age_s", None)
+                ours_age = age() if callable(age) else None
+            # PER TOKEN, not global. Measured 2026-09-17 the global `lag_ms()`
+            # read 121 ms while the round being priced was four minutes old, so
+            # the global number cannot answer "is THIS order priced off a live
+            # book?" -- some busy neighbour keeps the maximum high.
+            _book = getattr(wsb, "book", None)
+            if _book is not None and hasattr(_book, "lag_ms"):
+                try:
+                    ours_token_lag = _book.lag_ms(asset_id=token)
+                except Exception:                             # noqa: BLE001
+                    ours_token_lag = None
+            self._spawn_shadow_quote(
+                r.slug, side, token, stake, ceil_side,
+                ours_touch=touch_at_send, ours_sweep=book_at_send,
+                # LAG vs LEVEL SHIFT. `ours bid` separates the two readings of
+                # the 2026-09-17 08:49 line (`venue ask 0.2000 | ours touch
+                # 0.1100`): if OUR bid and ask are BOTH ~9c low the book is at
+                # an older price (the feed fell behind), and if only the ask is
+                # off then the ladder is wrong instead. `age` dates the sample:
+                # `Touch.recv_ms` is stamped per ASSET, so it is the only number
+                # that says how far behind the socket actually was.
+                ours_bid=ours_bid, ours_age=ours_age, ours_size=ours_size,
+                ours_other=other_at_send, ours_other_side=other,
+                ours_token_lag=ours_token_lag)
+            self._take_last = None
             fill = await self._place_order(
                 r, sig,
                 fair_up=(ceil_side if side == "Up" else 1.0 - ceil_side),
                 token=token, stake=stake, skip_pretrade_gates=True, take_px=ask,
                 # Bid up to the ceiling, not to the stale quote plus a tick. See
                 # limit_ceiling in _place_order for the round this cost us.
-                limit_ceiling=ceil_side, fill_cap=fill_cap)
+                limit_ceiling=ceil_side, fill_cap=fill_cap,
+                # THE VENUE'S OWN BOOK IS THE PRICE BASE (see config
+                # .cross_venue_take). None for the train arm, which keeps its
+                # own ceiling arithmetic, and None when the knob is off -- so
+                # both revert to the old base with no code change.
+                venue_token=(token if (not train
+                                       and self._ck("venue_take", r)) else None))
             elapsed = time.monotonic() - t_send
-            top_now = (wsb.best(r.market_id, settings.ws_book_max_age_s)
+            # WHICH PRICE THE LIMIT WAS BUILT FROM, on the same tick as the
+            # verdict: `base` is the VENUE's ask when it was readable, `src`
+            # says whether the venue or our own ladder priced it, and `attempt`
+            # says whether the FAK had to be re-priced and re-sent. Without this
+            # the exec line cannot be reconciled against the 20-miss cohort the
+            # 2026-09-18 measurement came from.
+            _tl = getattr(self, "_take_last", None) or {}
+            if _tl:
+                # "sent ceiling", not "cap": the exec line above already prints
+                # `limit` = OUR ladder's ceiling (0.58 in the 2026-09-18 eth-15m
+                # fill), and this is the number the ORDER carried (0.65, built
+                # from the venue's 0.60). Two different objects, two names.
+                log.info("%s take %s %s: base %.4f (%s) sent ceiling %.2f, "
+                         "attempt %s/%s", arm_mode, r.slug, side,
+                         _tl.get("base", 0.0), _tl.get("src", "?"),
+                         _tl.get("cap", 0.0), _tl.get("attempt", 0),
+                         _tl.get("attempts", 0))
+            top_now = (wsb.best(r, settings.ws_book_max_age_s)
                        if wsb is not None else None)
             book_now = top_now.ask(side) if top_now is not None else None
             got = getattr(fill, "filled_px", None) if fill else None
@@ -2917,6 +4400,19 @@ class Bot:
             # discriminator -- a 100% fill paid its limit, partial fills beat it.
             cash = getattr(fill, "stake", None) if fill else None
             shares = getattr(fill, "shares", None) if fill else None
+            # ⛔ `decided` AND `book now` ARE A REGRESSION DETECTOR, SO KEEP
+            # BOTH ON ONE LINE. `decided` is `Touch.sweep()`'s price -- the
+            # number the entry, the size, the gate, the LEDGER and the LIMIT
+            # CEILING are all derived from. `book now` is `Touch.ask`, the
+            # venue's own best ask, restated on every one of ~1,250 messages/s.
+            #
+            # They must agree. On 2026-09-17 they read 0.4000 against 0.6000 and
+            # the FAK came back `no orders found to match`, because the ladder
+            # behind `sweep()` was frozen at the last `book` snapshot while
+            # `ask` was live: the arm decided on a price that no longer existed
+            # and sent `round(0.40 + buf, 2) = 0.42` as its limit. A gap between
+            # these two numbers on a NO FILL is that bug returning, and it is
+            # the whole gate->fill story -- not latency, not adverse selection.
             log.info("%s exec %s %s: decided %.4f limit %.2f -> %s in %.2fs | "
                      "committed $%s of $%.2f (%s) | shares %s | cash/shares %s | "
                      "book now %s",
@@ -2934,14 +4430,59 @@ class Bot:
             await self._book_fill(r, sig, fill, did=did, up=up, spot=spot,
                                   sigma=sigma, tau=tau, token=token,
                                   mode=arm_mode)
-        except Exception as e:                              # pragma: no cover
-            self._release_round_slot(r)
-            log.exception("cross order failed for %s %s: %s: %s",
+        except Exception as e:
+            # ⛔ AN EXCEPTION IS NOT A NO-FILL, SO THE SLOT IS NOT GIVEN BACK.
+            # This used to `_release_round_slot(r)` and log, i.e. treat an
+            # unreadable venue state as "nothing filled" -- and the arm would
+            # then take a second entry in the same round while the first order
+            # may be live and unbooked. That is exactly the exposure the caps
+            # cannot see, because the caps read the ledger and the ledger has
+            # no row.
+            #
+            # LIVE 2026-09-17 19:09:12, btc-updown-5m-1789671900 Down: the
+            # exception was `UnexpectedResponseError: account trades response
+            # items malformed` raised while READING BACK an order the venue had
+            # already matched (3.1 shares @ 0.335, settled our way, paid
+            # $3.13). The line below said `cross order failed ... not retrying`
+            # and nothing was ever booked. The read-back side of that is fixed
+            # in the broker (`_trades_since` cannot raise, and `settle()`
+            # confirms from the position list); this is the arm-level rule that
+            # must hold even when some OTHER call in the order path throws:
+            # hold the round, and say the exposure is UNKNOWN rather than zero.
+            #
+            # The honest way to clear it is the ledger -- the position list, or
+            # a `fills` row from a later reconcile -- not a guess here.
+            log.exception("cross order path raised for %s %s: %s: %s -- the "
+                          "round's slot is HELD (not released): whether an "
+                          "order reached the venue is UNKNOWN, so this round "
+                          "will not be re-entered and the exposure must be "
+                          "reconciled from the venue's position list",
                           r.slug, side, type(e).__name__, e)
         finally:
             self._pending_n = max(0, getattr(self, "_pending_n", 1) - 1)
             self._pending_stake = max(
                 0.0, getattr(self, "_pending_stake", stake) - stake)
+
+    def _take_cap_for(self, r, base_px: float, fill_cap: float | None) -> float:
+        """The most a TAKE may pay when the best price that EXISTS is `base_px`.
+
+        The SAME arithmetic `_cross_tick` applies to the price it decided on --
+        `cross_max_price`, the inverse buffer, the `cross_max_fill_multiple`
+        bound -- re-run against the VENUE's ask instead of our own ladder sweep,
+        then clamped by the fill cap. The base is the ONLY thing that changes:
+        the band, the margin floor, the ceiling and the cap are the same objects
+        they were, so this can refuse a trade and can never enlarge one.
+        """
+        buf = max(0.01, min(self._ck("limit_buffer", r),
+                            self._ck("limit_buffer_inv", r) * (1.0 - base_px)))
+        cap = min(self._ck("max_price", r), round(base_px + buf, 2))
+        mult = self._ck("max_fill_multiple", r)
+        if mult and mult > 0:
+            cap = min(cap, math.floor(base_px * mult * 100) / 100)
+        fcap = self._ck("max_fill_px", r) if fill_cap is None else fill_cap
+        if fcap > 0:
+            cap = min(cap, fcap)
+        return min(cap, 0.99)
 
     def _release_round_slot(self, r) -> None:
         """Give the round's entry slot back when an order fills NOTHING.
@@ -2964,13 +4505,14 @@ class Bot:
         if isinstance(fired, dict) and fired.get(r.slug, 0) > 0:
             fired[r.slug] -= 1
 
-    def _spawn_shadow_quote(self, slug, side, token, stake, ceiling) -> None:
-        """Launch the log-only shadow quote; never raise into the fire path."""
+    def _spawn_shadow_quote(self, slug, side, token, stake, ceiling,
+                            **ours) -> None:
+        """Launch the log-only venue probe; never raise into the fire path."""
         if getattr(self.broker, "mode", "") != "live":
             return
         try:
             task = asyncio.create_task(
-                self._shadow_quote(slug, side, token, stake, ceiling))
+                self._shadow_quote(slug, side, token, stake, ceiling, **ours))
         except RuntimeError:                # no running loop (fixture use)
             return
         tasks = getattr(self, "_shadow_tasks", None)
@@ -2979,38 +4521,83 @@ class Bot:
         tasks.add(task)
         task.add_done_callback(tasks.discard)
 
-    async def _shadow_quote(self, slug, side, token, stake, ceiling) -> None:
-        """A fresh quote at fire time, logged; the ORDER never sees it.
+    async def _shadow_quote(self, slug, side, token, stake, ceiling,
+                            *, ours_touch=None, ours_sweep=None,
+                            ours_bid=None, ours_age=None, ours_size=None,
+                            ours_other=None, ours_other_side=None,
+                            ours_token_lag=None) -> None:
+        """The VENUE's own book at fire time, logged; the ORDER never sees it.
 
-        get-quote does not execute, so this is read-only. What it measures:
-        our place-order carries the WARM quote, the venue anchors its FOK
-        bound to that quote's averagePrice (the order record's `price` equals
-        it), and the 2026-09-15 fires show refs lagging the book by up to 20x
-        (0.03 against a 0.59 book). If fresh refs are systematically higher
-        at fire time, moving the quote fetch back onto the critical path --
-        or refreshing the warm entry -- becomes a measured argument instead
-        of a guess.
+        ⛔ THIS USED TO BE A TAUTOLOGY, AND THAT IS WHAT LET THE STALE LADDER
+        SURVIVE. It called `broker.get_quote()`, whose own docstring reads
+        "the wrapper's quote shape (NO VENUE CALL)" -- it re-reads OUR book,
+        same `Touch.sweep()`, and so echoed the decision price straight back:
+        `shadow quote ...: fresh px 0.4000 after 0ms`. A 0 ms "fresh" quote is
+        the tell. It could never disagree with the number it existed to audit,
+        so it certified a book that was 45 cents out.
+
+        `GET /book?token_id=` is read-only and answers the only question that
+        matters: on 2026-09-17 the arm logged `$1.00 sweeps to 0.610 (touch
+        0.160, +0.450)` -- its OWN two fields, 45 cents apart, with nothing 
+        available to say which was the dead one. This line says which.
         """
         t0 = time.monotonic()
         try:
-            q = await self.broker.get_quote(token, stake)
-        except Exception:
+            import aiohttp
+
+            from btcpredict.venues.polymarket.book import PmBook
+            to = aiohttp.ClientTimeout(total=None, connect=3.0, sock_read=4.0)
+            async with aiohttp.ClientSession(timeout=to) as s:
+                t = await PmBook.fetch_top(s, token)
+        except Exception as exc:                          # noqa: BLE001
+            # ⛔ THIS USED TO RETURN IN SILENCE. The probe is the ONLY instrument
+            # that can disagree with our own book (see the docstring), so a
+            # probe that fails without saying so reads exactly like a fire that
+            # was never probed -- which is what 24 of the first 46 live FAK
+            # attempts looked like: no `shadow book` line, no error, nothing in
+            # the log to reconcile against. A measurement that cannot report
+            # its own absence is not a measurement.
+            log.warning("shadow book %s %s: PROBE FAILED after %.0fms: %s: %s",
+                        slug, side, (time.monotonic() - t0) * 1000.0,
+                        type(exc).__name__, exc)
             return
-        if not q:
-            log.info("shadow quote %s %s: none", slug, side)
+        ms = (time.monotonic() - t0) * 1000.0
+        if t is None or t.ask <= 0:
+            log.info("shadow book %s %s: venue book unavailable after %.0fms",
+                     slug, side, ms)
             return
-        try:
-            px = float(q.get("averagePrice") or 0.0)
-        except (TypeError, ValueError):
-            return
-        if px <= 0 or not ceiling:
-            return
-        room = int((ceiling / px - 1.0) * 10_000)
-        slip = max(settings.slippage_bps, min(room, 10_000))
-        log.info("shadow quote %s %s: fresh px %.4f after %.0fms -> "
-                 "bound %.4f (ceiling %.3f)",
-                 slug, side, px, (time.monotonic() - t0) * 1000.0,
-                 px * (1 + slip / 10_000.0), ceiling)
+        # The verdict, spelled out rather than left as two numbers to subtract:
+        # `lag` is how far OUR touch sits from the venue's, and it is what the
+        # order's limit was derived from.
+        lag = (ours_touch - t.ask) if ours_touch is not None else None
+        verdict = "-"
+        if lag is not None:
+            if abs(lag) <= 0.02:
+                verdict = "ok"
+            elif lag > 0:
+                verdict = "OURS HIGH"
+            else:
+                verdict = "OURS LOW"
+        # LAG vs LEVEL SHIFT: our own book is shifted as a WHOLE only if the bid
+        # moved with the ask. `age` then says whether the socket was behind.
+        spread = (ours_touch - ours_bid) if (ours_touch is not None
+                                             and ours_bid is not None) else None
+        log.info("shadow book %s %s: venue %.4f/%.4f | ours %.4f/%.4f (%s) | "
+                 "ours sweep %s size %s age %sms tok-lag %sms | spread %s vs "
+                 "venue %s | ours %s ask %s | after %.0fms",
+                 slug, side, t.bid, t.ask,
+                 ours_bid if ours_bid is not None else float("nan"),
+                 ours_touch if ours_touch is not None else float("nan"),
+                 ("%+.4f" % lag) if lag is not None else "n/a",
+                 ("%.4f" % ours_sweep) if ours_sweep is not None else "n/a",
+                 ("%.0f" % ours_size) if ours_size is not None else "n/a",
+                 ("%.0f" % (1000.0 * ours_age)) if ours_age is not None else "n/a",
+                 ("%d" % ours_token_lag) if ours_token_lag is not None else "n/a",
+                 ("%.4f" % spread) if spread is not None else "n/a",
+                 "%.4f" % (t.ask - t.bid),
+                 ours_other_side or "other",
+                 ("%.4f" % ours_other) if ours_other is not None else "n/a",
+                 ms)
 
     @staticmethod
     def double_trigger(*, entry_px: float | None, ask: float | None, tau: float,
@@ -3164,14 +4751,37 @@ class Bot:
 
         Applies the optional sizing tilt on top of whichever base rule is
         active: the tilt redistributes the stake, it does not change the total.
+
+        THE CAP IS APPLIED HERE, ONCE, FOR EVERY RULE. `stake_for_fraction`
+        takes a `cap=` argument and `stake_for_edge` DOES NOT, and the clamp
+        used to live INSIDE the tilt branch above -- so it ran only when
+        `stake_tilt == "inv_z"`. With any sizing_mode that reaches the edge
+        branch (`edge`, or a name the dispatcher does not recognise, which
+        falls through to the same line) the configured cap was silently
+        ignored and the stake came straight off [min_stake_usdt,
+        max_stake_usdt].
+
+        MEASURED, 2026-09-16 17:29:39 UTC, `btc-updown-5m-1789579500`:
+        `stake_cap_usdt` was $1.00 and the bot spent **$5.00** -- 500 shares at
+        the $0.01 entry floor, plus a $0.3465 fee, i.e. **-$5.3465 realised**
+        when the round settled Up against the Down that was bought. There is no
+        `decisions` row for that slug, so nothing in the ledger shows it.
+
+        A risk bound has to bind LAST and bind on EVERY rule: a cap that one
+        sizing mode ignores is not a cap. Applying it at the bottom means a
+        future rule cannot opt out by forgetting to take `cap=`.
         """
         base = self._base_stake_for(sig)
         if base > 0 and settings.stake_tilt == "inv_z":
             t = tilt_factor(moneyness_sd, reference=settings.tilt_reference_z,
                             lo=settings.tilt_min, hi=settings.tilt_max)
             base = max(base * t, settings.min_order_usdt)
-            if settings.stake_cap_usdt > 0:      # 0 = no cap, see config
-                base = min(base, settings.stake_cap_usdt)
+        if base > 0 and settings.stake_cap_usdt > 0:      # 0 = no cap, see config
+            # Below `min_order_usdt` this makes the caller SKIP rather than
+            # place a small order -- `_place_order` and the arms check
+            # `stake < min_order_usdt` -- which is the honest outcome when the
+            # cap and the venue minimum leave no legal size.
+            base = min(base, settings.stake_cap_usdt)
         return base
 
     def _base_stake_for(self, sig: Signal) -> float:
@@ -3214,7 +4824,8 @@ class Bot:
                            take_px: float | None = None,
                            impulse_order: bool = False,
                            limit_ceiling: float | None = None,
-                           fill_cap: float | None = None) -> Fill | None:
+                           fill_cap: float | None = None,
+                           venue_token: str | None = None) -> Fill | None:
         """Place one order, retrying a confirmed rejection a bounded number of times.
 
         Returns the fill, or None when the order could not be placed -- having
@@ -3440,6 +5051,16 @@ class Bot:
             # instead was never the answer for an arm whose edge is seconds
             # wide.
             use_limit = settings.order_type in ("limit", "limit_take")
+            if pm_take_via_fak(settings, self.broker, limit_ceiling):
+                # Polymarket's LIMIT path is `post_only=True`, i.e. a maker order
+                # that these take arms cannot use. Trade them as takers instead:
+                # `buy()` routes to `buy_fak()` (FAK == IOC) under this knob.
+                # See `pm_take_via_fak` for the two live orders that put this
+                # here, and for what it does NOT fix (a stale ceiling).
+                log.info("%s take via FAK on Polymarket (pm_order_type=fak): "
+                         "the post-only LIMIT path cannot cross",
+                         arm_of(sig))
+                use_limit = False
             if self.broker.mode == "live" and use_limit:
                 if settings.order_type == "limit":
                     # Maker-first: post one tick below the quote and let it rest.
@@ -3569,6 +5190,12 @@ class Bot:
                     break
                 break
             kw = {"quote": quote} if self.broker.mode == "live" else {}
+            # The price this order is sent AT. Every arm but the take arms ends
+            # up sending `sig.quote` exactly as before; the take path may
+            # re-base it on the venue's ask below. Hoisted so the `buy(...)`
+            # call has one definition on every path.
+            base = sig.quote
+            base_src = "ours"
             # The cross arm's `limit_ceiling` is `ask + buffer` -- the highest
             # price its own measurement says is worth paying. Under MARKET it
             # becomes the quote ceiling, so the venue's lagging DISPLAYED price
@@ -3579,9 +5206,71 @@ class Bot:
                          else fill_cap)
                 if _fcap > 0:
                     cap = min(cap, _fcap)
+                # ── THE BASE PRICE IS THE VENUE'S ASK, NOT OUR LADDER ────────
+                # MEASURED 2026-09-18 on the live NO-FILL cohort: of the 20
+                # misses whose probing line caught the venue's own book, 17 had
+                # a venue ask ABOVE our 0.65 cap while we had DECIDED at ~0.60,
+                # and the mean gap between the venue's ask and the limit we sent
+                # was +0.155. The clearest one:
+                #     `shadow book xrp-updown-5m-1789704600 Down: venue
+                #      0.3200/0.6900 | ours 0.3200/0.4200` -> decided 0.42,
+                #      ceiling 0.54, "no orders found to match"
+                # OUR sweep() read 0.42 AT THE SAME INSTANT the venue's book read
+                # 0.69. The limit was then built off that 0.42, so it could not
+                # match a 0.69 ask: the FAK miss was arithmetic, not latency.
+                # Re-basing on the venue's ask changes the BASE only -- the cap,
+                # the band, the floor and the margin gate are the same objects,
+                # and `_take_cap_for` re-runs exactly the ceiling arithmetic
+                # `_cross_tick` used on the price it decided.
+                # A fetch failure is NOT a reason to refuse the trade: it falls
+                # back to the old base, logged.
+                if venue_token:
+                    vt = await venue_top(venue_token)
+                    if vt is not None and vt.ask > 0:
+                        base, base_src = vt.ask, "venue"
+                        cap = self._take_cap_for(r, base, fill_cap)
+                        if abs(base - sig.quote) >= 0.02:
+                            log.info("take base %s %s: VENUE ask %.3f against our"
+                                     " ladder %.3f (%+.3f) -- limit priced off "
+                                     "the venue (cap %.2f)", r.slug, sig.side,
+                                     base, sig.quote, base - sig.quote, cap)
+                    elif getattr(self, "_venue_take_dbg", None) != r.slug:
+                        self._venue_take_dbg = r.slug
+                        log.info("take base %s %s: venue book unreadable; "
+                                 "pricing off our ladder %.3f (old "
+                                 "behaviour)", r.slug, sig.side, sig.quote)
+                self._take_last = {"base": base, "src": base_src, "cap": cap,
+                                   "attempt": attempt + 1, "attempts": attempts}
+                # A TAKE CAP BELOW THE PRICE THAT EXISTS IS A DEAD ORDER.
+                # A taker can only match an ask at or below the cap, so if the
+                # book is already above it, nothing this order can reach is
+                # worth having. MEASURED 2026-09-17 04:54:20:
+                #     decided 0.7900 -> ceiling 0.8100 -> cap 0.65 (the fill cap)
+                #     FAK sent at <= 0.65 against a 0.79 book
+                #     venue: "no orders found to match with FAK order" (947 ms)
+                # Nothing was bought, but the round slot was burned and the log
+                # read like a trade attempt. The band allows entries to 0.90
+                # (`cross_max_price`) while the fill cap refuses above 0.65, so
+                # EVERY decision in 0.65-0.90 was this same dead order.
+                # Judged against `base` -- the best price we know of -- so with
+                # the venue readable this refuses exactly the orders the venue
+                # would refuse, BEFORE the venue is called.
+                if cap + 1e-9 < base:
+                    with contextlib.suppress(Exception):
+                        self.broker.last_failure = "above_fill_cap"
+                    log.info("cross skip %s %s: %s %.4f is above the fill cap"
+                             " %.2f -- a take at the cap cannot match",
+                             r.slug, sig.side, base_src, base, cap)
+                    with contextlib.suppress(Exception):
+                        self._cross_refuse(
+                            r, sig.side,
+                            f"{base_src} book {base:.3f} is above the fill cap "
+                            f"{cap:.2f}: a take at the cap cannot match",
+                            stake=stake, arm="cross")
+                    return None
                 kw["max_px"] = cap
             fill = await self.broker.buy(slug=r.slug, side=sig.side, token_id=token,
-                                         price=sig.quote, stake=stake, **kw)
+                                         price=base, stake=stake, **kw)
             if fill:
                 break
 
@@ -3601,6 +5290,24 @@ class Bot:
                 log.info("%s attempt %d/%d declined: quote above the ceiling "
                          "(price left the band)", arm_of(sig), attempt + 1,
                          attempts)
+                continue
+            # A FAK THAT FOUND NOTHING IS NOT A FAILED ORDER. It is the venue
+            # saying "nothing at or below your cap", and on this arm the cap is
+            # now derived from the venue's own ask -- so a miss means the book
+            # moved between our fetch and the venue's match, which a bounded
+            # re-price can answer. The machinery is the loop that already
+            # exists: `order_retry_delay_s` between attempts, the
+            # `order_min_tau_s` floor so an attempt never starts into a nearly
+            # over round, a FRESH quote per attempt, and -- the one that
+            # matters for exposure -- `_venue_position_tokens()` re-read before
+            # every re-place, so an attempt that DID fill cannot be doubled.
+            # ONLY on the take path (`limit_ceiling`): the model and impulse
+            # arms pass no ceiling and keep the single-attempt behaviour.
+            if (reason == "fak_unfilled" and limit_ceiling is not None
+                    and attempt + 1 < attempts):
+                log.info("%s FAK found no match at <= %.2f (attempt %d/%d): "
+                         "re-pricing off the venue and re-trying", arm_of(sig),
+                         kw.get("max_px"), attempt + 1, attempts)
                 continue
             if reason not in RETRYABLE_FAILURES:
                 log.error("%s order failed for %s %s (%s); not retrying",
@@ -3634,7 +5341,26 @@ class Bot:
             # or the ceiling that protects the arm silently throttles it.
             no_cooldown = {"limit_unfilled", "quote_above_ceiling",
                            "quote_unfillable", "quote_stale",
-                           "quote_price_missing"}
+                           "quote_price_missing",
+                           # The entry-price floor refusing a degenerate price
+                           # (broker.DEFAULT_MIN_ENTRY_PX, shipped after a
+                           # 500-share fill at 1c). That refusal IS the fix
+                           # working -- without this name a correctly-declined
+                           # order would pause every family for 30 s.
+                           "px_below_floor",
+                           # The venue's 5-SHARE minimum would spend more than
+                           # the stake cap, so no size both trades and fits
+                           # (_size_above_cap). A BOUND refusing, not an order
+                           # failing -- same reason as px_below_floor above.
+                           "size_above_cap",
+                           # A FAK/IOC order that finds nothing at or below its
+                           # ceiling comes back as a REJECTION, not as an
+                           # accepted order with zero fill. That is the venue
+                           # saying "nothing there", which is a no-fill -- and
+                           # without this name every miss would pause orders
+                           # for 30 s, the exact coupling that made a tighter
+                           # ceiling throttle the arm.
+                           "fak_unfilled"}
             if getattr(self.broker, "last_failure", None) in no_cooldown:
                 log.info("%s no fill for %s %s: %s (not a venue failure; "
                          "no cooldown)", arm_of(sig), r.slug, sig.side,
@@ -3647,6 +5373,36 @@ class Bot:
         return fill
 
     # -- settlement ---------------------------------------------------------
+    async def _backfill_async(self) -> None:
+        """`backfill_settlements` off the tick; see the call site in `run`.
+
+        ⛔ IT MUST NOT RAISE INTO THE LOOP, and it must not die quietly either.
+        A task that fails here stops settlement backfill for the rest of the
+        process's life -- and the failure would be silent by construction:
+        `live_round()` only ever returns the round that is CURRENTLY open, so by
+        the time a round settles the feed has moved on, and this call is the only
+        thing that ever attaches an outcome. Unlabelled rounds collect data that
+        cannot be scored, which is the entire point of Phase 0. So the exception
+        is caught and logged rather than propagated.
+
+        The cost is reported with the tick's own threshold, so the two numbers
+        are directly comparable in the log -- and the message says OFF the tick,
+        because that is the difference that matters: it is no longer paid for
+        with the cross arm's sampling window.
+        """
+        t0 = time.time()
+        try:
+            await self.backfill_settlements()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:                          # noqa: BLE001
+            log.exception("settlement backfill failed: %s: %s",
+                          type(e).__name__, e)
+        spent = time.time() - t0
+        if spent * 1000.0 >= _SLOW_TICK_MS:
+            log.warning("slow settlement backfill: %.2fs OFF the tick (the "
+                        "cross arm kept sampling through it)", spent)
+
     async def backfill_settlements(self, limit: int = 5) -> int:
         """Fetch outcomes for rounds that have ended but have no recorded winner.
 
@@ -3658,12 +5414,35 @@ class Bot:
         """
         now_ms = int(time.time() * 1000)
         pending = self.store.unsettled_rounds(before_ms=now_ms - 10_000)
+        by_slug = getattr(self.market, "by_slug", None)
         done = 0
-        for row in pending[:limit]:
+        # The budget counts ATTEMPTS, not rows, and the skip tests below are
+        # free. Counting a skipped row against `limit` lets a few
+        # unaddressable rounds occupy the whole window forever, because
+        # `unsettled_rounds` is ordered OLDEST FIRST and they never leave it.
+        # Measured 2026-09-16, the day this bot moved to Polymarket: five
+        # Binance-era rounds (16:25) sat at the head of an 18-row list, so
+        # `pending[:5]` was the same five rows on every call and not ONE of the
+        # 13 Polymarket rounds was ever labelled -- `grep -c 'settled '` was 0,
+        # with the resolution call itself working perfectly.
+        attempted = 0
+        for row in pending:
+            if attempted >= limit:
+                break
             tid = row["market_topic_id"]
-            if not tid:
+            # A round carries the addressing key of the venue that WROTE it:
+            # the wrapper's integer topic id, or nothing at all for a round
+            # discovered by slug. Handing the wrong key to the wrong feed does
+            # not fail loudly, it fetches an UNRELATED market (see
+            # PmMarketFeed.by_topic_id) -- so skip it rather than resolve it
+            # wrongly. Settlement is the one place a silently wrong answer
+            # costs money.
+            if by_slug is not None and tid:
                 continue
-            fresh = await self.market.by_topic_id(tid)
+            if not tid and by_slug is None:
+                continue
+            attempted += 1
+            fresh = await self._resolve_round(row)
             if fresh and fresh.winner_name:
                 self.store.upsert_round(round_row(fresh))
                 # Stamp WHEN the outcome was learned. The column has always
@@ -3678,6 +5457,306 @@ class Bot:
                 log.info("settled %s -> %s (end_price=%s)",
                          fresh.slug, fresh.winner_name, fresh.end_price)
         return done
+
+    async def _resolve_round(self, row):
+        """Re-fetch a round to collect its outcome, by whichever key its VENUE
+        uses.
+
+        The wrapper addresses a round by `marketTopicId`; Polymarket addresses
+        it by slug (gamma `?slug=&closed=true`). The two are NOT
+        interchangeable, and a Polymarket round carries no Binance topic id --
+        so asking the wrapper path for topic 0 would fetch an unrelated market
+        and then book ITS winner against a real position. Settlement is the one
+        place where a silently wrong answer costs money, so the key is chosen
+        by capability rather than by configuration.
+        """
+        by_slug = getattr(self.market, "by_slug", None)
+        slug = row["slug"] if "slug" in row.keys() else ""
+        if by_slug is not None and slug:
+            return await by_slug(slug)
+        return await self.market.by_topic_id(row["market_topic_id"])
+
+    def _pm_remember(self, r) -> None:
+        """Keep the Polymarket broker's per-round cache current.
+
+        `PmBroker` caches a round's token ids, tick and min order so the ORDER
+        path makes NO discovery call (each clob.polymarket.com call costs
+        ~260 ms, against a whole edge worth a few cents). That cache is keyed
+        by slug, and it has to follow the ROLL: booting remembers only the
+        rounds that were live then, so without this the next round could not be
+        priced at all -- `buy_limit` would find no tokens for the slug the arm
+        is trading, at exactly the moment the arm wants to fire.
+
+        A no-op on the Binance path, where `self.market` has no
+        `pm_round_for`.
+        """
+        br = getattr(self, "_pm_broker", None)
+        getter = getattr(self.market, "pm_round_for", None)
+        slug = getattr(r, "slug", "") if r is not None else ""
+        if br is None or getter is None or not slug or slug in self._pm_seen:
+            return
+        pmp = getter(slug)
+        if pmp is None:
+            return
+        self._pm_seen.add(slug)
+        try:
+            br.remember(pmp)
+        except Exception as e:                       # noqa: BLE001
+            log.warning("could not remember %s for the PM broker (%s: %s)",
+                        slug, type(e).__name__, e)
+
+    def _pm_window_log_int(self, r, symbol: str,
+                           tau: float) -> float | None:
+        """`J`, the realised part of the Polymarket settlement window.
+
+        Polymarket settles on a TWAP, so the round's average SO FAR is a state
+        variable, and near the bell it is the only one that matters -- the
+        answer is the sign of `J`. The point rule has no equivalent and the
+        models fitted on it cannot see this, which is why `TwapModel` needs it
+        and why `None` (an assumption) is a different thing from a number.
+
+        Two cheap guards, both deliberate:
+          * `tau >= TWAP_LOOKBACK_S` means the window has not even opened, so
+            there is nothing realised to report. Regime 1 of the distribution
+            needs no `J` -- a return of 0 here would be a WRONG anchor, not a
+            neutral one.
+          * `self._ticks` is the ~1 Hz poll buffer (2400 samples). It is keyed
+            by Binance symbol and appended once per poll for every symbol in
+            MARKETS, so its span is fixed by the poll cadence and covers the
+            whole round; `feed.ticks` is a high-rate buffer whose span depends
+            on the symbol's burst rate, which is not a property a window of a
+            stated length can be built on.
+
+        Returns None on the Binance path, where the window has no meaning.
+        """
+        if settings.venue != "polymarket" or r is None:
+            return None
+        if tau >= TWAP_LOOKBACK_S or not getattr(r, "strike", None):
+            return None
+        end_ms = getattr(r, "end_ms", None)
+        if end_ms is None:
+            return None
+        ticks = (getattr(self, "_ticks", None) or {}).get(symbol)
+        if not ticks:
+            return None
+        return window_log_integral(
+            ticks, r.strike,
+            open_ms=float(end_ms) - TWAP_LOOKBACK_S * 1000.0,
+            close_ms=float(end_ms) - max(tau, 0.0) * 1000.0)
+
+    def _pm_strike_backfill(self, slug: str) -> float | None:
+        """The round's START price, taken from the live spot tape.
+
+        WHY THIS EXISTS. Polymarket lists sol, xrp and doge up/down markets and
+        this bot can order in them, but the STRIKE had no source: Binance's
+        prediction feed (which supplies `variantData.startPrice`) carries
+        btc/eth/bnb up/down only, and gamma carries no reference price at all
+        (its resolution source is a Chainlink stream URL). A round with no
+        strike never reaches `_mkt`, so those families were discovered, cached
+        and then never evaluated -- `9/9 cached, 6 live`, with the three missing
+        ones showing up nowhere else, because a refusal is not an error.
+
+        WHAT THE NUMBER MUST BE. The SPOT PRICE AT THE START INSTANT, not a
+        window average. Measured against 2,120 BTC / 1,553 ETH / 962 BNB rounds
+        with known strikes: the 1 s close at T-1 reproduces it to **0.042/0.091/
+        0.114 bps** (p90 <= 0.07, 99% under 1 bp), while a 60 s TWAP is off by
+        1.42-2.13 bps mean and **8-10 bps p99** -- the size of the whole 10 bps
+        cross gate, so a TWAP strike would manufacture phantom crossings. A
+        websocket tick is FINER than the 1 s bar the 0.04 bps figure was
+        measured on, so this is the more accurate of the two sources.
+
+        `SpotFeed.ticks` is the tape: 40,000 updates in arrival order with the
+        clock reading at which each was seen -- ~5 minutes at BTC's ~114/s, so
+        it still brackets a round's open even when the round is only picked up
+        a minute or two late. (It was 4,000 = ~35 s until 2026-09-17, which is
+        why `sol/xrp/doge` could not be priced whenever discovery lagged: the
+        ticks from before the open had already been evicted.) It is maintained
+        for every symbol in MARKETS, so this costs no network and no new buffer.
+
+        FAILS CLOSED, and both conditions are load-bearing:
+          * the round must have OPENED (`start_ms <= now`). Before that the
+            newest tick is a pre-roll price, and the strike is the level the
+            round is settled against -- a price from before the round is not
+            that level. The caller retries on `recheck_s`, so this self-heals
+            within seconds rather than being cached as a miss.
+          * the newest tick at or before the open must be within
+            `_PM_STRIKE_TICK_TOL_MS`. Otherwise the tape stalled, or this
+            process booted after the open, and NO strike is the honest answer.
+            (The wrapper-first order means btc/eth/bnb keep their exact oracle
+            value; this only ever supplies the families it cannot.)
+        """
+        prefix = market_prefix(slug or "")
+        symbol = SYMBOL_BY_PREFIX.get(prefix or "")
+        if not symbol:
+            return None
+        try:
+            start_ms = int(slug.rsplit("-", 1)[1]) * 1000
+        except (IndexError, ValueError, AttributeError):
+            return None
+        if start_ms > int(time.time() * 1000):
+            return None                     # the round has not opened yet
+        feed = (getattr(self, "spots", None) or {}).get(symbol)
+        ticks = getattr(feed, "ticks", None) if feed is not None else None
+        if not ticks:
+            return None
+        # Append-ordered, so the newest tick at or before the open is the first
+        # one found scanning backwards. Bounded by the deque's own maxlen.
+        for ts_ms, px in reversed(ticks):
+            if ts_ms > start_ms:
+                continue
+            if start_ms - ts_ms > _PM_STRIKE_TICK_TOL_MS or not px:
+                return None
+            return float(px)
+        return None                         # nothing predates the open
+
+    async def _pm_strike_backfill_kline(self, slug: str) -> float | None:
+        """The round's START price from Binance's 1 s kline -- after a RESTART.
+
+        ⛔ THE HOLE THIS CLOSES. `_pm_strike_backfill` reads the newest tick at
+        or before the open off the LIVE spot tape, and fails closed when there
+        is none -- which is right, because a price from before the round is not
+        the level the round is settled against. But a process that BOOTS after
+        the open has an EMPTY tape for that round, so the round is unfireable
+        for its whole life, and `_cross_tick` returned on `r.strike is None`
+        without a line -- so it read as "no crossing".
+
+        MEASURED 2026-09-17: the 10:59:43 -> 11:00:01 restart (systemd takes
+        ~18 s, so the process was DOWN across the open) opened exactly one
+        round across the gap, `sol-updown-5m-1789642800` at 11:00:00. It was
+        the ONLY round of the 63 since 10:30 with `strike IS NULL`, and it
+        settled Up -- a round this arm could not act on and did not mention.
+
+        THE 1 s CLOSE AT T-1 IS THE SAME NUMBER, and that is measured, not
+        assumed: against 2,120 BTC / 1,553 ETH / 962 BNB rounds with known
+        strikes it reproduces the strike to **0.042 / 0.091 / 0.114 bps**
+        (p90 <= 0.07, 99% under 1 bp). That is the same figure the tape-based
+        backfill is justified by -- and unlike the tape, a REST kline is
+        RETROSPECTIVE: it does not care when this process started.
+
+        FAILS CLOSED on everything else. The bar must be EXACTLY the one ENDING
+        at the open (openTime == start_ms - 1000), so a gap, a wrong interval or
+        a shifted bar yields NO strike rather than a plausible one. A wrong
+        strike does not raise; it trades.
+        """
+        prefix = market_prefix(slug or "")
+        symbol = SYMBOL_BY_PREFIX.get(prefix or "")
+        if not symbol:
+            return None
+        try:
+            start_ms = int(slug.rsplit("-", 1)[1]) * 1000
+        except (IndexError, ValueError, AttributeError):
+            return None
+        if start_ms > int(time.time() * 1000):
+            return None                     # a pre-open ask cannot be answered
+        try:
+            bars = await fetch_klines(self.session, "1s", 3,
+                                      symbol=symbol, end_ms=start_ms)
+        except Exception as exc:                          # noqa: BLE001
+            log.warning("strike kline backfill failed for %s: %s: %s",
+                        slug, type(exc).__name__, exc)
+            return None
+        want = start_ms - 1000
+        for b in bars or ():
+            try:
+                if int(b[0]) != want:
+                    continue
+                px = float(b[4])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if px > 0:
+                log.info("strike recovered for %s from the 1s kline: %.6f "
+                         "(the round opened across a restart, so the spot "
+                         "tape cannot reach it)", slug, px)
+                return px
+        return None
+
+    async def _setup_polymarket(self) -> None:
+        """Build the Polymarket book + broker for the current and next round.
+
+        DISCOVERY IS OUT OF THE ORDER PATH ON PURPOSE. Every
+        clob.polymarket.com call costs ~260 ms whatever our box, our IP family
+        or how warm the connection is, and the order itself needs only two of
+        them (sign + post). So gamma discovery, token ids and the venue's own
+        tick/min-size are resolved HERE, once per roll, and cached -- see
+        `PmBroker`'s four rules.
+
+        A missing private key is not an error: it means we cannot sign, and
+        the rest of the bot already knows how to fall back to displayed
+        prices.
+        """
+        from btcpredict.feeds.market_feed import MarketFeed
+        from btcpredict.venues.polymarket import markets as pm
+        from btcpredict.venues.polymarket.book import PmBook, PmBookView
+        from btcpredict.venues.polymarket.feed import PmMarketFeed
+
+        if not registry.pm_credentials_present(settings):
+            log.warning("venue=polymarket but POLYMARKET_PRIVATE_KEY is missing "
+                        "(L2 creds alone cannot sign an order); falling back "
+                        "to displayed prices")
+            return
+
+        # The round source, swapped for this venue. `MarketFeed` is kept as the
+        # STRIKE provider only: Polymarket publishes no reference price for this
+        # family, and both rules compare against the price at the START of the
+        # range, so `variantData.startPrice` is the right number for both.
+        # `strike_backfill` covers the families that provider does NOT carry
+        # (sol/xrp/doge) -- see `_pm_strike_backfill` for why it is not a
+        # second-best source for them but the only one.
+        self.market = PmMarketFeed(session=self.session,
+                                   strike_feed=MarketFeed(self.session),
+                                   strike_backfill=self._pm_strike_backfill,
+                                   strike_backfill_async=(
+                                       self._pm_strike_backfill_kline))
+
+        # EVERY traded family, not just the default series. The venue lists
+        # eth/bnb 5m and 15m alongside BTC's (verified live: gamma returns a
+        # market for both `eth-updown-5m` and `bnb-updown-5m`), and the arms
+        # trade all six. Discovering only the default series is what left five
+        # families with no round and no book -- `no fresh websocket book
+        # off-primary`, 34 of them in one evening.
+        prefixes = [p for p, _, _ in MARKETS]
+        found = await self.market.rounds_by_prefixes(prefixes)
+        rounds = [r for r in found.values() if r is not None]
+        if not rounds:
+            log.warning("polymarket: no open round discovered for any of %s",
+                        ", ".join(prefixes))
+            return
+
+        # THE BOOK IS THE ARMS' PRICE SOURCE, not decoration. It is wired into
+        # `ws_book` -- the slot every arm reads through -- via an adapter that
+        # resolves each side to its OWN token, because Polymarket has a
+        # separate book per outcome where the wrapper had one covering both.
+        # Left unwired, this socket connects, ingests ~680 messages/s and is
+        # read by nothing: every arm silently falls back to displayed prices.
+        book = PmBook()
+        view = PmBookView(book)
+        view.follow(rounds)
+        self._pm_book = book
+        self._pm_view = view
+        self.ws_book = view
+        self._pm_book_task = asyncio.create_task(book.run())
+
+        # `make_pm_bundle` returns a VenueBundle (name + broker + book + note),
+        # not the broker itself.
+        bundle = registry.make_pm_bundle(settings=settings, book=book,
+                                         log=log.info)
+        br = bundle.broker
+        self._pm_broker = br
+        for r in rounds:
+            self._pm_remember(r)
+        # The signer's first call costs ~500 ms. Pay it at boot or pay it on
+        # the first order, where it is worth more than the whole edge.
+        cold_ms = br.prime()
+        bal = await br.equity()
+        now_ms = int(time.time() * 1000)
+        log.info("POLYMARKET venue live: %d famil(ies) %s | collateral $%.4f "
+                 "| signer prime %.0f ms", len(rounds),
+                 ",".join(sorted(found)), bal, cold_ms)
+        for pfx in sorted(found):
+            rr = found[pfx]
+            log.info("POLYMARKET round %-15s %s  tau %.0fs",
+                     pfx, rr.slug, rr.tau_s(now_ms))
+        self.book = br
 
     async def _refresh_bankroll(self) -> None:
         """Re-read wallet equity so percentage sizing compounds intraday.
@@ -3704,7 +5783,12 @@ class Bot:
         if self.mode != "live" or getattr(self, "book", None) is None:
             return
         try:
-            bal = await self.book.equity()
+            # `refresh=True`: the Polymarket broker serves `equity()` from a
+            # cache that only SPENDING invalidates, so without this a deposit is
+            # invisible while the bot is idle (measured 2026-09-17: $5.00 landed
+            # and the bot sized off the old number for four hours). `LiveBroker`
+            # accepts the kwarg and ignores it -- its read is live per call.
+            bal = await self.book.equity(refresh=True)
         except Exception as e:          # never let a read failure stop trading
             log.warning("bankroll refresh failed: %s: %s", type(e).__name__, e)
             return
@@ -3780,7 +5864,7 @@ class Bot:
                 continue
             winner = row["winner"]
             if not winner:
-                fresh = await self.market.by_topic_id(row["market_topic_id"])
+                fresh = await self._resolve_round(row)
                 if fresh:
                     self.store.upsert_round(round_row(fresh))
                     winner = fresh.winner_name
@@ -3862,27 +5946,118 @@ class Bot:
             return
         self._last_claim_sweep = now
         claimed = await broker.redeem()
-        if claimed:
+        # `redeem()` returns a DICT and a dict carrying no redemptions is TRUTHY,
+        # so `if claimed:` printed `{'redeemed': [], 'reason':
+        # 'nothing_redeemable'}` once a minute forever -- measured 64 of the
+        # ~1,600 lines in a 3-hour window, every one saying nothing happened.
+        got = claimed.get("redeemed") if isinstance(claimed, dict) else claimed
+        if got:
             log.info("claim sweep -> %s", str(claimed)[:160])
+        elif claimed:
+            log.debug("claim sweep -> %s", str(claimed)[:160])
+
+    async def refresh_bankroll_if_stale(self) -> None:
+        """Re-read wallet equity on a CLOCK, not only when a position settles.
+
+        `_refresh_bankroll` used to have exactly one caller -- `settle_due`,
+        when a fill settles -- and that is a loop with no exit:
+
+            no trade -> nothing settles -> the bankroll is never re-read
+                     -> the exposure cap keeps using a stale number
+                     -> no trade
+
+        MEASURED 2026-09-17: $5.00 was deposited (pUSD 5.5243 -> 10.5243,
+        confirmed on-chain) and the bot kept sizing off **$5.5243** for four
+        hours, until a human restarted it. With `cross_max_open_stake_pct=0.30`
+        and a $0.98 orphaned position open,
+
+            0.98 + 1.00 > 0.30 * 5.52 = $1.66
+
+        refused EVERY crossing -- so the account could not trade its way to a
+        settlement that would have refreshed the number. The cap is a FRACTION
+        of this figure, which is what makes a stale read a hard trading halt
+        rather than a cosmetic detail.
+
+        Rate-limited rather than event-driven, for two reasons: the read is a
+        260 ms venue call, and the number only moves when money moves.
+        `_reconcile_bankroll` is unchanged, so the redemption lag still cannot
+        shrink a stake -- it adopts a HIGHER read at once and needs
+        `_BANKROLL_DRIFT_READS` consecutive lower ones to believe a withdrawal.
+        """
+        if self.mode != "live" or getattr(self, "book", None) is None:
+            return
+        now = time.time()
+        if now - getattr(self, "_last_bankroll_refresh", 0.0) < _BANKROLL_REFRESH_S:
+            return
+        self._last_bankroll_refresh = now
+        await self._refresh_bankroll()
 
     # -- run ----------------------------------------------------------------
     async def run(self) -> None:
         await self.setup()
         log.info("running in %s mode (poll %.1fs)", self.mode, settings.poll_interval_s)
         n = 0
+        # At most one settlement backfill in flight; see the call site below.
+        bf: asyncio.Task | None = None
         while not self._stop.is_set():
             t0 = time.time()
+            # Timed phase marks for `_SLOW_TICK_MS`; see that constant for why.
+            ph: list[tuple[str, float]] = []
             try:
                 await self.tick()
+                ph.append(("tick", time.time()))
                 # Backfill outcomes at a low duty cycle -- rounds close every 5
                 # minutes, so checking every ~15s is ample and keeps the poll light.
-                if n % 15 == 0:
-                    await self.backfill_settlements()
+                #
+                # ⛔ DISPATCHED, NEVER AWAITED. This was the whole of the long
+                # tick, and the instrument put in for exactly this question said
+                # so on its first fire (2026-09-17 09:38:38, the first tick
+                # after a restart, where `n % 15 == 0` holds at n=0):
+                #     slow tick 8.39s: tick 32ms | backfill 8084ms
+                #                      | settle 0ms | claims 273ms | after 0ms
+                # `tick 32ms` is the healthy median; the other 8.36 s is this
+                # call. `backfill_settlements` walks up to `limit` rounds (5)
+                # and each one is a SEQUENTIAL REST round trip to the venue, so
+                # its cost is that latency times however many rounds are pending.
+                # The per-call figure is NOT constant, and the number that
+                # matters is the worst one: the same call has since returned
+                # inside this instrument's 2 s threshold (0 warnings in the 20
+                # minutes after the fix, against 8.08 s at boot). A mean would
+                # have hidden it -- five calls can fit in 50 ms, because gamma
+                # is edge-cached at 8.7 ms, yet the whole call took 8084 ms.
+                # Waiting on it here means the loop runs NO tick for
+                # eight seconds, and `_idle` is what evaluates the cross arm:
+                # the budget passed at the bottom of this loop is
+                # `max(0.05, 1.0 - 8.39)` = **50 ms of cross-arm sampling
+                # instead of ~960 ms**. The feed keeps ticking throughout, so
+                # nothing is lost on the socket -- what is lost is the chance to
+                # ACT, which is the same failure `_idle`'s own docstring records
+                # for leaving the cross arm on the 1 s clock.
+                # The deadline is unchanged (still every 15th tick) and still
+                # one at a time: `_resolve_round` calls the same venue the fire
+                # path does, so a pile of overlapping backfills would be a worse
+                # neighbour than the stall it replaces. A slow one cannot
+                # overlap itself into a stampede, and the next dispatch simply
+                # waits for `done()`.
+                if n % 15 == 0 and (bf is None or bf.done()):
+                    bf = asyncio.create_task(self._backfill_async())
+                ph.append(("backfill", time.time()))
                 if self.mode != "record":
                     await self.settle_due()
+                    ph.append(("settle", time.time()))
                     # Claims the venue rejected at settlement are retried on
                     # this clock, not on the next win (see sweep_claims).
                     await self.sweep_claims()
+                    ph.append(("claims", time.time()))
+                    # AND THE SAME FOR THE BANKROLL. `settle_due` re-reads equity
+                    # too, but only when a position settles -- so a bot that has
+                    # STOPPED trading never re-reads, and an arm locked out by
+                    # the exposure cap (a fraction of that stale number) cannot
+                    # trade its way out of it. Measured 2026-09-17: a $5.00
+                    # deposit sat invisible for four hours behind exactly that
+                    # loop. Self-guarded on a 60 s clock.
+                    await self.refresh_bankroll_if_stale()
+                    ph.append(("bankroll", time.time()))
             except Exception as e:
                 log.exception("tick failed: %s: %s", type(e).__name__, e)
             n += 1
@@ -3891,6 +6066,9 @@ class Bot:
                 log.info("stats: rounds=%d quotes=%d decisions=%d fills=%d | %s",
                          c["rounds"], c["quotes"], c["decisions"], c["fills"], self.pnl)
             elapsed = time.time() - t0
+            if elapsed * 1000.0 >= _SLOW_TICK_MS:
+                log.warning("slow tick %.2fs: %s", elapsed,
+                            _phase_breakdown(t0, ph, time.time()))
             # The cadence this arm's edge depends on. Reported rather than
             # assumed, because widening the websocket book to six families is
             # the one change in this repo measured to slow it (1.00s -> 4.15s).
@@ -3900,9 +6078,18 @@ class Bot:
             pm.append(elapsed * 1000.0)
             if len(pm) >= 120:
                 q = sorted(pm)
-                log.info("poll cadence over %d ticks: median %.0fms p90 %.0fms "
-                         "max %.0fms", len(q), q[len(q) // 2],
-                         q[int(len(q) * 0.9)], q[-1])
+                # WARNING when the worst tick in the window is actually bad,
+                # DEBUG otherwise. The number matters when it MOVES (widening the
+                # websocket book is the one change here measured to take the
+                # cadence 1.00s -> 4.15s) but a steady "median 40ms" every two
+                # minutes was 80 of the ~1,600 lines in a 3-hour window.
+                cad = ("poll cadence over %d ticks: median %.0fms p90 %.0fms "
+                       "max %.0fms", len(q), q[len(q) // 2],
+                       q[int(len(q) * 0.9)], q[-1])
+                if q[-1] >= _SLOW_TICK_MS:
+                    log.warning(*cad)
+                else:
+                    log.debug(*cad)
                 self._poll_ms = []
             # In impulse mode this is spent waiting on the price feed rather
             # than on the clock, so the trigger fires ~20 ms after the move
@@ -3917,6 +6104,14 @@ class Bot:
         wsb = getattr(self, "ws_book", None)
         if wsb is not None:
             wsb.stop()
+        # The backfill task is deliberately not awaited on the way in, so it must
+        # be cancelled on the way out: left pending it would keep a REST call and
+        # a SQLite write running past `stop()`, and "Task was destroyed but it is
+        # pending" is a confusing last word for a clean shutdown.
+        if bf is not None and not bf.done():
+            bf.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await bf
         task = getattr(self, "_ws_task", None)
         if task is not None and not task.done():
             task.cancel()
@@ -3926,6 +6121,30 @@ class Bot:
 
     def stop(self) -> None:
         self._stop.set()
+
+
+def _quiet_libraries() -> None:
+    """Silence third-party INFO chatter that is not a trading event.
+
+    httpx logs ONE INFO LINE PER REQUEST (`HTTP Request: GET <url> "HTTP/2 200
+    OK"`). That is right for a library and wrong for an operations log: the bot
+    fetches order metadata for every family at every round roll, reads positions
+    once a minute for the claim sweep, and reads balance-allowance for the
+    bankroll -- and EVERY one of those already logs its own line where it
+    matters (`warm quote used`, `claim sweep`, `pm FAK FILL`). Measured over the
+    last 3 hours of live.log: ~300 of ~1,600 lines were transport noise for
+    actions that each had a better line elsewhere. It also hides the lines worth
+    reading -- `POST /order "HTTP/2 400 Bad Request"` and the startup probe's 404
+    are both httpx INFO, so "scan the log for trouble" ends up reading the
+    transport instead of the decisions.
+
+    `log_level=DEBUG` restores everything: at DEBUG nothing is suppressed, on the
+    principle that diagnostic mode should be complete rather than merely tidier.
+    """
+    if settings.log_level.upper() == "DEBUG":
+        return
+    for name in ("httpx", "httpcore", "urllib3", "aiohttp", "asyncio"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 async def amain() -> None:
@@ -3943,6 +6162,7 @@ async def amain() -> None:
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
+    _quiet_libraries()
     store = Store(settings.db_path)
     async with aiohttp.ClientSession() as session:
         bot = Bot(args.mode, store, session)

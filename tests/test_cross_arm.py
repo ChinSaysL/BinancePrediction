@@ -2045,20 +2045,88 @@ class TestTickDepthFloor:
         assert "if not train and min_ticks > 0:" in src
 
     def test_the_floor_is_in_ticks_not_bps(self):
-        """The whole point: a bps floor cannot scale across symbols."""
+        """The whole point: a bps floor cannot scale across symbols.
+
+        And the unit lives in ONE place now. The arm must DELEGATE to
+        `passes_depth_floor`, not re-inline the arithmetic -- a second copy at
+        the call site is exactly how the tools drifted from the bot.
+        """
         import inspect
         import btcpredict.main as m
         src = inspect.getsource(m.Bot._cross_tick)
         i = src.index("min_ticks = ")
-        seg = src[i:i + 600]
-        assert "min_ticks * tick" in seg, "compare in price units, not bps"
-        assert "depth_bps" not in seg.split("if depth_bps")[0][-200:] or True
+        seg = src[i:src.index("min_depth_sigma", i)]
+        # Comments are excluded: this block explains the old form and quotes
+        # its literals, which would otherwise make the guards match themselves.
+        code = "\n".join(ln for ln in seg.splitlines()
+                         if not ln.strip().startswith("#"))
+        assert "passes_depth_floor(spot_now, level, mk)" in code, (
+            "the arm must apply the floor via main.passes_depth_floor, against "
+            "the LEVEL the round is paid on (`level`, see _cross_level) -- not "
+            "against `r.strike`")
+        assert "abs(spot_now - r.strike) <" not in code, (
+            "no second copy of the comparison at the call site")
+        assert "1e-12" not in code, (
+            "a FIXED absolute epsilon (1e-12) cannot absorb the ULP of a "
+            "difference of two doubles at BTC's ~7.6e4 (1.46e-11), so it "
+            "refuses crossings sitting exactly ON the floor")
 
     def test_it_is_checked_before_the_bps_ceiling(self):
         import inspect
         import btcpredict.main as m
         src = inspect.getsource(m.Bot._cross_tick)
         assert src.index("min_depth_ticks") < src.index('"max_depth_bps"')
+
+    def test_a_crossing_exactly_ON_the_floor_is_taken(self, store, armed):
+        """FLOAT CANCELLATION, measured live -- not a thought experiment.
+
+        Spot 75996.005 against strike 75996.015 is EXACTLY one tick through,
+        but `abs(spot - strike)` is a difference of two doubles and computes as
+        0.00999999999476. The old threshold was `1 * 0.01 - 1e-12` =
+        0.00999999999900, so the arm REFUSED a crossing sitting exactly on its
+        own floor, and said so out loud:
+
+            2026-09-16 06:19  btc-updown-5m  only 1 tick(s) through the
+                             strike, floor is 1
+
+        3 of the 154 recorded floor refusals are this case (06:19, 20:34,
+        23:39, all btc-5m). The ULP of a double at 7.6e4 is 1.46e-11 -- 14x
+        the epsilon that was supposed to absorb it.
+        """
+        from btcpredict.config import settings as S
+        assert S.cross_min_depth_ticks == 1.0, "this test is about floor 1"
+        bot = make_bot(store, ticks(76000.0, 75999.0, 75996.005),
+                       asks=(0.30, 0.40))
+        bot._round.strike = 75996.015
+        calls = []
+
+        async def execute(*a, **k):
+            calls.append(k.get("side"))
+
+        bot._cross_execute = execute
+        asyncio.run(bot._cross_tick())
+        assert calls == ["Down"], (
+            f"a crossing exactly ON the floor must trade -- refusing it is the "
+            f"1e-12-vs-1.46e-11 bug; got {calls}")
+
+    def test_a_hair_under_the_floor_is_still_refused(self, store, armed):
+        """The half-tick case must keep being refused -- the fix moves the
+        boundary, it does not remove it. 0.005 is one step of the spot's
+        half-tick grid, i.e. the spot exactly ON the strike."""
+        from btcpredict.config import settings as S
+        assert S.cross_min_depth_ticks == 1.0
+        bot = make_bot(store, ticks(76000.0, 75999.0, 75996.010),
+                       asks=(0.30, 0.40))
+        bot._round.strike = 75996.015
+        calls = []
+
+        async def execute(*a, **k):
+            calls.append(k.get("side"))
+
+        bot._cross_execute = execute
+        asyncio.run(bot._cross_tick())
+        assert calls == [], (
+            f"a half-tick crossing is below a 1-tick floor; got {calls}")
 
 
 class TestTheInFlightGuard:
@@ -2413,6 +2481,27 @@ class TestTheRefusedProbe:
         rows = [r[0] for r in bot.store.conn.execute(
             "select reason from decisions")]
         assert any("round already moved" in r for r in rows), rows
+
+    def test_the_range_refusal_names_its_own_margin(self, store, armed,
+                                                    monkeypatch):
+        """One decimal made a CORRECT refusal read as an impossible one.
+
+        MEASURED 2026-09-17: this gate logged
+            round already moved 13.6bps, gate is 13.6
+        for a true 13.6086 against a 13.6000 gate, and the operator rightly
+        asked why it refused. The comparison is exact; the LINE was not. Any
+        fixed precision fails when the margin is under the last digit, so the
+        line must also NAME THE EXCESS.
+        """
+        monkeypatch.setattr(
+            "btcpredict.config.settings.cross_max_round_range_bps", 2.0)
+        bot = self._wide(store)
+        asyncio.run(bot._cross_tick())
+        rows = [r[0] for r in bot.store.conn.execute(
+            "select reason from decisions")]
+        reason = next(r for r in rows if "round already moved" in r)
+        assert "gate is 2.00" in reason, reason
+        assert "over)" in reason, reason
 
     def test_probe_orders_are_sized_by_the_arm_formula(
             self, store, armed, monkeypatch):
@@ -2804,6 +2893,13 @@ class TestTheFillPriceIsCapped:
         monkeypatch.setattr("btcpredict.config.settings.cross_max_fill_px", 0.65)
         monkeypatch.setattr("btcpredict.config.settings.cross_max_price", 0.95)
         monkeypatch.setattr("btcpredict.config.settings.cross_limit_buffer_inv", 0.30)
+        # This scenario is a 0.52bps move (76997 -> 77001 on ~77000) quoted at
+        # 0.61, which the model-edge gate refuses: our fair for a crossing that
+        # shallow is ~0.50, so the venue is asking well over what the round is
+        # worth. That refusal is the gate working, but it means the order path
+        # is never reached and this test would be measuring the wrong gate.
+        # Turn it off here; it has its own tests.
+        monkeypatch.setattr("btcpredict.config.settings.cross_min_edge", 0.0)
         bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0), asks=(0.61, 0.39))
         seen = {}
 
@@ -2824,6 +2920,9 @@ class TestTheFillPriceIsCapped:
         monkeypatch.setattr("btcpredict.config.settings.cross_max_price", 0.95)
         monkeypatch.setattr("btcpredict.config.settings.cross_limit_buffer_inv", 0.30)
         monkeypatch.setattr("btcpredict.config.settings.order_type", "market")
+        # See test_the_limit_ceiling_is_capped: the edge gate refuses this
+        # shallow crossing, and this test is about the cap.
+        monkeypatch.setattr("btcpredict.config.settings.cross_min_edge", 0.0)
         bot = make_bot(store, ticks(76997.0, 76998.0, 77001.0), asks=(0.61, 0.39))
         bot.broker.mode = "live"
         seen = {}

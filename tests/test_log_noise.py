@@ -1,0 +1,177 @@
+"""The log is an operations record, not a request trace.
+
+WHY THIS FILE EXISTS. Measured over 3 hours of the live log, the largest sources
+of lines were things that had ALREADY been said better somewhere else:
+
+    220  pm order metadata: pre-resolved N token(s)   <- a SUCCESS line; the
+                                                         `warm N` counter on the
+                                                         liveness line carries it
+    171  httpx GET /markets-by-token/N                 <- transport for that warm
+    135  families: N/N cached, N live | ...            <- "no change", every 60s
+     80  poll cadence over 120 ticks: median 40ms     <- healthy, every 2 min
+     64  claim sweep -> {'redeemed': [], ...}          <- "nothing happened"
+    ~300 the rest of httpx (positions, balance-allowance, clob-markets, ...)
+
+Five shapes, roughly half the file, none of them a trading event -- and between
+them they drown the ones that are (`CROSS`, `pm FAK FILL`, `cross exec`,
+`settled`, and every WARNING).
+
+The risk in removing noise is removing the ALARM with it, so each is pinned in
+BOTH directions: silent when healthy, loud when it is not. `_quiet_libraries`
+goes further and gives httpx back wholesale at `log_level=DEBUG`, because a
+diagnostic mode that silently drops the transport is not a diagnostic mode.
+"""
+from __future__ import annotations
+
+import ast
+import asyncio
+import logging
+import pathlib
+
+import pytest
+
+import btcpredict.main as m
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+MAIN = ROOT / "btcpredict" / "main.py"
+
+
+class _Collect(logging.Handler):
+    """Collect records WITHOUT touching the logger's own level.
+
+    `caplog` and the `_capture` helper in test_pm_order_warm.py both call
+    `setLevel(DEBUG)`, which is exactly what these tests are trying to prove has
+    been turned OFF -- a helper that re-enables it would pass for the wrong
+    reason.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:    # noqa: E704
+        self.records.append(record)
+
+
+def _attach(name: str) -> tuple[_Collect, logging.Logger]:
+    lg = logging.getLogger(name)
+    h = _Collect()
+    lg.addHandler(h)
+    return h, lg
+
+
+@pytest.fixture()
+def httpx_logger():
+    """Restore httpx's level: `_quiet_libraries` mutates global logger state."""
+    lg = logging.getLogger("httpx")
+    old = lg.level
+    yield lg
+    lg.setLevel(old)
+
+
+class TestTheTransportIsSilenced:
+    def test_a_request_line_no_longer_reaches_the_log(self, httpx_logger,
+                                                      monkeypatch) -> None:
+        monkeypatch.setattr(m.settings, "log_level", "INFO")
+        m._quiet_libraries()
+        assert httpx_logger.getEffectiveLevel() == logging.WARNING
+        h, lg = _attach("httpx")
+        try:
+            lg.info('HTTP Request: GET https://clob.polymarket.com/order '
+                    '"HTTP/2 200 OK"')
+        finally:
+            lg.removeHandler(h)
+        assert h.records == [], [r.getMessage() for r in h.records]
+
+    def test_a_transport_FAILURE_still_gets_through(self, httpx_logger,
+                                                    monkeypatch) -> None:
+        """The point is not "hide httpx", it is "stop logging success loudly"."""
+        monkeypatch.setattr(m.settings, "log_level", "INFO")
+        m._quiet_libraries()
+        h, lg = _attach("httpx")
+        try:
+            lg.info('HTTP Request: POST https://clob.polymarket.com/order '
+                    '"HTTP/2 400 Bad Request"')
+            lg.warning("connection reset by peer")
+        finally:
+            lg.removeHandler(h)
+        assert [r.getMessage() for r in h.records] == ["connection reset by peer"], \
+            [r.getMessage() for r in h.records]
+
+    def test_debug_mode_is_left_complete(self, httpx_logger, monkeypatch) -> None:
+        """Nothing is suppressed at DEBUG: the diagnostic mode must not lie."""
+        httpx_logger.setLevel(logging.NOTSET)
+        monkeypatch.setattr(m.settings, "log_level", "DEBUG")
+        m._quiet_libraries()
+        assert httpx_logger.level == logging.NOTSET
+
+    def test_amain_installs_it_after_basicConfig(self) -> None:
+        """Attaching the level before the handler setup would be undone by it."""
+        src = MAIN.read_text()
+        seg = next(ast.get_source_segment(src, n)
+                   for n in ast.walk(ast.parse(src))
+                   if isinstance(n, ast.AsyncFunctionDef) and n.name == "amain")
+        assert seg is not None
+        assert "logging.basicConfig(" in seg
+        assert "_quiet_libraries()" in seg
+        assert seg.index("logging.basicConfig(") < seg.index("_quiet_libraries()")
+
+
+class TestTheOnesThatSaidNothingHappened:
+    def _sweep(self, result) -> list[logging.LogRecord]:
+        class _Broker:
+            mode = "live"
+
+            async def redeem(self):                       # noqa: E704
+                return result
+
+        bot = m.Bot.__new__(m.Bot)
+        bot.broker = _Broker()
+        bot._last_claim_sweep = 0.0
+        h, lg = _attach("btcpredict")
+        old, lg.level = lg.level, logging.DEBUG
+        try:
+            asyncio.run(bot.sweep_claims())
+        finally:
+            lg.removeHandler(h)
+            lg.level = old
+        return h.records
+
+    def test_an_empty_sweep_is_not_an_event(self) -> None:
+        """`{'redeemed': []}` is a TRUTHY dict, which is why `if claimed:`
+        printed it every 180s forever."""
+        recs = self._sweep({"redeemed": [], "reason": "nothing_redeemable"})
+        assert [r for r in recs if r.levelno >= logging.INFO] == [], \
+            [r.getMessage() for r in recs]
+
+    def test_a_real_redemption_is_still_reported(self) -> None:
+        recs = self._sweep({"redeemed": [{"txHash": "0xabc"}]})
+        info = [r for r in recs if r.levelno == logging.INFO]
+        assert len(info) == 1 and "claim sweep" in info[0].getMessage(), \
+            [r.getMessage() for r in recs]
+
+
+def _flat(fn: str) -> str:
+    """A method of `Bot` with whitespace collapsed, so a reflow cannot break a
+    pin. The liveness line is in `tick`, the cadence line in `run`."""
+    src = MAIN.read_text()
+    seg = next((ast.get_source_segment(src, n) for n in ast.walk(ast.parse(src))
+                if isinstance(n, ast.AsyncFunctionDef) and n.name == fn), None)
+    assert seg is not None, f"Bot.{fn} is gone: this guard would measure nothing"
+    return " ".join(seg.split())
+
+
+class TestTheAlarmsSurvive:
+    def test_the_liveness_line_shouts_only_when_a_family_is_missing(self) -> None:
+        """It exists for the ABSENCE case -- a family with no quote, no book and
+        no decision can be dead for hours while the log says only "no trades"."""
+        body = _flat("tick")
+        assert "if miss or dead: log.warning(pat, *fargs) else: log.debug(pat, *fargs)" \
+            in body, body[-1200:]
+
+    def test_the_cadence_line_shouts_only_when_a_tick_was_bad(self) -> None:
+        """A widened websocket book is measured to take the cadence 1.00s ->
+        4.15s, so the number has to still be able to reach the log."""
+        body = _flat("run")
+        assert "if q[-1] >= _SLOW_TICK_MS: log.warning(*cad) else: log.debug(*cad)" \
+            in body, body[-1200:]

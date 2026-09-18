@@ -23,13 +23,13 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from btcpredict.config import cross_knob, settings as S   # noqa: E402
-from btcpredict.main import crossed_side                  # noqa: E402
+from btcpredict.main import crossed_side, passes_depth_floor  # noqa: E402
 
 FEE = 0.0169
 FRAC = 0.0672
 
 
-def triggers(q, rounds, *, floor_ticks, gate, tau_lo, tau_hi, hold):
+def triggers(q, rounds, *, market, floor_ticks, gate, tau_lo, tau_hi, hold):
     out = []
     for slug, g in q.groupby('slug', sort=False):
         rr = rounds.get(slug)
@@ -56,9 +56,13 @@ def triggers(q, rounds, *, floor_ticks, gate, tau_lo, tau_hi, hold):
             if took and took != side:
                 continue
             dep = abs(sp[i] - K)
-            if dep < floor_ticks * S.cross_tick_size - 1e-12:
+            # `market` is required: the tick this converts to TICKS with is
+            # PER MARKET (XRP 0.0001, DOGE 0.00001) and so is the ceiling.
+            # `floor_ticks` overrides the shipped value, because this tool
+            # RANKS floors rather than applying one.
+            if not passes_depth_floor(sp[i], K, market, floor_ticks=floor_ticks):
                 continue
-            if 1e4 * dep / K > S.cross_max_depth_bps:
+            if 1e4 * dep / K > cross_knob(market, "max_depth_bps"):
                 continue
             rng = 1e4 * (np.nanmax(sp[:i + 1]) - np.nanmin(sp[:i + 1])) / K
             if gate > 0 and rng > gate:
@@ -141,26 +145,28 @@ def main() -> int:
         if not len(q):
             continue
         shipped_gate = cross_knob(fam, 'max_round_range_bps')
+        shipped_floor = cross_knob(fam, 'min_depth_ticks')
         print(f"\n=== {fam}   {q.slug.nunique()} rounds   "
-              f"shipped: floor {S.cross_min_depth_ticks:.0f} ticks, "
+              f"shipped: floor {shipped_floor:.0f} ticks, "
               f"gate {shipped_gate}, tau {S.cross_min_tau_s:.0f}-{S.cross_max_tau_s:.0f}s ===")
         print(hdr)
-        base = dict(gate=shipped_gate, tau_lo=S.cross_min_tau_s,
+        # `market` is part of every cell: the depth floor and the ceiling are
+        # per-market knobs, and a cell that reads the global tick_size is not
+        # the live gate.
+        base = dict(market=fam, gate=shipped_gate, tau_lo=S.cross_min_tau_s,
                     tau_hi=S.cross_max_tau_s, hold=a.hold)
         report("SHIPPED", fills(triggers(q, rounds,
-                                         floor_ticks=S.cross_min_depth_ticks, **base)))
+                                         floor_ticks=shipped_floor, **base)))
         for ft in (0.0, 2.0, 3.0, 8.0, 12.0):
             report(f"floor {ft:.0f} ticks",
                    fills(triggers(q, rounds, floor_ticks=ft, **base)))
         report("range gate OFF",
-               fills(triggers(q, rounds, floor_ticks=S.cross_min_depth_ticks,
-                              gate=0.0, tau_lo=S.cross_min_tau_s,
-                              tau_hi=S.cross_max_tau_s, hold=a.hold)))
+               fills(triggers(q, rounds, floor_ticks=shipped_floor,
+                              **{**base, "gate": 0.0})))
         for lo, hi in ((5, 120), (5, 180), (60, 240)):
             report(f"tau {lo}-{hi}s",
-                   fills(triggers(q, rounds, floor_ticks=S.cross_min_depth_ticks,
-                                  gate=shipped_gate, tau_lo=lo, tau_hi=hi,
-                                  hold=a.hold)))
+                   fills(triggers(q, rounds, floor_ticks=shipped_floor,
+                                  **{**base, "tau_lo": lo, "tau_hi": hi})))
     return 0
 
 

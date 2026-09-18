@@ -158,16 +158,36 @@ class PredictionBook:
     #: market ids with an established socket right now
     _live: set = field(default_factory=set)
 
-    def best(self, market_id: int | None, max_age_s: float) -> BookTop | None:
-        """The book for `market_id`, or None if missing or stale.
+    @staticmethod
+    def _as_market_id(x) -> int | None:
+        """A Round or a raw marketId -> the integer marketId, or None."""
+        if x is None:
+            return None
+        if isinstance(x, int):
+            return x
+        mid = getattr(x, "market_id", None)
+        try:
+            return int(mid) if mid is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def best(self, round_or_id, max_age_s: float) -> BookTop | None:
+        """The book for a Round (preferred) or a raw marketId.
+
+        BOTH forms are accepted. The arms pass the ROUND they are pricing,
+        because Polymarket addresses a market by its slug and its two outcomes
+        have separate books, so the wrapper's integer id does not exist there
+        -- a Round is the one argument that means the same thing on either
+        venue. `tops` itself stays keyed by marketId.
 
         Staleness is not an edge case here: a silently frozen feed would price
         every order off a dead book, which is strictly worse than the REST poll
         this replaces. Callers fall back rather than wait.
         """
-        if market_id is None:
+        mid = self._as_market_id(round_or_id)
+        if mid is None:
             return None
-        t = self.tops.get(int(market_id))
+        t = self.tops.get(mid)
         if t is None or t.age_s() > max_age_s:
             return None
         return t
@@ -185,7 +205,7 @@ class PredictionBook:
     #: `follow` existed to avoid.
     CLOSE_AFTER_ABSENT_S = 90.0
 
-    def follow(self, market_ids: list[int]) -> None:
+    def follow(self, rounds_or_ids) -> None:
         """Declare the markets that should have a live book.
 
         AUTHORITATIVE (with a grace period), where this used to be purely
@@ -199,10 +219,10 @@ class PredictionBook:
         """
         now = time.time()
         added = False
-        for m in market_ids:
+        for x in rounds_or_ids:
+            m = self._as_market_id(x)
             if not m:
                 continue
-            m = int(m)
             if m not in self._seen:
                 added = True
             self._seen[m] = now

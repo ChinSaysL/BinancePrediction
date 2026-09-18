@@ -36,8 +36,18 @@ class SpotFeed:
         # it. The impulse trigger reads THIS series rather than the once-a-second
         # poll sample: the venue is 5 ms away, so sampling the price only when
         # the poll wakes is what put a 500 ms median between the move and the
-        # order. Sized for minutes of updates (BTC bookTicker ran 33/s).
-        self.ticks: deque[tuple[int, float]] = deque(maxlen=4000)
+        # order.
+        #
+        # 40,000, NOT 4,000 (2026-09-17). The depth is a WINDOW on the recent
+        # past, and the Polymarket strike backfill reads it for the price at a
+        # round's START INSTANT -- which must be a tick AT OR BEFORE that
+        # instant. At BTC's measured 114 updates/s, 4,000 ticks is 35 seconds,
+        # so any round discovered more than ~35 s after it opened lost its
+        # pre-open ticks and could NEVER be priced (`sol/xrp/doge` sat at
+        # `not live` exactly this way). 40,000 is ~5 minutes at that rate and
+        # ~15 minutes at 45/s -- one round plus the discovery slack -- for
+        # ~2 MB per symbol of tuples.
+        self.ticks: deque[tuple[int, float]] = deque(maxlen=40_000)
         # Set on every update so the decision loop can wake on the price itself.
         self.tick_event = asyncio.Event()
 
