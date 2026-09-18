@@ -469,6 +469,18 @@ def _ts_epoch(x: Any) -> float | None:
     return d.timestamp()
 
 
+#: ⛔ A POSITION DELTA SMALLER THAN THIS FRACTION OF THE ORDER IS **DUST**, NOT A
+#: SALE. `list_positions` is a lagging aggregate and its numbers carry rounding:
+#: measured 2026-09-18 on `btc-updown-15m-1789752600`, a 1.7692-share sell read
+#: back as 1.769103 held -- a 9.7e-05 difference -- and `left < shares - 1e-9`
+#: duly called that a completed sale. The venue had in fact sold ALL 1.8 shares
+#: at 0.305; the bot booked 0.000097 of them, split the fill, stopped watching,
+#: and left 1.7692 shares in the ledger that `settle_due` would then pay out
+#: against the round's winner. Three exits died this way (15:02, 15:03, 17:42).
+#: A real sale moves the position by most of the order; anything less means the
+#: list has not caught up, which is a "ask again", not an answer.
+_MIN_SALE_FRACTION = 0.5
+
 class PmBroker:
     """Order placement against the Polymarket CLOB.
 
@@ -1804,6 +1816,18 @@ class PmBroker:
             self._log(f"pm sell {slug} {side}: the venue shows {shown} shares "
                       f"held; selling this fill's {held:g} (the position list "
                       f"lags the fill -- it is a cap, not a permission)")
+        # ⛔ PUBLISH THE SIZE ACTUALLY SENT. The caller knows only what the
+        # LEDGER believes it holds, and those differ whenever the entry was
+        # booked at its ceiling (the unverified path books `shares` at
+        # `ceiling`, which overstates both). Confirming a sale against the
+        # ledger's number instead of this one reads a full close where a
+        # remainder is still on-chain:
+        #   LIVE 2026-09-18 18:32 eth-updown-5m-1789756200 -- ledger held "2",
+        #   the venue held 1.8181, the order correctly sized down, and the
+        #   confirmation then booked "sold 2 sh" (shares - left = 2 - 0) with
+        #   frac = 1.0, so no split row was written and the 0.008182-share
+        #   remainder became invisible.
+        self.last_sell_size = float(sell_shares)
         # A STALE BOOK IS A REFUSAL, not a price to sell into: the floor is
         # derived from the bid we can SEE, and an old bid would set a floor the
         # live market has already left behind.
@@ -1894,7 +1918,12 @@ class PmBroker:
             if time.perf_counter() >= deadline:
                 break
             time.sleep(0.2)
+        # DUST IS NOT A SALE -- see `_MIN_SALE_FRACTION`. A delta under the
+        # floor means the list is behind, so fall through to the trade record
+        # rather than booking a rounding error as a completed exit.
         sold = 0.0 if left is None else max(0.0, sell_shares - left)
+        if sold < sell_shares * _MIN_SALE_FRACTION:
+            sold = 0.0
         if left is None or sold <= 1e-9:
             # ---- THE VENUE'S TRADE RECORD, WHICH IS THE ONLY SOURCE THAT IS A
             # FILL RATHER THAN A TOTAL -------------------------------------
@@ -1975,13 +2004,19 @@ class PmBroker:
         traded = got[0] if got else 0.0
         px = got[1] if got and 0.0 < got[1] < 1.0 else fallback_px
         fee = got[2] if got and got[2] > 0 else 0.0
-        if left is not None and left < shares - 1e-9:
+        # ⛔ THE DELTA MUST BE MATERIAL. `left < shares - 1e-9` accepted any
+        # rounding difference in a lagging aggregate as a finished sale -- see
+        # `_MIN_SALE_FRACTION` for the 9.7e-05 that cost a whole position.
+        if left is not None and (shares - left) >= shares * _MIN_SALE_FRACTION:
             sold = max(0.0, shares - left)
             if traded > 0:
                 sold = min(sold, traded) if traded < sold else sold
             return (sold, px, fee)
-        if traded >= shares * 0.5:
+        if traded >= shares * _MIN_SALE_FRACTION:
             return (min(traded, shares), px, fee)
+        # Neither source is convincing yet: the list may still be behind and the
+        # trade record may not have published. UNKNOWN, so ask again -- the
+        # watcher keeps the position and this is called on the next tick.
         return None
 
     async def buy_limit(self, *, slug: str, side: str, token_id: str,

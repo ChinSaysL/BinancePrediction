@@ -12959,3 +12959,70 @@ than expected is a BUG HYPOTHESIS, not a finding about the market. "Confirming
 a flip for 3 s almost never happens" should have been read as "my confirmation
 cannot see a persistent state", exactly as "the exit banks the entry price"
 should have been read as a pricing bug and not an edge.
+
+### ⛔ "CAN WE TUNE BINANCE TOWARD CHAINLINK?" — NO, AND IT WOULD MAKE IT WORSE (2026-09-18)
+
+Operator's question after `sol-updown-5m-1789756200` turned on **0.02 bps**: can
+the Binance tape be modified or corrected with a formula to track the Chainlink
+stream the venue settles on? `tools/pm_feed_residual.py`, 3,965 settled PM-era
+rounds with both a venue strike and a Binance tape covering both windows.
+
+**1. THERE IS NOTHING TO FIT.** The venue's own published reference against ours:
+
+    median +0.04 bps   mean +0.26   |gap| median 1.55   p10 -3.20   p90 +3.95
+
+Zero-mean, +-3.5 bps of dispersion. A constant correction moves nothing and the
+DISPERSION is what decides marginal rounds. Chainlink is a COMPOSITE of many
+exchanges, not a lagged Binance -- the residual is cross-venue dispersion, not a
+lag, so no lead/lag or scaling fit on one exchange's tape can reach it.
+
+**2. ⛔ USING THE VENUE'S OWN REFERENCE IS WORSE BY 3.6 POINTS.** Agreement with
+the venue's own winner, END = Binance twap60 in both columns:
+
+    REF = ours (Binance twap60 at open)   3830/3965 = 96.60%
+    REF = venue strike (Chainlink)        3688/3965 = 93.01%
+
+This REPLICATES `pm_rule_source_decomp.py`'s 73.66% vs 96.55%, which had been
+filed under the era conflict and looked backwards. It is not an era artifact.
+
+WHY, and this is the load-bearing insight: **the venue computes BOTH its
+reference AND its settlement from Chainlink.** Using Binance for both puts our
+source error on both sides, where it CANCELS -- this file already said so
+("the same rounds that the window moves one way, the source moves back") without
+drawing the conclusion. Mixing a Chainlink reference with a Binance end breaks
+the cancellation and the error shows in full. **CONSISTENCY OF SOURCE BEATS
+MATCHING THE VENUE'S ABSOLUTE LEVEL**, and "improving" the feed toward Chainlink
+would degrade exactly what earns the 96.6%. `twap_reference` is correct as built.
+
+**3. THE RESIDUAL IS ENTIRELY A SMALL-MOVE PHENOMENON**, by
+|final move| = |twap60(bell) - twap60(open)| on our own tape:
+
+    [ 0.0, 0.5) bps  n= 152  agree 59.2%   <- a COIN FLIP
+    [ 0.5, 1.0)      n= 123  agree 87.8%
+    [ 1.0, 2.0)      n= 270  agree 90.7%
+    [ 2.0, 3.0)      n= 244  agree 96.7%
+    [ 3.0, 5.0)      n= 523  agree 97.9%
+    [ 5.0,  10)      n=1074  agree 98.9%
+    [10.0, inf)      n=1579  agree 99.9%
+
+Below half a basis point the two feeds are a coin flip; above ten they are the
+same object. **So this was never a feed problem -- it is a SMALL-MOVE problem**,
+and no feed engineering touches it. The sol round sat at 0.02 bps, the deepest
+part of the 59.2% bucket: which side won was decided by which price series you
+read, not by the strategy.
+
+**WHAT THE ARM SHOULD DO, AND ALREADY DOES.** The quantity governing exposure to
+that band is the projected final move -- exactly `|fc - level|`, which
+`cross_min_margin_bps` already gates. So the instrument exists, and this explains
+WHY that floor earns and why it cannot simply be raised:
+  * a higher floor cuts feed-noise exposure (59.2% -> 96.7% agreement by 2 bps);
+  * a higher floor also selects bigger, faster moves, whose FILLS are worse
+    (slippage +0.0045 -> +0.0214 -> +0.0545/share as |m| goes 0.5-1 -> 1-2 -> 2+).
+0.50 bps is where those two curves cross -- which is where the tape sweep and the
+live fills independently landed the same day, for reasons neither knew about.
+
+**THE ONLY GENUINE FEED FIX, not built:** `quotes.oracle` exists and is NULL on
+all **1,669,984** PM-era rows. Polling the venue's own series into it would make
+the SIGNAL the quantity we are paid on rather than a correlated proxy. It is the
+real solution, it is real work, and it only pays if the venue exposes a LIVE
+twap rather than just the round's opening `priceToBeat`.

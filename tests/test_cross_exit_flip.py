@@ -891,3 +891,111 @@ class TestASustainedFlipSells:
         after = body[body.index("if w.get(\"flip_ms\") is None:"):]
         assert "now_side" not in after.split("# ---- ARMED")[-1], (
             "the fire path must not depend on a fresh crossing event")
+
+
+class TestDustIsNotASale:
+    """⛔ LIVE 2026-09-18 17:42, btc-updown-15m-1789752600.
+
+        pm sell: sizing down 1.7693 -> 1.7692 shares to what the venue holds
+        sale PLACED, confirmation pending
+        "sale confirmed late -- booking 9.7e-05 sh @ 0.2900"
+
+    The venue sold ALL 1.8 shares at 0.305 (+$0.54 on the account). The
+    position list simply had not caught up -- it read 1.769103 against the
+    1.7692 asked about -- and `left < shares - 1e-9` called that 9.7e-05
+    difference a completed sale. The fill was split, the watcher stopped, and
+    1.7692 shares stayed in the ledger for `settle_due` to pay out against the
+    round's winner. Three exits died this way (15:02, 15:03, 17:42).
+
+    `_trades_since` KNEW the real size; `sold = min(shares - left, traded)`
+    threw it away.
+    """
+
+    def test_the_constant_exists_and_is_a_real_fraction(self):
+        from btcpredict.venues.polymarket import broker as B
+        assert 0.0 < B._MIN_SALE_FRACTION <= 1.0
+
+    def test_a_dust_delta_is_not_confirmed_as_a_sale(self):
+        from btcpredict.venues.polymarket.broker import PmBroker
+        b = PmBroker.__new__(PmBroker)
+        b._position_size_checked = lambda tok: 1.769103   # the list, behind
+        b._trades_since = lambda tok, ts: (1.7692, 0.29, 0.0)
+        got = PmBroker.confirm_sale(b, token_id="t", shares=1.7692,
+                                    since_ts=0.0, fallback_px=0.29)
+        # The trade record IS convincing, so the sale is confirmed in FULL --
+        # what must never happen is booking the 9.7e-05 dust delta.
+        assert got is not None
+        assert got[0] > 1.7, f"booked {got[0]} shares, not the real sale"
+
+    def test_dust_with_no_trade_record_is_unknown_not_a_sale(self):
+        from btcpredict.venues.polymarket.broker import PmBroker
+        b = PmBroker.__new__(PmBroker)
+        b._position_size_checked = lambda tok: 1.769103
+        b._trades_since = lambda tok, ts: None
+        assert PmBroker.confirm_sale(b, token_id="t", shares=1.7692,
+                                     since_ts=0.0) is None, (
+            "neither source is convincing: ask again, do not book dust")
+
+    def test_a_real_delta_still_confirms(self):
+        from btcpredict.venues.polymarket.broker import PmBroker
+        b = PmBroker.__new__(PmBroker)
+        b._position_size_checked = lambda tok: 0.0        # genuinely gone
+        b._trades_since = lambda tok, ts: (1.7692, 0.29, 0.01)
+        got = PmBroker.confirm_sale(b, token_id="t", shares=1.7692,
+                                    since_ts=0.0)
+        assert got is not None and got[0] > 1.7
+
+
+class TestTheConfirmationUsesWhatWasSent:
+    """⛔ LIVE 2026-09-18 18:32, eth-updown-5m-1789756200 Down.
+
+        OPEN CROSS ... stake=$1.26 @0.630          (ledger: 2 shares)
+        pm sell: sizing down 2 -> 1.8181 shares to what the venue holds
+        sale PLACED, confirmation pending
+        "sale confirmed late -- booking 2 sh @ 0.2800"
+
+    The venue had bought 1.818182 @ 0.55 and sold 1.810000 @ 0.31. The ORDER
+    sized down correctly; the CONFIRMATION did not, because it asked
+    `confirm_sale(shares=w["shares"])` -- the ledger's 2.0, inflated by the
+    unverified entry path booking `shares` at `ceiling`. With `left = 0`,
+    `sold = shares - left = 2.0`, `frac = 1.0`, so it wrote no split row and
+    the 0.008182-share remainder became invisible to the bot while still
+    sitting on-chain.
+    """
+
+    def test_the_broker_publishes_the_size_it_sent(self):
+        src = (ROOT / "btcpredict" / "venues" / "polymarket"
+               / "broker.py").read_text()
+        i = src.index("def _sell_fak_body")
+        j = src.index("def confirm_sale", i)
+        assert "self.last_sell_size = float(sell_shares)" in src[i:j], (
+            "the caller cannot confirm against a size it does not know")
+
+    def test_pending_carries_the_sent_size_not_the_ledgers(self, monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
+                            True)
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_confirm_s",
+                            0.0)
+        b = _bot(monkeypatch=monkeypatch, pending=True)
+        b.broker.last_sell_size = 1.8181        # what the venue could take
+        b._exit_watch[SLUG]["shares"] = 2.0     # what the ledger believes
+        _fire(b, _round(), "Down")
+        pend = b._exit_watch[SLUG]["pending"]
+        assert len(pend) > 2, "the sent size must ride with the pending record"
+        assert pend[2] == pytest.approx(1.8181), (
+            f"confirming against {pend[2]} would book a full close")
+
+    def test_the_confirmation_is_asked_about_the_sent_size(self, monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
+                            True)
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_confirm_s",
+                            0.0)
+        b = _bot(monkeypatch=monkeypatch, pending=True,
+                 confirm=(1.8181, 0.31, 0.0))
+        b.broker.last_sell_size = 1.8181
+        b._exit_watch[SLUG]["shares"] = 2.0
+        _fire(b, _round(), "Down")               # places -> pending
+        _run(b, _round(), "Down")                # confirms
+        assert b.broker.confirms, "confirm_sale was never called"
+        assert b.broker.confirms[0]["shares"] == pytest.approx(1.8181), (
+            "asked about the ledger's 2.0 rather than the 1.8181 sent")

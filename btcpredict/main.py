@@ -4537,9 +4537,13 @@ class Bot:
         if fn is None:
             w.pop("pending", None)     # a broker that cannot answer: stop asking
             return None
-        since, floor = w["pending"]
+        pend = w["pending"]
+        since, floor = pend[0], pend[1]
+        # The SENT size bounds the confirmation; `w["shares"]` is only what the
+        # ledger believes. Older watch entries carry a 2-tuple, so fall back.
+        sent = pend[2] if len(pend) > 2 else float(w["shares"])
         try:
-            got = fn(token_id=w["token"], shares=float(w["shares"]),
+            got = fn(token_id=w["token"], shares=float(sent),
                      since_ts=float(since), fallback_px=float(floor or 0.0))
         except Exception as exc:                              # noqa: BLE001
             log.warning("cross exit %s: sale confirmation failed (%s)",
@@ -4604,7 +4608,14 @@ class Bot:
             # later tick when the venue catches up. Halting here is what left
             # four live sales unbooked today, with `settle_due` then booking the
             # round's result in their place.
-            w["pending"] = (time.time(), float(fill.requested_px or 0.0))
+            # THE SIZE THE BROKER ACTUALLY SENT, not the one we believe we
+            # hold -- they differ whenever the entry was booked at its ceiling,
+            # and confirming against the ledger's number reads a full close
+            # where a remainder is still on-chain (live 18:32, eth-1789756200:
+            # ledger "2", venue 1.8181, booked "sold 2 sh", no split row).
+            sent = getattr(self.broker, "last_sell_size", None)
+            w["pending"] = (time.time(), float(fill.requested_px or 0.0),
+                            float(sent) if sent else float(w["shares"]))
             w["done"] = w.get("done", 0) + 1
             log.info("cross exit %s: sale PLACED, confirmation pending (%s) -- "
                      "position stays watched, no second order", slug,
