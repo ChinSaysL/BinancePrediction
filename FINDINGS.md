@@ -13026,3 +13026,63 @@ all **1,669,984** PM-era rows. Polling the venue's own series into it would make
 the SIGNAL the quantity we are paid on rather than a correlated proxy. It is the
 real solution, it is real work, and it only pays if the venue exposes a LIVE
 twap rather than just the round's opening `priceToBeat`.
+
+### ⛔ CORRECTION to the entry above, and the CHAINLINK FIX IS BLOCKED (2026-09-18)
+
+**THE CORRECTION.** That entry called `rounds.strike` "the venue's own published
+reference" and built a causal story on it. **It is not.** `markets.py` says so
+outright: "`strike` is deliberately NOT sourced from Polymarket: gamma carries no
+reference price... The Binance wrapper's `variantData.startPrice` is the cheap,
+already-harvested **proxy**." `feed_provider = 'chainlink-twap-60s-vs-range-start'`
+is the RESOLUTION RULE label, not the provenance of the value.
+
+So the `REF = venue 93.01%` column compared a **Binance POINT price at the open**
+against a **Binance TWAP60 at the open** -- both the same source. It is a RULE
+comparison, not a SOURCE comparison, and the conclusion drawn from it
+("consistency of source beats matching the venue's absolute level") **was not
+tested by that measurement**. Withdrawn. It may still be true -- the corpus in
+`pm_rule_source_decomp.py` tested it properly and its cancellation argument
+stands on its own -- but this run is not evidence for it.
+
+WHAT THE RUN VALIDLY SHOWS, and it is worth keeping (3,965 current-era rounds):
+
+    REF = Binance twap60 at the open   3830/3965 = 96.60%
+    REF = Binance POINT at the open    3688/3965 = 93.01%
+
+A TWAP60 reference beats a POINT reference by 3.6 points, which independently
+confirms this file's §4 September finding (TAIL 90.7-92.0% > POINT 87.3-89.2%) on
+a sample 14x larger. `twap_reference` is correct as built, for THIS reason.
+
+The small-move residual table is UNAFFECTED -- it scores our own prediction
+against the venue's actual label, which is a genuine end-to-end measure:
+59.2% agreement under 0.5 bps rising to 99.9% above 10 bps.
+
+**THE REAL FIX IS BLOCKED.** `resolutionSource:
+data.chain.link/streams/btc-usd-twap-60s-streams` is Chainlink DATA STREAMS, a
+permissioned commercial product:
+
+    GET api.dataengine.chain.link/api/v1/reports/latest?feedID=btc-usd-twap-60s
+    -> {"error":"Headers.UserId required; Headers.Timestamp required;
+                 Headers.HmacSignature required"}
+
+It needs a commercial agreement and an HMAC keypair. `data.chain.link` is a UI
+page (429s to a bare curl) and Polymarket's gamma API 403s from the VPS. So
+filling `quotes.oracle` with the VENUE'S OWN series is not buildable without
+buying access -- it is a procurement decision, not an engineering one.
+
+THE ONE ENGINEERING ALTERNATIVE, stated and NOT built: Chainlink is a COMPOSITE
+of many exchanges, so a multi-exchange composite of our own (rather than Binance
+alone) would attack the dispersion directly. That is a real project, it needs
+several exchange feeds and a weighting that matches Chainlink's, and nothing in
+this repo measures whether it would close the 3.4% -- do not start it on the
+strength of this paragraph.
+
+**AND THERE IS NO NEW FLOOR TO SHIP.** The fallback was "gate on the projected
+final move instead" -- but that gate IS `cross_min_margin_bps`, it is already at
+0.50, and the sweep that set it optimised P&L directly, which already contains
+the cost of the coin-flip rounds. Raising it further is measured to LOSE on the
+live fills (|m|>=2 bps is -0.1788/share over 22 fills, because slippage rises
+with the margin faster than the feed noise falls). The scale-free variant was
+also already refuted (flat bps beats `|m|/(sigma*sqrt(resid))` at every matched
+entry count). So the feed work changes no parameter -- it EXPLAINS the one
+already shipped, which is a result, not a non-result.
