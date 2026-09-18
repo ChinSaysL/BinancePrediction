@@ -12815,3 +12815,78 @@ opposite ways.
 NOTHING SHIPPED. Bounds: 95 of 211 fills carry a shadow line (a selected
 subset), buckets are n=7-63, and the matched set is negative overall (-0.0585/sh)
 in line with the rest of the live record.
+
+### THE TWO ENTRY-SIDE LEADS, MEASURED — one shipped as RISK, one refused (2026-09-18)
+
+`tools/pm_window_risk.py` and the margin-ceiling probe. Both leads turn out to
+be **the same lead wearing two hats**, and both show the same tape/live
+contradiction.
+
+**LEAD 1 — STACKING. The window is the risk unit, and the old refutation scored
+the wrong one.** `pm_window_cap.py` refused a cap on the grounds that "every
+dropped cohort is POSITIVE". It counts FILLS as independent draws, but nine
+families cross within seconds because ONE macro move pushes them all across
+their levels. Re-asked with the WINDOW as the unit, at the new 0.50 floor:
+
+    TAPE  (317 windows)                    LIVE (97 windows, 140 fills)
+      1 entry   n=109 mean +0.1094 t+2.43    1 entry   n=66 mean -0.0351
+      2 entries n= 75 mean +0.1169 t+1.36    2 entries n=23 mean -0.1829
+      3 entries n= 67 mean +0.0813 t+0.68    3+        n= 8 mean -1.3316
+      4+        n= 66 mean +0.5692 t+3.23
+      cap none +63.705 | cap1 +15.573      cap none -17.176 | cap1 -8.040
+      cap2 +37.791 | cap3 +49.671          cap2 -14.361 | cap3 -17.559
+
+A flat contradiction, and **the floor change did not fix it** (3+ windows went
+47.0% -> 42.0% of all windows). Two things reconcile it without either sample
+being dishonest:
+  * the tape's advantage is **LEVERAGE, not edge**. Per ENTRY the 4+ windows are
+    +0.14 against +0.11 for solo ones. It says betting more earns more when the
+    edge is positive -- true, and silent on whether a correlated 4x is
+    survivable at this bankroll;
+  * the tape prices every entry at the TRIGGER-INSTANT ask, and simultaneous
+    fires are when every book reprices at once: live slippage in stacked windows
+    is **+0.0415/share against +0.0027** for solo ones, 15x.
+
+SHIPPED, as a bound on RUIN and not as a claim that stacking is -EV:
+`CROSS_MAX_OPEN_STAKE_PCT` 0 -> **0.35** (`.env`, backup `-pre-expo035`). On
+$5.83 that is $2.04 -- two concurrent $1 positions, refusing the third. Four $1
+positions on one move is $4.13, i.e. 71% of the account on a single correlated
+bet, and the live record has eight such windows in three days. A FRACTION is the
+right instrument because it self-relaxes as the balance grows.
+⛔ It was 0 for a reason: on 2026-09-17 this cap + a stale bankroll + an orphaned
+position refused every crossing for 2.5 h. That mechanism is fixed
+(`refresh_bankroll_if_stale` every 60 s, and `equity()` includes
+`positionValue`). KILL CRITERION: "open cross exposure ... exceeds 35%" on >50%
+of triggers for an hour.
+
+**LEAD 2 — THE MARGIN CEILING. NOT SHIPPED.** The tape and the live record
+invert cleanly, and the live sample is too small to overrule a t+4.51 tape cell:
+
+    TAPE (floor 0.50)                      LIVE (97 fills)
+      |m| [0.5,1) n=372 +0.0608 t+2.39       [0.5,1) n=21 +0.1420 win 71%
+      |m| [1,2)   n=249 +0.0479 t+1.57       [1,2)   n=22 +0.0486 win 59%
+      |m| [2,3)   n= 71 +0.1311 t+2.14       [2,3)   n=12 -0.1073 win 42%
+      |m| [3,5)   n= 38 +0.2431 t+3.14       [3,5)   n= 7 -0.2943 win 29%
+      |m| [5,99)  n= 25 +0.4241 t+4.51       [5,99)  n= 7 -0.2522 win 29%
+    a ceiling is monotone HARMFUL on tape   ceiling 2 refuses n=26 worth -11.730
+
+NOT CONFOUNDED WITH STACKING -- checked, and both effects are separately real:
+
+    |m| [0,2)   solo n=34 +2.362 | stacked n=18 -2.539
+    |m| [2,99)  solo n=11 -3.397 | stacked n=10 -8.114
+
+High margin loses in SOLO windows too (-0.31/fill against +0.07 for low-margin
+solo), and stacking hurts inside both margin buckets.
+
+WHY IT IS NOT SHIPPED: n=26 above 2 bps against a tape cell at t+4.51, and the
+measured mechanism explains only part of it. Entry slippage rises with margin
+(+0.0045 -> +0.0214 -> +0.0545/share) and the live fills at |m|>=2 pay 0.542
+where the tape assumes 0.487 -- 5.5c, about a QUARTER of the 0.24/share
+divergence. The rest is unexplained and may simply be n=7-12. Revisit at n~60.
+
+**THE COMMON SIGNATURE, and the thing worth remembering:** high margin and
+stacked windows are both proxies for *a large fast correlated move*, and that is
+precisely where the replay's fill model fails -- it books the trigger-instant
+ask while the venue has already repriced. The replay therefore systematically
+OVERVALUES the cohort the live record likes least. That is one defect with two
+symptoms, not two independent findings.
