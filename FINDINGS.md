@@ -13286,3 +13286,83 @@ we pay, and the error is +17-20c there. Re-read `cross_max_fill_px`'s note (the
 0.55-0.65 band it found is in the ladder's ACCURATE region, so it survives) and
 treat the cheap-tail results accordingly. The honest fix is to record the
 VENUE's book alongside the ladder so future replays can price at both.
+
+### ⛔⭐ THE EXIT IS OFF, ON THE FULL GRID AND THE RULE THAT ACTUALLY RUNS (2026-09-18)
+
+Every exit measurement in this file before now was VOID. Three separate
+defects, each found only after the previous one was fixed, and each one made the
+exit look better than it is:
+
+  1. `walk()` booked the exit at the tick AFTER THE ENTRY (~the entry price);
+  2. the fire check sat inside the "this tick is a crossing" branch, so a
+     SUSTAINED flip -- the case the rule exists for -- could never fire;
+  3. the arming demanded the margin floor AT THE CROSSING, which is zero-margin
+     BY CONSTRUCTION, so the watcher never armed at all.
+
+`tools/pm_exit_sweep.py` is an exact port of the shipped `_cross_exit_check` and
+sweeps tau / confirm_s / the exit's own floor on BOTH samples under today's
+entry gates (728 tape entries, 100 live fills, px [0.45,0.65], tau [30,180]):
+
+    BASELINE (no exit)        TAPE +32.02                  LIVE -3.745
+    tau>=8   c=3  fl=0.50     TAPE +15.80 x0.83 be -4.1c   LIVE -7.099
+    tau>=30  c=3  fl=0.50     TAPE +16.49 x0.83 be -3.9c   LIVE -7.240
+    tau>=60  c=3  fl=0.50     TAPE +17.22 x0.82 be -4.4c   LIVE -5.298
+    tau>=90  c=3  fl=0.50     TAPE +16.71 x0.78 be -5.8c   LIVE -3.008
+    confirm=0s                TAPE +17.65 x0.85 be -3.5c   LIVE -4.334
+    confirm=10s               TAPE +24.60 x0.89 be -2.1c   LIVE -7.219
+    exit floor 0.00 bps       TAPE  +6.10 x0.77 be -5.9c   LIVE -10.388
+    exit floor 2.00 bps       TAPE +30.44 x0.97 be -0.5c   LIVE -1.911
+    exit floor 3.00 bps       TAPE +31.19 x0.98 be -0.3c   LIVE -3.615
+
+**NOT ONE CELL BEATS "no exit" ON THE TAPE**, and every `be` is NEGATIVE -- the
+gain is below zero before any fill degradation, on a replay that already prices
+exits optimistically at `1 - other_ask` rather than the real bid.
+
+**THE DIAGNOSTIC IS `x`** -- loser value saved / winner value cut. It runs
+**0.77 to 1.13 across the entire grid** and never approaches the 1.5 bar. The
+exit gives up winner value about as fast as it saves loser value: a coin flip
+that pays two spreads.
+
+LIVE PROOF, `xrp-updown-5m-1789767300`: entered Up @0.620, sold 1.61 sh @ 0.33
+at tau 54 s, and the round settled **UP**. Booked -0.5184 against a +0.5863
+hold -- **-1.1047 on one fire**, the first winner cut after the arming fix.
+
+THE IDEA IS REAL AND STILL UNHARVESTABLE. P(win | flipped) is 37% against 85%
+for the rest; that part replicates. It cannot be turned into money because
+realising the flip crosses the spread twice and the signal does not discriminate
+enough to cover it. Each of the three bugs above independently manufactured the
+appearance that it could.
+
+SHIPPED: `CROSS_EXIT_ENABLED=false` (`.env`, backup `-pre-exit-off`). THE CODE
+STAYS AND IS NOW CORRECT -- arm-on-event/confirm-on-state, sent-size
+confirmation, the dust-vs-sale threshold, and the split handing the remainder
+its own `Fill`. Re-enabling is one line if a measurement ever earns it.
+
+⛔ ALSO RETRACTED: the "+$4.36 on live fills" figure quoted when the flag was
+turned on. That came from the broken-arming walk. The honest number on the rule
+that runs is NEGATIVE on the tape in every cell.
+
+### ⛔ AND THE BUG THAT WAS ACTUALLY DRAINING THE LEDGER: THE SPLIT'S Fill
+
+`settle_due` settles from the IN-MEMORY `Fill`, not the DB row, and the partial
+split did `self.open_fills[new_fid] = (slug, self.open_fills[fid][1])` -- handing
+the remainder **the original object**:
+
+    btc-updown-5m-1789767000 Up, winner Down
+      fid 984  sh=1.694914  stake=1.0000  ->  pnl -0.4777   (the exit, correct)
+      fid 985  sh=0.004914  stake=0.0029  ->  pnl **-1.0287**  (the FULL cost)
+      round booked -1.5064 against a true -0.4807
+
+A 0.0049-share dust remainder costing $0.0030 settled for the whole position's
+loss. **Every exited round was over-booked by roughly a full stake** -- which is
+what the operator was seeing as "bleeding a lot", and a large part of it was
+never real money. The DB row was right all along; only the object handed to
+`settle()` was wrong.
+
+FIXED: `dataclasses.replace` for the remainder, with a fallback that copies and
+sets the three sizes by hand -- returning the original on failure would
+reinstate the exact defect. Verified on the next split
+(`xrp-...-1789767300`: fid 987 sh=0.002902 stake=0.0018 pnl=+0.0011). Pinned by
+`TestThePartialSplitSettlesItsOwnSize`, including that the original object is
+not mutated, and the test fixture now uses a real `Fill` rather than a
+`SimpleNamespace` -- the namespace silently took the fallback path and hid this.

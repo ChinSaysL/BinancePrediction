@@ -145,7 +145,15 @@ def _bot(*, bid=0.55, sell_shares=2.0, sell_px=0.54, unverified=False,
     b.guard = FakeGuard()
     b.pnl = FakePnl()
     b._wsb = FakeWsb(bid) if bid is not None else None
-    b.open_fills = {7: (SLUG, SimpleNamespace())}
+    # A REAL Fill, not a bare namespace: `settle_due` settles from this object
+    # and a partial sale must hand the remainder its own copy with the
+    # remainder's sizes (see TestThePartialSplitSettlesItsOwnSize).
+    from btcpredict.venues.polymarket.broker import Fill as _F
+    b.open_fills = {7: (SLUG, _F(slug=SLUG, side=held_side, requested_px=0.65,
+                                 filled_px=0.57, shares=shares, stake=stake,
+                                 fee_paid=fee, order_id="o1",
+                                 ts_ms=int(time.time() * 1000),
+                                 token_id="tok", raw="entry"))}
     b._exit_watch = {SLUG: {
         "fid": 7, "side": held_side, "token": "tok", "shares": shares,
         "stake": stake, "fee": fee, "entry_ms": int(time.time() * 1000) - 2000,
@@ -703,11 +711,16 @@ class TestTheHysteresisBand:
         assert b.broker.calls == [], (
             "a 0.1 bps reversal closed a position the arm would not have "
             "opened on 0.1 bps -- that is the zero-width trapdoor")
-        assert b._exit_watch[SLUG]["flip_ms"] is None, (
-            "a sub-floor reading must not even arm the latch")
+        # ⛔ IT MAY ARM -- IT MUST NOT SELL. The floor belongs on the STATE,
+        # not on the crossing: `crossed_side` fires on the FIRST tick past the
+        # level, so a crossing is zero-margin by construction and a floor on the
+        # ARMING never arms at all (live 21:08:04, eth-1789765500: a real flip at
+        # -0.30 bps against a 0.50 floor, never armed, 0.600 -> 0.00).
+        assert b._exit_watch[SLUG]["flip_ms"] is not None, (
+            "a crossing must arm -- the floor is applied to the fire, not here")
 
     def test_the_same_move_past_the_floor_does_arm(self, monkeypatch):
-        """The control: identical machinery, a move that clears the floor."""
+        """The control: a move that clears the floor arms AND can fire."""
         b = self._bot_with_floor(monkeypatch, floor=1.0)
         r = _round()
         ticks = self._marginal(bps=5.0)           # 5 bps, floor is 1.0
@@ -999,3 +1012,111 @@ class TestTheConfirmationUsesWhatWasSent:
         assert b.broker.confirms, "confirm_sale was never called"
         assert b.broker.confirms[0]["shares"] == pytest.approx(1.8181), (
             "asked about the ledger's 2.0 rather than the 1.8181 sent")
+
+
+class TestTheFloorIsOnTheStateNotTheCrossing:
+    """⛔ LIVE 2026-09-18 21:07:47, eth-updown-5m-1789765500 Up @0.600.
+
+        21:08:04  crossed_side reads Down (logged "slot already used this
+                  round") -- a real flip 17 s after the entry
+        ...no `cross exit` line, ever. The position rode 0.600 -> 0.00.
+
+    The arming condition required `past_floor` AT THE CROSSING. But
+    `crossed_side` fires on the FIRST tick past the level, so a crossing is
+    zero-margin BY CONSTRUCTION -- the entry's own note says so. The live log
+    shows the flip at -0.30 bps against a 0.50 floor. The floor belongs on the
+    STATE, once the signal has moved clear, not on the instant it crosses.
+    """
+
+    def test_a_zero_margin_crossing_still_arms(self, monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
+                            True)
+        b = _bot(monkeypatch=monkeypatch)
+        b._ck = lambda name, r: {"look_s": 1.0, "min_margin_bps": 0.5,
+                                 "hold_s": 0.0}.get(name, 0.0)
+        r = _round()
+        ticks = TestTheHysteresisBand._marginal(bps=0.1)   # a real crossing, 0.1 bps
+        b._cross_signal = lambda r, t, tau: (ticks, "spot")
+        assert asyncio.run(b._cross_exit_check(r, 100.0, ticks)) is False
+        assert b._exit_watch[SLUG]["flip_ms"] is not None, (
+            "the crossing must arm; requiring the floor here arms never")
+        assert b.broker.calls == [], "but it must not SELL inside the floor"
+
+    def test_it_then_sells_once_the_state_clears_the_floor(self, monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
+                            True)
+        b = _bot(monkeypatch=monkeypatch)
+        b._ck = lambda name, r: {"look_s": 1.0, "min_margin_bps": 0.5,
+                                 "hold_s": 0.0}.get(name, 0.0)
+        r = _round()
+        arm = TestTheHysteresisBand._marginal(bps=0.1)     # crossing, sub-floor
+        b._cross_signal = lambda r, t, tau: (arm, "spot")
+        asyncio.run(b._cross_exit_check(r, 100.0, arm))
+        b._exit_watch[SLUG]["flip_ms"] -= 10_000           # the flip persisted
+        # the signal has now moved clear of the level on the other side
+        ticks, _ = _quiet(100.0, side="Down")
+        b._cross_signal = lambda r, t, tau: (ticks, "spot")
+        assert asyncio.run(b._cross_exit_check(r, 100.0, ticks)) is True
+        assert len(b.broker.calls) == 1
+
+    def test_the_arming_has_no_floor_in_the_source(self):
+        """Structural: the fire path keeps the floor, the arm must not."""
+        src = (ROOT / "btcpredict" / "main.py").read_text()
+        i = src.index("async def _cross_exit_check")
+        j = src.index("def _confirm_pending_sale", i)
+        body = src[i:j]
+        arm = body[body.index('if w.get("flip_ms") is None:'):]
+        arm = arm.split("# ---- ARMED")[0]
+        assert "past_floor" not in arm.split("w[\"flip_ms\"] = now_ms")[0].split(
+            "if now_side is not None")[-1], (
+            "a crossing is zero-margin by construction; a floor here never arms")
+
+
+class TestThePartialSplitSettlesItsOwnSize:
+    """⛔ LIVE 2026-09-18 21:33, btc-updown-5m-1789767000 Up.
+
+        fid 984  sold 1.69 of 1.69491 @0.34  -> pnl -0.4777   (correct)
+        fid 985  held 0.004914 sh, cost $0.0030
+                 -> settled **-1.0287**, the FULL original cost
+        round booked -1.5064 against a true -0.4807
+
+    `settle_due` settles from the IN-MEMORY Fill, not the DB row, and the split
+    handed the remainder `self.open_fills[fid][1]` -- the ORIGINAL object. The
+    DB row carried the right stake all along; only the object passed to
+    `settle()` was wrong, which is exactly why the ledger and the venue
+    disagreed by roughly a whole stake on every exited round.
+    """
+
+    def test_the_remainder_fill_carries_the_remainder_size(self, monkeypatch):
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
+                            True)
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_confirm_s",
+                            0.0)
+        # sell only part of the 2.0 held -> a split must happen
+        b = _bot(monkeypatch=monkeypatch, sell_shares=1.5, sell_px=0.40)
+        orig = b.open_fills[7][1]
+        assert _fire(b, _round(), "Down") is True
+        new = [k for k in b.open_fills if k != 7]
+        assert new, "a partial sale must leave a remainder fill open"
+        rem = b.open_fills[new[0]][1]
+        assert rem is not orig, (
+            "the remainder must not reuse the original Fill -- settle_due reads "
+            "this object, and the original carries the WHOLE position's stake")
+        assert rem.shares == pytest.approx(0.5), rem.shares
+        assert rem.stake < orig.stake, (
+            f"remainder stake {rem.stake} must be below the original "
+            f"{orig.stake} or the dust settles as the whole position")
+        assert rem.fee_paid <= orig.fee_paid
+
+    def test_the_original_object_is_not_mutated(self, monkeypatch):
+        """`dataclasses.replace` copies; mutating in place would corrupt the
+        settlement of the SOLD leg that is booked from the same object."""
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
+                            True)
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_confirm_s",
+                            0.0)
+        b = _bot(monkeypatch=monkeypatch, sell_shares=1.5, sell_px=0.40)
+        orig = b.open_fills[7][1]
+        before = (orig.shares, orig.stake, orig.fee_paid)
+        _fire(b, _round(), "Down")
+        assert (orig.shares, orig.stake, orig.fee_paid) == before

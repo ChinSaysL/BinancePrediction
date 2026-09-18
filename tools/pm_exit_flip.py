@@ -150,7 +150,9 @@ def walk(pre: dict, entry: dict, *, confirm_s: float, look_s: float,
             armed_ms = None           # back on our side: the flip died
             continue
         if armed_ms is None:
-            if side == other and past:    # only a CROSSING arms it
+            # NO FLOOR ON THE ARMING -- a crossing is zero-margin by
+            # construction; the floor is on the STATE below.
+            if side == other:             # only a CROSSING arms it
                 armed_ms = ts
             continue
         if side_now == held or not past:

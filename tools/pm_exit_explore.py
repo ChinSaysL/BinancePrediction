@@ -103,7 +103,12 @@ def walk(pre, entry, *, look_s, hold_s, tau_min, confirm_s,
             armed = None                 # back on our side: the flip died
             continue
         if armed is None:
-            if side == other and past:   # only a CROSSING arms it
+            # NO FLOOR ON THE ARMING: a crossing is zero-margin by construction,
+            # so requiring `past` here means it never arms (live 21:08:04,
+            # eth-1789765500: a real flip at -0.30 bps against a 0.50 floor,
+            # never armed, position rode 0.600 -> 0.00). The floor is on the
+            # STATE below.
+            if side == other:            # only a CROSSING arms it
                 armed = ts
             continue
         if side_now == held or not past:

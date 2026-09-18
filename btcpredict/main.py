@@ -17,6 +17,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import copy
+import dataclasses
 import logging
 import math
 import signal
@@ -4512,7 +4514,21 @@ class Bot:
             # NOT ARMED YET, and only a genuine CROSSING into the other side
             # arms it (with the entry's own `hold_s` applied, so a lone print is
             # not a flip). Arming is the event; everything after is state.
-            if now_side is not None and now_side != held and past_floor:
+            #
+            # ⛔ NO FLOOR ON THE ARMING, AND THAT IS THE WHOLE POINT.
+            # `crossed_side` fires on the FIRST tick past the level, so the
+            # margin AT a crossing is ~0 BY CONSTRUCTION -- the entry's own note
+            # says so ("every entry is BY CONSTRUCTION a zero-margin entry").
+            # Requiring `past_floor` here therefore asks for something that
+            # essentially never happens, and the watcher never arms:
+            #   LIVE 2026-09-18 21:07:47 eth-updown-5m-1789765500 Up @0.600.
+            #   21:08:04 crossed_side reads Down (logged as "slot already used")
+            #   -- a real flip 17 s in, margin ~-0.30 bps against a 0.50 floor.
+            #   NEVER ARMED, no `cross exit` line at all, and the position rode
+            #   0.600 -> 0.00.
+            # The floor belongs on the STATE below, where the signal has had
+            # time to move clear of the level, not on the instant it crosses.
+            if now_side is not None and now_side != held:
                 w["flip_ms"] = now_ms
             return False
         # ---- ARMED. Fire when the flip has PERSISTED, not when it re-crosses.
@@ -4662,7 +4678,32 @@ class Bot:
                 "raw": f"exit split: {sold:g} of {w['shares']:g} sold",
                 "token_id": w["token"], "ev_at_fill": None,
             })
-            self.open_fills[new_fid] = (slug, self.open_fills[fid][1])
+            # ⛔ THE REMAINDER NEEDS ITS OWN Fill, NOT THE ORIGINAL OBJECT.
+            # `settle_due` settles from the in-memory Fill, not from the DB row
+            # -- so reusing the original here made the DUST settle as if it were
+            # the whole position:
+            #   LIVE 2026-09-18 21:33, btc-updown-5m-1789767000 Up.
+            #   fid 984 sold 1.69 of 1.69491 -> pnl -0.4777 (correct).
+            #   fid 985 held 0.004914 shares costing $0.0030 and settled
+            #   **-1.0287** -- the FULL original cost -- so the round booked
+            #   -1.5064 against a true -0.4807. Every exited round was
+            #   over-booked by roughly a whole stake.
+            # The DB row was always right; only the object handed to `settle`
+            # was wrong, which is why the ledger and the venue disagreed.
+            # THE FALLBACK MUST STILL PRODUCE A DISTINCT OBJECT. Handing back
+            # `_orig` on any failure would reinstate the exact defect, so the
+            # copy path sets the three sizes by hand rather than giving up.
+            _orig = self.open_fills[fid][1]
+            try:
+                _rem = dataclasses.replace(_orig, shares=left, stake=rs,
+                                           fee_paid=rf)
+            except Exception:                                     # noqa: BLE001
+                _rem = copy.copy(_orig)
+                for _k, _v in (("shares", left), ("stake", rs),
+                               ("fee_paid", rf)):
+                    with contextlib.suppress(Exception):
+                        setattr(_rem, _k, _v)
+            self.open_fills[new_fid] = (slug, _rem)
             w["fid"], w["shares"], w["stake"], w["fee"] = (
                 new_fid, left, rs, rf)
         self.store.insert("settlements", {
