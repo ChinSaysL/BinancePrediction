@@ -12750,3 +12750,68 @@ than the rule already running — so the downside is bounded by doing nothing.
 HONEST BOUNDS: 20 exits on tape, 6 live; 6-for-6 is p~0.08 alone. A supported
 hypothesis, not a proven edge. KILL CRITERION: any winner cut inside the first
 ~20 live fires, or the loser/winner value ratio under 1.5.
+
+### ⛔ THE BOOK GAP IS REAL, THE LAG GATE IS NOT (2026-09-18) — nothing shipped
+
+Chasing the operator's question about a `venue 0.830 / ours 0.520` line. Three
+findings, one of them a refutation of my own proposal.
+
+**1. THE LADDER IS NOT HOLDING PHANTOM LEVELS** — the first hypothesis, and it
+is wrong. Across 172 shadow-probe fires the spreads are IDENTICAL:
+
+    spread: ours median 0.0200   venue median 0.0200
+
+`_apply_delta` prunes to `best_ask` on every frame that speaks about that side,
+and it is doing its job. The tighter spread in the line that prompted this was
+one stale `bnb-updown-15m` token, not a pattern.
+
+**2. THE GAP IS REAL AND DIRECTIONAL, AND IT IS NOT A BUG.**
+
+    signed gap (ours_ask - venue_ask): median -0.0550
+      ours CHEAPER 121 (70%) | ours DEARER 27 (16%) | equal 24 (14%)
+    by our touch age:  0-200ms .0600 | 500-1000 .0750 | 1000-3000 .2400
+    by tok-lag:        0-300ms .0200 | 600-1000 .0750 | 1000-5000 .1300
+    by PROBE delay:    200-300 .0400 | 300-500  .0700 | 500+     .0900
+
+It scales with the PROBE's own delay as well as with ours, which is the tell:
+one cause, not two. The venue is repricing to the same public spot print that
+triggered us, inside the same few hundred milliseconds. At tok-lag under 300 ms
+the gap collapses to 0.0200 and much of that is the probe's own 260 ms. There is
+no latency work left worth doing here -- we are racing the venue to react to a
+move we both just saw.
+
+Realized slippage on fills that ACTUALLY FILLED is much smaller than the raw
+gap -- **+1.0c median, +2.35c mean** -- because the fill cap and the price band
+already refuse the worst. The raw 6.5c is the gap across all fires, not a cost
+paid on every trade, and it should not be quoted as one.
+
+**3. ⛔ THE GATE I PROPOSED ON THE BACK OF IT IS REFUTED.** `lag_ms(asset_id=)`
+gates nothing today (it is logged at main.py:4755 and used nowhere else), and a
+freshness gate on it looked like a cheap tail fix. Scored on the 95 settled
+fills that carry a shadow line (`tools/pm_toklag_gate.py`):
+
+    ALL matched            n=95  total -12.824  per-share -0.0585
+    tok-lag < 500ms   kept n=70  total  -8.516  per-share -0.0496
+    tok-lag < 600ms   kept n=78  total  -6.303  per-share -0.0337
+    tok-lag < 800ms   kept n=85  total  -9.139  per-share -0.0458
+
+600 ms is a SPIKE between two worse cells, and the whole "effect" is the 8 fills
+in [500,600) earning +2.213 against the 7 in [600,800) earning -2.836. And the
+direction inverts at the fresh end, which is what kills it:
+
+    tok-lag [  0, 300)  n= 7  per-share -0.2461  win 29%  |gap| 0.0100
+    tok-lag [300, 500)  n=63  per-share -0.0304  win 49%  |gap| 0.0300
+    tok-lag [500, 800)  n=15  per-share -0.0223  win 53%  |gap| 0.0400
+    tok-lag [800, inf)  n=10  per-share -0.1867  win 40%  |gap| 0.0700
+
+**The freshest books are the worst trades.** Lag predicts how wrong our book is
+-- |gap| is monotone in it -- and does NOT predict the money. HYPOTHESIS for
+why, not a result: a fresh token book means a QUIET token, and a crossing on a
+quiet token is a weak signal; a laggy book means a fast-moving one, which is
+where the real moves are. The worse fill and the better signal cancel. If that
+holds, no gate on lag alone can work, because it proxies two things that pull
+opposite ways.
+
+NOTHING SHIPPED. Bounds: 95 of 211 fills carry a shadow line (a selected
+subset), buckets are n=7-63, and the matched set is negative overall (-0.0585/sh)
+in line with the rest of the live record.
