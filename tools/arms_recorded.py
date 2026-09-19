@@ -223,14 +223,44 @@ def arm_cross(rows: list, book: np.ndarray, strike: float) -> list[dict]:
 
 
 def arm_model(book: np.ndarray, strike: float, opens, sig, *, twap: bool,
-              start_ms: int) -> list[dict]:
+              start_ms: int, apply_range_gate: bool = True) -> list[dict]:
+    """The model arm, replayed.
+
+    ⛔ THE ROUND-RANGE GATE IS LIVE AND WAS MISSING HERE. `Bot._record` refuses
+    unless the round has travelled `model_min_round_range_bps` to
+    `model_max_round_range_bps` since its open (5-12 bps as shipped), and this
+    function never applied it -- so every fill count and EV this tool produced
+    was for an arm that does not exist.
+
+    It matters most on BTC, whose 2.65 bps/min is the lowest of the three: the
+    gate demands movement, and the movement that satisfies it is exactly what
+    prices the favourite past `max_quote`. Traced live on
+    btc-updown-5m-1789850700, tau 210: Down at 0.800 against fair 0.884, an
+    8.4-point edge, refused because the range was 4.5 bps against the 5.0
+    floor. Twelve seconds later the range cleared 5 bps and the same side was
+    priced ~0.87, outside the band.
+
+    Range is max(spot)-min(spot) since the round opened, in bps of the strike
+    -- the definition `_round_range_bps` uses.
+    """
     out = []
+    spots = np.array([float(b[2]) for b in book], dtype=float)
+    run_hi = np.maximum.accumulate(spots)
+    run_lo = np.minimum.accumulate(spots)
+    rng_bps = (1e4 * (run_hi - run_lo) / strike) if strike else np.zeros(len(book))
     j_int = 0.0      # integral of ln(S_u/K) du over the ticks seen so far
     prev_ts: int | None = None
     prev_x = 0.0
     for i in range(len(book)):
         ts, tau, spot = int(book[i][0]), float(book[i][1]), float(book[i][2])
         if not (S.min_tau_s <= tau <= S.max_tau_s) or tau <= 0:
+            continue
+        # The live gate. `_round_range_bps` returns None with fewer than two
+        # samples and the caller treats that as "no opinion", not a refusal,
+        # so a cold start cannot silently disable the arm -- mirrored here.
+        if (apply_range_gate and S.model_max_round_range_bps > 0 and i >= 1
+                and not (S.model_min_round_range_bps <= rng_bps[i]
+                         <= S.model_max_round_range_bps)):
             continue
         up_disp, dn_disp = float(book[i][3]), float(book[i][4])
         # ⛔ [6] IS up_ask. [5] is up_BID. The query selects
