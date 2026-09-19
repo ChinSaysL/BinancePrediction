@@ -4500,7 +4500,13 @@ class Bot:
         if w.get("pending"):
             got = self._confirm_pending_sale(r, w)
             if got is not None:
-                await self._cross_exit_execute(r, w, tau=0.0,
+                # ⛔ THE REAL TAU, NOT 0.0. This passed a literal zero, so
+                # every confirmed-late sale logged "at tau 0s" and read as a
+                # dump into the bell. The real taus were 51-160 s. Two people
+                # (one of them an assistant, 2026-09-19) read the artifact as
+                # evidence the exit was selling at the close and argued from it.
+                _tau = (int(r.end_ms or 0) - int(time.time() * 1000)) / 1000.0
+                await self._cross_exit_execute(r, w, tau=_tau,
                                                sig_name="confirm",
                                                confirmed=got)
             return True
@@ -4727,6 +4733,12 @@ class Bot:
                              float(confirmed[2] or 0.0))
             if px <= 0.0 and w.get("pending"):
                 px = float(w["pending"][1] or 0.0)   # the floor: a lower bound
+            # KEEP THE FLOOR FOR THE LOG. On this path `fill` is None -- it is
+            # only assigned when `confirmed is None` -- so the log line's
+            # `getattr(fill, "requested_px", ...) or 0.0` printed 0.0000 for
+            # EVERY confirmed-late sale, which reads as "sold with no floor".
+            # The floor was real; only the log could not see it.
+            w["_floor_seen"] = float(w["pending"][1] or 0.0) if w.get("pending") else 0.0
             w.pop("pending", None)
             log.info("cross exit %s: sale confirmed late -- booking %g sh @ "
                      "%.4f", slug, sold, px)
@@ -4849,7 +4861,8 @@ class Bot:
         log.info("cross EXIT %s %s: sold %g sh @ %.4f (floor %.4f) "
                  "proceeds %+.4f pnl %+.4f at tau %.0fs (sig=%s) | running: %s",
                  slug, held, sold, px,
-                 float(getattr(fill, "requested_px", None) or 0.0),
+                 float(getattr(fill, "requested_px", None)
+                       or w.get("_floor_seen") or 0.0),
                  proceeds, pnl, tau, sig_name, self.pnl)
 
     async def _cross_execute(self, *, r, sig, side, token, stake, ask,
@@ -5047,7 +5060,26 @@ class Bot:
         bound -- re-run against the VENUE's ask instead of our own ladder sweep,
         then clamped by the fill cap. The base is the ONLY thing that changes:
         the band, the margin floor, the ceiling and the cap are the same objects
-        they were, so this can refuse a trade and can never enlarge one.
+        they were.
+
+        ⛔ "CAN NEVER ENLARGE ONE" WAS WRONG AND IS REMOVED. The caller assigns
+        `cap = self._take_cap_for(r, venue_ask, fill_cap)`, REPLACING the
+        ceiling the decision authorised -- so when the venue sits above our
+        ladder (68% of fills, median +0.030) this RAISES the limit. That is the
+        feature working as designed (it exists to clear a venue ask our stale
+        ladder could not reach, see the call site) but the sentence describing
+        it as one-directional was false.
+          LIVE 2026-09-19 10:47 eth-updown-5m-1789814700: ours 0.51 / venue
+          0.64, decision ceiling 0.57, re-priced to 0.65, FILLED 0.63 at an
+          ev_at_fill of -0.2022, exited at 0.05 for -0.9465.
+        WHETHER IT PAYS IS UNRESOLVED. Raw, it looks bad -- re-based fills
+        n=79 win 51% -0.1048/fill against n=101 win 51% -0.0568/fill. But the
+        re-base fires precisely when the market has moved, so it is confounded
+        with fast tape, and CONTROLLING FOR THE PAID PRICE the buckets
+        disagree: at 0.5 re-based is +0.1307/fill against -0.2266, at 0.6 it is
+        -0.1175 against -0.0007. n=76 vs 93. Not evidence either way.
+        DO NOT change this to a ratchet on the raw comparison alone; measure it
+        with the price controlled and a sample that can carry the split.
         """
         buf = max(0.01, min(self._ck("limit_buffer", r),
                             self._ck("limit_buffer_inv", r) * (1.0 - base_px)))
