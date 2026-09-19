@@ -157,6 +157,12 @@ class TestItActuallyFetches:
         monkeypatch.setattr(
             "btcpredict.config.settings.cross_venue_prefetch_max_age_s", max_age)
         monkeypatch.setattr("btcpredict.config.settings.cross_venue_take", True)
+        # ⛔ THESE TESTS ARE ABOUT THE POLYMARKET PATH. `Bot._venue_top`
+        # dispatches on `settings.venue`, so without this the arm takes the
+        # BINANCE branch (`LiveBroker.best_prices`) and the monkeypatched
+        # `venue_top` is never called -- the test then passes or fails for
+        # reasons that have nothing to do with what it is checking.
+        monkeypatch.setattr("btcpredict.config.settings.venue", "polymarket")
         calls = []
 
         async def fake_top(token):
@@ -221,6 +227,7 @@ class TestItActuallyFetches:
         monkeypatch.setattr(
             "btcpredict.config.settings.cross_venue_prefetch_max_age_s", 0.5)
         monkeypatch.setattr("btcpredict.config.settings.cross_venue_take", True)
+        monkeypatch.setattr("btcpredict.config.settings.venue", "polymarket")
 
         async def boom(_token):
             raise RuntimeError("venue said no")
@@ -273,6 +280,7 @@ class TestTheImminenceGate:
         monkeypatch.setattr("btcpredict.config.settings.cross_venue_take", True)
         monkeypatch.setattr(
             "btcpredict.config.settings.cross_venue_prefetch_margin_bps", band)
+        monkeypatch.setattr("btcpredict.config.settings.venue", "polymarket")
 
         async def fake_top(token):
             calls.append(token)
@@ -358,6 +366,7 @@ class TestTheRefreshInterval:
             "btcpredict.config.settings.cross_venue_prefetch_margin_bps", 2.0)
         monkeypatch.setattr(
             "btcpredict.config.settings.cross_venue_prefetch_refresh_s", 60.0)
+        monkeypatch.setattr("btcpredict.config.settings.venue", "polymarket")
 
         async def fake_top(token):
             calls.append(token)

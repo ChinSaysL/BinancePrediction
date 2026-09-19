@@ -23,6 +23,7 @@ import logging
 import math
 import signal
 import time
+from types import SimpleNamespace
 
 import aiohttp
 
@@ -3317,7 +3318,7 @@ class Bot:
 
         async def _go():
             try:
-                vt = await venue_top(token)
+                vt = await self._venue_top(token, r)
             except Exception:                            # noqa: BLE001
                 return
             if vt is not None and getattr(vt, "ask", 0) > 0:
@@ -6111,7 +6112,7 @@ class Bot:
                                  getattr(self, "_vtop_warm_age_s", -1.0),
                                  base, sig.quote, cap)
                     else:
-                        vt = await venue_top(venue_token)
+                        vt = await self._venue_top(venue_token, r)
                     if vt is not None and vt.ask > 0:
                         base, base_src = vt.ask, "venue"
                         cap = self._take_cap_for(r, base, fill_cap)
@@ -6328,6 +6329,48 @@ class Bot:
         if spent * 1000.0 >= _SLOW_TICK_MS:
             log.warning("slow settlement backfill: %.2fs OFF the tick (the "
                         "cross arm kept sampling through it)", spent)
+
+    async def _venue_top(self, token: str, r):
+        """The VENUE's own top of book, on whichever venue we are trading.
+
+        ⛔ THE ARM MUST BEHAVE IDENTICALLY ON BOTH VENUES, and before this it
+        could not. `venue_top()` is the Polymarket CLOB `/book` read, hardcoded.
+        On Binance it simply fails, so `base_src` never became "venue" -- and
+        `cross_ladder_band_pad`'s fail-closed branch refuses any order whose
+        price it could not check against the real book. With the live
+        `CROSS_LADDER_BAND_PAD=0.10`, switching `VENUE=binance` would therefore
+        have refused EVERY cross order, silently, with the arm looking healthy.
+
+        The two venues offer the same thing under different names:
+            Polymarket   GET /book?token_id=            (venue_top)
+            Binance      SAPI /w3w/wallet/prediction/order-book
+                         via `LiveBroker.best_prices(token_id, market_id)`
+        Both are a REST read of the book we PAY into, independent of our own
+        websocket ladder -- which is the entire point of the re-base: it is the
+        only source in the process that can disagree with us.
+
+        Returns an object with `.bid`/`.ask` or None. NEVER raises: an
+        unreadable venue book is a fallback, not an exception.
+        """
+        if registry.normalise(getattr(settings, "venue", "binance")) == "polymarket":
+            return await venue_top(token)
+        bp = getattr(self.broker, "best_prices", None)
+        mid = getattr(r, "market_id", None)
+        if bp is None or not mid or not token:
+            return None
+        try:
+            got = await bp(str(token), int(mid))
+        except Exception:                                # noqa: BLE001
+            return None
+        if not got:
+            return None
+        try:
+            bid, ask = float(got[0]), float(got[1])
+        except (TypeError, ValueError, IndexError):
+            return None
+        if not (ask > 0):
+            return None
+        return SimpleNamespace(bid=bid, ask=ask)
 
     def _locked_tail_p(self, r, sym: str, tau: float):
         """P(Up) for a round whose TWAP window is partly PRINTED, or None.

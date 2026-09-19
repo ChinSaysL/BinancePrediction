@@ -107,6 +107,12 @@ def venue(seq, calls=None):
 
 def place(bot, r, sig, monkeypatch, *, venue_top=None, ceiling=0.54,
           attempts=3, delay=0.0, venue_token="tok"):
+    # ⛔ THESE TESTS ARE ABOUT THE POLYMARKET PATH. `Bot._venue_top`
+    # dispatches on `settings.venue`, so without this the arm takes the
+    # BINANCE branch (`LiveBroker.best_prices`) and the monkeypatched
+    # `venue_top` is never called -- the test then passes or fails for
+    # reasons that have nothing to do with what it is checking.
+    monkeypatch.setattr("btcpredict.config.settings.venue", "polymarket")
     monkeypatch.setattr("btcpredict.config.settings.pm_order_type", "fak")
     monkeypatch.setattr("btcpredict.config.settings.order_type", "market")
     monkeypatch.setattr("btcpredict.config.settings.order_max_attempts", attempts)
