@@ -3585,3 +3585,30 @@ class TestTheExposureCapCannotDeadlock:
         blk = src[i:i + 2200]
         assert "min_order_usdt / cap_pct" in blk
         assert "LARGER FRACTION IS NOT THE FIX" in blk
+
+
+def test_the_train_arm_stays_off_after_its_pm_remeasure():
+    """⭐ The re-measure `cross_train_enabled`'s note demanded is DONE
+    (tools/pm_train_chain.py, 2026-09-19) and the verdict is OFF.
+
+    The Binance-era 89-95% becomes 80.5% on the PM tape against a 79.5%
+    break-even -- a +1.1 point margin on n=442, t +1.62 -- and it turns
+    NEGATIVE above 20 bps. The cheap-ceiling variant (max_ask 0.65, margin
+    +13.8, t +2.65) cannot be held out: it has ELEVEN train-half entries
+    against 87 on the test half, because a distance trigger's firing rate
+    follows how far the day moved. Where it can be measured it degrades,
+    76.5% on train to 62.8% on test.  See config.cross_train_enabled."""
+    from btcpredict.config import Settings
+    assert Settings.model_fields["cross_train_enabled"].default is False
+
+
+def test_the_remeasure_is_recorded_so_the_binance_table_is_not_recited():
+    """The note carries a retracted table AND its replacement. If the PM
+    numbers are lost, the next reader sees 89-95% and turns it on."""
+    cfg = (pathlib.Path(__file__).resolve().parents[1]
+           / "btcpredict" / "config.py").read_text()
+    j = cfg.index("cross_train_enabled: bool =")
+    block = cfg[max(0, j - 4000):j]
+    assert "80.5%" in block, "the PM-era hit rate must be stated"
+    assert "pm_train_chain" in block, "the tool that produced it must be named"
+    assert "11" in block or "ELEVEN" in block, "the train/test imbalance too"

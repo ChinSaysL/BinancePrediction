@@ -2281,6 +2281,43 @@ class Settings(BaseSettings):
     # record for the train trigger is **n=2 fills on $2.00 = -$0.72**
     # (xrp-5m 09-17, one win one loss), i.e. nothing at all. RE-MEASURE on the PM
     # tape before this is enabled on the strength of the numbers above.
+    # ⭐ THE RE-MEASURE THE NOTE ABOVE DEMANDED, DONE 2026-09-19 --
+    # `tools/pm_train_chain.py`, PM tape, 4057 settled rounds. VERDICT: the
+    # shipped configuration has no edge worth the name, and the variant that
+    # looks better cannot be validated. STAYS OFF.
+    #
+    # THE BINANCE TABLE DOES NOT TRANSFER, exactly as the correction said. Its
+    # 89-95% hit rates become 80.5% here, and at a mean price of 0.795 the
+    # break-even is 79.5%: a margin of +1.1 points on n=442, t +1.62. It is a
+    # coin flip that pays its own fee. Above 20 bps it goes NEGATIVE:
+    #     X>=10bps  n=1246 win 77.4% be 77.8%  margin -0.4  $+53.30  t+1.98
+    #     X>=15bps  n= 442 win 80.5% be 79.5%  margin +1.1  $+22.61  t+1.62
+    #     X>=20bps  n= 156 win 78.8% be 80.1%  margin -1.3  $ -3.82  t-0.56
+    #     X>=25bps  n=  74 win 75.7% be 80.5%  margin -4.8  $ -6.12  t-1.29
+    #
+    # ONE BINANCE FINDING DOES REPLICATE: the edge lives in the first seconds.
+    # D=0 makes +$22.61, a 2 s delay makes -$2.06, a 5 s delay -$0.52. That is
+    # the same shape the old table reported -- and it means the trigger races
+    # latency, against a measured token lag of 400-700 ms.
+    #
+    # ⛔ AND THE CHEAP CEILING, WHICH LOOKS TEMPTING, CANNOT BE HELD OUT. The
+    # edge appears at cheap entries, not the 0.89 this ships:
+    #     max_ask 0.89  n=442 margin  +1.1  t+1.62
+    #     max_ask 0.70  n= 98 margin  +8.0  t+2.17
+    #     max_ask 0.65  n= 76 margin +13.8  t+2.65
+    # Split train/test, those cells have ELEVEN entries on the train half
+    # against 87 on the test half. A distance trigger fires as a function of how
+    # far the day travelled, so its rate swings with the day -- 11 vs 87 is the
+    # trigger being day-dependent, not a sampling accident. Where it can be
+    # measured it degrades: X>=10 at max_ask 0.65 wins 76.5% on train and 62.8%
+    # on test. No selection rule can run on ten observations, so the better
+    # ceiling is UNPROVEN rather than good, and `cross_train_max_ask` is left at
+    # 0.89 rather than tuned on a cell that cannot be checked.
+    #
+    # TO REVISIT: re-run `tools/pm_train_chain.py` once the tape has ~2 weeks,
+    # which is the first point at which the cheap cells could have a train half.
+    # Enabling it also costs SLOTS the cross arm is using, and its edge sits in
+    # the same price band the cross arm already trades.
     cross_train_enabled: bool = False
     # ---- GATE PARITY WITH THE CROSS ARM (audited 2026-09-16) -------------
     # The TRAIN trigger is NOT a separate arm: it sets `train = True` and falls
