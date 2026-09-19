@@ -3892,12 +3892,27 @@ class Bot:
             self._cross_refuse(r, side, "no ask on the book",
                                tau=tau, spot=spot_now, sigma=sigma_now)
             return
-        if not (self._ck("min_price", r) <= ask
-                <= self._ck("max_price", r)):
+        # ⭐ THE BAND IS CHECKED ON THE BOOK WE PAY, NOT THE ONE WE SEE.
+        # `ask` here is OUR websocket ladder, and that book runs a median 593 ms
+        # behind the venue's (p90 1015 ms), which puts it a median 0.030 BELOW
+        # the venue and 0.130 below it at the tail. Gating the real band on it
+        # selects a different set of trades from the one we then buy.
+        # MEASURED, `tools/pm_two_book.py`, which models both books:
+        #     band on the ladder  n=743 miss=129 win 57.1% $+160.81 | TEST $+85.61
+        #     band on the venue   n=947 miss=  0 win 58.5% $+272.80 | TEST $+151.15
+        # So this becomes a cheap SANITY filter, padded outwards, and the real
+        # band is applied to the VENUE ask in `_place_order` -- which already
+        # fetches it, so the only cost is probes on candidates that then fail
+        # the real band: 9.0/hr -> 11.7/hr at a 0.10 pad. `pad` 0 = old
+        # behaviour exactly.
+        _pad = max(0.0, self._ck("ladder_band_pad", r))
+        if not (self._ck("min_price", r) - _pad <= ask
+                <= self._ck("max_price", r) + _pad):
             self._cross_refuse(
                 r, side,
-                f"ask {ask:.3f} outside [{self._ck('min_price'):.2f},"
-                f"{self._ck('max_price'):.2f}]",
+                f"ask {ask:.3f} outside "
+                f"[{self._ck('min_price') - _pad:.2f},"
+                f"{self._ck('max_price') + _pad:.2f}] (ladder, pad {_pad:.2f})",
                 tau=tau, spot=spot_now)
             return
         # MODEL-EDGE GATE. This is the arm's economic constraint; the band
@@ -5871,6 +5886,35 @@ class Bot:
                 # Judged against `base` -- the best price we know of -- so with
                 # the venue readable this refuses exactly the orders the venue
                 # would refuse, BEFORE the venue is called.
+                # ⭐ THE REAL PRICE BAND, ON THE PRICE WE WILL PAY. The
+                # decision gated a PADDED band on our ladder (see
+                # `cross_ladder_band_pad`); this is where the true one binds,
+                # and it is free because `base` is already the venue's ask.
+                # Only the MIN is new: the max has always been enforced by the
+                # dead-order check immediately below.
+                # ⛔ A PAD WITH NO VENUE READ IS A HOLE: if the probe failed,
+                # `base` is still our ladder and the padded band was the only
+                # one applied. Refuse rather than buy outside the band on a
+                # book we could not check.
+                _pad2 = max(0.0, self._ck("ladder_band_pad", r))
+                if _pad2 > 0 and arm_of(sig) == "CROSS":
+                    _lo = self._ck("min_price", r)
+                    if base_src != "venue":
+                        log.info("cross skip %s %s: venue book unreadable and "
+                                 "the ladder band was padded -- refusing rather "
+                                 "than trusting a stale price",
+                                 r.slug, sig.side)
+                        return None
+                    if base + 1e-9 < _lo:
+                        log.info("cross skip %s %s: venue %.4f is below the "
+                                 "%.2f floor (our ladder read %.4f)",
+                                 r.slug, sig.side, base, _lo, sig.quote)
+                        with contextlib.suppress(Exception):
+                            self._cross_refuse(
+                                r, sig.side,
+                                f"venue book {base:.3f} below the "
+                                f"{_lo:.2f} floor", stake=stake, arm="cross")
+                        return None
                 if cap + 1e-9 < base:
                     with contextlib.suppress(Exception):
                         self.broker.last_failure = "above_fill_cap"

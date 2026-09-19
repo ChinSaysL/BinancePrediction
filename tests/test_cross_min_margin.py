@@ -225,7 +225,11 @@ def test_the_ladder_artifact_is_recorded_beside_the_floor():
     must ride with it or someone will 'fix' the floor back."""
     cfg = (ROOT / "btcpredict" / "config.py").read_text()
     i = cfg.index("cross_min_price: float")
-    block = cfg[max(0, i - 4000):i]
+    # A GENEROUS window. `cross_ladder_band_pad` was later inserted directly
+    # above this knob and pushed the note past a tighter offset, failing this
+    # test although nothing had been lost. The window is the whole note block,
+    # not a guess at its length.
+    block = cfg[max(0, i - 12000):i]
     assert "WEBSOCKET ladder" in block
     assert "CROSS_MIN_PRICE=0.10" in block, "the revert must be stated"
 

@@ -1644,6 +1644,32 @@ class Settings(BaseSettings):
     # where the two-second reprice is +0.2174 to +0.5407. Two independent
     # sweeps have now asked for this floor to come down; both were artifacts of
     # pricing fills that cannot be had.
+    # ⭐ HOW FAR THE DECISION-TIME BAND IS PADDED OUTWARDS, so the REAL band
+    # can be applied to the venue's ask at send instead of our ladder's.
+    # 0 = off, which is exactly the old behaviour.
+    #
+    # WHY. Our websocket book runs a median 593 ms behind the venue (p90
+    # 1015 ms), which puts its ask a median 0.030 under the venue's and 0.130
+    # under at the tail. Gating [0.45,0.65] on it therefore selects trades by a
+    # price we do not pay. `tools/pm_two_book.py` models both books:
+    #     band on the ladder  n=743 miss=129 win 57.1% $+160.81 | TEST $+85.61
+    #     band on the venue   n=947 miss=  0 win 58.5% $+272.80 | TEST $+151.15
+    # worth +$66 (look 1.0) and +$69 (look 2.0) on held-out days.
+    #
+    # THE COST IS PROBES, AND IT IS SMALL: candidates that clear the padded
+    # ladder band and then fail the real one still cost a venue read. Measured
+    # on the tape, 9.0/hr at pad 0 against 11.7/hr at pad 0.10, which also
+    # captures essentially every available fill (839 of the 838-947 range).
+    # A wider pad only buys wasted probes: [0.30,0.80] gives 832 fills for 12.1
+    # probes/hr, [0.00,1.00] gives 838 for 13.6.
+    #
+    # ⛔ AND IT IS NOT A LICENCE TO WIDEN THE REAL BAND. cross_min_price stays
+    # 0.45 because the cheap book is unfillable; this changes WHICH BOOK the
+    # 0.45 is read on, not the number. A venue read that FAILS while the pad is
+    # on means the padded band was the only one applied, so `_place_order`
+    # refuses outright rather than buying on an unchecked price.
+    # Revert: CROSS_LADDER_BAND_PAD=0 + restart.
+    cross_ladder_band_pad: float = 0.0
     cross_min_price: float = 0.45
     # ⛔ RETIRED 2026-09-19, THE SAME DAY IT SHIPPED. It was chosen on live
     # fills bucketed by their realised margin. Those buckets are not a

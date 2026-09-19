@@ -341,3 +341,53 @@ def test_the_order_path_fetch_is_time_bounded():
     block = src[i:src.index("def ws_follow_rounds")]
     assert "connect=2.0, sock_read=2.0" in block
     assert "connect=3.0" not in block
+
+
+# ---------------------------------------------------------------------------
+# THE BAND ON THE BOOK WE PAY -- 2026-09-19
+# ---------------------------------------------------------------------------
+
+def test_the_pad_ships_off_so_behaviour_is_unchanged_until_asked():
+    """`cross_ladder_band_pad` 0 must be byte-for-byte the old path."""
+    from btcpredict.config import Settings
+    assert Settings.model_fields["cross_ladder_band_pad"].default == 0.0
+
+
+def test_a_pad_moves_the_real_band_onto_the_venue():
+    """The decision gates a PADDED band on our ladder; the true band binds on
+    the venue's ask at send. Our book runs a median 593 ms behind the venue,
+    0.030 under it, so gating the real band on it selects trades by a price we
+    do not pay -- worth +$66/+$69 on held-out days (tools/pm_two_book.py)."""
+    src = (pathlib.Path(__file__).resolve().parents[1]
+           / "btcpredict" / "main.py").read_text()
+    i = src.index('_pad = max(0.0, self._ck("ladder_band_pad", r))')
+    blk = src[i:i + 500]
+    assert 'self._ck("min_price", r) - _pad' in blk
+    assert 'self._ck("max_price", r) + _pad' in blk
+    j = src.index('_pad2 = max(0.0, self._ck("ladder_band_pad", r))')
+    blk2 = src[j:j + 1400]
+    assert "base + 1e-9 < _lo" in blk2, "the venue MIN must bind at send"
+
+
+def test_an_unreadable_venue_refuses_while_the_pad_is_on():
+    """⛔ THE HOLE THIS CLOSES. With the pad on, the padded band is the only one
+    the decision applied. If the venue probe then fails, `base` is still our
+    ladder -- so without this the arm would buy OUTSIDE the real band on a book
+    it could not check. It refuses instead."""
+    src = (pathlib.Path(__file__).resolve().parents[1]
+           / "btcpredict" / "main.py").read_text()
+    j = src.index('_pad2 = max(0.0, self._ck("ladder_band_pad", r))')
+    blk = src[j:j + 1400]
+    assert 'base_src != "venue"' in blk
+    assert "return None" in blk
+
+
+def test_the_probe_cost_is_recorded():
+    """The pad buys fills with venue reads, so the rate has to ride with it or
+    someone widens it to [0,1] and pays 36% wasted probes for nothing."""
+    cfg = (pathlib.Path(__file__).resolve().parents[1]
+           / "btcpredict" / "config.py").read_text()
+    j = cfg.index("cross_ladder_band_pad: float =")
+    block = cfg[max(0, j - 2500):j]
+    assert "11.7/hr" in block and "9.0/hr" in block
+    assert "CROSS_LADDER_BAND_PAD=0" in block, "the revert must be stated"
