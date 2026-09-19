@@ -160,12 +160,55 @@ def test_a_venue_ask_above_the_cap_is_refused_before_the_venue_is_called(
 
 def test_an_unreadable_venue_book_keeps_the_old_base(monkeypatch):
     """A failed read is not a reason to refuse a trade the arm's own gates
-    approved; it falls back to the behaviour that shipped before this."""
+    approved; it falls back to the behaviour that shipped before this.
+
+    ⛔ THIS CONTRACT IS PAD-DEPENDENT, AND THE PIN BELOW IS THE POINT. It holds
+    only while `cross_ladder_band_pad` is 0, because then the decision band and
+    the real band are the same band and our ladder has already been checked
+    against it. With a pad the decision band is WIDER than the real one, so a
+    fallback to the ladder would be buying outside the real band on a book we
+    could not read -- see the sibling test below, which is the other half of
+    this contract. Unpinned, this test silently swaps which half it is
+    asserting depending on which profile is deployed: it passed locally at the
+    shipped default of 0.0 and failed on the VPS at the live 0.10.
+    """
+    monkeypatch.setattr("btcpredict.config.settings.cross_ladder_band_pad", 0.0)
     bot, r, sig = make_bot()
     place(bot, r, sig, monkeypatch, venue_top=venue([None]), attempts=1)
     assert len(bot.buys) == 1
     assert bot.buys[0]["price"] == pytest.approx(0.42)
     assert bot.buys[0]["max_px"] == pytest.approx(0.54)
+
+
+def test_an_unreadable_venue_book_REFUSES_once_the_band_is_padded(monkeypatch):
+    """The other half. A pad widens the DECISION band on our ladder and moves
+    the real band onto the venue's ask -- so with the venue unreadable the only
+    band that ran is the wide one, and falling back to the ladder would buy
+    outside the real band on a book we never checked.
+
+    FAIL-CLOSED IS AFFORDABLE HERE, which is why it is the choice: measured on
+    the live log, the venue probe answered 212 times against 1 unreadable, and
+    that one read 0.660 on our ladder -- above the 0.65 fill cap, so the old
+    behaviour would have sent a FAK that could not match anyway.
+    """
+    monkeypatch.setattr("btcpredict.config.settings.cross_ladder_band_pad", 0.10)
+    bot, r, sig = make_bot()
+    place(bot, r, sig, monkeypatch, venue_top=venue([None]), attempts=1)
+    assert bot.buys == [], (
+        "with the band padded and the venue unreadable, no band was actually "
+        "applied to the price we would pay -- nothing may be sent")
+
+
+def test_the_pad_does_not_refuse_when_the_venue_reads_fine(monkeypatch):
+    """The fail-closed path must cost nothing on the 99.5% case: a readable
+    venue book inside the band still trades, pad or no pad."""
+    monkeypatch.setattr("btcpredict.config.settings.cross_ladder_band_pad", 0.10)
+    monkeypatch.setattr("btcpredict.config.settings.cross_min_price", 0.45)
+    bot, r, sig = make_bot()
+    place(bot, r, sig, monkeypatch, venue_top=venue([Top(0.30, 0.60)]),
+          attempts=1)
+    assert len(bot.buys) == 1
+    assert bot.buys[0]["price"] == pytest.approx(0.60)
 
 
 def test_the_model_path_never_reads_the_venue(monkeypatch):

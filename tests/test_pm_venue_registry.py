@@ -44,8 +44,12 @@ class TestNormalise:
             registry.normalise("polymarket-clob")
 
     def test_the_config_default_is_binance(self):
-        from btcpredict.config import settings
-        assert settings.venue == "binance"
+        """THE DEFAULT, read as the default. `settings` is the RESOLVED value
+        and the live `.env` sets `VENUE=polymarket`, so reading it here asserts
+        which profile is deployed rather than what ships -- green locally, red
+        on the VPS, and saying nothing either way."""
+        from btcpredict.config import Settings
+        assert Settings.model_fields["venue"].default == "binance"
 
 
 # ---------------------------------------------------------------- config map

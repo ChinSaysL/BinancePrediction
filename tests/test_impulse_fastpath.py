@@ -307,6 +307,11 @@ def test_model_mode_does_not_run_the_trigger_on_the_feed_clock(store, monkeypatc
     tick path, or every model run would start evaluating impulse entries."""
     monkeypatch.setattr("btcpredict.config.settings.entry_mode", "model")
     monkeypatch.setattr("btcpredict.config.settings.impulse_on_tick", True)
+    # ⛔ AND THE CROSS ARM OFF. `_idle` waits on the FEED whenever the cross arm
+    # is armed, independently of `entry_mode` -- and the live `.env` sets
+    # `CROSS_ENABLED=true`, so this assertion was reading the cross arm rather
+    # than the impulse switch it names. It ships False.
+    monkeypatch.setattr("btcpredict.config.settings.cross_enabled", False)
     bot = make_bot(store, moving_ticks(1.0))
 
     async def boom():

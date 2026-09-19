@@ -381,6 +381,10 @@ def test_the_tilt_moves_the_stake_the_right_way(store, monkeypatch, no_gates):
     is where the edge is: it must stake MORE, not less."""
     bot = make_bot(store)
     sig = actionable(monkeypatch)
+    # With the live `stake_cap_usdt=1.0` BOTH sides clamp to 1.0 and the
+    # comparison becomes `1.0 > 1.0` -- the test stops measuring the tilt and
+    # starts measuring the cap. It ships 0.0 (off); pin that.
+    monkeypatch.setattr("btcpredict.config.settings.stake_cap_usdt", 0.0)
     assert bot._stake_for(sig, 0.05) > bot._stake_for(sig, 3.0)
 
 

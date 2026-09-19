@@ -236,8 +236,10 @@ class TestTheRefusalMustNameWhatRefused:
         actually decides it -- the confusion that cost two wrong diagnoses."""
         import types
 
-        from btcpredict.config import settings as s
-        assert s.cross_stake_usdt is None
+        from btcpredict.config import Settings, settings as s
+        # The DEFAULT is None; the live `.env` sets 1.0. What this test is
+        # about is which NAME `_ck` reads, so the default is the honest anchor.
+        assert Settings.model_fields["cross_stake_usdt"].default is None
         b = m.Bot.__new__(m.Bot)
         b._round = types.SimpleNamespace(slug="btc-updown-5m-1")
         assert b._ck("stake_usdt") == s.cross_stake_usdt

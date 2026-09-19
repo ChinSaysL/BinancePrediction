@@ -137,6 +137,16 @@ def armed(monkeypatch):
     monkeypatch.setattr("btcpredict.config.settings.cross_max_tau_s", 30.0)
     monkeypatch.setattr("btcpredict.config.settings.cross_max_price", 0.50)
     monkeypatch.setattr("btcpredict.config.settings.cross_min_price", 0.02)
+    # ⛔ PINNED FOR THE SAME REASON AS THE BAND ITSELF: these tests are about
+    # the arm's own arithmetic, not about which profile is deployed. The live
+    # `.env` sets `CROSS_LADDER_BAND_PAD=0.10`, which routes `_place_order`
+    # through the VENUE-side band -- and the fake brokers here have no venue
+    # book, so the padded path refuses the order and five tests that never
+    # mention the pad fail on the VPS while passing locally. That is the exact
+    # trap already recorded in test_cross_venue_take.py's
+    # `test_the_cap_arithmetic_is_the_arms_own_bound`. The padded path has its
+    # own tests; this fixture asks for the unpadded one.
+    monkeypatch.setattr("btcpredict.config.settings.cross_ladder_band_pad", 0.0)
 
 
 
@@ -700,6 +710,13 @@ class TestTheStake:
 
     def test_it_scales_with_the_bankroll_when_no_flat_stake_is_set(
             self, store, monkeypatch):
+        # ⛔ AND THE HARD CAP OFF. `stake_cap_usdt` ships 0.0 (no cap) but the
+        # live `.env` sets 1.0 -- it clamps EVERY stake to a dollar, so the
+        # sizing rule this test exists to measure came out as 1.0 on the VPS
+        # while passing locally. Pinning `cross_stake_usdt` is not enough:
+        # there are two flatteners, and only one of them has "stake" in the
+        # name the test mentions.
+        monkeypatch.setattr("btcpredict.config.settings.stake_cap_usdt", 0.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_stake_usdt", None)
         monkeypatch.setattr("btcpredict.config.settings.sizing_mode", "fraction")
         monkeypatch.setattr("btcpredict.config.settings.stake_fraction", 0.05)
@@ -2579,6 +2596,14 @@ class TestTheRefusedProbe:
         monkeypatch.setattr("btcpredict.config.settings.cross_probe_enabled",
                             True)
         monkeypatch.setattr("btcpredict.config.settings.cross_stake_mult", 3.0)
+        # ⛔ BOTH FLATTENERS OFF, and they are different mechanisms. The live
+        # `.env` sets `CROSS_STAKE_USDT=1.0`, which makes the arm take a FLAT
+        # dollar size and never call `_stake_for` at all -- so the formula this
+        # test monkeypatches is not merely capped, it is unreachable. And
+        # `stake_cap_usdt=1.0` would clamp the 1.5 afterwards even if it were.
+        # Neither is the subject here; both ship off.
+        monkeypatch.setattr("btcpredict.config.settings.cross_stake_usdt", None)
+        monkeypatch.setattr("btcpredict.config.settings.stake_cap_usdt", 0.0)
         bot = self._wide(store)
         bot._stake_for = lambda *a, **k: 0.5
         seen = {}
