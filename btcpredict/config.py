@@ -729,7 +729,21 @@ class Settings(BaseSettings):
     # (+0.018/$1 under the harsher slippage model) -- it is a supporting arm,
     # not a driver.
     model_min_round_range_bps: float = 5.0
-    model_max_round_range_bps: float = 12.0
+    # ⛔ 12.0 -> 16.0 on 2026-09-19. The 12 above was fitted with a replay that
+    # was wrong five ways: it priced every Up fill at the BID, used BTCUSDT's
+    # sigma for every family, modelled the taker fee at ~60% of the charge,
+    # read the analysis machine's .env instead of the live host's, and did not
+    # apply THIS gate at all. Re-swept with all of that corrected, on
+    # btc-updown-5m over 2,267 rounds with every decision knob pinned to live,
+    # the best cell moved to min_quote 0.55 / max_quote 0.85 / range [5,16] /
+    # tau [60,180] at EV/$ +0.0531, day-t +5.54.
+    #
+    # It is a PLATEAU, not a spike -- nine of its ten one-axis neighbours sit
+    # at day-t +2.2 to +4.3, the exception being range_lo 7 (+1.23). Against a
+    # calibrated null (600 draws, outcome ~ Bernoulli(entry-implied p)) the
+    # shipped cell tests at p = 0.0017 PRE-SPECIFIED, and best-of-grid at
+    # p = 0.0017 multiplicity-honest.
+    model_max_round_range_bps: float = 16.0
     # --- stale-display maker ------------------------------------------------
     # MEASURED 2026-09-12, lead-lag cross-correlation over 1,372 rounds of the
     # 1 Hz quote tape (corr of the venue's implied-probability change against

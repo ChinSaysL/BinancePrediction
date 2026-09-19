@@ -2208,12 +2208,17 @@ class Bot:
         # it only ever consumes a signal that would OTHERWISE have traded --
         # that is what the replay simulated, and counting skipped polls instead
         # would make the live rule a different rule than the measured one.
+        # `getattr`, not attribute access: fixtures build a Bot without running
+        # __init__, and the block around this SWALLOWS AttributeError -- so a
+        # missing attribute would not raise here, it would silently disable the
+        # cooldown in production and look like the rule simply never fired.
+        # Same guard, same reason, as the `histories` lookup above.
         if (sig.act and not gate_reason
                 and settings.model_cooldown_after_loss > 0
-                and self._model_cooldown > 0):
-            if self._cooldown_round != r.slug:
+                and getattr(self, "_model_cooldown", 0) > 0):
+            if getattr(self, "_cooldown_round", None) != r.slug:
                 self._cooldown_round = r.slug
-                self._model_cooldown -= 1
+                self._model_cooldown = getattr(self, "_model_cooldown", 0) - 1
             gate_reason = (f"cooldown after a loss "
                            f"({self._model_cooldown} signal(s) left)")
 
@@ -7398,7 +7403,7 @@ class Bot:
             # count: the other arms have their own budgets and their outcomes
             # say nothing about this one's regime (see config).
             if (settings.model_cooldown_after_loss > 0 and not s.won
-                    and _is_main_arm_mode(self._fill_mode(fid))):
+                    and _is_main_arm_mode(self._fill_mode(fid))):  # noqa: E501
                 self._model_cooldown = int(settings.model_cooldown_after_loss)
                 self._cooldown_round = None
                 log.info("model arm cooldown armed: skipping the next %d "

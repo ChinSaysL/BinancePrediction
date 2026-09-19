@@ -1411,9 +1411,22 @@ class TestModelRoundRangeWindow:
         assert bot._round_range_bps(bot._round) is None
 
     def test_the_window_brackets_the_measured_sweet_spot(self):
+        """Re-measured 2026-09-19: the top moved 12 -> 16.
+
+        The 12 was fitted with a replay that priced Up at the bid, used BTC's
+        sigma for every family, under-charged the taker fee, read the wrong
+        .env and did not apply this gate at all. Corrected, the best cell is
+        range [5,16] with max_quote 0.85 and tau [60,180] -- a plateau, nine
+        of ten neighbours at day-t +2.2 to +4.3, p = 0.0017 against a
+        calibrated null.
+
+        This reads the merged `settings` ON PURPOSE. It is the drift check
+        that catches the live host running a window the repo does not ship,
+        which is exactly what it caught when the live value moved first.
+        """
         from btcpredict.config import settings as s
         assert s.model_min_round_range_bps == 5.0
-        assert s.model_max_round_range_bps == 12.0
+        assert s.model_max_round_range_bps == 16.0
 
     def test_the_range_gate_is_off_on_its_own_replay(self):
         """12.0 -> 0.0 on 2026-09-18. See config.cross_max_round_range_bps.
