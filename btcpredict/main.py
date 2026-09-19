@@ -4515,6 +4515,38 @@ class Bot:
         tau = (int(r.end_ms or 0) - now_ms) / 1000.0
         if tau <= settings.cross_exit_min_tau_s:
             return False          # the book goes one-sided at the bell
+        # ⭐ A MINIMUM HOLD, MEASURED FROM THE FILL. `entry_ms` is the FILL's
+        # timestamp, not the decision's, and that distinction is the whole
+        # point: the decision and the fill are separated by a median 1.03 s and
+        # a p90 of 1.79 s (live, n=30), because a missed FAK re-prices and
+        # retries. A position is therefore BORN on a signal already a second or
+        # more old, and an exit judging it immediately is judging the latency.
+        #
+        # MEASURED, `tools/pm_exit_models.py`, exit versus HOLDING the same
+        # positions, bucketed by how long after entry the exit fired:
+        #     0-5s     n=  7  exit -2.16  hold +0.22  delta -2.38   <- the only
+        #     5-10s    n=  9  exit -4.48  hold -5.58  delta +1.10      losing
+        #     10-30s   n= 57  exit -28.35 hold -39.17 delta +10.82     bucket
+        #     30-60s   n= 91  exit -52.63 hold -68.51 delta +15.88
+        # A minimum hold gains +2.38/+1.24 at 5 s and +1.23/+1.23 at 2 s across
+        # the two looks, and TURNS HARMFUL at 12 s (-1.70/-1.92) and 20 s
+        # (-8.07/-11.39). So this is a narrow guard on a known-bad bucket, not a
+        # fitted parameter -- it is bounded on both sides by measurement.
+        #
+        # ⛔ SHIPPED ON n=7, WHICH IS BELOW THIS REPO'S USUAL BAR, and the
+        # justification is asymmetry rather than significance: the guard can
+        # only DELAY an exit, it touches ~2.4% of them, and both looks agree on
+        # the direction. It was declined once on the sample size and then seen
+        # live -- xrp-updown-5m-1789804800, filled 08:02:23.334 at 0.49 after a
+        # 3.57 s decision-to-fill gap (the day's worst), sold 08:02:25.353 at
+        # 0.31, a 2.02 s hold for -$0.4336.
+        # KILL CRITERION: exits in [5s,10s) turning negative against holding
+        # over ~40 of them. Revert: CROSS_EXIT_MIN_HOLD_S=0 + restart.
+        hold_ms = int(settings.cross_exit_min_hold_s * 1000)
+        if hold_ms > 0:
+            ems = int(w.get("entry_ms") or 0)
+            if ems and now_ms - ems < hold_ms:
+                return False
         sig_ticks, sig_name = self._cross_signal(r, ticks, tau)
         if not sig_ticks:
             return False

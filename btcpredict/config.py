@@ -3072,6 +3072,31 @@ class Settings(BaseSettings):
     # Revert: CROSS_EXIT_MARGIN_BPS=0 (back to the flip rule), or
     # CROSS_EXIT_ENABLED=false (back to holding) + restart.
     cross_exit_margin_bps: float = 4.0
+    # ⭐ A MINIMUM HOLD FROM THE FILL, NEW 2026-09-19. 0 = off.
+    #
+    # The exit versus HOLDING the same positions, by how long after the fill it
+    # fired (`tools/pm_exit_models.py`):
+    #     0-5s     n=  7  exit  -2.16  hold  +0.22  delta  -2.38  <- only loser
+    #     5-10s    n=  9  exit  -4.48  hold  -5.58  delta  +1.10
+    #     10-30s   n= 57  exit -28.35  hold -39.17  delta +10.82
+    #     30-60s   n= 91  exit -52.63  hold -68.51  delta +15.88
+    # A guard gains +2.38/+1.24 at 5 s and +1.23/+1.23 at 2 s across the two
+    # looks, and TURNS HARMFUL at 12 s (-1.70/-1.92) and 20 s (-8.07/-11.39).
+    #
+    # WHY IT IS MEASURED FROM THE FILL AND NOT THE DECISION. Live, the two are
+    # a median 1.03 s apart (p90 1.79 s, n=30) because a missed FAK re-prices
+    # and retries, so a position is born on a signal already a second old. The
+    # replay measures lag from the SIGNAL and therefore understates how early a
+    # live exit can look.
+    #
+    # ⛔ SHIPPED ON n=7, BELOW THIS REPO'S USUAL BAR. The case is asymmetry, not
+    # significance: it can only DELAY an exit, it touches ~2.4% of them, and
+    # both looks agree. Declined once on sample size, then seen live --
+    # xrp-updown-5m-1789804800 filled 08:02:23.334 at 0.49 after the day's worst
+    # 3.57 s decision-to-fill gap, sold 08:02:25.353 at 0.31: a 2.02 s hold for
+    # -$0.4336.
+    # Revert: CROSS_EXIT_MIN_HOLD_S=0 + restart.
+    cross_exit_min_hold_s: float = 5.0
     # ⭐ 8.0 -> 60.0 on 2026-09-19 -- THE SAME NUMBER RETRACTED EARLIER THE SAME
     # DAY, restored on different evidence. The first 60.0 rested on a sweep run
     # over `pm_exit_flip.py:walk()`, which latched the exit candidate on the

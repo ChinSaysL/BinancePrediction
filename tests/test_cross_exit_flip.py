@@ -156,7 +156,11 @@ def _bot(*, bid=0.55, sell_shares=2.0, sell_px=0.54, unverified=False,
                                  token_id="tok", raw="entry"))}
     b._exit_watch = {SLUG: {
         "fid": 7, "side": held_side, "token": "tok", "shares": shares,
-        "stake": stake, "fee": fee, "entry_ms": int(time.time() * 1000) - 2000,
+        # 60 s ago, not 2 s: `cross_exit_min_hold_s` (5.0) now refuses to judge
+        # a position younger than that, so a fixture entered 2 s ago would make
+        # every rule test assert the HOLD rather than the rule. The hold has its
+        # own behavioural test below, with a deliberately fresh entry.
+        "stake": stake, "fee": fee, "entry_ms": int(time.time() * 1000) - 60_000,
         "did": 3, "px": 0.57, "req": 0.65, "oid": "o1",
         "flip_ms": None, "done": 0, "halted": False}}
     b._ck = lambda name, r: {"look_s": 1.0}.get(name, 0.0)
@@ -1340,3 +1344,79 @@ class TestTheMarginExitRule:
         block = cfg[max(0, j - 2600):j]
         assert "0.39" in block and "0.88" in block, "the rate sweep must ride along"
         assert "CROSS_EXIT_MARGIN_BPS=0" in block, "the revert must be stated"
+
+
+class TestTheMinimumHold:
+    """A position must be held a few seconds before the exit may judge it.
+
+    The decision and the FILL are a median 1.03 s apart live (p90 1.79 s,
+    n=30) because a missed FAK re-prices and retries, so a position is born on
+    a signal already a second old. Judging it immediately judges the latency.
+    """
+
+    def test_it_ships_the_measured_guard(self):
+        from btcpredict.config import Settings
+        assert Settings().cross_exit_min_hold_s == 5.0
+
+    def test_it_is_measured_from_the_fill_not_the_decision(self):
+        """`entry_ms` is the FILL's timestamp -- that is the whole point, and a
+        future refactor that points it at the decision would silently undo
+        this guard."""
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "btcpredict" / "main.py").read_text()
+        i = src.index("hold_ms = int(settings.cross_exit_min_hold_s * 1000)")
+        blk = src[i:i + 400]
+        assert 'w.get("entry_ms")' in blk
+        assert "now_ms - ems < hold_ms" in blk
+        j = src.index('"entry_ms": int(entry_ms or 0)')
+        arm = src[max(0, j - 1200):j]
+        assert "entry_ms=fill.ts_ms" in src, "entry_ms must come from the FILL"
+
+    def test_it_guards_BOTH_exit_rules(self):
+        """The failure is generic -- a sale seconds after the fill -- so the
+        guard sits before the rule choice, not inside the margin branch."""
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "btcpredict" / "main.py").read_text()
+        hold = src.index("hold_ms = int(settings.cross_exit_min_hold_s * 1000)")
+        margin = src.index("xb = float(settings.cross_exit_margin_bps)")
+        flip = src.index('if w.get("flip_ms") is None:', margin)
+        assert hold < margin < flip, (
+            "the hold must precede both the margin rule and the flip rule")
+
+    def test_zero_turns_it_off(self):
+        """0 = off is the repo convention and the stated revert."""
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "btcpredict" / "main.py").read_text()
+        i = src.index("hold_ms = int(settings.cross_exit_min_hold_s * 1000)")
+        assert "if hold_ms > 0:" in src[i:i + 200]
+
+    def test_a_fresh_position_is_not_sold(self, monkeypatch):
+        """The behaviour, not just the source: a position filled moments ago
+        must survive a signal that would otherwise sell it."""
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
+                            True)
+        b = _bot(monkeypatch=monkeypatch)
+        b._exit_watch[SLUG]["entry_ms"] = int(time.time() * 1000) - 500
+        assert _run(b, _round(), "Down") is False
+        assert b.broker.calls == [], "nothing may be sold inside the hold"
+
+    def test_and_is_sold_once_the_hold_has_passed(self, monkeypatch):
+        """...and the same signal must sell it once the guard expires, or the
+        guard is a mute button rather than a delay."""
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
+                            True)
+        b = _bot(monkeypatch=monkeypatch)
+        b._exit_watch[SLUG]["entry_ms"] = int(time.time() * 1000) - 60_000
+        _run(b, _round(), "Down")
+        assert b.broker.calls, "past the hold the exit must be free to act"
+
+    def test_the_losing_bucket_is_recorded_beside_the_knob(self):
+        """It ships on n=7, so the reason has to travel with it -- otherwise it
+        reads as an unjustified delay and gets tuned away."""
+        cfg = (pathlib.Path(__file__).resolve().parents[1]
+               / "btcpredict" / "config.py").read_text()
+        j = cfg.index("cross_exit_min_hold_s: float =")
+        block = cfg[max(0, j - 2200):j]
+        assert "-2.38" in block, "the losing 0-5s bucket must be stated"
+        assert "-8.07" in block or "-1.70" in block, "the upper bound too"
+        assert "CROSS_EXIT_MIN_HOLD_S=0" in block, "the revert must be stated"
