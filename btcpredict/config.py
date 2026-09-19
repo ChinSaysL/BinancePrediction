@@ -2304,6 +2304,41 @@ class Settings(BaseSettings):
     # and the venue-position re-read that makes doubling impossible.
     # Revert = `CROSS_VENUE_TAKE=false` + restart (old base, one less REST call).
     cross_venue_take: bool = True
+    # How old a PREFETCHED venue ask may be and still price a ceiling, in
+    # seconds. 0 = OFF, which is the shipped default and the old path byte for
+    # byte (see Bot._prefetch_venue_top).
+    #
+    # WHAT IT BUYS. Measured 2026-09-19 over the live log, decision -> verdict
+    # is 1001ms median / 1999ms p90, and only two of its steps are network:
+    #     get_quote   LOCAL `book.best()` on this venue          ~0ms
+    #     venue_top   REST                                     ~292ms
+    #     FAK ack     REST, and this IS the order               452ms median
+    # `venue_top` must finish before the FAK can be priced, so they cannot
+    # overlap -- but the SIDE is knowable before the crossing (below the strike
+    # the next cross is Up), so the fetch can start a tick early. That is the
+    # whole of it: ~292ms off the order path, or ~29% of the median.
+    #
+    # ⭐ WHY A STALE BASE CANNOT COST MONEY HERE. The probe does not set the
+    # price we pay. A FAK fills at the BOOK bounded by the limit, which the
+    # live fills show plainly -- they land below BOTH the ceiling and our own
+    # estimate:
+    #     pm FAK FILL 2.08333 Down @ 0.48 ... ceiling 0.59 ask 0.53
+    #     pm FAK FILL 1.78571 Up   @ 0.56 ... ceiling 0.65 ask 0.62
+    # The base feeds `_take_cap_for`, which sets the CEILING, and
+    # `cross_max_fill_px` hard-bounds that ceiling regardless. A stale base
+    # moves the ceiling slightly and cannot move the fill or lift the cap.
+    #
+    # ⛔ THE RISK IS THE OTHER DIRECTION, and it is why this is a knob. A base
+    # that is too LOW builds a ceiling under the ask that exists and the FAK
+    # finds nothing -- which is today's failure mode, the one `cross_venue_take`
+    # was added to fix. Too tight a bound wastes the prefetch (falls through to
+    # the synchronous fetch, no harm); too loose reintroduces the miss. The
+    # venue ask moves a median 0.070 per ~320ms of our own book staleness, so
+    # anything past ~0.5s is giving back what the re-base bought.
+    # UNMEASURED IN LIVE at the time of writing: ships 0.0 so it changes
+    # nothing until someone turns it on and reads the `warm venue ask used`
+    # lines against the `take base` ones.
+    cross_venue_prefetch_max_age_s: float = 0.0
     # ---- TRAIN entry trigger: DISTANCE from the strike, not a crossing ----
     # Explicitly an OVERRIDE of three of the arm's gates, taken as a risk
     # decision by the operator on 2026-09-15. The strike IS the round's open, so

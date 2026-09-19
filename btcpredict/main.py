@@ -3204,6 +3204,117 @@ class Bot:
         task.add_done_callback(tasks.discard)
         return task
 
+    async def _prefetch_venue_top(self, r, up, down, feed):
+        """Keep the VENUE's own ask WARM for the side the next crossing buys.
+
+        ⛔ THE LARGEST REMAINING COST ON THE ORDER PATH, and it is the only one
+        left that is not the order itself. Measured 2026-09-19 over the live
+        log, decision -> verdict is 1001ms median (p90 1999ms), and it
+        decomposes as:
+
+            get_quote        LOCAL `book.best()` read          ~0ms
+            venue_top        REST                            ~292ms
+            FAK ack          REST, and this IS the order      452ms median
+            shadow book      spawned, off the path              --
+
+        `venue_top` has to finish before the FAK can be priced, so the two
+        cannot overlap -- but nothing says the fetch has to START at the
+        decision. The side is knowable BEFORE the crossing (below the strike
+        the next cross is Up, above it Down), which is the same fact
+        `_prefetch_cross_quote` already exploits, from the same call site.
+
+        ⭐ WHY A STALE BASE IS SAFE HERE, and it is worth being exact because
+        the opposite would be a money bug. The probe does NOT set the price we
+        pay. A FAK fills at the BOOK, bounded by the limit -- verified on the
+        live fills, which land BELOW both the ceiling and our own estimate:
+
+            pm FAK FILL 2.08333 Down @ 0.48 ... ceiling 0.59 ask 0.53
+            pm FAK FILL 1.78571 Up   @ 0.56 ... ceiling 0.65 ask 0.62
+
+        So the base feeds `_take_cap_for`, which sets the CEILING, and
+        `cross_max_fill_px` hard-bounds that ceiling regardless. A base that is
+        slightly stale moves the ceiling slightly; it cannot move the fill
+        price, and it cannot lift the cap.
+
+        The residual risk is the other direction: a base that is too LOW builds
+        a ceiling under the ask that exists, and the FAK finds nothing. That is
+        exactly today's failure mode, which is why the freshness bound is a
+        knob and not a constant, and why any doubt -- stale, missing, fetch
+        failed -- falls through to the synchronous fetch. This can only ever be
+        faster, never a different price.
+        """
+        max_age = float(settings.cross_venue_prefetch_max_age_s)
+        if max_age <= 0:                       # ships OFF
+            return None
+        broker = getattr(self, "broker", None)
+        if broker is None or getattr(broker, "mode", None) != "live":
+            return None
+        if not settings.cross_venue_take:      # nothing consumes it otherwise
+            return None
+        spot, strike = getattr(feed, "price", None), getattr(r, "strike", None)
+        if not spot or not strike or spot == strike:
+            return None
+        side = "Up" if spot < strike else "Down"
+        token = up.token_id if side == "Up" else down.token_id
+        if not token:
+            return None
+        cache = getattr(self, "_vtop_pre", None)
+        if not isinstance(cache, dict):
+            cache = self._vtop_pre = {}
+        # Already warm and still fresh: a second fetch would only add load.
+        e = cache.get(token)
+        if e is not None and time.monotonic() - e[0] <= max_age * 0.5:
+            return None
+
+        async def _go():
+            try:
+                vt = await venue_top(token)
+            except Exception:                            # noqa: BLE001
+                return
+            if vt is not None and getattr(vt, "ask", 0) > 0:
+                cache[token] = (time.monotonic(), float(vt.ask))
+                # Unbounded growth is the failure mode a dict cache invites;
+                # the arm trades 9 families x 2 sides, so anything past that is
+                # dead rounds.
+                if len(cache) > 64:
+                    # TRIM TO A TARGET, not by a fixed count: dropping 32 from
+                    # 201 leaves 169, which is still a leak wearing a bound.
+                    # Oldest first -- they are the ones a `max_age` check would
+                    # refuse anyway.
+                    for k in sorted(cache, key=lambda x: cache[x][0])[:-32]:
+                        cache.pop(k, None)
+
+        task = asyncio.create_task(_go())
+        tasks = getattr(self, "_vtop_pre_tasks", None)
+        if not isinstance(tasks, set):
+            tasks = self._vtop_pre_tasks = set()
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+        return task
+
+    def _take_prefetched_venue_top(self, token: str) -> float | None:
+        """Pop the warm venue ask when it is fresh enough to price a ceiling.
+
+        ONE SHOT, like the quote: the attempt that consumes it has spent it, so
+        a retry can never build its ceiling from a base the first attempt
+        already used and that is now a full round older.
+        """
+        max_age = float(settings.cross_venue_prefetch_max_age_s)
+        if max_age <= 0:
+            return None
+        cache = getattr(self, "_vtop_pre", None)
+        if not isinstance(cache, dict):
+            return None
+        entry = cache.pop(token, None)
+        if entry is None:
+            return None
+        ts, ask = entry
+        age = time.monotonic() - ts
+        if age > max_age:
+            return None
+        self._vtop_warm_age_s = age
+        return float(ask)
+
     def _take_prefetched_quote(self, token: str, stake: float) -> dict | None:
         """Pop the warm quote for this token when it is fresh and exact.
 
@@ -3655,6 +3766,10 @@ class Bot:
             # only point that is in the tradeable window, live, fresh and not
             # already spent -- a fire from here is plausible.
             await self._prefetch_cross_quote(r, up, down, feed, tau, ctx)
+            # AND THE VENUE'S OWN ASK, for the same reason and from the same
+            # fact: the side is knowable before the crossing. This is the
+            # ~292ms that `venue_top` costs inside the order path.
+            await self._prefetch_venue_top(r, up, down, feed)
             return
         # WHIPSAW. Stamped on the CROSSING, before any gate, because that is the
         # hole `cross_allow_reversal` leaves: it arms on the ENTRY, so a crossing
@@ -5883,7 +5998,24 @@ class Bot:
                 # A fetch failure is NOT a reason to refuse the trade: it falls
                 # back to the old base, logged.
                 if venue_token:
-                    vt = await venue_top(venue_token)
+                    # WARM FIRST. `_prefetch_venue_top` fires this same read at
+                    # the tick before the crossing, so the ~292ms it costs is
+                    # already spent by the time we get here. One shot, and any
+                    # doubt falls through to the synchronous fetch below --
+                    # which is the old path, byte for byte, when the knob is 0.
+                    _warm = (self._take_prefetched_venue_top(venue_token)
+                             if attempt == 0 else None)
+                    vt = None
+                    if _warm is not None and _warm > 0:
+                        base, base_src = _warm, "venue"
+                        cap = self._take_cap_for(r, base, fill_cap)
+                        log.info("warm venue ask used for %s %s: age %.2fs "
+                                 "ask %.4f against our ladder %.4f (cap %.2f)",
+                                 r.slug, sig.side,
+                                 getattr(self, "_vtop_warm_age_s", -1.0),
+                                 base, sig.quote, cap)
+                    else:
+                        vt = await venue_top(venue_token)
                     if vt is not None and vt.ask > 0:
                         base, base_src = vt.ask, "venue"
                         cap = self._take_cap_for(r, base, fill_cap)
@@ -5892,7 +6024,13 @@ class Bot:
                                      " ladder %.3f (%+.3f) -- limit priced off "
                                      "the venue (cap %.2f)", r.slug, sig.side,
                                      base, sig.quote, base - sig.quote, cap)
-                    elif getattr(self, "_venue_take_dbg", None) != r.slug:
+                    elif (_warm is None
+                          and getattr(self, "_venue_take_dbg", None) != r.slug):
+                        # ⛔ `_warm is None` IS LOAD-BEARING. On the warm path
+                        # `vt` is never assigned, so without this guard a
+                        # SUCCESSFUL prefetch logs "venue book unreadable" --
+                        # a line whose whole job is to report the opposite, and
+                        # the one the fail-closed pad check is read against.
                         self._venue_take_dbg = r.slug
                         log.info("take base %s %s: venue book unreadable; "
                                  "pricing off our ladder %.3f (old "
