@@ -2335,9 +2335,40 @@ class Settings(BaseSettings):
     # the synchronous fetch, no harm); too loose reintroduces the miss. The
     # venue ask moves a median 0.070 per ~320ms of our own book staleness, so
     # anything past ~0.5s is giving back what the re-base bought.
-    # UNMEASURED IN LIVE at the time of writing: ships 0.0 so it changes
-    # nothing until someone turns it on and reads the `warm venue ask used`
-    # lines against the `take base` ones.
+    # ⛔⛔ MEASURED, ENABLED FOR FIVE MINUTES, AND TURNED BACK OFF. DO NOT
+    # ENABLE THIS WITHOUT RE-MEASURING BOTH NUMBERS BELOW. The reasoning above
+    # is sound and the implementation is correct and tested; the premise -- that
+    # the 292ms is worth paying for -- is what failed.
+    #
+    # WHAT IT WOULD SAVE, from 2,143 live `cross meter` samples, which record
+    # the price at +0.25s / +0.50s / +1.00s after each decision:
+    #     +0.25 -> +0.50 (250ms)  median +0.0000   mean +0.0118
+    #     +0.25 -> +1.00 (750ms)  median +0.0000   mean +0.0181
+    #     the price moved AT ALL within 250ms: 43.8% of the time
+    # So in the ~292ms this buys back, the price moves a MEDIAN OF ZERO. More
+    # than half the time it has not moved at all. The mean is a cent, and it is
+    # a tail.
+    #
+    # WHAT IT WOULD COST. The prefetch fires per family per tick with no
+    # crossing, deduped at max_age*0.5. At 9 families that is ~19.3 probes per
+    # SECOND against the ~9-12 per HOUR the order path pays today -- roughly a
+    # 1,500x load increase on `GET /book`, the same public endpoint the FAK
+    # depends on. Gating on imminence helps but does not rescue it; measured
+    # over 1,060,056 replay ticks:
+    #     |margin| <= 1 bps   12.75% of ticks   63.3% of pre-crossings   2.5/s
+    #     |margin| <= 2 bps   24.06% of ticks   84.9% of pre-crossings   4.6/s
+    #     |margin| <= 5 bps   50.39% of ticks   96.9% of pre-crossings   9.7/s
+    # The best of those is still ~400x today's rate.
+    #
+    # THE TRADE IS THEREFORE: risk throttling the endpoint the order path runs
+    # on, to save a median of zero. No live rate-limiting was observed in the
+    # five minutes it ran (the "429"s in the log are `win_rate=0.429`), but
+    # five minutes is not evidence and the downside lands on the money path.
+    #
+    # Kept rather than deleted because it is correct, tested (19 tests) and
+    # inert at 0.0, and because the measurement is the valuable part: if the
+    # venue ever gets slower or the drift ever gets steeper, this is ready and
+    # the two numbers to re-check are named above.
     cross_venue_prefetch_max_age_s: float = 0.0
     # ---- TRAIN entry trigger: DISTANCE from the strike, not a crossing ----
     # Explicitly an OVERRIDE of three of the arm's gates, taken as a risk
