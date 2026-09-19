@@ -71,16 +71,34 @@ def load_quotes(c) -> dict:
     return out
 
 
-def sigma_by_bar(c) -> tuple:
-    """Replay the shipped VolEstimator over the recorded 1m bars.
+def sigma_by_bar(c, symbol: str = "BTCUSDT") -> tuple:
+    """Replay the shipped VolEstimator over ONE symbol's recorded 1m bars.
 
-    Mirrors live: close-to-close log returns, hour-aware, fed in order, with
-    seasonality recomputed as the day rolls. Returns (bar_open_ms[], sigma[])
-    where sigma[i] is the estimate AFTER bar i closed -- i.e. what a decision
-    taken during the next bar would have seen.
+    ⛔ THE SYMBOL IS AN ARGUMENT. This used to read `where symbol='BTCUSDT'`
+    unconditionally and the result was handed to every family, so ETH and BNB
+    rounds were priced with BITCOIN's volatility. Measured on 1,000 live 1m
+    klines (2026-09-19): BTC 2.92 bps/min, ETH 5.35, BNB 4.99 -- so BTC's sigma
+    is ~55% of ETH's, which nearly DOUBLES |z| on every ETH round and pushes
+    `fair` far past what the model should have said.
+
+    Live never had this bug: `Bot.vols` is a dict keyed by symbol and the
+    decision path reads `self.vols[symbol]` (main.py:1732). It was the REPLAY
+    that disagreed with live, which is worse than a plain bug -- every
+    six-family backtest run through this tool was measuring a model the bot
+    does not run.
+
+    Mirrors live otherwise: hour-aware, fed in order, seasonality recomputed as
+    the day rolls. Returns (bar_open_ms[], sigma[]) where sigma[i] is the
+    estimate AFTER bar i closed -- what a decision in the next bar would see.
+
+    (Live feeds log(close/open) per bar while this feeds close-to-close. On
+    1,000 klines the two differ by 0.03%-0.09% -- the close->open gap carries
+    0.01-0.10 bps against a 3-5 bps bar -- so the distinction is immaterial and
+    the previous docstring's "close-to-close" claim, while wrong about live,
+    was harmless.)
     """
-    bars = list(c.execute("select open_ms, close from bars where symbol='BTCUSDT'"
-                          " order by open_ms"))
+    bars = list(c.execute("select open_ms, close from bars where symbol=?"
+                          " order by open_ms", (symbol,)))
     vol = VolEstimator()
     opens, sig = [], []
     prev, prev_day = None, None
@@ -95,6 +113,25 @@ def sigma_by_bar(c) -> tuple:
         opens.append(ts)
         sig.append(vol.sigma_1m(hour=int((ts // 3600000) % 24)))
     return np.array(opens, dtype=np.int64), np.array(sig)
+
+
+#: Family prefix -> Binance symbol, for picking that family's OWN vol series.
+SYMBOL_FOR = {"btc": "BTCUSDT", "eth": "ETHUSDT", "bnb": "BNBUSDT",
+              "sol": "SOLUSDT", "xrp": "XRPUSDT", "doge": "DOGEUSDT"}
+
+
+def sigma_series_by_symbol(c) -> dict:
+    """One (opens, sigma) series per symbol that has bars. See `sigma_by_bar`."""
+    out = {}
+    for (sym,) in c.execute("select distinct symbol from bars"):
+        o, g = sigma_by_bar(c, sym)
+        if len(o):
+            out[sym] = (o, g)
+    return out
+
+
+def symbol_of(slug: str) -> str:
+    return SYMBOL_FOR.get((slug or "")[:4].split("-")[0].lower(), "BTCUSDT")
 
 
 def sigma_at(opens: np.ndarray, sig: np.ndarray, ts_ms: int) -> float:
@@ -305,7 +342,12 @@ def main() -> None:
     c = sqlite3.connect(args.db)
     rounds = load_rounds(c)
     quotes = load_quotes(c)
-    opens, sig = sigma_by_bar(c)
+    # ⛔ ONE SERIES PER SYMBOL. Handing BTC's sigma to an ETH round nearly
+    # doubles |z| there -- see `sigma_by_bar`. Live keys its vol by symbol
+    # (main.py:1732) and this must match it or the tool measures a different
+    # model than the one that trades.
+    sigma_series = sigma_series_by_symbol(c)
+    fallback = sigma_by_bar(c, "BTCUSDT")
     rounds = [r for r in rounds if r["slug"] in quotes]
     if args.since or args.until:
         import datetime as _dt
@@ -331,7 +373,8 @@ def main() -> None:
         book = np.array(sorted(book, key=lambda x: x[0]), dtype=object)
         day = int(r["start_ms"] // 86400000)
         for d in (arm_impulse(r, book) + arm_cross(r, book, r["strike"])
-                  + arm_model(book, r["strike"], opens, sig,
+                  + arm_model(book, r["strike"],
+                              *sigma_series.get(symbol_of(r["slug"]), fallback),
                               twap=r["twap"], start_ms=r["start_ms"])):
             d["slug"] = r["slug"]
             d["day"] = day

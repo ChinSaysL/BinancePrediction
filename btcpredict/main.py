@@ -330,8 +330,19 @@ def arm_of(sig) -> str:
     their orders through `_place_order`, so without this the retry, decline and
     no-fill lines read identically whichever arm produced them, as did OPEN.
     """
-    return ("TRAIN" if str(getattr(sig, "reason", "")).startswith("train")
-            else "CROSS")
+    r = str(getattr(sig, "reason", ""))
+    if r.startswith("train"):
+        return "TRAIN"
+    if r.startswith("cross"):
+        return "CROSS"
+    if r.startswith("impulse"):
+        return "IMPULSE"
+    # Anything else came from `evaluate`/`evaluate_hybrid`, i.e. the model arm.
+    # This used to fall through to "CROSS", so with the cross arm DISABLED the
+    # log still read `CROSS no fill for ...` on every model order -- which cost
+    # a live misdiagnosis on 2026-09-19: the unfilled-order problem was read as
+    # belonging to a disabled arm and dismissed.
+    return "MODEL"
 
 
 def pm_take_via_fak(settings, broker, limit_ceiling) -> bool:
@@ -1228,6 +1239,58 @@ class Bot:
             "SELECT f.* FROM fills f "
             "LEFT JOIN settlements s ON s.fill_id = f.id "
             f"WHERE s.id IS NULL AND f.mode IN ({ph})", modes)
+        # ⛔ A POSITION BELONGS TO THE VENUE THAT SOLD IT. `rows` is every
+        # unsettled fill in the ledger, and the ledger spans both venues, so
+        # after a venue switch the OTHER venue's open positions are restored
+        # into this process. They can never settle here -- the broker has no
+        # such market -- so they are re-restored at every start forever, each
+        # one holding a `max_open_rounds` slot against live trading.
+        #
+        # Observed 2026-09-19: `bnb-updown-5m-1789823100`, a Polymarket cross
+        # fill from 13:06 (feed_provider chainlink-twap-60s-vs-range-start),
+        # still `status=open` 6.8 h after its bell, holding $1 and 1 of 6 slots
+        # while the bot ran on Binance.
+        #
+        # The money is NOT written off: the fill and its stake stay in the
+        # ledger untouched, so switching back recovers it. This only stops the
+        # position taking a slot in a process that cannot settle it.
+        here = registry.normalise(getattr(settings, "venue", "binance"))
+        skipped = []
+        keep = []
+        for row in rows:
+            # `store.query` yields sqlite3.Row, which has no `.get`; a missing
+            # round is an empty list, and both must read as "unknown".
+            fp = self.store.query(
+                "SELECT feed_provider FROM rounds WHERE slug = ?",
+                (row["slug"],))
+            prov = ""
+            if fp:
+                try:
+                    prov = str(fp[0]["feed_provider"] or "").strip().lower()
+                except (KeyError, IndexError, TypeError):
+                    prov = ""
+            # Skip ONLY when the row positively identifies the OTHER venue.
+            # `chainlink-twap-*` is Polymarket's settlement family and
+            # CHAINLINK/BINANCE are the point venue's; anything else -- an
+            # empty string, or no `rounds` row at all -- is unknown, and an
+            # unknown position is restored HERE. Defaulting the unknown case to
+            # a venue name instead is how a missing round row silently strands
+            # a live position, which is strictly worse than carrying a dead one.
+            if prov.startswith("chainlink-twap"):
+                owner = "polymarket"
+            elif prov in ("chainlink", "binance"):
+                owner = "binance"
+            else:
+                owner = here          # unknown -> ours, restore it
+            (skipped if owner != here else keep).append((row, owner))
+        if skipped:
+            log.warning(
+                "not restoring %d position(s) from another venue (we are on "
+                "%s): %s -- the stake stays in the ledger and is recoverable "
+                "by switching back, but it cannot settle here",
+                len(skipped), here,
+                ", ".join(f"{r['slug']}({o})" for r, o in skipped))
+        rows = [r for r, _ in keep]
         for row in rows:
             fill = Fill(
                 slug=row["slug"], side=row["side"],

@@ -190,3 +190,83 @@ def test_guard_seeding_halts_on_a_streak_still_running_today(store):
     # ...and it expires with the day rather than needing a manual resume.
     bot.guard.state._day = "1999-01-01"
     assert bot.guard.check("tomorrow")[0]
+
+
+class TestVenueOwnershipOnRestore:
+    """A restart must not adopt the OTHER venue's open positions.
+
+    The ledger spans both venues. After a venue switch, the old venue's open
+    fills can never settle in this process -- the broker has no such market --
+    so they are re-restored at every start forever, each holding a
+    `max_open_rounds` slot against live trading.
+
+    Observed 2026-09-19: `bnb-updown-5m-1789823100`, a Polymarket cross fill
+    from 13:06, still `status=open` 6.8 h after its bell, holding $1 and 1 of
+    6 slots while the bot traded on Binance.
+    """
+
+    def _fill(self, store, slug, provider):
+        if provider is not None:
+            store.upsert_round({
+                "slug": slug, "market_topic_id": 0, "market_id": None,
+                "condition_id": "0xc", "symbol": "BNBUSDT",
+                "start_ms": 1000, "end_ms": 2000, "strike": 100.0,
+                "end_price": None, "fee_rate_bps": 200,
+                "up_token_id": "1", "down_token_id": "2",
+                "price_feed_id": None, "feed_provider": provider,
+                "status": "open", "winner": None, "settled_at_ms": None,
+            })
+        return store.insert("fills", {
+            "decision_id": 1, "slug": slug, "ts_ms": 1000, "mode": "paper",
+            "side": "Up", "requested_px": 0.60, "filled_px": 0.62,
+            "shares": 1.6129, "stake": 1.0, "fee_paid": 0.02,
+            "order_id": "o-1", "raw": "",
+        })
+
+    def test_the_other_venues_position_is_not_restored(self, store, monkeypatch):
+        import btcpredict.config as cfg
+        monkeypatch.setattr(cfg.settings, "venue", "binance")
+        fid = self._fill(store, "bnb-updown-5m-1", "chainlink-twap-60s-vs-range-start")
+        bot = make_bot(store)
+        bot._restore_open_positions()
+        assert fid not in bot.open_fills, "a Polymarket fill must not hold a slot on Binance"
+        assert bot.guard.state.open_rounds == set() or \
+            "bnb-updown-5m-1" not in bot.guard.state.open_rounds
+
+    def test_our_own_venues_position_is_restored(self, store, monkeypatch):
+        import btcpredict.config as cfg
+        monkeypatch.setattr(cfg.settings, "venue", "binance")
+        fid = self._fill(store, "btc-updown-5m-2", "CHAINLINK")
+        bot = make_bot(store)
+        bot._restore_open_positions()
+        assert fid in bot.open_fills
+
+    def test_an_unknown_provider_is_restored_rather_than_stranded(self, store, monkeypatch):
+        """The dangerous default.
+
+        A missing `rounds` row, or an empty provider, must read as OURS. The
+        first version of this guard defaulted the unknown case to a venue NAME,
+        which silently refused to restore a live position whose round row had
+        not been written yet -- strictly worse than carrying a dead one.
+        """
+        import btcpredict.config as cfg
+        monkeypatch.setattr(cfg.settings, "venue", "binance")
+        no_round = self._fill(store, "btc-updown-5m-3", None)     # no rounds row
+        blank = self._fill(store, "btc-updown-5m-4", "")          # empty provider
+        bot = make_bot(store)
+        bot.guard.max_open_rounds = 5
+        bot._restore_open_positions()
+        assert no_round in bot.open_fills, "a missing round row must not strand a position"
+        assert blank in bot.open_fills, "an empty provider must not strand a position"
+
+    def test_the_skipped_stake_stays_in_the_ledger(self, store, monkeypatch):
+        """Skipping is not writing off: the fill and its stake are untouched,
+        so switching the venue back recovers the money."""
+        import btcpredict.config as cfg
+        monkeypatch.setattr(cfg.settings, "venue", "binance")
+        fid = self._fill(store, "bnb-updown-5m-5", "chainlink-twap-60s-vs-range-start")
+        bot = make_bot(store)
+        bot._restore_open_positions()
+        rows = store.query("SELECT stake FROM fills WHERE id = ?", (fid,))
+        assert rows and abs(rows[0]["stake"] - 1.0) < 1e-9
+        assert not store.query("SELECT id FROM settlements WHERE fill_id = ?", (fid,))

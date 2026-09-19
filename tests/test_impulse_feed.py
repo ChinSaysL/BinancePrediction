@@ -151,3 +151,22 @@ def test_the_model_arm_is_not_confined_to_the_primary() -> None:
         "consume every slot"
     )
 
+
+
+def test_arm_of_names_the_model_arm():
+    """`arm_of` used to return CROSS for anything that was not the Train arm.
+
+    With the cross arm DISABLED, every model order still logged
+    `CROSS no fill for ...`, and on 2026-09-19 that cost a live misdiagnosis:
+    a real 27% unfilled rate on the MODEL arm was read as belonging to an arm
+    that was not running, and dismissed.
+    """
+    from types import SimpleNamespace
+    from btcpredict.main import arm_of
+    assert arm_of(SimpleNamespace(reason="train into btc-updown-5m")) == "TRAIN"
+    assert arm_of(SimpleNamespace(reason="cross")) == "CROSS"
+    assert arm_of(SimpleNamespace(reason="impulse +4.2bps/3s")) == "IMPULSE"
+    # everything `evaluate`/`evaluate_hybrid` produces is the model arm
+    for r in ("ok", "", "edge below hurdle", "Up skipped: 1h ret +0.0061 > +0.005"):
+        assert arm_of(SimpleNamespace(reason=r)) == "MODEL", r
+    assert arm_of(SimpleNamespace()) == "MODEL"
