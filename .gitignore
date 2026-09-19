@@ -12,3 +12,4 @@ __pycache__/
 reports/
 *.parquet
 *.zip
+.live-config.json
