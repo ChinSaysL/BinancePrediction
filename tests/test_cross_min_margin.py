@@ -175,7 +175,37 @@ def test_the_floor_is_not_an_argument_for_a_HIGHER_one():
     +14.34/+19.16. The band is fillable at 0.45 and the edge is inside it."""
     from btcpredict.config import Settings
     assert Settings().cross_min_price == 0.45
-    assert Settings().cross_max_fill_px == 0.65
+    assert Settings().cross_max_fill_px == 0.70
+
+
+def test_the_fill_ceiling_ships_the_jointly_searched_value():
+    """⭐ 0.65 -> 0.70 on 2026-09-19, the first knob chosen by a JOINT search
+    under the full live gate chain instead of a one-at-a-time sweep of six.
+
+    `tools/pm_joint_chain.py` fixes its selection rule before the run, because
+    1,728 cells on a four-day tape produce a winner either way: rank by
+    MIN(train look 1.0, train look 2.0), then require the winner to beat the
+    shipped config on the HELD-OUT days at BOTH looks. 0.70 does -- TEST
+    +27.00/+22.19 against 0.65's +19.17/+18.29 -- and it is INTERIOR, 0.75
+    through 0.90 all scoring worse, so it is not the edge of the grid.
+    Nine of the top ten cells carry it.  See config.cross_max_fill_px."""
+    from btcpredict.config import Settings
+    assert Settings().cross_max_fill_px == 0.70
+
+
+def test_the_thin_break_even_at_the_new_ceiling_is_recorded():
+    """A fill AT 0.70 needs 71.5% to break even against 66.6% at 0.65, and the
+    measured win rate for asks in [0.65,1.00) inside the arm's margin band is
+    72.5%. About one point of cushion, so the number has to ride with the knob
+    or the next person will widen it further on the win-rate column alone --
+    which rises monotonically to 0.90 while the MONEY falls."""
+    cfg = (pathlib.Path(__file__).resolve().parents[1]
+           / "btcpredict" / "config.py").read_text()
+    j = cfg.index("cross_max_fill_px: float =")
+    block = cfg[max(0, j - 3000):j]
+    assert "71.5%" in block and "72.5%" in block
+    assert "CROSS_MAX_FILL_PX=0.65" in block, "the revert must be stated"
+    assert "does not model" in block.lower() or "DOES NOT LICENSE" in block
 
 
 def test_the_unfillability_of_the_cheap_book_is_recorded():

@@ -238,7 +238,21 @@ def test_a_fak_that_finds_nothing_is_re_priced_and_re_sent(monkeypatch):
         "re-reading (the stub holds 0.62 after the second read)")
     assert [k["price"] for k in bot.buys] == [0.60, 0.62, 0.62], (
         "each send must be priced off a FRESH read of the venue")
-    assert all(k["max_px"] == pytest.approx(0.65) for k in bot.buys)
+    # Each send carries the ceiling for ITS OWN fresh read -- buffer above the
+    # base, clamped by the fill cap -- not one fixed number.
+    #
+    # This used to assert `max_px == 0.65` on all three, which passed only
+    # because cross_max_fill_px was ALSO 0.65 and the clamp bound on every
+    # send. Raising the cap to 0.70 on 2026-09-19 separated the two and the
+    # coincidence broke: the sends now carry 0.65 / 0.67 / 0.67, which is the
+    # buffer tracking each re-read exactly as it should.
+    from btcpredict.config import settings as _s
+    assert [k["max_px"] for k in bot.buys] == [
+        pytest.approx(bot._take_cap_for(r, p, None))
+        for p in (0.60, 0.62, 0.62)], (
+        "the ceiling must follow each fresh read, not stay at the first one")
+    assert all(k["max_px"] <= _s.cross_max_fill_px + 1e-9 for k in bot.buys), (
+        "and it may never exceed the fill cap")
 
 
 def test_the_number_of_sends_is_bounded_by_order_max_attempts(monkeypatch):

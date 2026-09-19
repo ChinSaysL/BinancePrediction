@@ -2132,7 +2132,39 @@ class Settings(BaseSettings):
     # the second is the only one of the two that can be enforced at the moment
     # it matters. Applied to BOTH paths: it caps the LIMIT ceiling and the
     # MARKET `max_px`, so neither instrument can buy outside the band.
-    cross_max_fill_px: float = 0.65
+    # ⭐ 0.65 -> 0.70 on 2026-09-19, the first change chosen by a JOINT search
+    # under the FULL live gate chain rather than a one-at-a-time sweep of six
+    # gates. `tools/pm_joint_chain.py` scores 1,728 cells; the selection rule
+    # was fixed BEFORE the run, because 1,728 cells on a four-day tape will
+    # hand you a winner whether or not one exists: rank by MIN(train look 1.0,
+    # train look 2.0) -- which puts look-stability inside the selection instead
+    # of checking it afterwards -- then require the winner to beat what ships
+    # on the HELD-OUT days at BOTH looks, or ship nothing.
+    #
+    # With every other knob at its shipped value:
+    #     px_hi   TRAIN L1/L2       TEST L1/L2        FULL L1 win/$/t
+    #     0.60    +32.17 / +31.41   +26.64 / +29.94   61.3%  +58.81  +2.55
+    #     0.65    +44.95 / +44.96   +19.17 / +18.29   63.1%  +64.12  +2.70
+    #     0.70    +50.23 / +55.52   +27.00 / +22.19   65.1%  +77.23  +3.28
+    #     0.75    +44.24 / +49.29   +25.68 / +19.83   65.1%  +69.92  +2.91
+    #     0.90    +41.05 / +49.40   +24.35 / +18.34   65.6%  +65.39  +2.63
+    # Best on train, on test and on the full tape at BOTH looks, and INTERIOR:
+    # 0.75 through 0.90 are all worse, so this is not a grid edge. Nine of the
+    # joint search's top ten cells carry 0.70, so it is not one lucky cell.
+    #
+    # ⛔ THE MARGIN IS THIN AND MUST BE WATCHED. A fill AT 0.70 needs 71.5% to
+    # break even (fee 0.0147) against 66.6% at 0.65. The band pays for itself
+    # only because, inside the arm's own margin window, an ask in [0.65,1.00)
+    # wins 72.5% (n=12840) -- about one point of cushion. If the realised win
+    # rate on fills over 0.65 drops under ~71% across ~40 of them, this is the
+    # first knob to revert.
+    # ⛔ AND IT DOES NOT LICENSE A LOWER FLOOR. The same search prefers px_lo
+    # 0.30, and that is refused: the +0.0038 execution cost these numbers use
+    # was measured on 119 live fills averaging 0.554, i.e. inside [0.45,0.65].
+    # Below 0.45 the measured 2 s repricing is +0.2174, so extending the floor
+    # would price fills with a constant known to be wrong exactly there.
+    # Revert: CROSS_MAX_FILL_PX=0.65 and cross_max_price=0.65 + restart.
+    cross_max_fill_px: float = 0.70
     # ---- the SAME bound expressed RELATIVE to the ask we actually saw ----
     # `cross_max_fill_px` and the `ask + buffer` ceiling are both ABSOLUTE, so
     # the allowance they give is REGRESSIVE in the ask: 1.5x at 0.50, 3.0x at
