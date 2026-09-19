@@ -175,22 +175,22 @@ def test_the_floor_is_not_an_argument_for_a_HIGHER_one():
     +14.34/+19.16. The band is fillable at 0.45 and the edge is inside it."""
     from btcpredict.config import Settings
     assert Settings().cross_min_price == 0.45
-    assert Settings().cross_max_fill_px == 0.70
+    assert Settings().cross_max_fill_px == 0.65
 
 
-def test_the_fill_ceiling_ships_the_jointly_searched_value():
-    """⭐ 0.65 -> 0.70 on 2026-09-19, the first knob chosen by a JOINT search
-    under the full live gate chain instead of a one-at-a-time sweep of six.
-
-    `tools/pm_joint_chain.py` fixes its selection rule before the run, because
-    1,728 cells on a four-day tape produce a winner either way: rank by
-    MIN(train look 1.0, train look 2.0), then require the winner to beat the
-    shipped config on the HELD-OUT days at BOTH looks. 0.70 does -- TEST
-    +27.00/+22.19 against 0.65's +19.17/+18.29 -- and it is INTERIOR, 0.75
-    through 0.90 all scoring worse, so it is not the edge of the grid.
-    Nine of the top ten cells carry it.  See config.cross_max_fill_px."""
+def test_the_fill_ceiling_was_reverted_to_065():
+    """⛔ 0.65 -> 0.70 shipped and was REVERTED the same day. The joint search
+    is not wrong about the tape -- 0.70 is the interior optimum there -- but the
+    tape prices entries at the QUOTED ASK and the live FAK sweeps up to whatever
+    ceiling it is given. 59% of that day's 63 fills landed above the decided
+    price, 25% by 5c+, and eth-1789811400 filled 0.58 against a 0.47 decision
+    for an ev_at_fill of -0.2041. A knob that widens what the arm MAY pay
+    cannot be chosen on a tape that assumes what it DOES pay.
+    See config.cross_max_fill_px."""
     from btcpredict.config import Settings
-    assert Settings().cross_max_fill_px == 0.70
+    assert Settings().cross_max_fill_px == 0.65
+
+
 
 
 def test_the_thin_break_even_at_the_new_ceiling_is_recorded():

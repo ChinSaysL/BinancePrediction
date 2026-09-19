@@ -2164,7 +2164,24 @@ class Settings(BaseSettings):
     # Below 0.45 the measured 2 s repricing is +0.2174, so extending the floor
     # would price fills with a constant known to be wrong exactly there.
     # Revert: CROSS_MAX_FILL_PX=0.65 and cross_max_price=0.65 + restart.
-    cross_max_fill_px: float = 0.70
+    # ⛔ 0.70 REVERTED TO 0.65 THE SAME DAY, 2026-09-19. The table above is not
+    # withdrawn -- on the tape 0.70 really is the interior optimum -- but the
+    # tape PRICES ENTRIES AT THE QUOTED ASK, and the live FAK does not pay the
+    # ask. It sweeps up to whatever ceiling it is handed. So a wider ceiling did
+    # not admit better trades, it bought room to overpay:
+    #     59% of the day's 63 fills landed ABOVE the price the gate decided on
+    #     25% overpaid by more than 5 cents; mean +0.0176, worst +0.13
+    #     09:52 eth decided 0.4700 limit 0.58 FILLED 0.5800, ev_at_fill -0.2041
+    # That last line is the same failure `cross_limit_buffer_inv` already
+    # records from 2026-09-15 ("it converted no fill into fill at a price the
+    # arm cannot win at"), and the root cause was there too: the live .env
+    # carried inv=0.200 against this file's 0.125, so the ceiling at a 0.48 ask
+    # was 0.58 rather than 0.54. Both are now 0.65 / 0.125.
+    #
+    # THE LESSON IS ABOUT THE REPLAY, NOT THE NUMBER. Any knob that widens what
+    # the arm MAY pay cannot be chosen on a tape that assumes what it DOES pay.
+    # Re-raising this needs a fill model, not a better sweep.
+    cross_max_fill_px: float = 0.65
     # ---- the SAME bound expressed RELATIVE to the ask we actually saw ----
     # `cross_max_fill_px` and the `ask + buffer` ceiling are both ABSOLUTE, so
     # the allowance they give is REGRESSIVE in the ask: 1.5x at 0.50, 3.0x at
