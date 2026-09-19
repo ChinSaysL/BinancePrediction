@@ -3732,6 +3732,51 @@ class Settings(BaseSettings):
     #: nothing but the edit -- the same separation `CROSS_TRADED` keeps from
     #: `MARKETS`, and for the same reason.
     model_families: str = ""
+    #: Skip this many of the MODEL arm's next signals after one of its trades
+    #: settles a LOSS. 0 = off, which is the shipped default.
+    #:
+    #: Measured 2026-09-19 on btc-updown-5m, 886 signals over 9 days, every
+    #: other knob pinned to the live host, simulated SEQUENTIALLY (a skipped
+    #: signal never happens, so it has no outcome and cannot advance the
+    #: chain -- the earlier filter test got that wrong and used information a
+    #: live bot would not have):
+    #:
+    #:     cooldown  traded     WR     EV/$   day-t     tot$
+    #:        0 (today)  886  78.1%  +0.0531   +5.54   +47.05
+    #:        1          736  79.6%  +0.0747   +3.88   +54.94   <- ships as 1
+    #:        3          553  79.9%  +0.0840   +3.49   +46.46
+    #:        5          466  82.0%  +0.1099   +4.19   +51.23
+    #:
+    #: Against a calibrated null (800 draws, outcome ~ Bernoulli(entry-implied
+    #: p), cooldown and baseline BOTH simulated), the EV/$ advantage of
+    #: cooldown 1 is +0.0215 against a null mean of -0.0000, p = 0.019.
+    #:
+    #: ⛔ DO NOT read a p-value off the TOTAL-$ column. In a null every trade
+    #: has EV = -fee, so trading less mechanically improves the total there and
+    #: the null's own total advantage is +3.79. That confound does not apply to
+    #: real positive-EV data, which makes the total-$ p meaningless in either
+    #: direction. The EV/$ null is the clean one.
+    #:
+    #: Temporal holdout, fit on days 1-5 and scored on 6-9:
+    #:     cooldown 0: train +0.0497 tot +23.44 | test +0.0570 tot +23.62
+    #:     cooldown 1: train +0.0755 tot +29.61 | test +0.0736 tot +25.33
+    #:     cooldown 5: train +0.1214 tot +31.08 | test +0.0960 tot +20.15
+    #:
+    #: 1 is the only setting that beats no-rule on BOTH EV/$ and total dollars
+    #: out of sample. Longer cooldowns look better per dollar and OVER-FILTER:
+    #: at 5 the holdout total falls to $20.15 against no-rule's $23.62, which
+    #: is the same trap every other filter tried on this arm fell into (higher
+    #: yield, less money -- see the exits, the momentum split and max_fair,
+    #: all rejected the same day).
+    #:
+    #: Mechanism: volatility regimes cluster, so a round the model got wrong is
+    #: followed by conditions that make it wrong again. Not proven -- this is a
+    #: rule found by search, carried mainly by the holdout.
+    #:
+    #: Counted per ROUND, not per poll: a round is evaluated many times a
+    #: second and consuming the cooldown on each would burn it inside one
+    #: round. Seeded from the ledger at startup so a restart cannot launder it.
+    model_cooldown_after_loss: int = 0
     # May a cross entry take the side OPPOSITE a position already held in this
     # round? No. Buying both sides is not a hedge: with the first position sunk,
     #     EV(take) - EV(decline) = stake_B * [ (1 - p)/b - 1 ]

@@ -297,6 +297,18 @@ def stale_maker_px(display: float | None, ask: float | None, fair_side: float,
     return limit
 
 
+#: Fill modes that belong to arms OTHER than the model arm. The model arm
+#: books under the broker's own mode ('live' / 'paper'), so anything not in
+#: here is its own. Listing the others rather than the broker's mode keeps a
+#: new broker mode from silently reading as "not the model arm".
+OTHER_ARM_MODES = frozenset({"cross", "train", "double", "maker",
+                             "stale_maker", "ticket"})
+
+
+def _is_main_arm_mode(mode: str | None) -> bool:
+    return str(mode or "") not in OTHER_ARM_MODES
+
+
 def pool_for_mode(mode: str | None) -> tuple[bool, str | None]:
     """Which risk budget a fill's MODE belongs to: (reserved, pool).
 
@@ -944,6 +956,11 @@ class Bot:
         self._round: Round | None = None
         self._asks: tuple[float | None, float | None] = (None, None)
         self._sigma = 0.0
+        #: Signals the model arm still owes a skip for, after one of its trades
+        #: lost. `_cooldown_round` is the slug that has already consumed one,
+        #: so a round evaluated many times a second only ever consumes one.
+        self._model_cooldown = 0
+        self._cooldown_round: str | None = None
         # Cross arm: one claim per round, and its own day-scoped counter.
         self._cross_fired: dict[str, int] = {}
         # Finished rounds still inside the post-close scan window, by slug.
@@ -1084,6 +1101,7 @@ class Bot:
             self._seed_cross_count()
         if self.mode == "live":
             self._seed_guard_state()
+            self._seed_model_cooldown()
             if self.resume_guard:
                 self.guard.resume()
                 # Persist the reset: without a marker the next restart
@@ -1171,6 +1189,38 @@ class Bot:
         if n:
             log.info("cross arm already attempted %d time(s) today; the daily "
                      "cap is counted from the database, not from memory", n)
+
+    def _seed_model_cooldown(self) -> None:
+        """Re-arm the loss cooldown across a restart.
+
+        Without this, restarting inside a cooldown launders it -- exactly the
+        hole `_seed_guard_state` exists to close for the daily cap, and the
+        same fix. Conservative by design: it cannot tell how many of the
+        cooldown's signals were already consumed before the restart, so it
+        re-arms the full count. Skipping one extra signal is the cheap error;
+        trading through a cooldown the rule said to sit out is the expensive
+        one.
+        """
+        n = int(getattr(settings, "model_cooldown_after_loss", 0) or 0)
+        if n <= 0:
+            return
+        rows = self.store.query(
+            "SELECT f.mode, s.won FROM settlements s "
+            "JOIN fills f ON f.id = s.fill_id "
+            "ORDER BY s.ts_ms DESC LIMIT 20")
+        for row in rows or []:
+            try:
+                mode, won = row["mode"], row["won"]
+            except (KeyError, TypeError):
+                continue
+            if not _is_main_arm_mode(mode):
+                continue                      # another arm's fill, keep looking
+            if not won:
+                self._model_cooldown = n
+                self._cooldown_round = None
+                log.info("model arm cooldown re-armed after restart: the last "
+                         "settled main-arm fill LOST, skipping %d signal(s)", n)
+            return                            # only the most recent one counts
 
     def _seed_guard_state(self) -> None:
         """Carry today's live PnL and loss streak into the fresh guard.
@@ -2151,6 +2201,21 @@ class Bot:
             allowed, why = self.guard.check(r.slug)
             if not allowed:
                 gate_reason = why
+
+        # COOLDOWN AFTER A LOSS. Consumed once per ROUND, not per poll: a round
+        # is evaluated many times a second and decrementing on each would burn
+        # the whole cooldown inside a single round. Placed after the guard so
+        # it only ever consumes a signal that would OTHERWISE have traded --
+        # that is what the replay simulated, and counting skipped polls instead
+        # would make the live rule a different rule than the measured one.
+        if (sig.act and not gate_reason
+                and settings.model_cooldown_after_loss > 0
+                and self._model_cooldown > 0):
+            if self._cooldown_round != r.slug:
+                self._cooldown_round = r.slug
+                self._model_cooldown -= 1
+            gate_reason = (f"cooldown after a loss "
+                           f"({self._model_cooldown} signal(s) left)")
 
         acted = False
         stake = 0.0
@@ -7329,6 +7394,15 @@ class Bot:
             reserved, pool = pool_for_mode(self._fill_mode(fid))
             self.guard.on_settle(slug, s.pnl, reserved=reserved, pool=pool)
             self.pnl.add(s.pnl, fill.stake, fill.fee_paid, s.won)
+            # Arm the model arm's loss cooldown. Only the MAIN arm's own fills
+            # count: the other arms have their own budgets and their outcomes
+            # say nothing about this one's regime (see config).
+            if (settings.model_cooldown_after_loss > 0 and not s.won
+                    and _is_main_arm_mode(self._fill_mode(fid))):
+                self._model_cooldown = int(settings.model_cooldown_after_loss)
+                self._cooldown_round = None
+                log.info("model arm cooldown armed: skipping the next %d "
+                         "signal(s) after %s", self._model_cooldown, slug)
             # The LEDGER, moved immediately and exactly: the stake has already
             # left the wallet and the payout is on its way, so equity changes by
             # exactly the settlement P&L. Waiting for the venue to agree is what
