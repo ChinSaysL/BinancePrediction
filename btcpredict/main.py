@@ -1304,7 +1304,11 @@ class Bot:
                 for k in klines[:-1]:      # skip the still-forming bar
                     o, c = float(k[1]), float(k[4])
                     if o > 0 and c > 0:
-                        v.add(math.log(c / o))
+                        # add_bar, NOT add: this poll runs every 60 s and
+                        # re-fetches the same completed bars, so a plain add()
+                        # re-feeds them and shortens the EWMA's time constant by
+                        # the number of duplicates (see VolEstimator.add_bar).
+                        v.add_bar(int(k[0]), math.log(c / o))
                 self.histories[sym].merge(klines)
                 # Persist the bars incl. taker-buy volume (kline field 9): the
                 # quotes table cannot reconstruct order flow, so without this

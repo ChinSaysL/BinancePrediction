@@ -34,6 +34,8 @@ class VolEstimator:
     _hours: list[int] = field(default_factory=list)
     _ewma_var: float | None = None
     _season: dict[int, float] = field(default_factory=dict)
+    #: open time (ms) of the newest COMPLETED bar already ingested.
+    _last_ms: int = 0
 
     # -- ingestion ----------------------------------------------------------
     def seed_from_klines(self, klines: list[list]) -> None:
@@ -45,9 +47,38 @@ class VolEstimator:
             except (TypeError, ValueError, IndexError):
                 continue
             if o > 0 and c > 0:
-                self.add(math.log(c / o), hour=time.gmtime(ts).tm_hour)
+                self.add_bar(int(k[0]), math.log(c / o),
+                             hour=time.gmtime(ts).tm_hour)
         self._recompute_seasonality()
         log.info("vol seeded: n=%d sigma_1m=%.6f", len(self._returns), self.sigma_1m())
+
+    def add_bar(self, open_ms: int, log_return: float,
+                hour: int | None = None) -> bool:
+        """Ingest a COMPLETED 1-minute bar, at most once.
+
+        THE REFRESH PATH RE-FETCHES THE SAME BARS EVERY 60 s. `fetch_klines(
+        "1m", 5)[:-1]` is the last FOUR completed bars, and it is polled once a
+        minute, so three of them arrive again on the very next call. Feeding
+        them again is not harmless: every duplicate is another EWMA update
+        carrying the newest bar's return, so the filter's effective time
+        constant shortens by the number of duplicates (4 bars a minute turns
+        `lam^n` into `lam^(4n)`, a 23-minute half-life into ~8) and the simple
+        mean over-weights the most recent -- and most volatile -- bars.
+
+        MEASURED 2026-09-19: sigma_1m reached **1.65-1.9x** the out-of-sample
+        estimator AND the vol implied by the venue's own quote (live 6.6-7.6
+        bps/min against 4.0-4.3). Because fair = Phi(ln(S/K)/(sigma*sqrt(tau))),
+        that drags every fair toward 0.50, so no quote inside [0.45,0.80] ever
+        showed an edge and the model arm sent NOTHING for five days while its
+        gates were correct.
+
+        Returns True when the bar was new and ingested.
+        """
+        if open_ms and open_ms <= self._last_ms:
+            return False
+        self._last_ms = open_ms
+        self.add(log_return, hour=hour)
+        return True
 
     def add(self, log_return: float, hour: int | None = None) -> None:
         self._returns.append(log_return)
