@@ -4566,6 +4566,36 @@ class Bot:
             # still building is not a flip that died.
             w["flip_ms"] = None
             return False
+        # ⭐ THE MARGIN RULE, 2026-09-19. The block below arms on a crossing
+        # EVENT and confirms on the state. This leaves on the STATE ALONE, with
+        # no event required -- and that single difference is what separates a
+        # rule that loses from one that wins. `tools/pm_exit_models.py` put
+        # seven rules on the same entries, slots and sale mechanics:
+        #     off           L1 $+64.12 t+2.70 | TEST $+19.17   win 63.1%
+        #     flip   3.0    L1 $+60.61 t+3.15 | TEST $+27.05   win 43.9%
+        #     margin 4.0    L1 $+85.04 t+3.97 | TEST $+39.46   win 57.1%
+        # take/bracket/trail are all worse; `take` reaches 87% win rate and
+        # makes nothing, because it caps winners. The crossing-event arming was
+        # crippling the old rule: a SUSTAINED flip produces exactly ONE
+        # crossing, so a rule waiting for a second one waits forever.
+        #
+        # WHY IT SURVIVES THE SALE NOT LANDING, which is the risk that matters
+        # here. A miss is a RETRY next tick, not an abandoned exit, and this
+        # fires only ~165 times against margin 0.5's ~322 -- so it beats holding
+        # at EVERY completion rate measured, down to the worst case:
+        #     completion  1.00   0.88   0.70   0.50   0.39   (hold: +27.00)
+        #     TEST L1    +45.39 +43.91 +43.33 +42.75 +40.85
+        # 0.88 is the live rate once the UNVERIFIED bug is excluded (7 of 8
+        # post-fix attempts completed); 0.39 is the all-time rate including it.
+        # margin 0.5 stops beating holding below 0.70, which is why the larger
+        # threshold ships even though the search ranked 0.5 first on train.
+        # 0 = OFF, which restores the event-armed rule below.
+        xb = float(settings.cross_exit_margin_bps)
+        if xb > 0:
+            if side_now == held or abs(margin) < xb:
+                return False
+            await self._cross_exit_execute(r, w, tau=tau, sig_name=sig_name)
+            return True
         if w.get("flip_ms") is None:
             # NOT ARMED YET, and only a genuine CROSSING into the other side
             # arms it (with the entry's own `hold_s` applied, so a lone print is

@@ -237,13 +237,24 @@ def _fire(b, r, sig_side="Down", level=100.0):
 
 class TestTheFlag:
     def test_the_exit_is_shut_by_default(self):
+        """⛔ THE FIELD DEFAULT, NOT `Settings()`. Instantiating resolves the
+        `.env`, so this assertion used to pass only on machines that happened
+        not to enable the exit -- it could not tell "we ship it off" from "this
+        box has it off", and it failed the moment a deploy turned it on. The
+        claim being guarded is about the SHIPPED default, which is env-free.
+        The first sell path in this repo must ship off, like
+        cross_train_enabled and every other new order path."""
         from btcpredict.config import Settings
-        assert Settings().cross_exit_enabled is False, (
-            "the first sell path in this repo must ship off, like "
-            "cross_train_enabled and every other new order path")
+        assert Settings.model_fields["cross_exit_enabled"].default is False
 
     def test_nothing_sells_while_it_is_shut(self, monkeypatch):
         b = _bot(monkeypatch=monkeypatch)
+        # The flip rule is still supported and still reachable, but it is no
+        # longer the DEFAULT -- `cross_exit_margin_bps` ships at 4.0 and leaves
+        # on the state alone. These tests exercise the event-armed path, so
+        # they pin the knob to 0 rather than depending on a default that moved.
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_margin_bps",
+                            0.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
                             False)
         r = _round()
@@ -260,6 +271,12 @@ class TestTheFlag:
 
 class TestTheFlipMustPersist:
     def test_one_print_does_not_sell(self, monkeypatch):
+        # The flip rule is still supported and still reachable, but it is no
+        # longer the DEFAULT -- `cross_exit_margin_bps` ships at 4.0 and leaves
+        # on the state alone. These tests exercise the event-armed path, so
+        # they pin the knob to 0 rather than depending on a default that moved.
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_margin_bps",
+                            0.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
                             True)
         b = _bot(monkeypatch=monkeypatch)
@@ -278,6 +295,12 @@ class TestTheFlipMustPersist:
         the watcher armed SIX times on three positions and sold NOTHING while
         they went to the bell and lost. A quiet tick must not disarm.
         """
+        # The flip rule is still supported and still reachable, but it is no
+        # longer the DEFAULT -- `cross_exit_margin_bps` ships at 4.0 and leaves
+        # on the state alone. These tests exercise the event-armed path, so
+        # they pin the knob to 0 rather than depending on a default that moved.
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_margin_bps",
+                            0.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
                             True)
         b = _bot(monkeypatch=monkeypatch)          # confirm_s = 3.0 (default)
@@ -298,6 +321,12 @@ class TestTheFlipMustPersist:
             "a sustained flip must sell without a second crossing event")
         assert len(b.broker.calls) == 1
     def test_a_persistent_flip_sells_once(self, monkeypatch):
+        # The flip rule is still supported and still reachable, but it is no
+        # longer the DEFAULT -- `cross_exit_margin_bps` ships at 4.0 and leaves
+        # on the state alone. These tests exercise the event-armed path, so
+        # they pin the knob to 0 rather than depending on a default that moved.
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_margin_bps",
+                            0.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
                             True)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_confirm_s",
@@ -444,6 +473,12 @@ def _sell_bot(*, positions, bid=0.55, trades=None):
 
 class TestTheGuardsThatProtectTheOrder:
     def test_no_exit_inside_the_last_seconds(self, monkeypatch):
+        # The flip rule is still supported and still reachable, but it is no
+        # longer the DEFAULT -- `cross_exit_margin_bps` ships at 4.0 and leaves
+        # on the state alone. These tests exercise the event-armed path, so
+        # they pin the knob to 0 rather than depending on a default that moved.
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_margin_bps",
+                            0.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
                             True)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_confirm_s",
@@ -483,6 +518,12 @@ class TestTheGuardsThatProtectTheOrder:
         assert "slip=settings.cross_exit_slip" in src
 
     def test_an_unverified_sale_halts_the_watcher(self, monkeypatch):
+        # The flip rule is still supported and still reachable, but it is no
+        # longer the DEFAULT -- `cross_exit_margin_bps` ships at 4.0 and leaves
+        # on the state alone. These tests exercise the event-armed path, so
+        # they pin the knob to 0 rather than depending on a default that moved.
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_margin_bps",
+                            0.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
                             True)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_confirm_s",
@@ -497,6 +538,12 @@ class TestTheGuardsThatProtectTheOrder:
         assert len(b.broker.calls) == 1
 
     def test_a_failed_sale_retries_next_tick(self, monkeypatch):
+        # The flip rule is still supported and still reachable, but it is no
+        # longer the DEFAULT -- `cross_exit_margin_bps` ships at 4.0 and leaves
+        # on the state alone. These tests exercise the event-armed path, so
+        # they pin the knob to 0 rather than depending on a default that moved.
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_margin_bps",
+                            0.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
                             True)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_confirm_s",
@@ -511,6 +558,12 @@ class TestTheGuardsThatProtectTheOrder:
 
 class TestTheLedger:
     def test_the_sale_closes_the_position_in_every_consumer(self, monkeypatch):
+        # The flip rule is still supported and still reachable, but it is no
+        # longer the DEFAULT -- `cross_exit_margin_bps` ships at 4.0 and leaves
+        # on the state alone. These tests exercise the event-armed path, so
+        # they pin the knob to 0 rather than depending on a default that moved.
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_margin_bps",
+                            0.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
                             True)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_confirm_s",
@@ -532,6 +585,12 @@ class TestTheLedger:
         assert b.pnl.added and b.pnl.added[0][0] == pytest.approx(s["pnl"])
 
     def test_a_partial_sale_splits_the_fill(self, monkeypatch):
+        # The flip rule is still supported and still reachable, but it is no
+        # longer the DEFAULT -- `cross_exit_margin_bps` ships at 4.0 and leaves
+        # on the state alone. These tests exercise the event-armed path, so
+        # they pin the knob to 0 rather than depending on a default that moved.
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_margin_bps",
+                            0.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
                             True)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_confirm_s",
@@ -550,6 +609,12 @@ class TestTheLedger:
         """AUDIT: `on_settle` releases the guard slot. On a PARTIAL sale the
         remainder is still open, so releasing it lets the arm open another
         position against a bound it believes it has freed."""
+        # The flip rule is still supported and still reachable, but it is no
+        # longer the DEFAULT -- `cross_exit_margin_bps` ships at 4.0 and leaves
+        # on the state alone. These tests exercise the event-armed path, so
+        # they pin the knob to 0 rather than depending on a default that moved.
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_margin_bps",
+                            0.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
                             True)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_confirm_s",
@@ -563,6 +628,12 @@ class TestTheLedger:
         assert SLUG in b._exit_watch, "and the remainder stays watched"
 
     def test_a_full_sale_gives_the_slot_back_once(self, monkeypatch):
+        # The flip rule is still supported and still reachable, but it is no
+        # longer the DEFAULT -- `cross_exit_margin_bps` ships at 4.0 and leaves
+        # on the state alone. These tests exercise the event-armed path, so
+        # they pin the knob to 0 rather than depending on a default that moved.
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_margin_bps",
+                            0.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
                             True)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_confirm_s",
@@ -615,6 +686,12 @@ class TestTheSaleTheVenueWasSlowToShow:
     """
 
     def _pending_bot(self, monkeypatch, **kw):
+        # The flip rule is still supported and still reachable, but it is no
+        # longer the DEFAULT -- `cross_exit_margin_bps` ships at 4.0 and leaves
+        # on the state alone. These tests exercise the event-armed path, so
+        # they pin the knob to 0 rather than depending on a default that moved.
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_margin_bps",
+                            0.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
                             True)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_confirm_s",
@@ -681,6 +758,12 @@ class TestTheHysteresisBand:
     """
 
     def _bot_with_floor(self, monkeypatch, floor=1.0):
+        # The flip rule is still supported and still reachable, but it is no
+        # longer the DEFAULT -- `cross_exit_margin_bps` ships at 4.0 and leaves
+        # on the state alone. These tests exercise the event-armed path, so
+        # they pin the knob to 0 rather than depending on a default that moved.
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_margin_bps",
+                            0.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
                             True)
         b = _bot(monkeypatch=monkeypatch)
@@ -756,6 +839,12 @@ class TestTheConfirmationRunsFromTheFlip:
     every exit fired at 4.30-4.44 s after its own entry, the floor exactly."""
 
     def test_an_old_entry_does_not_licence_an_instant_sale(self, monkeypatch):
+        # The flip rule is still supported and still reachable, but it is no
+        # longer the DEFAULT -- `cross_exit_margin_bps` ships at 4.0 and leaves
+        # on the state alone. These tests exercise the event-armed path, so
+        # they pin the knob to 0 rather than depending on a default that moved.
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_margin_bps",
+                            0.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
                             True)
         b = _bot(monkeypatch=monkeypatch)             # confirm_s = 3.0
@@ -768,6 +857,12 @@ class TestTheConfirmationRunsFromTheFlip:
         assert b.broker.calls == []
 
     def test_the_clock_is_the_flip_not_the_entry(self, monkeypatch):
+        # The flip rule is still supported and still reachable, but it is no
+        # longer the DEFAULT -- `cross_exit_margin_bps` ships at 4.0 and leaves
+        # on the state alone. These tests exercise the event-armed path, so
+        # they pin the knob to 0 rather than depending on a default that moved.
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_margin_bps",
+                            0.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
                             True)
         b = _bot(monkeypatch=monkeypatch)
@@ -780,6 +875,12 @@ class TestTheConfirmationRunsFromTheFlip:
     def test_a_reversal_back_to_our_side_kills_the_latch(self, monkeypatch):
         """A reading back on the side we HOLD is the flip dying -- a different
         event from a quiet tick, and the two must not be conflated."""
+        # The flip rule is still supported and still reachable, but it is no
+        # longer the DEFAULT -- `cross_exit_margin_bps` ships at 4.0 and leaves
+        # on the state alone. These tests exercise the event-armed path, so
+        # they pin the knob to 0 rather than depending on a default that moved.
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_margin_bps",
+                            0.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
                             True)
         b = _bot(monkeypatch=monkeypatch)
@@ -803,13 +904,31 @@ class TestTheTauGateIsTheEdge:
     """
 
     def test_the_gate_defaults_to_the_measured_value(self):
-        """60.0 was RETRACTED: the sweep that chose it ran on a walk() that
-        could only fire on oscillating signals. 8.0 has its own reason (the
-        book goes one-sided at the bell). See config.cross_exit_min_tau_s."""
+        """8.0 -> 60.0 on 2026-09-19, THE SAME NUMBER THAT WAS RETRACTED EARLIER
+        THAT DAY, and it must not be mistaken for the retraction being ignored.
+
+        The first 60.0 came from a sweep run on `pm_exit_flip.py:walk()`, which
+        latched its exit candidate on the first tick after the entry -- so it
+        could only ever fire on oscillating signals and priced every exit at
+        roughly the entry price. That evidence is dead and stays dead.
+
+        This 60.0 comes from the joint entry-x-exit search under the full live
+        gate chain (`tools/pm_joint_exit.py`), where the winning cell is
+        margin 4.0 at xmin 60: TEST $+45.39/$+42.14 against holding's
+        $+27.00/$+22.19, and it beats holding at every sale completion rate
+        down to 0.39. 8.0's own reason -- the book goes one-sided at the bell --
+        is not contradicted; 60 is simply further from it.
+        See config.cross_exit_min_tau_s."""
         from btcpredict.config import Settings
-        assert Settings().cross_exit_min_tau_s == 8.0
+        assert Settings().cross_exit_min_tau_s == 60.0
 
     def test_a_flip_inside_the_gate_does_not_sell(self, monkeypatch):
+        # The flip rule is still supported and still reachable, but it is no
+        # longer the DEFAULT -- `cross_exit_margin_bps` ships at 4.0 and leaves
+        # on the state alone. These tests exercise the event-armed path, so
+        # they pin the knob to 0 rather than depending on a default that moved.
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_margin_bps",
+                            0.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
                             True)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_min_tau_s",
@@ -823,6 +942,12 @@ class TestTheTauGateIsTheEdge:
             "about a round that is already decided")
 
     def test_a_flip_outside_the_gate_still_sells(self, monkeypatch):
+        # The flip rule is still supported and still reachable, but it is no
+        # longer the DEFAULT -- `cross_exit_margin_bps` ships at 4.0 and leaves
+        # on the state alone. These tests exercise the event-armed path, so
+        # they pin the knob to 0 rather than depending on a default that moved.
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_margin_bps",
+                            0.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
                             True)
         b = _bot(monkeypatch=monkeypatch)
@@ -862,6 +987,12 @@ class TestASustainedFlipSells:
     """
 
     def _armed(self, monkeypatch):
+        # The flip rule is still supported and still reachable, but it is no
+        # longer the DEFAULT -- `cross_exit_margin_bps` ships at 4.0 and leaves
+        # on the state alone. These tests exercise the event-armed path, so
+        # they pin the knob to 0 rather than depending on a default that moved.
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_margin_bps",
+                            0.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
                             True)
         b = _bot(monkeypatch=monkeypatch)
@@ -985,6 +1116,12 @@ class TestTheConfirmationUsesWhatWasSent:
             "the caller cannot confirm against a size it does not know")
 
     def test_pending_carries_the_sent_size_not_the_ledgers(self, monkeypatch):
+        # The flip rule is still supported and still reachable, but it is no
+        # longer the DEFAULT -- `cross_exit_margin_bps` ships at 4.0 and leaves
+        # on the state alone. These tests exercise the event-armed path, so
+        # they pin the knob to 0 rather than depending on a default that moved.
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_margin_bps",
+                            0.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
                             True)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_confirm_s",
@@ -999,6 +1136,12 @@ class TestTheConfirmationUsesWhatWasSent:
             f"confirming against {pend[2]} would book a full close")
 
     def test_the_confirmation_is_asked_about_the_sent_size(self, monkeypatch):
+        # The flip rule is still supported and still reachable, but it is no
+        # longer the DEFAULT -- `cross_exit_margin_bps` ships at 4.0 and leaves
+        # on the state alone. These tests exercise the event-armed path, so
+        # they pin the knob to 0 rather than depending on a default that moved.
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_margin_bps",
+                            0.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
                             True)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_confirm_s",
@@ -1029,6 +1172,12 @@ class TestTheFloorIsOnTheStateNotTheCrossing:
     """
 
     def test_a_zero_margin_crossing_still_arms(self, monkeypatch):
+        # The flip rule is still supported and still reachable, but it is no
+        # longer the DEFAULT -- `cross_exit_margin_bps` ships at 4.0 and leaves
+        # on the state alone. These tests exercise the event-armed path, so
+        # they pin the knob to 0 rather than depending on a default that moved.
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_margin_bps",
+                            0.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
                             True)
         b = _bot(monkeypatch=monkeypatch)
@@ -1043,6 +1192,12 @@ class TestTheFloorIsOnTheStateNotTheCrossing:
         assert b.broker.calls == [], "but it must not SELL inside the floor"
 
     def test_it_then_sells_once_the_state_clears_the_floor(self, monkeypatch):
+        # The flip rule is still supported and still reachable, but it is no
+        # longer the DEFAULT -- `cross_exit_margin_bps` ships at 4.0 and leaves
+        # on the state alone. These tests exercise the event-armed path, so
+        # they pin the knob to 0 rather than depending on a default that moved.
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_margin_bps",
+                            0.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
                             True)
         b = _bot(monkeypatch=monkeypatch)
@@ -1088,6 +1243,12 @@ class TestThePartialSplitSettlesItsOwnSize:
     """
 
     def test_the_remainder_fill_carries_the_remainder_size(self, monkeypatch):
+        # The flip rule is still supported and still reachable, but it is no
+        # longer the DEFAULT -- `cross_exit_margin_bps` ships at 4.0 and leaves
+        # on the state alone. These tests exercise the event-armed path, so
+        # they pin the knob to 0 rather than depending on a default that moved.
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_margin_bps",
+                            0.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
                             True)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_confirm_s",
@@ -1111,6 +1272,12 @@ class TestThePartialSplitSettlesItsOwnSize:
     def test_the_original_object_is_not_mutated(self, monkeypatch):
         """`dataclasses.replace` copies; mutating in place would corrupt the
         settlement of the SOLD leg that is booked from the same object."""
+        # The flip rule is still supported and still reachable, but it is no
+        # longer the DEFAULT -- `cross_exit_margin_bps` ships at 4.0 and leaves
+        # on the state alone. These tests exercise the event-armed path, so
+        # they pin the knob to 0 rather than depending on a default that moved.
+        monkeypatch.setattr("btcpredict.config.settings.cross_exit_margin_bps",
+                            0.0)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_enabled",
                             True)
         monkeypatch.setattr("btcpredict.config.settings.cross_exit_confirm_s",
@@ -1120,3 +1287,56 @@ class TestThePartialSplitSettlesItsOwnSize:
         before = (orig.shares, orig.stake, orig.fee_paid)
         _fire(b, _round(), "Down")
         assert (orig.shares, orig.stake, orig.fee_paid) == before
+
+
+# ---------------------------------------------------------------------------
+# THE MARGIN RULE -- 2026-09-19
+# ---------------------------------------------------------------------------
+
+class TestTheMarginExitRule:
+    """Leave on the signal STATE, with no crossing event required.
+
+    That one difference is what separates a rule that loses from one that wins:
+    a SUSTAINED flip produces exactly ONE crossing, so the event-armed rule
+    waits for a second that never comes. Seven rules on identical entries,
+    slots and sale mechanics -- off TEST $+19.17 (win 63.1%), flip 3.0 TEST
+    $+27.05 (43.9%), margin 4.0 TEST $+39.46 (57.1%).
+    """
+
+    def test_it_ships_the_threshold_that_survives_the_sale_not_landing(self):
+        from btcpredict.config import Settings
+        s = Settings()
+        assert s.cross_exit_margin_bps == 4.0
+        assert s.cross_exit_min_tau_s == 60.0
+
+    def test_zero_restores_the_event_armed_rule(self):
+        """0 = OFF is this repo's convention, and here OFF must mean "use the
+        flip rule", not "never exit" -- the flip path has to stay reachable."""
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "btcpredict" / "main.py").read_text()
+        i = src.index('xb = float(settings.cross_exit_margin_bps)')
+        blk = src[i:i + 400]
+        assert "if xb > 0:" in blk
+        assert 'if w.get("flip_ms") is None:' in src[i:i + 1200], (
+            "the event-armed rule must still follow it")
+
+    def test_it_fires_on_state_alone_without_waiting_for_a_crossing(self):
+        """The whole point: no `crossed_side` event in the fire condition."""
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "btcpredict" / "main.py").read_text()
+        i = src.index('xb = float(settings.cross_exit_margin_bps)')
+        blk = src[i:src.index('if w.get("flip_ms") is None:', i)]
+        assert "side_now == held or abs(margin) < xb" in blk
+        assert "now_side" not in blk, (
+            "the margin rule must not consult the crossing EVENT at all")
+
+    def test_the_execution_sensitivity_is_recorded_beside_the_knob(self):
+        """4.0 ships over the 0.5 the search ranked first, and the reason is
+        that it halves the exposure to a sale that does not land. If that table
+        is lost, someone will 'optimise' the threshold back down."""
+        cfg = (pathlib.Path(__file__).resolve().parents[1]
+               / "btcpredict" / "config.py").read_text()
+        j = cfg.index("cross_exit_margin_bps: float =")
+        block = cfg[max(0, j - 2600):j]
+        assert "0.39" in block and "0.88" in block, "the rate sweep must ride along"
+        assert "CROSS_EXIT_MARGIN_BPS=0" in block, "the revert must be stated"

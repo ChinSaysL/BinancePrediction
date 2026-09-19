@@ -32,7 +32,7 @@ fresh bid, and a floor not strictly inside (0, bid).
 """
 from __future__ import annotations
 
-import argparse, datetime as dt, math, os, sys
+import argparse, datetime as dt, hashlib, math, os, sys
 import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -55,10 +55,24 @@ def _sellable(bid, slip):
     return bid                                        # measured: fills at bid
 
 
-def exit_at(ticks, i0, held, pay, rule, prm, floor_bps, slip, min_tau):
+def _draws(seed, n):
+    """Deterministic per-position coin flips, so a completion rate is a
+    property of the run and not of the scheduler."""
+    h = hashlib.blake2b(str(seed).encode(), digest_size=8).digest()
+    x = int.from_bytes(h, "big") or 1
+    out = []
+    for _ in range(n):
+        x = (x * 6364136223846793005 + 1442695040888963407) & ((1 << 64) - 1)
+        out.append((x >> 11) / float(1 << 53))
+    return out
+
+
+def exit_at(ticks, i0, held, pay, rule, prm, floor_bps, slip, min_tau,
+            p_fill=1.0, seed=0):
     """Walk forward from the entry and return (ts, price) or None."""
     armed = None
     best_bid = None
+    draws = []
     for k in range(i0 + 1, len(ticks)):
         ts, tau, ev, margin, ub, db = ticks[k]
         if tau <= min_tau:
@@ -96,11 +110,23 @@ def exit_at(ticks, i0, held, pay, rule, prm, floor_bps, slip, min_tau):
         if hit:
             px = _sellable(bid, slip)
             if px is not None:
-                return ts, px
+                # THE SALE CAN SIMPLY NOT LAND, and the live arm then RETRIES on
+                # the next tick ("sell did not fill (%s) -- retrying next tick").
+                # So a miss is not an abandoned exit, it is a delayed one -- and
+                # modelling it as abandonment would understate the exit as badly
+                # as ignoring it overstates it.
+                if p_fill >= 1.0:
+                    return ts, px
+                if not draws:
+                    draws.extend(_draws(seed, 64))
+                if draws.pop() < p_fill:
+                    return ts, px
+                # else: fall through and try again at the next qualifying tick
     return None
 
 
-def sim(R, *, bankroll, expo, rule, prm, min_tau, stake=1.0, days=None, **gk):
+def sim(R, *, bankroll, expo, rule, prm, min_tau, p_fill=1.0,
+        stake=1.0, days=None, **gk):
     fc = gk.pop("fill_cap")
     ev = []
     for end, cands, ticks in R:
@@ -126,7 +152,8 @@ def sim(R, *, bankroll, expo, rule, prm, min_tau, stake=1.0, days=None, **gk):
         free_at, x = end, None
         if rule != "off":
             x = exit_at(ticks, ti, side, pay, rule, prm, gk["floor"],
-                        LIVE["cross_exit_slip"], min_tau)
+                        LIVE["cross_exit_slip"], min_tau,
+                        p_fill=p_fill, seed=ts)
         if x:
             xts, xpx = x
             tot += (xpx - pay) * sh - FEE(pay) * sh

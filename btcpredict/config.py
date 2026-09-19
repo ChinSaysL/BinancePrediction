@@ -3047,7 +3047,42 @@ class Settings(BaseSettings):
     # RESTORED to 8.0 because the value's justification was retracted, not
     # because 60 was disproved: 8.0 carries its own independent reason, above.
     # See config.cross_exit_enabled for the corrected numbers.
-    cross_exit_min_tau_s: float = 8.0
+    # ⭐ THE EXIT RULE ITSELF, NEW 2026-09-19. >0 leaves on the SIGNAL STATE:
+    # sell when the signal sits this many bps on the WRONG side of the level,
+    # with no crossing event required. 0 restores the event-armed flip rule.
+    #
+    # Seven rules on identical entries, slots and sale mechanics
+    # (`tools/pm_exit_models.py`), full tape / held-out days:
+    #     off           L1 $+64.12 t+2.70 | TEST $+19.17   win 63.1%
+    #     flip   3.0    L1 $+60.61 t+3.15 | TEST $+27.05   win 43.9%
+    #     margin 0.5    L1 $+82.98 t+4.70 | TEST $+38.05   win 44.7%
+    #     margin 4.0    L1 $+85.04 t+3.97 | TEST $+39.46   win 57.1%
+    # take/bracket/trail are worse; `take` hits 87% win rate and makes nothing.
+    #
+    # ⛔ 4.0 SHIPS THOUGH THE SEARCH RANKED 0.5 FIRST ON TRAIN, and the reason
+    # is execution, not score. 4.0 fires ~165 times to 0.5's ~322, so it is half
+    # as exposed to a sale that does not land -- and a miss is a RETRY, not an
+    # abandoned exit. Beating holding by completion rate:
+    #     rate       1.00   0.88   0.70   0.50   0.39
+    #     4.0 TEST  +45.39 +43.91 +43.33 +42.75 +40.85   all beat hold
+    #     0.5 TEST  +34.79 +34.08 +33.95 +29.99 +25.36   fails under 0.70
+    # (hold is +27.00.) 0.88 is the live completion rate excluding the
+    # UNVERIFIED bug -- 7 of 8 post-fix attempts -- and 0.39 is the all-time
+    # rate including it. It also keeps 55.6% win rate against 0.5's 41.6%.
+    # Revert: CROSS_EXIT_MARGIN_BPS=0 (back to the flip rule), or
+    # CROSS_EXIT_ENABLED=false (back to holding) + restart.
+    cross_exit_margin_bps: float = 4.0
+    # ⭐ 8.0 -> 60.0 on 2026-09-19 -- THE SAME NUMBER RETRACTED EARLIER THE SAME
+    # DAY, restored on different evidence. The first 60.0 rested on a sweep run
+    # over `pm_exit_flip.py:walk()`, which latched the exit candidate on the
+    # first tick after the entry and so priced every exit at roughly the ENTRY
+    # price; that evidence is dead. This one comes from the joint entry-x-exit
+    # search under the full gate chain (`tools/pm_joint_exit.py`): the winning
+    # cell is margin 4.0 at xmin 60, TEST $+45.39/$+42.14 against holding's
+    # $+27.00/$+22.19, and it still beats holding at a sale completion rate of
+    # 0.39. 8.0's own reason -- the book goes one-sided at the bell -- is not
+    # contradicted, only exceeded. Revert: CROSS_EXIT_MIN_TAU_S=8 + restart.
+    cross_exit_min_tau_s: float = 60.0
     # The sell's price floor: `min_price` on the FAK, set this far BELOW the bid
     # we can see. It is the only risk bound on the order -- the venue will not
     # take less -- so it is also what the ledger books when the venue's own fill
