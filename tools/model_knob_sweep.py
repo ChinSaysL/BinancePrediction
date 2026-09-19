@@ -161,6 +161,11 @@ def main() -> None:
                          "halves test spans ONE rule")
     ap.add_argument("--dump", type=int, default=0,
                     help="print the first N entries (slug, tau, side, px)")
+    ap.add_argument("--sigma-scale", type=float, default=1.0,
+                    help="multiply the out-of-sample sigma by this factor. The "
+                         "live estimator applies an hour-of-day seasonality "
+                         "multiplier, so its sigma runs above the replay's; "
+                         "pricing the edge at 1.0 alone overstates it.")
     args = ap.parse_args()
     persist = (settings.signal_persistence if args.persistence is None
                else args.persistence)
@@ -189,7 +194,11 @@ def main() -> None:
           f"{settings.max_tau_s:g} min_quote {settings.min_quote:g} max_quote "
           f"{settings.max_quote:g} persistence {persist} exec {args.exec} "
           f"latency {args.latency_s:g}s")
-    sigmas = [ao.rolling_sigma(rs, i) for i in range(len(rs))]
+    sigmas = [ao.rolling_sigma(rs, i) * args.sigma_scale
+              for i in range(len(rs))]
+    if args.sigma_scale != 1.0:
+        print(f"sigma scaled x{args.sigma_scale:g} "
+              f"(mean {sum(sigmas)/len(sigmas)*1e4:.2f} bps/min)")
 
     base = dict(persistence=persist, exec_mode=args.exec,
                 latency_s=args.latency_s)
