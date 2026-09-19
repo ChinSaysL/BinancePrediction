@@ -105,6 +105,19 @@ def exit_at(ticks, i0, held, pay, rule, prm, floor_bps, slip, min_tau,
                    and best_bid - bid >= prm and best_bid > pay)
         elif rule == "margin":
             hit = adverse and abs(margin) >= prm
+        elif rule == "either":
+            # MARGIN **OR** A PRICE STOP. The margin rule invalidates the
+            # SIGNAL; it cannot cut a loss the signal never invalidates, and
+            # only 29% of positions ever put the signal 4 bps offside. This
+            # adds the backstop: leave when the signal turns OR the bid falls
+            # `x` under what we paid, whichever prints first.
+            #   LIVE 2026-09-19 bnb-1789802100: entered 0.42, signal oscillated
+            #   -1.64/+2.95/-1.51/+2.43/-0.33/-2.43 and never reached -4.0, so
+            #   the margin rule held while the bid went 0.76 -> 0.24 -> 0.00.
+            #   A 0.20 stop fires at 07:17:53 with the bid at 0.24.
+            mb, sx = prm
+            hit = ((adverse and abs(margin) >= mb)
+                   or (bid > 0 and bid <= pay - sx))
         elif rule == "late":
             hit = tau <= prm and bid > 0 and bid < pay
         if hit:
@@ -179,7 +192,9 @@ MODELS = [("off", [None]),
           ("bracket", [(0.10, 0.10), (0.15, 0.10), (0.10, 0.15), (0.20, 0.15)]),
           ("trail", [0.05, 0.08, 0.12]),
           ("margin", [0.5, 1.0, 2.0, 4.0]),
-          ("late", [30.0, 60.0, 90.0])]
+          ("late", [30.0, 60.0, 90.0]),
+          ("either", [(4.0, 0.15), (4.0, 0.20), (4.0, 0.25), (4.0, 0.30),
+                      (2.0, 0.20), (2.0, 0.25)])]
 
 
 def main():
