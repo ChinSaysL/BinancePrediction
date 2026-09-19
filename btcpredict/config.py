@@ -2338,6 +2338,47 @@ class Settings(BaseSettings):
     # ladder sits BELOW the venue 82.7% of the time, so `ladder > cap` still
     # implies `venue > cap`. What is lost there is 93 pre-flight refusals
     # becoming FAKs that cannot match -- ~450ms each and no money.
+    # ---- LOCKED-IN TAIL: buy the near-certain favourite near the bell ----
+    # THE ONE EDGE MEASURED TODAY THAT IS LATENCY-IMMUNE. Priced at the tick and
+    # then at realistic delays, on 15,755 qualifying ticks:
+    #     0ms +$0.0806/bet | 1000ms +$0.0768 | 2000ms +$0.0786 | 5000ms +$0.0929
+    # The crossing arm, on the same tape, fell from +6.2 points to +0.9 over
+    # that first second. This does not decay because "the outcome is locked" is
+    # not a print the venue races to reprice -- it is a slow drift to 1.00.
+    #
+    # THE MECHANISM. Near the bell the paid 60s TWAP window is partly PRINTED,
+    # so the outcome is close to determined while the book still walks the
+    # price up. The favourite-longshot bias is monotone and large-sample:
+    #     model P 0.90-0.95  n=35679  realises 91.5%  market implies 88.3%
+    #     model P 0.95-0.98  n=30223  realises 93.5%  market implies 91.2%
+    #     model P 0.00-0.02  n=61052  realises  3.1%  market implies  5.6%
+    # The venue's fee curve helps: 0.07*p*(1-p) is 33 bps at 0.95 against 364
+    # bps at 0.50, so the extreme is exactly where trading is cheapest.
+    #
+    # ⛔ NOT PROVEN, AND THE HONEST NUMBER IS THE ROUND-LEVEL ONE. Ticks inside
+    # a round share one outcome, so per-tick statistics are inflated by about
+    # sqrt(9.7). Corrected to one bet per round:
+    #     n=1618 rounds  +2.3%/bet  t+1.04  day-clustered t+0.32
+    #     by day: 09-16 -0.0275 | 09-17 -0.0106 | 09-18 +0.0696 | 09-19 -0.0044
+    # Three of four days negative and one day carries it. That is why this
+    # ships OFF and why `locked_tail_shadow` exists: it needs weeks, not days.
+    locked_tail_enabled: bool = False
+    # LOG ONLY, never order. The arm writes what it WOULD have done so the
+    # opportunity rate and the price it would have paid can be measured live
+    # before a dollar is risked. Leave True until the day-clustered t clears 2.
+    locked_tail_shadow: bool = True
+    # How certain the model must be before the favourite is worth buying.
+    locked_tail_min_p: float = 0.95
+    # How far below our probability the ask must sit, after fees, to be worth
+    # taking. The measured bias is 1-3 points; asking for 2 keeps the thin half.
+    locked_tail_min_edge: float = 0.02
+    # The window where the TWAP is partly locked. The edge is here and nowhere
+    # else: at tau 60-300 it measured +$0.004/bet, which is nothing.
+    locked_tail_tau_lo: float = 5.0
+    locked_tail_tau_hi: float = 60.0
+    # Never pay more than this for a favourite -- above it the remaining edge
+    # cannot cover a single adverse round.
+    locked_tail_max_px: float = 0.97
     # ---- POST-CLOSE SCAN: buy a settled winner the book has not repriced ----
     # How many seconds past the bell to keep scanning a finished round. 0 = OFF.
     #

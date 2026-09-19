@@ -1438,6 +1438,9 @@ class Bot:
         # scan is reading what the tick actually saw.
         with contextlib.suppress(Exception):
             await self._post_close_scan()
+        # The locked-in tail. Runs on the same refreshed books.
+        with contextlib.suppress(Exception):
+            await self._locked_tail_tick()
         wsb = getattr(self, "ws_book", None)
         if wsb is not None:
             # EVERY family the cross arm may order in. Off-primary there is no
@@ -6325,6 +6328,131 @@ class Bot:
         if spent * 1000.0 >= _SLOW_TICK_MS:
             log.warning("slow settlement backfill: %.2fs OFF the tick (the "
                         "cross arm kept sampling through it)", spent)
+
+    def _locked_tail_p(self, r, sym: str, tau: float):
+        """P(Up) for a round whose TWAP window is partly PRINTED, or None.
+
+        The venue pays `TWAP60(bell) >= TWAP60(open)`, so at `ts` with `tau`
+        left the paid window is `[ts+tau-60, ts+tau]`:
+
+            tau <  60   printed `[ts-(60-tau), ts]` + future `[ts, ts+tau]`
+                        forecast = ((60-tau)*M_printed + tau*spot)/60
+                        Var      = (tau/60)^2 * sigma^2 * tau/3
+            tau >= 60   nothing printed; forecast = spot, and there is no edge
+                        here (measured +$0.004/bet), so this returns None.
+
+        ⛔ M_PRINTED IS THE RECENT (60-tau) SECONDS, NOT THE TRAILING MINUTE.
+        `twap_forecast` averages `[ts-60, ts]` at every tau, so at tau=30 it
+        averages 30 seconds the paid window will never contain. Measured MAE
+        against the realised TWAP60(bell): 0.349 bps for this window against
+        0.629 for the trailing minute at tau 5-30.
+
+        `sigma` is fitted from THIS round's own recent tape rather than assumed,
+        because the probability -- not the point forecast -- is what decides the
+        trade, and the probability is all variance.
+        """
+        lo = float(settings.locked_tail_tau_lo)
+        hi = float(settings.locked_tail_tau_hi)
+        if not (lo <= tau < hi) or tau >= TWAP_REF_LOOKBACK_S:
+            return None
+        feed = self.spots.get(sym)
+        ticks = list(getattr(feed, "ticks", None) or []) if feed is not None else []
+        if len(ticks) < 40:
+            return None
+        start_ms = int(getattr(r, "start_ms", 0) or 0)
+        if not start_ms:
+            return None
+        level = twap_reference(ticks, start_ms)
+        if not level or level <= 0:
+            return None
+        now_ms = int(ticks[-1][0])
+        spot = float(ticks[-1][1])
+        if spot <= 0:
+            return None
+        W = TWAP_REF_LOOKBACK_S
+        lo_ms = now_ms - int((W - tau) * 1000.0)
+        seg = [p for t, p in ticks if lo_ms <= t <= now_ms and p and p > 0]
+        if len(seg) < 4:
+            return None
+        m_printed = sum(seg) / len(seg)
+        fc = ((W - tau) * m_printed + tau * spot) / W
+        # per-sample move of the recent tape, as the diffusion scale
+        tail = [p for _t, p in ticks[-300:] if p and p > 0]
+        if len(tail) < 30:
+            return None
+        d = [tail[i + 1] - tail[i] for i in range(len(tail) - 1)]
+        sig = (sum(x * x for x in d) / len(d)) ** 0.5
+        if sig <= 0:
+            return None
+        var = (tau / W) ** 2 * (sig ** 2) * (tau / 3.0)
+        sd = max(var, 1e-18) ** 0.5
+        z = (fc - level) / sd
+        p_up = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+        return p_up, level, fc
+
+    async def _locked_tail_tick(self) -> None:
+        """Buy the near-certain favourite while the book still discounts it.
+
+        Ships OFF, and SHADOW by default -- it logs what it would have done so
+        the live opportunity rate can be measured before anything is risked.
+        See config.locked_tail_enabled for the measurement and for why the
+        round-level t (+1.04) is the number that matters, not the tick-level
+        one (+6.31) that the same data produces if rounds are double-counted.
+        """
+        if not settings.locked_tail_enabled:
+            return
+        wsb = getattr(self, "ws_book", None)
+        if wsb is None:
+            return
+        now_ms = int(time.time() * 1000)
+        for prefix, sym, _ in MARKETS:
+            r = (self._mkt or {}).get(prefix)
+            if r is None or getattr(r, "strike", None) is None:
+                continue
+            tau = (int(getattr(r, "end_ms", 0) or 0) - now_ms) / 1000.0
+            got = self._locked_tail_p(r, sym, tau)
+            if got is None:
+                continue
+            p_up, level, fc = got
+            side = "Up" if p_up >= float(settings.locked_tail_min_p) else (
+                "Down" if (1.0 - p_up) >= float(settings.locked_tail_min_p) else None)
+            if side is None:
+                continue
+            p_side = p_up if side == "Up" else (1.0 - p_up)
+            top = wsb.best(r, settings.ws_book_max_age_s)
+            if top is None:
+                continue
+            ask = top.ask(side) if callable(getattr(top, "ask", None)) else None
+            if ask is None or not (0.01 < ask <= float(settings.locked_tail_max_px)):
+                continue
+            fee = 0.07 * ask * (1.0 - ask)
+            if (p_side - ask - fee) < float(settings.locked_tail_min_edge):
+                continue
+            fired = getattr(self, "_tail_fired", None)
+            if not isinstance(fired, set):
+                fired = self._tail_fired = set()
+            if r.slug in fired:
+                continue
+            fired.add(r.slug)
+            if len(fired) > 256:
+                fired.clear()
+                fired.add(r.slug)
+            log.info("LOCKED TAIL%s %s %s: P=%.4f ask=%.4f edge=%+.4f "
+                     "tau=%.0fs fc=%.4f level=%.4f",
+                     " (shadow)" if settings.locked_tail_shadow else "",
+                     r.slug, side, p_side, ask, p_side - ask - fee, tau, fc, level)
+            if settings.locked_tail_shadow:
+                continue
+            up = next((o for o in r.outcomes if o.name == "Up"), None)
+            dn = next((o for o in r.outcomes if o.name == "Down"), None)
+            token = (up.token_id if side == "Up" else dn.token_id) if (up and dn) else None
+            stake = self._ck("stake_usdt", r) or settings.min_order_usdt
+            if not token or self.bankroll < stake or self.broker.mode != "live":
+                continue
+            with contextlib.suppress(Exception):
+                await self.broker.buy(slug=r.slug, side=side, token_id=token,
+                                      price=float(ask), stake=float(stake),
+                                      max_px=float(settings.locked_tail_max_px))
 
     def _settled_winner(self, r, sym: str):
         """The winner of a FINISHED round, from our own spot tape, or None.
