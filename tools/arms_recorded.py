@@ -36,6 +36,7 @@ from btcpredict.edge.impulse import impulse_bps, impulse_side
 from btcpredict.edge.signal import evaluate, fee_rate_for_price
 from btcpredict.main import crossed_side
 from btcpredict.pricing.digital import fair_value
+from btcpredict.pricing.twap import twap_fair_value
 from btcpredict.pricing.vol import VolEstimator
 
 DEFAULT_DB = ("/tmp/claude-1000/-var-home-abdou-Documents-BinancePrediction/"
@@ -43,11 +44,19 @@ DEFAULT_DB = ("/tmp/claude-1000/-var-home-abdou-Documents-BinancePrediction/"
 
 
 def load_rounds(c) -> list[dict]:
-    q = """select slug, start_ms, end_ms, strike, winner from rounds
+    q = """select slug, start_ms, end_ms, strike, winner, feed_provider
+           from rounds
            where winner is not null and strike is not null
            order by start_ms"""
-    return [{"slug": s, "start_ms": a, "end_ms": b, "strike": k, "winner": w}
-            for s, a, b, k, w in c.execute(q)]
+    # ⛔ THE SETTLEMENT RULE IS A COLUMN, NOT A CONSTANT. `CHAINLINK` (6,697
+    # rounds) settles on the point: end_price >= strike. `chainlink-twap-60s-
+    # vs-range-start` (4,282) settles TWAP60(bell) >= TWAP60(open). Scoring
+    # the second with a point pricer is the same bug that was fixed on the
+    # cross arm in main.py (`_settles_on_twap`); the model arm is the only
+    # arm here that prices anything, so it is the only one that cares.
+    return [{"slug": s, "start_ms": a, "end_ms": b, "strike": k, "winner": w,
+             "twap": (fp or "").strip().lower().startswith("chainlink-twap")}
+            for s, a, b, k, w, fp in c.execute(q)]
 
 
 def load_quotes(c) -> dict:
@@ -148,8 +157,12 @@ def arm_cross(rows: list, book: np.ndarray, strike: float) -> list[dict]:
     return out
 
 
-def arm_model(book: np.ndarray, strike: float, opens, sig) -> list[dict]:
+def arm_model(book: np.ndarray, strike: float, opens, sig, *, twap: bool,
+              start_ms: int) -> list[dict]:
     out = []
+    j_int = 0.0      # integral of ln(S_u/K) du over the ticks seen so far
+    prev_ts: int | None = None
+    prev_x = 0.0
     for i in range(len(book)):
         ts, tau, spot = int(book[i][0]), float(book[i][1]), float(book[i][2])
         if not (S.min_tau_s <= tau <= S.max_tau_s) or tau <= 0:
@@ -180,7 +193,18 @@ def arm_model(book: np.ndarray, strike: float, opens, sig) -> list[dict]:
         if not (0 < up_disp < 1 and 0 < dn_disp < 1):
             continue
         sg = sigma_at(opens, sig, ts)
-        fair = far_guard(spot, strike, tau, sg)
+        # Running time-average of ln(S/K), which is what a TWAP settles on.
+        # Trapezoid over the recorded ticks: the tape is dense (a median 9.7
+        # ticks per round-second band), so this tracks the true integral far
+        # better than the "assume flat" the pricer falls back to.
+        x_now = math.log(spot / strike) if (spot > 0 and strike > 0) else 0.0
+        if prev_ts is not None and ts > prev_ts:
+            j_int += 0.5 * (prev_x + x_now) * (ts - prev_ts) / 1000.0
+        prev_ts, prev_x = ts, x_now
+        elapsed = max(0.0, (ts - start_ms) / 1000.0)
+        avg = (j_int / elapsed) if elapsed > 0 and j_int != 0.0 else None
+        fair = far_guard(spot, strike, tau, sg, twap=twap,
+                         elapsed_s=elapsed or None, realized_log_avg=avg)
         if fair is None:
             continue
         s = evaluate(fair, up_disp, dn_disp, half_spread=S.assumed_half_spread,
@@ -197,8 +221,15 @@ def arm_model(book: np.ndarray, strike: float, opens, sig) -> list[dict]:
     return out
 
 
-def far_guard(spot: float, strike: float, tau: float, sg: float):
+def far_guard(spot: float, strike: float, tau: float, sg: float, *,
+              twap: bool = False, elapsed_s: float | None = None,
+              realized_log_avg: float | None = None):
+    """P(settles Up) under the rule THIS round actually settles by."""
     try:
+        if twap:
+            return float(twap_fair_value(spot, strike, tau, sg,
+                                         elapsed_s=elapsed_s,
+                                         realized_log_avg=realized_log_avg))
         return float(fair_value(spot, strike, tau, sg))
     except Exception:
         return None
@@ -300,7 +331,8 @@ def main() -> None:
         book = np.array(sorted(book, key=lambda x: x[0]), dtype=object)
         day = int(r["start_ms"] // 86400000)
         for d in (arm_impulse(r, book) + arm_cross(r, book, r["strike"])
-                  + arm_model(book, r["strike"], opens, sig)):
+                  + arm_model(book, r["strike"], opens, sig,
+                              twap=r["twap"], start_ms=r["start_ms"])):
             d["slug"] = r["slug"]
             d["day"] = day
             d["won"] = int(r["winner"] == d["side"])
