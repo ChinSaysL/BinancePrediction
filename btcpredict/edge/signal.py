@@ -45,10 +45,63 @@ FEE_MAX_BPS = 200.0
 FLOOR_MAX_BANKROLL_FRACTION = 0.25
 
 
+#: The TAKER coefficient, measured 2026-09-19 on 303 fee-paying PREDICT_FUN
+#: fills. `FEE_MAX_BPS` (the venue's own reported `fee_rate_bps`) describes the
+#: BLENDED rate, which is a different number, and mixing them up is what this
+#: block exists to stop.
+#:
+#: The venue charges a fee ONLY on a partial fill -- 273 of 273 partial fills
+#: paid one, 225 of 255 complete fills paid nothing. A crossing order eats the
+#: available depth and comes back partial; a resting order that someone fills
+#: comes back complete. So "partial" is effectively "we took", and the fee is a
+#: TAKER fee.
+#:
+#: That made the 200 coefficient honest while the bot posted resting limits:
+#: blended over every fill it came to 1.12x the model, because most fills paid
+#: zero. Under `order_type=limit_take` every fill crosses, so the taker column
+#: is what is actually paid:
+#:
+#:      px band   blended bps   taker-only bps   200-model bps
+#:      0.40-0.50       272.7            429.6           244.4
+#:      0.50-0.60       168.7            312.8           163.6
+#:      0.60-0.70        88.5            172.8           107.7
+#:      0.70-0.80        54.4             88.3            66.7
+#:      0.80-0.90        24.2             44.7            35.3
+#:
+#: The shape is still (1-px)/px, but the coefficient itself falls with price,
+#: so a single constant cannot fit it. Least squares on the five bands gives
+#: K(px) = 518.6 - 313.8*px, which reproduces the measured taker rate within
+#: 7% over 0.65-0.85 and understates it below 0.50 (461 vs 430 predicted at
+#: 0.45). The arm trades [0.55, 0.80], i.e. where the fit is good.
+#:
+#: WHY THIS IS NOT COSMETIC: this function feeds the live EV and the entry
+#: hurdle, not just the backtest. At px 0.65 the old curve understated the
+#: charge by 65 bps against a `min_edge` worth ~154 bps of stake -- roughly
+#: 40% of the entry bar was being spent on a fee the arm did not know it paid.
+TAKER_K_INTERCEPT = 518.6
+TAKER_K_SLOPE = -313.8
+TAKER_K_MIN, TAKER_K_MAX = 240.0, 430.0
+#: Cap on the modelled charge. Below ~px 0.35 the fee is a large share of the
+#: stake and the measured points are thin (n=11 under 0.45), so this bounds an
+#: extrapolation rather than describing a measurement.
+TAKER_FEE_MAX_BPS = 600.0
+
+
+def taker_fee_k(px: float) -> float:
+    """The measured taker coefficient at this price, clamped to the fitted range."""
+    return min(TAKER_K_MAX, max(TAKER_K_MIN,
+                                TAKER_K_INTERCEPT + TAKER_K_SLOPE * px))
+
+
 def fee_bps_for_price(px: float) -> float:
+    """What a TAKER is charged at this price, in bps of notional.
+
+    Taker, not blended: every order the arm sends now crosses the book. See the
+    measurement above, and `FEE_MAX_BPS` for the venue's own headline rate.
+    """
     if px <= 0.0:
-        return FEE_MAX_BPS
-    return min(FEE_MAX_BPS, FEE_MAX_BPS * (1.0 - px) / px)
+        return TAKER_FEE_MAX_BPS
+    return min(TAKER_FEE_MAX_BPS, taker_fee_k(px) * (1.0 - px) / px)
 
 
 def fee_rate_for_price(px: float) -> float:

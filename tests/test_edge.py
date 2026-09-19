@@ -116,27 +116,60 @@ def test_min_quote_floor_rejects_cheap_longshots():
 
 
 def test_fee_curve_matches_the_venue():
-    """Regression lock re-measured 2026-09-12 on the 311 live fills that paid.
+    """Regression lock re-measured 2026-09-19 on 528 PREDICT_FUN fills.
 
-    Shape (1-px)/px, capped at the coefficient below px 0.50 -- confirmed. The
-    LEVEL was 15-21% low in every band with the old 180 constant, so the
-    coefficient is now the venue's own reported rate (fee_rate_bps=200, stated
-    on 278,011 of 278,929 recorded ticks). The 0.90+ band has n=6 and both
-    coefficients fall short of its 19.8 mean, so it is checked loosely.
+    THE CURVE IS THE TAKER CURVE. The venue charges a fee only on a PARTIAL
+    fill (273/273 partial paid, 225/255 complete paid nothing), and a crossing
+    order is what comes back partial. So there are two different true rates:
 
-    Passing fee_rate_bps/1e4 as a flat `fee=` would be a bug: that is the
-    coefficient, not the charge.
+        px band   blended bps   taker-only bps   old 200-model bps
+        0.40-0.50       272.7            429.6               244.4
+        0.50-0.60       168.7            312.8               163.6
+        0.60-0.70        88.5            172.8               107.7
+        0.70-0.80        54.4             88.3                66.7
+        0.80-0.90        24.2             44.7                35.3
+
+    The previous lock asserted the BLENDED column and was correct for its era:
+    the bot posted resting limits, most fills paid nothing, and blended came to
+    1.12x the 200 model. `order_type=limit_take` makes every fill a taker fill,
+    so the taker column is now what is paid and what the hurdle must clear.
+
+    Both numbers are real. Asserting the blended one while taking every fill is
+    the bug this rewrite fixes.
     """
     from btcpredict.edge.signal import fee_bps_for_price
-    for px, charged in ((0.45, 209.9), (0.55, 175.1), (0.65, 116.0),
-                        (0.75, 72.7), (0.85, 38.1)):
+    # measured taker rate per band, from the table above
+    for px, charged in ((0.45, 429.6), (0.55, 312.8), (0.65, 172.8),
+                        (0.75, 88.3), (0.85, 44.7)):
         modelled = fee_bps_for_price(px)
-        assert 0.75 * charged <= modelled <= 1.25 * charged, (px, modelled, charged)
-        # never under-charge a taker by more than 15%
-        assert modelled >= 0.85 * charged, (px, modelled, charged)
-    assert fee_bps_for_price(0.50) == pytest.approx(200.0)
-    assert fee_bps_for_price(0.90) == pytest.approx(22.2, abs=0.5)
-    assert fee_bps_for_price(0.60) > fee_bps_for_price(0.80) > fee_bps_for_price(0.95)
+        assert 0.85 * charged <= modelled <= 1.15 * charged, (px, modelled, charged)
+    # the shape must stay monotone decreasing in price
+    assert (fee_bps_for_price(0.60) > fee_bps_for_price(0.80)
+            > fee_bps_for_price(0.95))
+    # and it must never be CHEAPER than the old blended curve in the band the
+    # arm trades -- that is the direction that manufactures edge
+    for px in (0.55, 0.65, 0.75):
+        assert fee_bps_for_price(px) > 200.0 * (1.0 - px) / px, px
+
+
+def test_the_fee_curve_is_not_confused_with_the_venue_headline_rate():
+    """`FEE_MAX_BPS` is the venue's REPORTED rate; it is not what a taker pays.
+
+    Keeping the constant is deliberate -- it documents the headline number and
+    some callers pass the round's own reported rate through as `fee=`. This
+    pins that the taker curve is derived from its own measurement instead.
+    """
+    from btcpredict.edge.signal import (FEE_MAX_BPS, fee_bps_for_price,
+                                        taker_fee_k)
+    assert FEE_MAX_BPS == 200.0
+    # the taker coefficient is well above the headline rate everywhere the arm
+    # trades, and falls with price rather than being constant
+    assert taker_fee_k(0.55) > taker_fee_k(0.80) > FEE_MAX_BPS
+    # a degenerate price must not return a free trade
+    assert fee_bps_for_price(0.0) > 0.0
+    assert fee_bps_for_price(-1.0) > 0.0
+    # and the charge is bounded rather than exploding as px -> 0
+    assert fee_bps_for_price(1e-9) <= 600.0
 
 
 def test_edge_haircut_shrinks_the_claim_toward_the_venue_price():
