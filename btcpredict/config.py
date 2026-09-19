@@ -3278,7 +3278,43 @@ class Settings(BaseSettings):
     #       --tau-lo 5 --tau-hi 180
     #   /root/analysis-venv/bin/python tools/pm_cross_replay.py --by-family \
     #       --tau-lo 5 --tau-hi 180
-    cross_disabled_families: str = ""
+    # ⭐ NARROWED 2026-09-19 TO THE THREE DEEPEST SAMPLES, and this is a RISK
+    # decision taken by the operator on a small account, not an edge one.
+    #
+    # Per family on the tape under the shipped chain, held to settlement:
+    #     eth-updown-5m  n=240 win 70% +49.65  +0.2069/fill  t +3.84
+    #     bnb-updown-5m  n=220 win 62%  +9.87  +0.0449/fill  t +0.78
+    #     btc-updown-5m  n=175 win 67% +25.49  +0.1456/fill  t +2.31
+    #     ---- kept above, dropped below ----
+    #     xrp-updown-5m  n=141 win 61%  +2.08  bnb-15m n=33 +10.23
+    #     sol-updown-5m  n= 89 win 63%  +2.73  btc-15m n=34  +6.89
+    #     doge-updown-5m n= 67 win 60%  -0.46  eth-15m n=25  -3.58
+    # The three kept are the three with the MOST evidence (240/220/175); every
+    # family dropped has 141 entries or fewer and eth-15m has 25. This is
+    # declining to bet where the sample cannot see, NOT selecting on return --
+    # bnb-5m is kept at t +0.78 while bnb-15m (+10.23, t +2.46) is dropped,
+    # because n=33 is not a measurement.
+    #
+    # WHY IT IS SAFE EVEN IF THE RANKING IS WRONG, which is what separates it
+    # from the four knobs refused the same day: tuning a threshold only helps if
+    # the tuning is right, whereas trading fewer and better-sampled markets cuts
+    # variance either way. Simulated from $6.36 at the $1 venue minimum:
+    #     everything   n=1022 win 60% end +140.03  maxDD 12.13  LOW 4.11  streak 8
+    #     these three  n= 635 win 61% end  +99.82  maxDD  9.50  LOW 6.36  streak 6
+    # It gives up ~29% of return to never dip below the starting balance, and it
+    # stops the exposure cap binding at all -- which removes the spiral seen at
+    # cap 0.35 on the full set, where 63 trades took equity to $0.96 and the
+    # falling equity then tightened the cap further.
+    #
+    # ⛔ WHAT THIS DOES NOT FIX. `min_order_usdt` is $1.00, so stake size is not
+    # a lever, and max drawdown is a property of the STRATEGY -- identical at
+    # every starting balance ($9.50 here, $12.13 on the full set). A 6-loss
+    # streak is -$6 against $6.36: survivable in the replay only because equity
+    # grew first. The dominant risk is the bankroll, not the family list.
+    # REVERT: `cross_disabled_families=""` + restart.
+    cross_disabled_families: str = (
+        "xrp-updown-5m,sol-updown-5m,doge-updown-5m,"
+        "eth-updown-15m,btc-updown-15m,bnb-updown-15m")
     # May a cross entry take the side OPPOSITE a position already held in this
     # round? No. Buying both sides is not a hedge: with the first position sunk,
     #     EV(take) - EV(decline) = stake_B * [ (1 - p)/b - 1 ]

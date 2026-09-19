@@ -130,11 +130,11 @@ def _one(args):
                       1e4 * (hi - lo) / lvl if lo and hi else 0.0))
     if not cands:
         return None
-    return (int(row.end_ms), cands, ticks)
+    return (int(row.end_ms), cands, ticks, str(row.slug))
 
 
 def build(look, hold, jobs):
-    cache = os.path.join(ROOT, "data", f".exit-look{look:.1f}.pkl")
+    cache = os.path.join(ROOT, "data", f".exit2-look{look:.1f}.pkl")
     if os.path.exists(cache):
         return pickle.load(open(cache, "rb"))
     r, q = load()
@@ -228,7 +228,7 @@ def sim(R, *, bankroll, expo, exit_on, confirm_s, min_tau, sale_px="bid",
         stake=1.0, days=None, **gk):
     fc = gk.pop("fill_cap")
     ev = []
-    for end, cands, ticks in R:
+    for end, cands, ticks, *_ in R:
         c = claim(cands, **gk)
         if c is None:
             continue
@@ -286,7 +286,7 @@ def main():
     for look in (LIVE["cross_look_s"], 2.0):
         R = build(look, LIVE["cross_hold_s"], a.jobs)
         days = sorted({dt.datetime.fromtimestamp(c[0] / 1000, dt.UTC).strftime("%m-%d")
-                       for _, cs, _ in R for c in cs})
+                       for _, cs, *_ in R for c in cs})
         k = len(days) // 2
         TR, TE = set(days[:k]), set(days[k:])
         print("\n" + "=" * 100)

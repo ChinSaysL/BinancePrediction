@@ -39,10 +39,38 @@ from btcpredict.config import (CROSS_TRADED, Settings, cross_disabled,
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
-def test_nothing_is_disabled_by_default():
-    """The switch is live and set to off-nothing as of 2026-09-18 evening."""
-    assert Settings().cross_disabled_families == ""
-    assert cross_disabled() == frozenset()
+def test_the_traded_set_is_the_three_deepest_samples():
+    """⭐ NARROWED 2026-09-19 from "nothing disabled" to the three families with
+    the most evidence -- eth-5m (n=240), bnb-5m (n=220), btc-5m (n=175).
+
+    A RISK decision on a small account, not an edge one: every family dropped
+    has 141 entries or fewer and eth-15m has 25. bnb-5m is KEPT at t +0.78 while
+    bnb-15m (+10.23, t +2.46) is DROPPED, which is the tell that this selects on
+    sample depth and not on return. From $6.36 at the $1 venue minimum it gives
+    up ~29% of return (+99.82 vs +140.03) to never dip below the starting
+    balance (low 6.36 vs 4.11), cut max drawdown 12.13 -> 9.50 and shorten the
+    worst losing streak 8 -> 6.  See config.cross_disabled_families."""
+    assert cross_disabled() == frozenset({
+        "xrp-updown-5m", "sol-updown-5m", "doge-updown-5m",
+        "eth-updown-15m", "btc-updown-15m", "bnb-updown-15m"})
+    for fam in ("eth-updown-5m", "btc-updown-5m", "bnb-updown-5m"):
+        assert cross_traded(fam) is True, fam
+
+
+def test_the_dropped_families_cannot_order():
+    """Recorded, quoted and book-followed -- but never risking money."""
+    for fam in ("xrp-updown-5m", "sol-updown-5m", "doge-updown-5m",
+                "eth-updown-15m", "btc-updown-15m", "bnb-updown-15m"):
+        assert cross_traded(fam) is False, fam
+
+
+def test_the_switch_can_still_be_emptied():
+    """The revert in the note has to actually work."""
+    import btcpredict.config as cfg
+    from unittest.mock import patch
+    with patch.object(cfg.settings, "cross_disabled_families", ""):
+        assert cross_disabled() == frozenset()
+        assert cross_traded("xrp-updown-5m") is True
 
 
 def test_the_switch_still_flips_exactly_one_family(monkeypatch):
@@ -51,16 +79,19 @@ def test_the_switch_still_flips_exactly_one_family(monkeypatch):
     monkeypatch.setattr(cfg.settings, "cross_disabled_families",
                         "eth-updown-5m")
     assert cross_traded("eth-updown-5m") is False
-    # eth-15m measured +9.7pp on n=5 and was never disabled
-    assert cross_traded("eth-updown-15m") is True
+    # With the string overridden to ONE family, everything else trades again --
+    # which is the mechanism, independent of what ships in the string.
     for fam in ("btc-updown-5m", "sol-updown-5m", "xrp-updown-5m",
-                "doge-updown-5m", "bnb-updown-5m"):
+                "doge-updown-5m", "bnb-updown-5m", "eth-updown-15m"):
         assert cross_traded(fam) is True, fam
 
 
 def test_eth_5m_is_traded_by_default():
-    for fam in ("eth-updown-5m", "eth-updown-15m"):
-        assert cross_traded(fam) is True, fam
+    """eth-5m stays the arm's best family (n=240, 70% win, t +3.84). eth-15m
+    is no longer traded -- n=25 and -3.58 is not a measurement either way, and
+    on a small account an unmeasured family is a risk, not an option."""
+    assert cross_traded("eth-updown-5m") is True
+    assert cross_traded("eth-updown-15m") is False
 
 
 def test_a_family_outside_CROSS_TRADED_is_never_traded():

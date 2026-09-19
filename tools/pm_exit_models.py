@@ -159,7 +159,7 @@ def sim(R, *, bankroll, expo, rule, prm, min_tau, p_fill=1.0,
         stake=1.0, days=None, **gk):
     fc = gk.pop("fill_cap")
     ev = []
-    for end, cands, ticks in R:
+    for end, cands, ticks, *_ in R:
         c = claim(cands, **gk)
         if c is None:
             continue
@@ -229,7 +229,7 @@ def main():
     for look in (LIVE["cross_look_s"], 2.0):
         R = build(look, LIVE["cross_hold_s"], a.jobs)
         days = sorted({dt.datetime.fromtimestamp(c[0] / 1000, dt.UTC).strftime("%m-%d")
-                       for _, cs, _ in R for c in cs})
+                       for _, cs, *_ in R for c in cs})
         TE = set(days[len(days) // 2:])
         print("\n" + "=" * 98)
         print(f"look_s {look}   bankroll ${B:.2f}   expo {E}   min_tau {a.min_tau:.0f}s"

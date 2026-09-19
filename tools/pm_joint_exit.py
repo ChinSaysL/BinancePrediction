@@ -86,7 +86,7 @@ def main():
     for look in (L1, L2):
         R[look] = build(look, LIVE["cross_hold_s"], a.jobs)
         days = sorted({dt.datetime.fromtimestamp(c[0] / 1000, dt.UTC).strftime("%m-%d")
-                       for _, cs, _ in R[look] for c in cs})
+                       for _, cs, *_ in R[look] for c in cs})
         k = len(days) // 2
         TR[look], TE[look] = set(days[:k]), set(days[k:])
     E = LIVE["cross_max_open_stake_pct"]
