@@ -595,7 +595,30 @@ class Settings(BaseSettings):
     # the magnitude is not. min_edge is set against the HAIRCUT edge, so
     # changing this knob alone changes which trades qualify.
     #
-    # DEFAULT IS 0.5 (a deliberate safety haircut, not a fitted constant).
+    # ⛔ THE DEFAULT IS 1.0 -- WHICH DISABLES THE HAIRCUT (p = q + 1.0*(p-q)).
+    # The paragraph below says "DEFAULT IS 0.5" and has been wrong since the
+    # value was raised; it is kept because the 31 h measurement it records is
+    # still the reason the knob exists. Re-measured 2026-09-19 on the 9-day
+    # Binance tape with every other knob pinned to the live values
+    # (min_quote 0.55, max_quote 0.80, min_edge 0.01, tau 60-210, per-symbol
+    # sigma, measured taker fee), the 0.5 finding did NOT reproduce:
+    #
+    #     haircut  fills   EV/$     day-t   halves            neg
+    #     1.00     2,170  +0.0202   +1.30   +0.0211/+0.0183   4/9   <- shipped
+    #     0.95     2,158  +0.0238   +1.64   +0.0267/+0.0218   3/9
+    #     0.90     2,133  +0.0240   +1.69   +0.0268/+0.0229   3/9
+    #     0.85     2,117  +0.0266   +1.94   +0.0269/+0.0276   2/9
+    #     0.80     2,088  +0.0186   +1.22   +0.0164/+0.0198   3/9
+    #     0.50     1,823  +0.0155   +0.59   -0.0025/+0.0251   5/9
+    #
+    # 0.85 is an isolated peak with a cliff at 0.80, and the calibrated null
+    # for this tape returns a best-cell day-t of +4.08 on average, so none of
+    # these rows is distinguishable from the others. NOT changed on that
+    # evidence. If it is ever changed, change `min_edge` with it -- min_edge is
+    # compared against the HAIRCUT edge.
+    #
+    # (historical, and the reason the knob exists:)
+    # THE OLD NOTE SAID: DEFAULT IS 0.5 (a deliberate safety haircut).
     # Measured on 31h of live btc-5m recordings the realised edge is roughly
     # half the claimed edge, so believing half of the disagreement is the
     # conservative choice. min_edge is compared against the HAIRCUT edge: with

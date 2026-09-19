@@ -43,6 +43,34 @@ DEFAULT_DB = ("/tmp/claude-1000/-var-home-abdou-Documents-BinancePrediction/"
               "2631457b-390c-4726-81f1-8af14c73be89/scratchpad/vps.db")
 
 
+#: Every knob that reaches a MODEL-arm decision. Printed on every run.
+#:
+#: ⛔ THIS EXISTS BECAUSE A BACKTEST SILENTLY MEASURED A DIFFERENT BOT.
+#: `settings` merges whatever `.env` sits next to the checkout, and on
+#: 2026-09-19 the analysis machine's `.env` differed from the live host's on 15
+#: of 35 knobs. `edge_haircut` was 0.85 here and 1.0 there, and since
+#: `arm_model` passes it straight into `evaluate`, every band, fee and sigma
+#: comparison run that day was scoring a configuration the bot does not run --
+#: reporting +0.0266 EV/$ at day-t +1.94 for a live band that actually returns
+#: +0.0202 at +1.30.
+#:
+#: A run that does not say what it was run WITH cannot be checked against the
+#: live host, so it prints them. Compare against the live box with:
+#:     ssh <host> 'cd <repo> && .venv/bin/python -c "
+#:         from btcpredict.config import settings as s
+#:         print({k: getattr(s,k) for k in (...)})"'
+DECISION_KNOBS = ("venue", "pricing_model", "up_model", "min_quote", "max_quote",
+                  "min_tau_s", "max_tau_s", "min_edge", "edge_haircut",
+                  "safety_margin", "assumed_half_spread", "up_regime_gate",
+                  "signal_persistence", "trade_on_candle_open", "vol_floor_1m")
+
+
+def print_decision_knobs() -> None:
+    vals = "  ".join(f"{k}={getattr(S, k, '<absent>')}" for k in DECISION_KNOBS)
+    print(f"  KNOBS THIS RUN SCORED (compare to the live host before quoting "
+          f"any number):\n    {vals}\n")
+
+
 def load_rounds(c) -> list[dict]:
     q = """select slug, start_ms, end_ms, strike, winner, feed_provider
            from rounds
@@ -365,7 +393,8 @@ def main() -> None:
           f"cross [{S.cross_min_price},{S.cross_max_price}] "
           f"model [{S.min_quote},{S.max_quote}] | tau: impulse/model "
           f"[{S.min_tau_s:.0f},{S.max_tau_s:.0f}] cross "
-          f"[{S.cross_min_tau_s:.0f},{S.cross_max_tau_s:.0f}]\n")
+          f"[{S.cross_min_tau_s:.0f},{S.cross_max_tau_s:.0f}]")
+    print_decision_knobs()
 
     rows = []
     for r in rounds:
