@@ -106,6 +106,24 @@ def exit_at(ticks, i0, held, pay, rule, prm, floor_bps, slip, min_tau,
                    and best_bid - bid >= prm and best_bid > pay)
         elif rule == "margin":
             hit = adverse and abs(margin) >= prm
+        elif rule == "mute":
+            # ⭐ A PRICE STOP THAT ONLY SPEAKS WHEN THE SIGNAL DOES NOT.
+            # `either` ORs the two unconditionally and loses $10-13 out of
+            # sample, because the price swings far more than the signal inside a
+            # round and a stop then cuts positions that recover. But the failure
+            # the operator actually saw is narrower than that: the signal was
+            # MUTE, not adverse.
+            #   LIVE 2026-09-19 bnb-1789802100: entered 0.42, margin oscillated
+            #   -1.64/+2.95/-1.51/+2.43/-0.33/-2.43 -- never 4 bps either way,
+            #   so the margin rule had no opinion -- while the bid went
+            #   0.76 -> 0.24 -> 0.00. The price knew; the signal could not say.
+            # So: leave on the margin as usual, OR on the price ONLY while
+            # |margin| is under `ms`, i.e. only while the signal is not
+            # adjudicating. When the signal IS talking, the price is ignored and
+            # recoveries are not cut.
+            ms, sx = prm
+            hit = ((adverse and abs(margin) >= 4.0)
+                   or (abs(margin) < ms and bid > 0 and bid <= pay - sx))
         elif rule == "adapt":
             # ⭐ THE THRESHOLD SCALED BY WHAT THIS ROUND IS ACTUALLY DOING,
             # instead of a flat number that means 41% of a typical btc-5m round
@@ -211,7 +229,10 @@ MODELS = [("off", [None]),
           ("margin", [0.5, 1.0, 2.0, 4.0]),
           ("late", [30.0, 60.0, 90.0]),
           ("either", [(4.0, 0.20), (4.0, 0.30)]),
-          ("adapt", [1.5, 2.0, 2.5, 3.0, 4.0, 5.0])]
+          ("adapt", [2.5]),
+          ("mute", [(1.0, 0.15), (1.0, 0.20), (1.0, 0.25),
+                    (1.5, 0.15), (1.5, 0.20), (1.5, 0.25),
+                    (2.0, 0.20), (2.0, 0.25), (2.0, 0.30)])]
 
 
 def main():

@@ -3311,10 +3311,23 @@ class Settings(BaseSettings):
     # every starting balance ($9.50 here, $12.13 on the full set). A 6-loss
     # streak is -$6 against $6.36: survivable in the replay only because equity
     # grew first. The dominant risk is the bankroll, not the family list.
-    # REVERT: `cross_disabled_families=""` + restart.
-    cross_disabled_families: str = (
-        "xrp-updown-5m,sol-updown-5m,doge-updown-5m,"
-        "eth-updown-15m,btc-updown-15m,bnb-updown-15m")
+    # ⛔ REVERTED TO EMPTY 2026-09-19, BY OPERATOR CHOICE, ON THROUGHPUT. The
+    # narrowing above held for roughly an hour and was reverted because three
+    # families is too slow to trade -- 635 entries against 1022 over the same
+    # four days. THE MEASUREMENT IS NOT WITHDRAWN, only the decision it fed:
+    #     everything    n=1022 win 60% end +140.03  maxDD 12.13  LOW 4.11  streak 8
+    #     three deepest n= 635 win 61% end  +99.82  maxDD  9.50  LOW 6.36  streak 6
+    # So the full set is ~61% more trades and ~40% more return, bought with a
+    # drawdown that takes the account BELOW its starting balance (4.11 from
+    # 6.36) and a worst losing streak of 8 rather than 6. At the $1 venue
+    # minimum an 8-loss streak is -$8.
+    # ⛔ AND THE CAP MATTERS MORE ON THE FULL SET. With nine families the
+    # exposure cap binds hard: at 0.35 the replay takes 63 trades and falls to
+    # $0.96, the falling equity tightening the cap that caused it. At 0.50 it is
+    # fine. Do not lower `cross_max_open_stake_pct` while this string is empty.
+    # RE-NARROW: cross_disabled_families="xrp-updown-5m,sol-updown-5m,
+    # doge-updown-5m,eth-updown-15m,btc-updown-15m,bnb-updown-15m" + restart.
+    cross_disabled_families: str = ""
     # May a cross entry take the side OPPOSITE a position already held in this
     # round? No. Buying both sides is not a hedge: with the first position sunk,
     #     EV(take) - EV(decline) = stake_B * [ (1 - p)/b - 1 ]
