@@ -2303,6 +2303,76 @@ class Settings(BaseSettings):
     # (3 sends per decision), `order_retry_delay_s`, the `order_min_tau_s` floor
     # and the venue-position re-read that makes doubling impossible.
     # Revert = `CROSS_VENUE_TAKE=false` + restart (old base, one less REST call).
+    # Send the FAK with `cross_max_fill_px` as its ceiling and SKIP the venue
+    # probe entirely. 0/False = off, which is the shipped default.
+    #
+    # ⭐ WHY THE PROBE IS REMOVABLE. It costs ~292ms inside the order path to
+    # derive a ceiling. Over 195 real FAK fills that ceiling NEVER ONCE BOUND:
+    #     filled exactly AT the ceiling : 0.0%
+    #     headroom (ceiling - filled)   : median +0.0700, p10 +0.0200
+    #     filled at or below the ask    : 73.8%, median sweep +0.0000
+    # The size-at-touch tape says why: at a $1 stake the touch alone fills the
+    # order 98.84% of the time, so it never reaches a level a ceiling could
+    # refuse. What the probe buys is HEIGHT, not precision -- a ladder-derived
+    # ceiling is too LOW 82.7% of the time and the FAK finds nothing. The fill
+    # cap is also always high enough, and it is free.
+    #
+    # WHAT THE LATENCY IS WORTH. Slippage (filled - decided) is monotone in
+    # time to fill, n=204 live fills:
+    #     0.6-0.9s  n= 16  median +0.0000  mean -0.0044
+    #     0.9-1.2s  n=135  median +0.0100  mean +0.0228
+    #     1.2-2.0s  n= 28  median +0.0200  mean +0.0242
+    #     2.0s+     n= 25  median +0.0600  mean +0.0352
+    #     $3.79 total over 204 fills, $0.0186 per fill
+    # This is the measurement that overturned an earlier `cross meter` reading
+    # of "median +0.0000 over 250ms" -- that one tracked OUR LADDER's quoted
+    # price, not the price we pay, and it is why two versions of a prefetch got
+    # built and withdrawn before the probe itself was questioned.
+    #
+    # ⛔ WHAT IT GIVES UP. No probe means no venue price, so
+    # `cross_ladder_band_pad`'s venue-side FLOOR check cannot run -- the one
+    # that caught `venue 0.3900 while our ladder read 0.5100` twice on
+    # 2026-09-19. Turning this on turns that off, and `setup()` says so in the
+    # log rather than leaving it to be discovered. The fill-cap refusal
+    # SURVIVES: it re-runs against `base`, which is then our ladder, and the
+    # ladder sits BELOW the venue 82.7% of the time, so `ladder > cap` still
+    # implies `venue > cap`. What is lost there is 93 pre-flight refusals
+    # becoming FAKs that cannot match -- ~450ms each and no money.
+    # ---- POST-CLOSE SCAN: buy a settled winner the book has not repriced ----
+    # How many seconds past the bell to keep scanning a finished round. 0 = OFF.
+    #
+    # THE EDGE. After the bell the outcome is DETERMINISTIC -- the 60s TWAP
+    # window is fully printed -- but the venue's resolution is not instant and
+    # the book keeps trading. MEASURED on the recorded tape, post-bell rows
+    # whose book was genuinely fresh:
+    #     book_age < 2000ms  27271 rows   88 chances to buy the winner < 0.99
+    #     book_age < 1000ms  17801 rows   52 chances   mean ask 0.8223
+    #     book_age <  500ms   9195 rows   30 chances   mean ask 0.8050
+    # Buying a decided winner at 0.82 is +0.18/share with no directional risk.
+    #
+    # ⭐ THIS IS THE ONLY CONCEPT TESTED TODAY THAT SURVIVED EVERY FILTER. The
+    # complete-set arb (`up_ask+down_ask < 1`) hit 408 of 1,938,243 ticks and
+    # ZERO once a fresh book was required -- every instance was a stale frame.
+    # This one does not vanish when the same filter is applied.
+    #
+    # ⛔ THE RISK IS OUR OWN ARITHMETIC, not the market. We compute the winner
+    # from our spot tape; that reproduces the venue's settlement on 98.6% of
+    # rounds. The residual 1.4% is a round we call wrong and buy at ~0.86,
+    # losing it. At those odds the trade is still strongly positive
+    # (0.986 - 0.86 = +0.126/share), but `post_close_min_margin_bps` exists so
+    # a near-tie -- where our reconstruction is least reliable -- never fires.
+    post_close_scan_s: float = 0.0
+    # Highest ask we will pay for an already-settled winner. Above this the
+    # book has repriced and there is nothing left to take.
+    post_close_max_px: float = 0.97
+    # How far TWAP60(bell) must sit from TWAP60(open), in bps, before we
+    # believe our own reconstruction enough to bet on it. A near-tie is exactly
+    # where a 1.4% error rate concentrates.
+    post_close_min_margin_bps: float = 1.0
+    # Freshest-book requirement for the post-close read, in ms. The whole edge
+    # is an un-repriced book; a stale frame is how a phantom one is invented.
+    post_close_max_book_age_ms: float = 1000.0
+    cross_flat_take_ceiling: bool = False
     cross_venue_take: bool = True
     # How old a PREFETCHED venue ask may be and still price a ceiling, in
     # seconds. 0 = OFF, which is the shipped default and the old path byte for

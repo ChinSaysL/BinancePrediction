@@ -933,6 +933,8 @@ class Bot:
         self._sigma = 0.0
         # Cross arm: one claim per round, and its own day-scoped counter.
         self._cross_fired: dict[str, int] = {}
+        # Finished rounds still inside the post-close scan window, by slug.
+        self._post_close: dict = {}
         # The side already taken in a round, so a later crossing cannot buy the
         # opposite one. See config.cross_allow_reversal.
         self._cross_side: dict[str, str] = {}
@@ -1339,6 +1341,24 @@ class Bot:
         # found, and a quiet family sinks through the day (bnb-updown-5m hit
         # offset 1450 -- 30 pages, 3.95s). Re-sweeping all six every poll is
         # precisely the coupling that made short crossings invisible.
+        # ⭐ STASH THE ROUND THAT JUST ENDED, before the cache drops it. Its
+        # outcome is now DETERMINISTIC and the book has not necessarily caught
+        # up -- see `_post_close_scan`. Kept keyed by slug so a re-fetch of the
+        # same prefix cannot overwrite the finished one with its successor.
+        if float(settings.post_close_scan_s) > 0:
+            pc = getattr(self, "_post_close", None)
+            if not isinstance(pc, dict):
+                pc = self._post_close = {}
+            for _p, _sym, _ in MARKETS:
+                _r = cache.get(_p)
+                if _r is None or getattr(_r, "strike", None) is None:
+                    continue
+                _e = int(getattr(_r, "end_ms", 0) or 0)
+                if _e and _e <= now_ms and _r.slug not in pc:
+                    pc[_r.slug] = (_r, _sym)
+            if len(pc) > 32:                 # 9 families; anything more is dead
+                for _k in sorted(pc, key=lambda k: int(pc[k][0].end_ms or 0))[:16]:
+                    pc.pop(_k, None)
         stale = [p for p, _, _ in MARKETS
                  if cache.get(p) is None
                  or getattr(cache[p], "end_ms", 0) <= now_ms
@@ -1413,6 +1433,11 @@ class Bot:
         # mid-round (inside the cross window) when that happens, and will fall
         # back to the REST/displayed price for the reconnect. That fallback is
         # the same one a stale book already takes.
+        # The settled-but-still-trading window. Runs here because `_record`
+        # above has just refreshed every book, so the freshness check in the
+        # scan is reading what the tick actually saw.
+        with contextlib.suppress(Exception):
+            await self._post_close_scan()
         wsb = getattr(self, "ws_book", None)
         if wsb is not None:
             # EVERY family the cross arm may order in. Off-primary there is no
@@ -6018,6 +6043,35 @@ class Bot:
                          else fill_cap)
                 if _fcap > 0:
                     cap = min(cap, _fcap)
+                # ⭐ THE FLAT CEILING: DON'T COMPUTE A NUMBER THAT NEVER BINDS.
+                # The venue probe below costs ~292ms on the order path to derive
+                # a ceiling. MEASURED over 195 real FAK fills, that ceiling has
+                # NEVER ONCE BOUND:
+                #     filled exactly AT the ceiling : 0.0%
+                #     headroom (ceiling - filled)   : median +0.0700, p10 +0.0200
+                #     filled at or below the ask    : 73.8%, median sweep +0.0000
+                # The size-at-touch tape says why: at a $1 stake the touch alone
+                # fills the order 98.84% of the time, so the order never reaches
+                # a level the ceiling could refuse.
+                # What the probe actually buys is HEIGHT, not precision -- a
+                # ladder-derived ceiling is too LOW 82.7% of the time and the FAK
+                # then finds nothing. `cross_max_fill_px` is also always high
+                # enough, and it is free.
+                # THE LATENCY IS WORTH REAL MONEY. Slippage (filled - decided)
+                # is monotone in time to fill, n=204:
+                #     0.6-0.9s  median +0.0000   2.0s+  median +0.0600
+                #     $3.79 total, $0.0186 per fill
+                # ⛔ WHAT IS GIVEN UP, and it is why this ships OFF. Without the
+                # probe there is no venue price, so `cross_ladder_band_pad`'s
+                # venue-side FLOOR check cannot run -- the one that caught
+                # `venue 0.3900 while our ladder read 0.5100` twice on 09-19.
+                # The fill-cap refusal survives: it re-runs below against `base`,
+                # which is our ladder, and the ladder sits BELOW the venue 82.7%
+                # of the time, so `ladder > cap` still implies `venue > cap`.
+                _flat = (bool(settings.cross_flat_take_ceiling)
+                         and arm_of(sig) == "CROSS" and _fcap > 0)
+                if _flat:
+                    cap = _fcap
                 # ── THE BASE PRICE IS THE VENUE'S ASK, NOT OUR LADDER ────────
                 # MEASURED 2026-09-18 on the live NO-FILL cohort: of the 20
                 # misses whose probing line caught the venue's own book, 17 had
@@ -6036,7 +6090,7 @@ class Bot:
                 # `_cross_tick` used on the price it decided.
                 # A fetch failure is NOT a reason to refuse the trade: it falls
                 # back to the old base, logged.
-                if venue_token:
+                if venue_token and not _flat:
                     # WARM FIRST. `_prefetch_venue_top` fires this same read at
                     # the tick before the crossing, so the ~292ms it costs is
                     # already spent by the time we get here. One shot, and any
@@ -6101,7 +6155,12 @@ class Bot:
                 # one applied. Refuse rather than buy outside the band on a
                 # book we could not check.
                 _pad2 = max(0.0, self._ck("ladder_band_pad", r))
-                if _pad2 > 0 and arm_of(sig) == "CROSS":
+                # ⛔ `not _flat`: with no probe there is no venue price to gate
+                # on, and `base_src` is "ours" -- so this would refuse EVERY
+                # order via its own fail-closed branch. Turning the flat ceiling
+                # on therefore turns the venue-side floor OFF, which is stated
+                # at startup rather than left to be discovered.
+                if _pad2 > 0 and arm_of(sig) == "CROSS" and not _flat:
                     _lo = self._ck("min_price", r)
                     if base_src != "venue":
                         log.info("cross skip %s %s: venue book unreadable and "
@@ -6266,6 +6325,95 @@ class Bot:
         if spent * 1000.0 >= _SLOW_TICK_MS:
             log.warning("slow settlement backfill: %.2fs OFF the tick (the "
                         "cross arm kept sampling through it)", spent)
+
+    def _settled_winner(self, r, sym: str):
+        """The winner of a FINISHED round, from our own spot tape, or None.
+
+        Returns `(side, margin_bps)`. None when the tape cannot cover either
+        60 s window -- which is the honest answer, not a guess: the whole trade
+        rests on this being right, and it reproduces the venue's settlement on
+        98.6% of rounds ONLY when both windows are actually printed.
+        """
+        feed = self.spots.get(sym)
+        ticks = list(getattr(feed, "ticks", None) or []) if feed is not None else []
+        if len(ticks) < 8:
+            return None
+        end_ms, start_ms = int(r.end_ms or 0), int(r.start_ms or 0)
+        if not end_ms or not start_ms:
+            return None
+        lvl = twap_reference(ticks, start_ms)
+        fin = twap_reference(ticks, end_ms)
+        if not lvl or not fin or lvl <= 0:
+            return None
+        margin = 1e4 * (fin - lvl) / lvl
+        return ("Up" if fin >= lvl else "Down"), margin
+
+    async def _post_close_scan(self) -> None:
+        """Buy a winner the book has not finished repricing. See config.
+
+        ⛔ EVERY GUARD HERE IS LOAD-BEARING and each one killed a phantom
+        version of this trade in testing:
+          * the round must be FINISHED -- before the bell this is just a
+            directional bet at a bad price;
+          * our reconstruction must clear `post_close_min_margin_bps`, because
+            the 1.4% of rounds we call wrong are concentrated in near-ties;
+          * the book must be FRESHER than `post_close_max_book_age_ms`. This is
+            the one that matters most: the complete-set arb looked real on the
+            same tape and went to exactly ZERO instances once a fresh book was
+            required. A stale frame is how a free lunch gets invented;
+          * one buy per round, and never above `post_close_max_px`.
+        """
+        window = float(settings.post_close_scan_s)
+        if window <= 0 or self.broker is None or self.broker.mode != "live":
+            return
+        pend = getattr(self, "_post_close", None)
+        if not isinstance(pend, dict) or not pend:
+            return
+        now_ms = int(time.time() * 1000)
+        wsb = getattr(self, "ws_book", None)
+        for slug, (r, sym) in list(pend.items()):
+            age_s = (now_ms - int(r.end_ms or 0)) / 1000.0
+            if age_s < 0 or age_s > window:
+                pend.pop(slug, None)
+                continue
+            got = self._settled_winner(r, sym)
+            if got is None:
+                continue
+            side, margin = got
+            if abs(margin) < float(settings.post_close_min_margin_bps):
+                continue
+            if wsb is None:
+                continue
+            top = wsb.best(r, float(settings.post_close_max_book_age_ms) / 1000.0)
+            if top is None:
+                continue
+            ask = top.ask(side) if callable(getattr(top, "ask", None)) else None
+            if ask is None or not (0.01 < ask <= float(settings.post_close_max_px)):
+                continue
+            up = next((o for o in r.outcomes if o.name == "Up"), None)
+            dn = next((o for o in r.outcomes if o.name == "Down"), None)
+            token = (up.token_id if side == "Up" else dn.token_id) if (up and dn) else None
+            if not token:
+                continue
+            stake = self._ck("stake_usdt", r) or settings.min_order_usdt
+            if self.bankroll < stake:
+                continue
+            pend.pop(slug, None)                       # one attempt per round
+            log.info("POST-CLOSE %s %s: settled %+.2f bps past the level "
+                     "%.1fs ago, book still asks %.4f -- taking it",
+                     slug, side, margin, age_s, ask)
+            try:
+                fill = await self.broker.buy(
+                    slug=slug, side=side, token_id=token,
+                    price=float(ask), stake=float(stake),
+                    max_px=float(settings.post_close_max_px))
+            except Exception as e:                       # noqa: BLE001
+                log.warning("post-close buy failed %s: %s: %s", slug,
+                            type(e).__name__, e)
+                continue
+            if fill:
+                log.info("POST-CLOSE FILL %s %s @ %.4f", slug, side,
+                         getattr(fill, "price", ask))
 
     async def _housekeeping_async(self) -> None:
         """`settle_due` + `sweep_claims` + the bankroll re-read, OFF the tick.

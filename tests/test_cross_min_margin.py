@@ -246,9 +246,17 @@ def test_the_margin_ceiling_ships_OFF_because_its_evidence_did_not_survive():
     look_s 1.0 and 2.0 -- ceiling off makes +19.00 (t+1.68) against 1.5's
     +12.53 (t+1.27), and +10.00 against +5.92 on days the choice never saw.
     The MECHANISM stays in main.py and is exercised below; only the default
-    changes, so re-enabling is one env var.  See config.cross_max_margin_bps."""
+    changes, so re-enabling is one env var.  See config.cross_max_margin_bps.
+
+    ⛔ THE SHIPPED DEFAULT, read as a default. `Settings()` resolves the live
+    `.env`, and on 2026-09-19 that was set to CROSS_MAX_MARGIN_BPS=1.0 after
+    the live record contradicted the replay this docstring cites: entries past
+    1.0 bps of margin won 38.5% against a 57.6% implied price (n=39, -2.4 sd).
+    Reading the resolution here asserted which profile is deployed rather than
+    what ships -- green locally, red on the VPS, saying nothing either way.
+    """
     from btcpredict.config import Settings
-    assert Settings().cross_max_margin_bps == 0.0
+    assert Settings.model_fields["cross_max_margin_bps"].default == 0.0
 
 
 def test_the_ceiling_mechanism_survives_its_retirement():
