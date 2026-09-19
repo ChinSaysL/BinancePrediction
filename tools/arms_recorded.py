@@ -106,7 +106,14 @@ def arm_impulse(rows: list, book: np.ndarray) -> list[dict]:
         side = impulse_side(bps, S.impulse_bps)
         if side is None:
             continue
-        ask = float(book[i][5]) if side == "Up" else float(book[i][8])
+        # ⛔ [6] IS up_ask. [5] is up_BID. The query selects
+        #   ts_ms tau_s spot up_price down_price up_bid up_ask down_bid down_ask
+        # so after `row[1:]` the asks are [6] and [8]. Every arm here read
+        # [5] for the Up side, i.e. filled Up at the BID -- about a cent
+        # cheap on every Up trade, against a docstring that promises "fill
+        # at the ASK of the side chosen". Down was always correct, so the
+        # error was asymmetric and flattered whichever arm leaned Up.
+        ask = float(book[i][6]) if side == "Up" else float(book[i][8])
         if not (S.impulse_min_price <= ask <= S.impulse_max_price):
             continue
         out.append({"arm": "impulse", "tau": tau, "side": side, "px": ask,
@@ -126,7 +133,14 @@ def arm_cross(rows: list, book: np.ndarray, strike: float) -> list[dict]:
             continue
         if 1e4 * abs(spot - strike) / strike > S.cross_max_depth_bps:
             continue
-        ask = float(book[i][5]) if side == "Up" else float(book[i][8])
+        # ⛔ [6] IS up_ask. [5] is up_BID. The query selects
+        #   ts_ms tau_s spot up_price down_price up_bid up_ask down_bid down_ask
+        # so after `row[1:]` the asks are [6] and [8]. Every arm here read
+        # [5] for the Up side, i.e. filled Up at the BID -- about a cent
+        # cheap on every Up trade, against a docstring that promises "fill
+        # at the ASK of the side chosen". Down was always correct, so the
+        # error was asymmetric and flattered whichever arm leaned Up.
+        ask = float(book[i][6]) if side == "Up" else float(book[i][8])
         if not (S.cross_min_price <= ask <= S.cross_max_price):
             continue
         out.append({"arm": "cross", "tau": tau, "side": side, "px": ask,
@@ -141,7 +155,28 @@ def arm_model(book: np.ndarray, strike: float, opens, sig) -> list[dict]:
         if not (S.min_tau_s <= tau <= S.max_tau_s) or tau <= 0:
             continue
         up_disp, dn_disp = float(book[i][3]), float(book[i][4])
-        up_ask, dn_ask = float(book[i][5]), float(book[i][8])
+        # ⛔ [6] IS up_ask. [5] is up_BID. The query selects
+        #   ts_ms tau_s spot up_price down_price up_bid up_ask down_bid down_ask
+        # so after `row[1:]` the asks are [6] and [8]. Every arm here read
+        # [5] for the Up side, i.e. filled Up at the BID -- about a cent
+        # cheap on every Up trade, against a docstring that promises "fill
+        # at the ASK of the side chosen". Down was always correct, so the
+        # error was asymmetric and flattered whichever arm leaned Up.
+        up_ask, dn_ask = float(book[i][6]), float(book[i][8])
+        # ⛔ POLYMARKET HAS NO DISPLAYED PRICE. `pm_round` builds its Outcomes
+        # with `price=0.0` on purpose -- "the venue does not publish a reference
+        # price for this family" (venues/polymarket/rounds.py) -- so the book IS
+        # the price there. Without this fallback the model arm scored ZERO fills
+        # on the entire Polymarket era and looked untradeable, when in fact the
+        # field it gates on is simply never populated.
+        # The mid of the recorded book is the honest equivalent of a displayed
+        # price: it is what the venue would quote if it quoted one.
+        if not (0 < up_disp < 1):
+            ub, ua = float(book[i][5]), float(book[i][6])
+            up_disp = (ub + ua) / 2.0 if (0 < ub < 1 and 0 < ua < 1) else 0.0
+        if not (0 < dn_disp < 1):
+            db_, da = float(book[i][7]), float(book[i][8])
+            dn_disp = (db_ + da) / 2.0 if (0 < db_ < 1 and 0 < da < 1) else 0.0
         if not (0 < up_disp < 1 and 0 < dn_disp < 1):
             continue
         sg = sigma_at(opens, sig, ts)
@@ -229,12 +264,27 @@ def main() -> None:
     ap.add_argument("--db", default=DEFAULT_DB if os.path.exists(DEFAULT_DB)
                     else "data/btcpredict.db")
     ap.add_argument("--flat", type=float, default=1.0)
+    # ⛔ THE VENUE CHANGED MID-TAPE. Binance until 2026-09-16, Polymarket after,
+    # and they settle on DIFFERENT statistics (point vs 60s TWAP -- measured
+    # 98.7% vs 90.4% in tools/pm_venue_settlement.py). Pooling them scores two
+    # different markets as one, so the era has to be selectable.
+    ap.add_argument("--since", default=None, help="YYYY-MM-DD, inclusive")
+    ap.add_argument("--until", default=None, help="YYYY-MM-DD, exclusive")
     args = ap.parse_args()
     c = sqlite3.connect(args.db)
     rounds = load_rounds(c)
     quotes = load_quotes(c)
     opens, sig = sigma_by_bar(c)
     rounds = [r for r in rounds if r["slug"] in quotes]
+    if args.since or args.until:
+        import datetime as _dt
+        lo = (_dt.datetime.fromisoformat(args.since).replace(tzinfo=_dt.timezone.utc)
+              .timestamp()*1000) if args.since else -1
+        hi = (_dt.datetime.fromisoformat(args.until).replace(tzinfo=_dt.timezone.utc)
+              .timestamp()*1000) if args.until else 1e18
+        rounds = [r for r in rounds if lo <= r["start_ms"] < hi]
+        print("  era filter %s .. %s -> %d rounds"
+              % (args.since or "-", args.until or "-", len(rounds)))
     print(f"{args.db}\n  {len(rounds):,} settled rounds with quotes | "
           f"{sum(len(quotes[r['slug']]) for r in rounds):,} book rows | "
           f"sigma from {len(opens):,} 1m bars")
