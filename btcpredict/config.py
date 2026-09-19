@@ -1636,6 +1636,14 @@ class Settings(BaseSettings):
     # +14.34/+19.16. The band is fillable at 0.45 and the edge is inside it.
     # KILL CRITERION: the [0.45,0.55) cohort turning negative over ~40 fills.
     # Revert: CROSS_MIN_PRICE=0.10 + restart.
+    # ⭐ RE-CONFIRMED 2026-09-19 against a SECOND tool that wanted it lowered.
+    # `tools/pm_two_book.py` models both books and prefers a 0.35 floor
+    # monotonically ($+272 against $+176). It is wrong for the reason above: it
+    # draws one gap distribution at every price and cannot see that the cheap
+    # book is stale. A 0.35 floor adds 171 entries of which 27% PAY under 0.45,
+    # where the two-second reprice is +0.2174 to +0.5407. Two independent
+    # sweeps have now asked for this floor to come down; both were artifacts of
+    # pricing fills that cannot be had.
     cross_min_price: float = 0.45
     # ⛔ RETIRED 2026-09-19, THE SAME DAY IT SHIPPED. It was chosen on live
     # fills bucketed by their realised margin. Those buckets are not a
@@ -2030,6 +2038,20 @@ class Settings(BaseSettings):
     # 0.66 and 0.62 and neither would have filled. The raise did not buy better
     # trades; it converted "no fill" into "fill at a price the arm cannot win
     # at". See cross_max_fill_px for the bound that now enforces that directly.
+    # ⛔ THIS KNOB IS INERT WHILE `cross_venue_take` IS ON, measured 2026-09-19
+    # with `tools/pm_two_book.py`. The send path re-bases the cap on the VENUE's
+    # ask, and `venue + buffer` always covers `venue`, so the fill test
+    # collapses to `venue <= cross_max_fill_px`. Sweeping inv from 0.05 to 0.25
+    # returns IDENTICAL results -- same n, same misses, same P&L, both looks.
+    #     venue 0.50 -> cap 0.53 @inv.05, 0.62 @inv.25 -- fills either way
+    #     venue 0.66 -> cap 0.65 either way             -- misses either way
+    # It binds only when the re-base is OFF or the venue is unreadable, where it
+    # matters a great deal (inv 0.05: 411 misses $+122; inv 0.25: 148 misses
+    # $+156).
+    # ⛔ SO THE 0.200 -> 0.125 CHANGE MADE THAT DAY DID NOTHING, and the fill
+    # improvement credited to it (59% of fills over the decided price, then 1 of
+    # 6) belonged to the `cross_max_fill_px` 0.70 -> 0.65 revert shipped in the
+    # same breath. Recorded because the wrong lever was thanked for it.
     cross_limit_buffer_inv: float = 0.125
     # How long a cross limit rests before it is cancelled. 0 keeps the shared
     # `limit_wait_s` (20s).

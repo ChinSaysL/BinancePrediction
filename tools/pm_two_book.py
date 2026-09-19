@@ -24,6 +24,18 @@ separate them: raw, re-based fills look worse (n=79 -0.1048/fill against n=101
 -0.0568), but controlling for the paid price the buckets disagree (+0.1307 vs
 -0.2266 at 0.5; -0.1175 vs -0.0007 at 0.6).
 
+⛔ WHAT THIS MODEL CANNOT SEE, AND IT WILL LIE TO YOU ABOUT ONE THING. The gap
+is drawn from a SINGLE distribution regardless of price, so the model has no
+notion of the cheap book being stale. It therefore recommends lowering
+`cross_min_price`, monotonically, all the way down -- $+176 at a 0.45 ladder
+floor against $+272 at 0.35. That is the artifact `config.cross_min_price`
+already documents: below 0.45 the quote reprices +0.2174 to +0.5407 within two
+seconds, so those fills cannot be had at the price shown. Measured directly: a
+0.35 ladder floor adds 171 entries of which 27% PAY a venue price under 0.45.
+DO NOT lower the floor on this tool's advice.
+`band_on="venue"` does not have the same flaw -- it gates the PAID price into
+the band, so it never reaches that zone.
+
     python3 tools/pm_two_book.py
 """
 from __future__ import annotations
@@ -50,11 +62,13 @@ def take_cap(base, *, buf_inv, buf_abs, max_price, fill_cap):
 
 
 def sim(R, *, rebase, days=None, bankroll=22.6, expo=0.50, stake=1.0, seed=7,
-        px_lo=None, px_hi=None, fill_cap=None):
+        px_lo=None, px_hi=None, fill_cap=None, buf_inv=None, gap_scale=1.0,
+        band_on="ladder"):
     px_lo = LIVE["cross_min_price"] if px_lo is None else px_lo
     px_hi = LIVE["cross_max_price"] if px_hi is None else px_hi
     fill_cap = LIVE["cross_max_fill_px"] if fill_cap is None else fill_cap
-    bi, ba = LIVE["cross_limit_buffer_inv"], LIVE["cross_limit_buffer"]
+    bi = LIVE["cross_limit_buffer_inv"] if buf_inv is None else buf_inv
+    ba = LIVE["cross_limit_buffer"]
     rng = np.random.default_rng(seed)
     ev = []
     for end, cands, ticks, slug in R:
@@ -70,8 +84,11 @@ def sim(R, *, rebase, days=None, bankroll=22.6, expo=0.50, stake=1.0, seed=7,
             if md > 0 and dbps > md:
                 continue
             venue = float(ask)                       # the tape IS the venue
-            ladder = round(venue - float(rng.choice(GAPS)), 2)
-            if not (px_lo <= ladder <= px_hi):       # the GATE sees the ladder
+            # `gap_scale` models LATENCY: 0.5 = half the current staleness,
+            # 0.0 = our book is the venue's (a perfect feed).
+            ladder = round(venue - float(rng.choice(GAPS)) * gap_scale, 2)
+            gated = ladder if band_on == "ladder" else venue
+            if not (px_lo <= gated <= px_hi):
                 continue
             ev.append((ts, end, side, won, venue, ladder, ticks, ti))
             break

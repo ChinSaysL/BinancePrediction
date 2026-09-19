@@ -269,3 +269,37 @@ def test_the_ceiling_fires_after_the_floor_and_before_the_slot_is_taken():
     src = (ROOT / "btcpredict" / "main.py").read_text()
     assert src.index("if abs(margin) < floor:") < src.index("if abs(margin) > cap:")
     assert src.index("if abs(margin) > cap:") < src.index("self._cross_fired[r.slug] = ")
+
+
+def test_two_independent_sweeps_have_asked_to_lower_the_price_floor():
+    """Both were artifacts, and the guard has to outlive the memory of them.
+
+    `pm_joint_chain` wanted 0.10 (it prices at the quoted ask, which the cheap
+    book does not honour). `pm_two_book` wants 0.35 (it draws one gap
+    distribution at every price, so it cannot see the cheap book being stale
+    either). A 0.35 ladder floor adds 171 entries of which 27% PAY under 0.45,
+    where the two-second reprice is +0.2174 to +0.5407.
+
+    If a third sweep asks, check whether it models PRICE-DEPENDENT staleness
+    before believing it.  See config.cross_min_price."""
+    from btcpredict.config import Settings
+    assert Settings().cross_min_price == 0.45
+    cfg = (pathlib.Path(__file__).resolve().parents[1]
+           / "btcpredict" / "config.py").read_text()
+    j = cfg.index("cross_min_price: float =")
+    block = cfg[max(0, j - 7000):j]
+    assert "pm_two_book" in block, "the second refuted sweep must be named"
+    assert "27%" in block, "and why it was refused"
+
+
+def test_the_limit_buffer_is_recorded_as_inert():
+    """It reads like a live risk knob and is not one while the venue re-base is
+    on -- `venue + buffer` always covers `venue`, so the fill test is just
+    `venue <= cross_max_fill_px`. Without this note someone tunes it for a day
+    and measures nothing, which is exactly what happened on 2026-09-19."""
+    cfg = (pathlib.Path(__file__).resolve().parents[1]
+           / "btcpredict" / "config.py").read_text()
+    j = cfg.index("cross_limit_buffer_inv: float =")
+    block = cfg[max(0, j - 2000):j]
+    assert "INERT" in block and "cross_venue_take" in block
+    assert "DID NOTHING" in block, "the mis-credited fix must be recorded"
