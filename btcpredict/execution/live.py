@@ -608,12 +608,42 @@ class LiveBroker:
         filled = float((rec or {}).get("fillPercentage") or 0.0)
         if filled <= 0.0:
             cancelled = await self.cancel_orders([order_id])
-            self.last_failure = "limit_unfilled"
-            log.info("limit %s %s @%.2f unfilled after %.0fs -> %s (%s)",
-                     slug, side, limit_px, wait_s,
-                     "cancelled" if cancelled else "CANCEL NOT CONFIRMED",
-                     order_id)
-            return None
+            # ⛔ RE-READ AFTER CANCELLING, ALWAYS. `filled` came from the last
+            # POLL; the venue can fill the order in the gap between that poll
+            # and the cancel landing. Returning None there books no fill for a
+            # position the venue has actually opened -- an untracked holding
+            # that never settles, never redeems, and never appears in the
+            # ledger or the daily P&L.
+            #
+            # Trusting `cancelled` is not enough on its own: it only tells us
+            # what the CANCEL call reported, and a venue that fills first and
+            # then accepts the cancel of a zero remainder looks identical to a
+            # clean cancel. The order record is the only authority on whether
+            # shares were bought, so ask it.
+            #
+            # Cheap: this runs only on the no-fill path, which is 10 orders in
+            # the tape so far. Under `order_type=limit_take` the race window is
+            # small because a crossing order resolves in ~840 ms rather than
+            # resting 20 s, but small is not zero.
+            post = await self.order_record(order_id, tries=2)
+            post_filled = float((post or {}).get("fillPercentage") or 0.0)
+            if post_filled > 0.0:
+                log.warning(
+                    "limit %s %s @%.2f RACED THE CANCEL: polled 0%% filled, "
+                    "cancel %s, but the venue now reports %.0f%% filled (%s). "
+                    "Booking the fill -- returning None here would leave an "
+                    "untracked position.",
+                    slug, side, limit_px,
+                    "confirmed" if cancelled else "NOT confirmed",
+                    post_filled * 100, order_id)
+                rec, filled = post, post_filled
+            else:
+                self.last_failure = "limit_unfilled"
+                log.info("limit %s %s @%.2f unfilled after %.0fs -> %s (%s)",
+                         slug, side, limit_px, wait_s,
+                         "cancelled" if cancelled else "CANCEL NOT CONFIRMED",
+                         order_id)
+                return None
 
         usdt = amount_usdt(rec.get("filledUsdtAmount")) or stake * filled
         shares = amount_usdt(rec.get("filledShareQty"))
