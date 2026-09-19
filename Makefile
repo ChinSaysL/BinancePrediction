@@ -53,10 +53,17 @@ test:
 #     into assertions that 1.0 == 1.0.
 #
 # A test that fails here and passes under `make test` is not flaky: it is a
-# test that does not say what it thinks it says. Pin the knob, or read
+# test that does not say what it thinks it says.
+#
+# ⛔ NO TRAILING SLASH ON THE RSYNC SOURCES. `rsync -a tests/ dest/` copies the
+# CONTENTS of tests into dest; `rsync -a tests dest/` copies the DIRECTORY.
+# The first form scattered 75 test files and five package subdirectories loose
+# into the repo root, updated neither `tests/` nor `btcpredict/`, and so ran
+# the suite against STALE CODE -- which passed, and looked like a verification.
+# A deploy that silently tests the previous commit is worse than no deploy. Pin the knob, or read
 # `Settings.model_fields[...].default` when the DEFAULT is the subject.
 test-live:
-	$(if $(LIVE_HERE),cd /root/BinancePrediction && .venv/bin/python -m pytest tests/ -q,$(RSYNC) tests/ btcpredict/ $(VPS):/root/BinancePrediction/ && $(SSH) $(VPS) 'cd /root/BinancePrediction && .venv/bin/python -m pytest tests/ -q')
+	$(if $(LIVE_HERE),cd /root/BinancePrediction && .venv/bin/python -m pytest tests/ -q,$(RSYNC) tests btcpredict $(VPS):/root/BinancePrediction/ && $(SSH) $(VPS) 'cd /root/BinancePrediction && .venv/bin/python -m pytest tests/ -q')
 
 record:
 	python -m btcpredict.main --mode record

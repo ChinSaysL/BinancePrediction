@@ -835,6 +835,30 @@ class RoundTop:
     def down_ask(self) -> float:
         return self.down.ask if self.down is not None else 0.0
 
+    # ⛔ THE SIZES ARE PART OF THAT SAME SURFACE. The recorder reads
+    # `top.up_ask_size` off whatever `wsb.best()` returned, and that is a
+    # `BookTop` on the wrapper and a `RoundTop` here. Adding the columns
+    # without adding these properties raised `AttributeError` on EVERY tick
+    # against the live venue -- which is the only one that trades.
+    # 0.0 for a missing side, exactly as the four prices above do: a side we
+    # have no book for already reports a 0.0 price, so the row is degenerate
+    # either way and consistency is worth more than a second convention.
+    @property
+    def up_ask_size(self) -> float:
+        return self.up.ask_size if self.up is not None else 0.0
+
+    @property
+    def up_bid_size(self) -> float:
+        return self.up.bid_size if self.up is not None else 0.0
+
+    @property
+    def down_ask_size(self) -> float:
+        return self.down.ask_size if self.down is not None else 0.0
+
+    @property
+    def down_bid_size(self) -> float:
+        return self.down.bid_size if self.down is not None else 0.0
+
 
 class PmBookView:
     """The `PredictionBook` surface over `PmBook`, keyed by the ROUND.
