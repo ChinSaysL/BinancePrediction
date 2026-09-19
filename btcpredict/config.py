@@ -3791,6 +3791,42 @@ class Settings(BaseSettings):
     #: second and consuming the cooldown on each would burn it inside one
     #: round. Seeded from the ledger at startup so a restart cannot launder it.
     model_cooldown_after_loss: int = 0
+    #: Stake MULTIPLIER for model-arm entries whose `fair` for the side bought
+    #: sits at or below `model_low_fair_cut`. 1.0 = off (the shipped default).
+    #:
+    #: NOT a filter -- every trade is still taken. It reallocates a FIXED
+    #: capital budget toward the bucket that earns more per dollar. That
+    #: distinction is why this survives where `max_fair` did not: capping at a
+    #: flat stake means fewer trades and less total money, while reweighting at
+    #: constant deployment means the same money spent better.
+    #:
+    #: Measured 2026-09-19, btc-updown-5m, 886 entries, every other knob pinned
+    #: to the live host:
+    #:     fair <= 0.684 (bottom third)  n=295  EV/$ +0.1006
+    #:     fair >  0.684                 n=591  EV/$ +0.0294
+    #: The cut ships as a round 0.70 (n=332, EV/$ +0.0962) rather than the
+    #: fitted 0.6844, because a quantile to four decimals is a fitted constant
+    #: and 0.70 measures the same thing.
+    #:
+    #: Weights normalised to the same total capital, fit on days 1-5, scored on
+    #: days 6-9:
+    #:     flat      train +23.44   test +23.62
+    #:     1.5x      train +25.82   test +26.84
+    #:     2.0x      train +27.61   test +29.29   <- ships as 2.0
+    #:     3.0x      train +30.12   test +32.78
+    #:
+    #: ⛔ IT NEVER TURNS. "low-fair only" is the in-sample optimum (test
+    #: +47.49), so this is a concentration rule, not an optimum -- the ceiling
+    #: is set by risk, not by the data. It is also NOT significant: against a
+    #: calibrated null the 2x advantage is +5.67 with a null mean of -0.50 and
+    #: sd 4.83, p = 0.10. Shipped at the operator's explicit instruction with
+    #: that stated; 2.0 rather than 3.0 because at an $8 balance with the risk
+    #: guards off, 3x is $3/trade and four losses ends the account.
+    #:
+    #: `stake_cap_usdt` still binds LAST and will clamp this, so the cap must
+    #: be raised with the multiplier or the reweight silently does nothing.
+    model_low_fair_cut: float = 0.0
+    model_low_fair_stake_mult: float = 1.0
     # May a cross entry take the side OPPOSITE a position already held in this
     # round? No. Buying both sides is not a hedge: with the first position sunk,
     #     EV(take) - EV(decline) = stake_B * [ (1 - p)/b - 1 ]

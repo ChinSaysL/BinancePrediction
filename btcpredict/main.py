@@ -5799,6 +5799,18 @@ class Bot:
         future rule cannot opt out by forgetting to take `cap=`.
         """
         base = self._base_stake_for(sig)
+        # LOW-FAIR CONCENTRATION. Reallocates a fixed budget toward the bucket
+        # that earns more per dollar -- see config.model_low_fair_cut for the
+        # measurement and for why it is NOT significant. MODEL arm only: the
+        # measurement is the model arm's own, and the other arms pick their
+        # side by a different rule, so their `fair` is not the same quantity.
+        # Applied BEFORE the cap, which still binds last.
+        if (base > 0 and settings.model_low_fair_cut > 0
+                and settings.model_low_fair_stake_mult != 1.0
+                and arm_of(sig) == "MODEL"):
+            f = getattr(sig, "fair", None)
+            if f is not None and 0.0 < float(f) <= settings.model_low_fair_cut:
+                base *= float(settings.model_low_fair_stake_mult)
         if base > 0 and settings.stake_tilt == "inv_z":
             t = tilt_factor(moneyness_sd, reference=settings.tilt_reference_z,
                             lo=settings.tilt_min, hi=settings.tilt_max)
