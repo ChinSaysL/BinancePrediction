@@ -3903,3 +3903,39 @@ def market_prefix(slug: str | None) -> str | None:
         return None
     head, _, tail = slug.rpartition("-")
     return head if head and tail.isdigit() else slug
+
+
+# ⛔ sol/xrp/doge up-down markets are POLYMARKET-ONLY. They were added to
+# MARKETS on 2026-09-16 off `pm_train_sweep` (the PM tail-60 rule) -- the same
+# day the venue flipped to Polymarket -- and Binance does not list them at all.
+#
+# Leaving them in the Binance list is not cosmetic. `rounds_by_prefixes` pages
+# the venue's ~1,600-topic market list and stops only once EVERY requested
+# prefix is found, so three prefixes that can never be found force the full
+# sweep every time and log
+#     round refresh: no round for sol-updown-5m, xrp-updown-5m, doge-updown-5m
+# once per poll. That is the same coupling the RECORDED_REFRESH_S block above
+# was written to kill: an unfindable family stalls the decision loop.
+#
+# Filtered here rather than at line 62 because the venue is only known once
+# `settings` has merged `.env`. `main.py` imports these names after this module
+# has finished executing, so it sees the narrowed list.
+PM_ONLY_FAMILIES = ("sol-updown-5m", "xrp-updown-5m", "doge-updown-5m")
+
+
+def active_markets() -> list[tuple[str, str, int]]:
+    """`MARKETS` narrowed to the families that EXIST on the live venue.
+
+    A FUNCTION, not a filtered constant: the venue is a setting, and the test
+    profile flips it after this module has imported. Baking the narrowing in at
+    import time makes `MARKETS` disagree with `settings.venue` for the rest of
+    the process, which is exactly the stale-default trap `registry.normalise`
+    exists to prevent.
+    """
+    if (settings.venue or "binance").strip().lower() == "binance":
+        return [m for m in MARKETS if m[0] not in PM_ONLY_FAMILIES]
+    return list(MARKETS)
+
+
+def active_symbol_by_prefix() -> dict[str, str]:
+    return {p: s for p, s, _ in active_markets()}

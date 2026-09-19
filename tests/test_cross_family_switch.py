@@ -116,13 +116,49 @@ def test_the_knob_is_a_comma_list_and_empty_means_nothing_disabled(monkeypatch):
 
 
 def test_the_recording_path_still_runs_for_every_market():
-    """The switch must gate `trade=`, NOT the loop over MARKETS -- otherwise the
-    disabled family stops being recorded, which is the opposite of the intent."""
+    """The switch must gate `trade=`, NOT the loop over the markets -- otherwise
+    the disabled family stops being recorded, which is the opposite of the
+    intent.
+
+    The loop iterates `active_markets()` rather than `MARKETS` since 2026-09-19:
+    that narrows the list by VENUE only (sol/xrp/doge do not exist on Binance
+    and made every sweep page all ~1,600 topics looking for them). It is not the
+    cross switch, and the assertion below pins that the two stay separate.
+    """
     src = (ROOT / "btcpredict" / "main.py").read_text()
-    assert "for prefix, sym, _ in MARKETS:" in src
+    assert "for prefix, sym, _ in active_markets():" in src
     assert "trade=cross_traded(prefix)," in src
     assert "trade=(prefix in CROSS_TRADED)," not in src, \
         "the raw membership test must not remain: it ignores the switch"
+
+
+def test_the_venue_filter_is_not_the_cross_switch(monkeypatch):
+    """`active_markets()` must ignore `cross_disabled_families` entirely.
+
+    Collapsing the two is how a family disabled from TRADING would also stop
+    being RECORDED -- the exact failure the test above exists to prevent.
+    """
+    import btcpredict.config as cfg
+    monkeypatch.setattr(cfg.settings, "venue", "binance")
+    before = cfg.active_markets()
+    monkeypatch.setattr(cfg.settings, "cross_disabled_families",
+                        "eth-updown-5m,bnb-updown-5m")
+    assert cfg.active_markets() == before, \
+        "the cross switch must not narrow the recorded market list"
+    assert "eth-updown-5m" in {p for p, _, _ in cfg.active_markets()}
+
+
+def test_active_markets_follows_the_venue(monkeypatch):
+    import btcpredict.config as cfg
+    monkeypatch.setattr(cfg.settings, "venue", "polymarket")
+    assert {p for p, _, _ in cfg.active_markets()} == {p for p, _, _ in cfg.MARKETS}
+    monkeypatch.setattr(cfg.settings, "venue", "binance")
+    on_binance = {p for p, _, _ in cfg.active_markets()}
+    assert on_binance == {p for p, _, _ in cfg.MARKETS} - set(cfg.PM_ONLY_FAMILIES)
+    # the six the operator named, and nothing that Binance does not list
+    assert on_binance == {"btc-updown-5m", "eth-updown-5m", "bnb-updown-5m",
+                          "btc-updown-15m", "eth-updown-15m", "bnb-updown-15m"}
+    assert cfg.active_markets()[0][0] == "btc-updown-5m", "primary must not move"
 
 
 def test_the_disabled_family_is_still_in_MARKETS():

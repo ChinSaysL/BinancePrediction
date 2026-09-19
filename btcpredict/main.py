@@ -30,8 +30,8 @@ import aiohttp
 from btcpredict.calibration.report import PnLSummary
 from btcpredict.edge.impulse import impulse_bps, impulse_side
 from btcpredict.config import (CROSS_TRADED, MARKETS, SYMBOL_BY_PREFIX,
-                               TRAIN_P_WIN, cross_knob, cross_traded,
-                               market_prefix, settings)
+                               TRAIN_P_WIN, active_markets, cross_knob,
+                               cross_traded, market_prefix, settings)
 from btcpredict.edge.signal import (FLOOR_MAX_BANKROLL_FRACTION, FeeModel,
                                     Signal, evaluate,
                                     evaluate_hybrid, expected_value,
@@ -860,7 +860,7 @@ class Bot:
         # One spot feed and volatility estimator per market in MARKETS. There is
         # only one now (BTC 5m); the dicts stay keyed by symbol because the
         # feeds, the histories and the models are all per-underlying.
-        self.symbols = sorted({sym for _, sym, _ in MARKETS})
+        self.symbols = sorted({sym for _, sym, _ in active_markets()})
         self.spots: dict[str, SpotFeed] = {
             sym: SpotFeed(session, symbol=sym) for sym in self.symbols}
         self.vols: dict[str, VolEstimator] = {}
@@ -1328,7 +1328,7 @@ class Bot:
     # -- main tick ----------------------------------------------------------
     async def tick(self) -> None:
         await self.refresh_vol_if_stale()
-        primary = MARKETS[0][0]
+        primary = active_markets()[0][0]
         now_s = time.time()
         now_ms = int(now_s * 1000)
         cache = getattr(self, "_round_cache", None)
@@ -1350,7 +1350,7 @@ class Bot:
             pc = getattr(self, "_post_close", None)
             if not isinstance(pc, dict):
                 pc = self._post_close = {}
-            for _p, _sym, _ in MARKETS:
+            for _p, _sym, _ in active_markets():
                 _r = cache.get(_p)
                 if _r is None or getattr(_r, "strike", None) is None:
                     continue
@@ -1360,7 +1360,7 @@ class Bot:
             if len(pc) > 32:                 # 9 families; anything more is dead
                 for _k in sorted(pc, key=lambda k: int(pc[k][0].end_ms or 0))[:16]:
                     pc.pop(_k, None)
-        stale = [p for p, _, _ in MARKETS
+        stale = [p for p, _, _ in active_markets()
                  if cache.get(p) is None
                  or getattr(cache[p], "end_ms", 0) <= now_ms
                  or getattr(cache[p], "strike", None) is None]
@@ -1401,7 +1401,7 @@ class Bot:
             buf = self._ticks = {}
         # Guarded: fixtures build a Bot via __new__ and have no `spots`.
         spots = getattr(self, "spots", None) or {}
-        for sym in {s for _, s, _ in MARKETS}:
+        for sym in {s for _, s, _ in active_markets()}:
             f = spots.get(sym)
             px = getattr(f, "price", None) if f is not None else None
             if px:
@@ -1414,7 +1414,7 @@ class Bot:
         # the risk, and collapsing them is how the daily loss cap was once
         # bypassed.
         self._mkt = {}
-        for prefix, sym, _ in MARKETS:
+        for prefix, sym, _ in active_markets():
             r = cache.get(prefix)
             if r:
                 await self._record(r, sym,
@@ -1503,8 +1503,8 @@ class Bot:
             # that only appears on failure -- the same blindness that hid the
             # dead first version.
             warm = getattr(getattr(self, "_pm_broker", None), "warm_calls", None)
-            miss = [p for p, _, _ in MARKETS if p not in cached]
-            dead = [p for p, _, _ in MARKETS if p not in live]
+            miss = [p for p, _, _ in active_markets() if p not in cached]
+            dead = [p for p, _, _ in active_markets() if p not in live]
             # WARNING when a family is missing, DEBUG when all nine are fine.
             # The line exists for the FAILURE case: a family that is not in
             # `_mkt` gets no quote, no book and no decision, and every one of
@@ -1513,7 +1513,7 @@ class Bot:
             # of the ~1,600 lines in a 3-hour window, all of them "no change".
             pat = ("families: %d/%d cached, %d live | missing cache: %s | "
                    "not live: %s | warm %s")
-            fargs = (len(cached), len(MARKETS), len(live), miss or "-",
+            fargs = (len(cached), len(active_markets()), len(live), miss or "-",
                      dead or "-", "n/a" if warm is None else warm)
             if miss or dead:
                 log.warning(pat, *fargs)
@@ -1569,7 +1569,7 @@ class Bot:
             # no round listed between rounds -- but if a prefix is here on every
             # sweep it is DEAD, and that is what this line is for.
             log.warning("round refresh: no round for %s (%d/%d cached)",
-                        ", ".join(missing), len(cache), len(MARKETS))
+                        ", ".join(missing), len(cache), len(active_markets()))
 
     async def _record(self, r, symbol: str, *, trade: bool,
                       primary: bool = False) -> None:
@@ -1815,32 +1815,61 @@ class Bot:
             "round": r, "asks": (buy_up, buy_down), "feed": feed,
             "symbol": symbol, "sigma": sigma, "primary": primary,
         }
-        # Everything below is the PRIMARY-only path: the model, impulse and
-        # double arms were measured on BTC 5m and are not widened here.
-        if not primary:
+        # THE IMPULSE AND DOUBLE ARMS STAY PRIMARY-ONLY. Their state below is
+        # SINGLE-VALUED and `_impulse_tick` reads it from OUTSIDE this call, so
+        # widening it would leave it holding whichever family ran last -- which
+        # is exactly the bug the comment inside this block records.
+        #
+        # THE MODEL ARM IS WIDENED to every family in `active_markets()`
+        # (2026-09-19, operator's instruction: one trade per round for each
+        # coin). That is safe where the block below is not, because the model
+        # path carries no cross-call state: the persistence and candle gates are
+        # keyed `[r.slug]`, the price history is keyed `[symbol]`, sigma and the
+        # quotes are arguments, and the entry uses the local `r`. The cap the
+        # operator asked for is `guard.check(r.slug)` -- a slug IS one family's
+        # round, so one position per coin per round falls out of it.
+        #
+        # `max_open_rounds` must be >= the number of traded families or it
+        # becomes the real cap; it is 6 for the six families here.
+        #
+        # 15m IS SAFE ONLY BECAUSE `pricing_model` IS `digital`, which reads
+        # tau_s and sigma_1m and nothing else. `models/sniper.py` hardcodes
+        # ROUND_SECONDS = 300 (used as `window_age = ROUND_SECONDS - tau`, which
+        # goes NEGATIVE at tau > 300) -- so selecting sniper while a 15m family
+        # is traded is the failure config.py:44 warns about. Re-check that line
+        # before changing `pricing_model`.
+        if primary:
+            # What the fast impulse path needs to act between polls (see
+            # _impulse_tick). Deliberately not cached in record mode: `_round`
+            # is the fast path's only precondition, so leaving it None is what
+            # guarantees --mode record can never place an order.
+            self._round = r
+            self._asks = (buy_up, buy_down)
+            self._sigma = sigma
+            # The feed THIS round settles against, captured here because here is
+            # the only place it is unambiguous: _record runs once per market in
+            # MARKETS and each call reassigns self.spot, so after the loop
+            # self.spot holds the LAST symbol's feed (eth-updown-15m ->
+            # ETHUSDT) while _round holds the traded BTC market. _impulse_tick
+            # runs on the websocket clock, i.e. outside this call, so reading
+            # self.spot there compared ETH's price to BTC's strike (measured
+            # 2026-09-12: spot=2530.835 vs strike=77344.005, -9672 bps) and
+            # bought BTC Down because ETH had ticked. The same nonsense fair
+            # priced an Up take-limit at max(0.01, 0 - 0.04) = 0.01, which is
+            # the unfillable order that stalled the arm for an hour.
+            self._primary_spot = feed
+            await self._double_tick()
+
+        # Guarded the same way `_ticks` is below, and for the same two reasons:
+        # fixtures build a Bot without running __init__, and since the model arm
+        # widened past the primary this runs for EVERY family -- so a symbol
+        # with no seeded history must be skipped rather than raise. In
+        # production every active family's symbol is seeded at startup
+        # (`self.symbols` comes from `active_markets()`), and a family with no
+        # history has nothing to price against anyway.
+        hist = (getattr(self, "histories", None) or {}).get(symbol)
+        if hist is None:
             return
-
-        # What the fast impulse path needs to act between polls (see
-        # _impulse_tick). Deliberately not cached in record mode: `_round` is
-        # the fast path's only precondition, so leaving it None is what
-        # guarantees --mode record can never place an order.
-        self._round = r
-        self._asks = (buy_up, buy_down)
-        self._sigma = sigma
-        # The feed THIS round settles against, captured here because here is the
-        # only place it is unambiguous: _record runs once per market in MARKETS
-        # and each call reassigns self.spot, so after the loop self.spot holds
-        # the LAST symbol's feed (eth-updown-15m -> ETHUSDT) while _round holds
-        # the traded BTC market. _impulse_tick runs on the websocket clock, i.e.
-        # outside this call, so reading self.spot there compared ETH's price to
-        # BTC's strike (measured 2026-09-12: spot=2530.835 vs strike=77344.005,
-        # -9672 bps) and bought BTC Down because ETH had ticked. The same
-        # nonsense fair priced an Up take-limit at max(0.01, 0 - 0.04) = 0.01,
-        # which is the unfillable order that stalled the arm for an hour.
-        self._primary_spot = feed
-        await self._double_tick()
-
-        hist = self.histories[symbol]
         hist.add_tick(spot)
         # tick() now appends `_ticks` for EVERY symbol, so this only reads it.
         # Guarded lookup: fixtures build a Bot without running __init__, and the
@@ -1856,7 +1885,10 @@ class Bot:
             return
 
         sig = None
-        if settings.entry_mode in ("impulse", "both"):
+        # `and primary`: the impulse arm was measured on BTC 5m and its fast
+        # path is primary-only (above), so widening the poll branch alone would
+        # trade families the trigger was never measured on.
+        if settings.entry_mode in ("impulse", "both") and primary:
             if not settings.impulse_on_tick:
                 # Trade the underlying's own move. The model is not consulted:
                 # its gate measured +1.3%/$1 net with a negative second half on
@@ -6495,7 +6527,7 @@ class Bot:
         if wsb is None:
             return
         now_ms = int(time.time() * 1000)
-        for prefix, sym, _ in MARKETS:
+        for prefix, sym, _ in active_markets():
             r = (self._mkt or {}).get(prefix)
             if r is None or getattr(r, "strike", None) is None:
                 continue

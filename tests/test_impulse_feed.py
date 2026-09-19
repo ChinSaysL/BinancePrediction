@@ -81,15 +81,73 @@ def test_record_never_reads_shared_spot_state_for_a_recorded_row() -> None:
 
 
 def test_the_primary_market_is_the_one_captured() -> None:
-    """_primary_spot is assigned after the `not primary` return, so no other
-    family -- traded or merely recorded -- can become the impulse arm's feed.
+    """The impulse arm's single-valued feed state is assigned ONLY for the
+    primary, so no other family -- traded or merely recorded -- can become it.
 
     Tightened when the cross arm was widened to six families: the guard used to
-    be `not trade`, which now admits eth/bnb/15m."""
+    be `not trade`, which now admits eth/bnb/15m.
+
+    Re-expressed 2026-09-19 when the MODEL arm widened to every family. The
+    guard stopped being an early `if not primary: return` -- the method now
+    continues past it to price the other coins -- so this pins the invariant
+    that actually matters: every assignment to the impulse arm's cross-call
+    state sits inside the `if primary:` block.
+    """
     src = _method_source("_record")
-    guard = src.index("if not primary:")
-    capture = src.index("self._primary_spot = feed")
-    assert capture > guard, (
-        "_primary_spot must be captured after the `not trade` return, or an "
-        "untraded family (ETH/BNB/15m) becomes the impulse arm's price feed"
+    lines = src.splitlines()
+
+    def block_after(i: int) -> str:
+        indent = len(lines[i]) - len(lines[i].lstrip())
+        out = []
+        for ln in lines[i + 1:]:
+            if ln.strip() and (len(ln) - len(ln.lstrip())) <= indent:
+                break
+            out.append(ln)
+        return "\n".join(out)
+
+    # `_record` has more than one `if primary:`; take the one that actually
+    # carries the impulse arm's feed state.
+    bodies = [block_after(i) for i, ln in enumerate(lines)
+              if ln.strip() == "if primary:"]
+    owning = [b for b in bodies if "self._primary_spot = feed" in b]
+    assert len(owning) == 1, (
+        "expected exactly one `if primary:` block to assign _primary_spot, "
+        f"found {len(owning)}"
     )
+    body = owning[0]
+
+    SINGLE_VALUED = ("self._primary_spot", "self._round", "self._asks",
+                     "self._sigma")
+    for name in SINGLE_VALUED:
+        assign = f"{name} = "
+        assert assign in body, (
+            f"{name} must be assigned inside `if primary:` -- outside it, an "
+            f"untraded family (ETH/BNB/15m) becomes the impulse arm's state"
+        )
+        assert src.count(assign) == body.count(assign), (
+            f"{name} is also assigned OUTSIDE the `if primary:` block; that is "
+            f"how ETH's spot came to be compared against BTC's strike"
+        )
+    assert "await self._double_tick()" in body, (
+        "the double arm must stay primary-only: it reads the same state"
+    )
+
+
+def test_the_model_arm_is_not_confined_to_the_primary() -> None:
+    """The model arm must run for every family, one position per coin per round.
+
+    The operator asked for this on 2026-09-19. Pinned because the obvious way to
+    restore the old impulse guard -- an early `if not primary: return` -- would
+    silently narrow the model arm back to BTC-5m with no test failing.
+    """
+    src = _method_source("_record")
+    assert "if not primary:\n            return" not in src, (
+        "an early primary-only return confines the model arm to BTC-5m again"
+    )
+    # The cap is per-SLUG, i.e. per family-round, not a global counter: that
+    # is what makes "one trade per round for each coin" true.
+    assert "self.guard.check(r.slug)" in src, (
+        "the entry must gate on r.slug; a global counter would let one coin "
+        "consume every slot"
+    )
+
