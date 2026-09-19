@@ -2899,10 +2899,41 @@ class Settings(BaseSettings):
     # refused the FOURTH entry of the 11:20 window above.
     # Do not confuse it with a concurrency cap: the entry-COUNT caps are refuted
     # (see `cross_max_round_stake_mult`), this one bounds STAKE as a fraction of
-    # bankroll. Turning it back on is a risk decision, and it cannot be priced
-    # from the replay (the tape carries no bankroll) -- `_open_cross_stake` reads
-    # the LEDGER, so the live record is the measurement.
-    cross_max_open_stake_pct: float = 0.30
+    # bankroll.
+    #
+    # ⭐ 0.30 -> 0.50 on 2026-09-19, and the claim above that it "cannot be
+    # priced from the replay (the tape carries no bankroll)" is WITHDRAWN. The
+    # tape carries no bankroll, but it carries every round's OPEN AND END, so a
+    # bankroll can be imposed on it: replay wall-clock ordered, let a position
+    # hold its slot until its own round ends, and drop a signal that arrives
+    # with no free slot exactly as the live arm drops it.
+    #
+    # That constraint is not academic. In 70 minutes live at $6 the cap BLOCKED
+    # 16 signals against 9 fills, and the arm never held more than the 2
+    # concurrent $1 positions 0.35 allows. Simulated at $6 with $1 stakes,
+    # chosen on 09-16..09-17 and scored on 09-18..09-19:
+    #     pct   slots  blocked(test)  win%    TEST $  look1.0 / look2.0
+    #     0.20    1        506        56.9     +1.80 / -2.46
+    #     0.35    2        304        60.4    +32.16 / +19.59   <- was shipped
+    #     0.50    3        150        60.1    +36.10 / +37.14
+    #     0.70    4         53        60.6    +48.96 / +42.21
+    #     1.00    6          0        60.5    +50.00 / +48.29
+    # MONOTONE at both looks, on train AND test, and THE WIN RATE IS FLAT at
+    # 60-62% throughout: extra slots do not admit worse trades, they stop
+    # discarding good ones. This is the only knob swept on 09-19 whose optimum
+    # did not flip between look_s 1.0 and 2.0 -- `cross_max_fill_px` picks 0.55
+    # at one look and 0.70 at the other, and `cross_min_margin_bps` picks 0.25
+    # (test -1.13) at one and 0.75 at the other. Those were left alone.
+    #
+    # ⛔ WHY 0.50 AND NOT 1.00, WHICH THE TABLE PREFERS. The simulation prices
+    # EXPECTED DOLLARS. It does not model RUIN, and it cannot: at 1.00 the arm
+    # may hold six concurrent $1 positions on a six-dollar account, so one bad
+    # cluster takes most of it, and there is no bankroll left to trade the edge
+    # the table is measuring. 0.50 keeps half the account uncommitted and still
+    # halves the blocking. The operator chose this level; going further is a
+    # risk decision, not a measurement one.
+    # Revert: CROSS_MAX_OPEN_STAKE_PCT=0.35 + restart.
+    cross_max_open_stake_pct: float = 0.50
     # EXIT-ON-FLIP: SELL the position when the SAME trigger that justified it
     # reads the other side. Operator's idea, 2026-09-18; measured, SHIPPED, and
     # then REFUTED ON THE LIVE RECORD the same day.

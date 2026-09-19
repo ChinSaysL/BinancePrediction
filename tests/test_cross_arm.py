@@ -3519,6 +3519,40 @@ _MAIN_SRC = (pathlib.Path(__file__).resolve().parents[1]
              / "btcpredict" / "main.py")
 
 
+def test_the_exposure_cap_ships_the_swept_level():
+    """⭐ 0.30 -> 0.50 on 2026-09-19, the only knob swept that day whose optimum
+    did NOT flip between look_s 1.0 and the 2.0 the arm does not trade.
+
+    The replay was given a bankroll: rounds carry their own open and end, so a
+    position can hold a slot until its round ends and a signal arriving with no
+    free slot is dropped as the live arm drops it. That matters -- in 70 minutes
+    live at $6 the cap blocked 16 signals against 9 fills. Simulated at $6 with
+    $1 stakes, chosen on 09-16..09-17 and scored on 09-18..09-19, the test-day
+    dollars run 0.20:+1.80/-2.46  0.35:+32.16/+19.59  0.50:+36.10/+37.14
+    0.70:+48.96/+42.21  1.00:+50.00/+48.29 -- monotone at both looks, with the
+    WIN RATE FLAT at 60-62% throughout, so the extra slots are not buying worse
+    trades, they are ceasing to discard good ones.
+
+    ⛔ 1.00 scores best and was NOT taken: the simulation prices expected
+    dollars and cannot price ruin, and at 1.00 six concurrent $1 positions fit
+    on a six-dollar account.  See config.cross_max_open_stake_pct."""
+    from btcpredict.config import Settings
+    assert Settings().cross_max_open_stake_pct == 0.50
+
+
+def test_the_cap_is_a_risk_limit_so_it_stays_under_one():
+    """Whatever the sweep says, a cap at or above 1.0 is not a cap. The note
+    beside the knob has to keep saying why the best-scoring cell was refused."""
+    from btcpredict.config import Settings
+    assert 0.0 < Settings().cross_max_open_stake_pct < 1.0
+    cfg = (pathlib.Path(__file__).resolve().parents[1]
+           / "btcpredict" / "config.py").read_text()
+    j = cfg.index("cross_max_open_stake_pct: float =")
+    block = cfg[max(0, j - 3000):j]
+    assert "does not model RUIN" in block or "cannot price ruin" in block.lower()
+    assert "CROSS_MAX_OPEN_STAKE_PCT=0.35" in block, "the revert must be stated"
+
+
 class TestTheExposureCapCannotDeadlock:
     """⛔ LIVE 2026-09-19 01:52-02:02. Bankroll $1.83, cap 0.35 -> $0.64 against
     a $1.00 venue minimum, so every trigger read "open cross exposure $0.00 +
