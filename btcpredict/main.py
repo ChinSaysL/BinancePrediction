@@ -5805,12 +5805,18 @@ class Bot:
         # measurement is the model arm's own, and the other arms pick their
         # side by a different rule, so their `fair` is not the same quantity.
         # Applied BEFORE the cap, which still binds last.
-        if (base > 0 and settings.model_low_fair_cut > 0
-                and settings.model_low_fair_stake_mult != 1.0
-                and arm_of(sig) == "MODEL"):
+        # `getattr` on SETTINGS too, not just on the signal. This runs on the
+        # money path, and callers pass stub config objects (tests build a `Cfg`
+        # with only the knobs they care about). A bare attribute read would
+        # raise there and, worse, could be swallowed in production and silently
+        # change sizing. Third time this pattern has bitten today -- histories,
+        # _model_cooldown, and now this.
+        _cut = float(getattr(settings, "model_low_fair_cut", 0.0) or 0.0)
+        _mult = float(getattr(settings, "model_low_fair_stake_mult", 1.0) or 1.0)
+        if base > 0 and _cut > 0 and _mult != 1.0 and arm_of(sig) == "MODEL":
             f = getattr(sig, "fair", None)
-            if f is not None and 0.0 < float(f) <= settings.model_low_fair_cut:
-                base *= float(settings.model_low_fair_stake_mult)
+            if f is not None and 0.0 < float(f) <= _cut:
+                base *= _mult
         if base > 0 and settings.stake_tilt == "inv_z":
             t = tilt_factor(moneyness_sd, reference=settings.tilt_reference_z,
                             lo=settings.tilt_min, hi=settings.tilt_max)
