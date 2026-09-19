@@ -3781,6 +3781,14 @@ class Bot:
                     f"tau {tau:.0f}s), floor is {min_sig:.2f}",
                     tau=tau, spot=spot_now, sigma=sigma_now)
                 return
+        # ⛔ 0 IS *NOT* OFF FOR THIS KNOB, unlike every other cap in this arm.
+        # `depth_bps > 0` is true for essentially every crossing, so 0 means
+        # REFUSE ALL -- and `cross_overrides` relies on that to disable a single
+        # family (test_an_override_on_this_market_blocks_the_entry). A `> 0`
+        # guard was written here to restore the repo's usual convention and then
+        # REVERTED: it would have silently inverted a documented, tested meaning
+        # on the live order path. To disable the gate, use a large number
+        # (config ships 99.0), not 0.
         if not train and depth_bps > self._ck("max_depth_bps", r):
             self._cross_refuse(r, side,
                                f"{depth_bps:.2f}bps through the {level_src} "

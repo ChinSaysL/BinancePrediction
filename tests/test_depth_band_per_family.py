@@ -59,7 +59,14 @@ def _knobs(prefix: str) -> tuple[float, float, float]:
     s = _settings()
     ov = s.cross_overrides.get(prefix, {})
     tick = ov.get("tick_size") or s.cross_tick_size
+    # ⭐ 0 = OFF for this ceiling (shipped 2026-09-19), so the band is
+    # unbounded above. Represent that as +inf rather than 0: every assertion
+    # below is about the floor not EMPTYING the band, and an off ceiling makes
+    # that impossible, not certain. Leaving it as 0 would have turned the
+    # guard into "the band is always empty".
     ceil_bps = ov.get("max_depth_bps") or s.cross_max_depth_bps
+    if not ceil_bps:
+        ceil_bps = float("inf")
     sym = C.SYMBOL_BY_PREFIX[prefix].lower().removesuffix("usdt")
     spot = SPOT[sym]
     floor_bps = 1e4 * _ticks(prefix) * tick / spot
@@ -109,7 +116,12 @@ def test_the_global_tick_WOULD_have_left_xrp_and_doge_inert():
     s = _settings()
     for prefix, sym in (("xrp-updown-5m", "xrp"), ("doge-updown-5m", "doge")):
         old_floor_bps = 1e4 * s.cross_min_depth_ticks * 0.01 / SPOT[sym]
-        assert old_floor_bps > s.cross_max_depth_bps, (prefix, old_floor_bps)
+        # Against the ceiling THAT WAS IN FORCE, not today's. This records a
+        # historical fact -- the floor swamped a 5 bps ceiling and left both
+        # families inert -- and it has to keep recording it now that the
+        # ceiling ships disabled (cross_max_depth_bps 5 -> 99, 2026-09-19).
+        HISTORIC_CEILING_BPS = 5.0
+        assert old_floor_bps > HISTORIC_CEILING_BPS, (prefix, old_floor_bps)
         new_floor_bps, ceil_bps, _ = _knobs(prefix)
         assert new_floor_bps < ceil_bps
 

@@ -2465,7 +2465,37 @@ class Settings(BaseSettings):
     # are the SAMPLED Aug set (n=7-19), so the per-day column is noisy; the
     # mechanical argument above -- that 0.5 measures the strike, not the
     # strategy -- is what rules 0.5 out regardless of which column you read.
-    cross_max_depth_bps: float = 5.0
+    # ⭐ SHIPPED OFF 2026-09-19. The table above measured 0.5 / 2.0 / 5.0 on
+    # BINANCE-ERA L2 and never tested anything wider. On the PM tape, under the
+    # full live chain with the exit on, the gate is monotonically HARMFUL and
+    # `off` wins train AND test at BOTH looks:
+    #     gate   TRAIN L1/L2         TEST L1/L2
+    #     5      +50.50 / +49.58     +51.03 / +65.09
+    #     8      +53.78 / +53.81     +62.35 / +72.19   (what ran live)
+    #     12     +59.38 / +59.87     +64.82 / +75.26
+    #     off    +63.32 / +63.80     +70.82 / +81.25
+    #
+    # ⛔ AND IT IS NOT OUTLIER-DRIVEN, which is the check that changed the
+    # verdict: the 22 entries an 8 bps gate refuses total +19.11 with a MEDIAN
+    # of +1.0103 per dollar, and dropping the three largest still leaves +15.66.
+    # The typical refused trade is excellent, not one lucky tail. Mechanically
+    # they are deep crossings -- >8 bps through the reference -- that the book
+    # still prices inside [0.45,0.65], i.e. exactly the disagreement between
+    # move and price that this arm exists to take.
+    #
+    # THE BINANCE FINDING IS NOT CONTRADICTED, only extended: its own note said
+    # "widening is also free ... the win rate goes 0.544 -> 0.631 and triggers
+    # nearly double". It simply stopped measuring at 5.0.
+    # ⛔ 99.0 RATHER THAN 0, AND THAT IS NOT COSMETIC. For this knob 0 means
+    # REFUSE ALL, not off -- `depth_bps > 0` is true for every crossing, and
+    # `cross_overrides` uses exactly that to disable one family (see
+    # test_an_override_on_this_market_blocks_the_entry). It is the one cap in
+    # this arm that breaks the repo's 0=off convention. A `> 0` guard was
+    # written to fix that and reverted: inverting a documented, tested meaning
+    # on the live order path is not worth the tidiness. 99 bps is past the p90
+    # round range of every family, so it is off in practice.
+    # Revert: CROSS_MAX_DEPTH_BPS=8 + restart.
+    cross_max_depth_bps: float = 99.0
     # Skip a round that has ALREADY moved this far. 0 = OFF.
     #
     # The arm's edge is regime-dependent, and this is the causal way to say so:

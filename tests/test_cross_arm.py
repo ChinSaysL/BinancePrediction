@@ -594,7 +594,7 @@ class TestTheArm:
             r[0].startswith("cross refused:") for r in
             bot.store.conn.execute("select reason from decisions"))
 
-    def test_a_deep_cross_is_refused(self, store, armed):
+    def test_a_deep_cross_is_refused(self, store, armed, monkeypatch):
         """Past the gate the venue has repriced and the edge is gone.
 
         The boundary MOVED 2026-09-13 (0.5 -> 5.0 bps), so the old fixture at
@@ -604,6 +604,12 @@ class TestTheArm:
         negative (-0.094/$1). Measured on 31 days with the REAL Chainlink
         strike; see config.cross_max_depth_bps.
         """
+        # The GATE ships disabled (cross_max_depth_bps 5 -> 99 on 2026-09-19:
+        # the ceiling was monotonically harmful on the PM tape and `off` won
+        # train AND test at both looks). The MECHANISM must still work, so pin
+        # the knob to the boundary this test was written against rather than
+        # lean on a shipped value that moved.
+        monkeypatch.setattr("btcpredict.config.settings.cross_max_depth_bps", 5.0)
         bot = make_bot(store, ticks(76990.0, 76995.0, 77080.0))   # ~10 bps deep
 
         async def boom(*a, **k):
