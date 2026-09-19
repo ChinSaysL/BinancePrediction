@@ -6428,6 +6428,19 @@ class Bot:
         because the probability -- not the point forecast -- is what decides the
         trade, and the probability is all variance.
         """
+        # ⛔ TWAP VENUES ONLY, AND DELIBERATELY SO. The whole premise is that
+        # part of the paid 60 s window is ALREADY PRINTED, which is what makes
+        # the outcome near-determined while the book still discounts it. A
+        # point venue has no printed component: the payout is the bell price,
+        # so the right model is P(S_bell >= K) = Phi((S-K)/(sigma*sqrt(tau))),
+        # a DIFFERENT variance with a different shape.
+        # The edge was measured on Polymarket only (+2.3%/bet, t+1.04 at round
+        # level, 3 of 4 days negative -- see config.locked_tail_enabled). It is
+        # unproven there and entirely unmeasured on a point venue, so this
+        # refuses rather than extrapolating a thin edge onto a market whose
+        # mechanism it was never tested against.
+        if not self._settles_on_twap():
+            return None
         lo = float(settings.locked_tail_tau_lo)
         hi = float(settings.locked_tail_tau_hi)
         if not (lo <= tau < hi) or tau >= TWAP_REF_LOOKBACK_S:
@@ -6546,8 +6559,25 @@ class Bot:
         end_ms, start_ms = int(r.end_ms or 0), int(r.start_ms or 0)
         if not end_ms or not start_ms:
             return None
-        lvl = twap_reference(ticks, start_ms)
-        fin = twap_reference(ticks, end_ms)
+        if self._settles_on_twap():
+            lvl = twap_reference(ticks, start_ms)
+            fin = twap_reference(ticks, end_ms)
+        else:
+            # ⛔ POINT VENUE. Binance settles the BELL PRICE against the open,
+            # not a 60 s mean against a 60 s mean. Measured against each
+            # venue's own recorded winner on Binance 1-second bars
+            # (tools/pm_venue_settlement.py):
+            #     BINANCE     n=5924  TWAP60 90.4%   point-vs-strike 98.7%
+            #     POLYMARKET  n=4054  TWAP60 98.6%
+            # Reconstructing this trade's whole justification with the wrong
+            # rule would be wrong on ~1 round in 10 -- and the entire edge is
+            # that we KNOW the outcome the book has not priced yet.
+            lvl = float(getattr(r, "strike", 0) or 0) or None
+            fin = None
+            for ts, px in reversed(ticks):
+                if ts <= end_ms and px and px > 0:
+                    fin = float(px)
+                    break
         if not lvl or not fin or lvl <= 0:
             return None
         margin = 1e4 * (fin - lvl) / lvl
