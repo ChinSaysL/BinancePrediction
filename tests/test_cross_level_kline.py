@@ -213,6 +213,11 @@ def armed(monkeypatch):
     monkeypatch.setattr("btcpredict.config.settings.cross_max_tau_s", 30.0)
     monkeypatch.setattr("btcpredict.config.settings.cross_max_price", 0.50)
     monkeypatch.setattr("btcpredict.config.settings.cross_min_price", 0.02)
+    # This file tests where the LEVEL comes from, not the margin gates. The
+    # fixture's crossing is 77030 -> 77045, i.e. 1.95 bps, which the 1.5 bps
+    # ceiling would refuse -- so neutralise it here rather than re-tune the
+    # tape and lose the level-source coverage. See config.cross_max_margin_bps.
+    monkeypatch.setattr("btcpredict.config.settings.cross_max_margin_bps", 0.0)
 
 
 CROSS_UP = [(int(time.time() * 1000) - 3000, 77030.0),

@@ -149,13 +149,45 @@ def test_the_tau_floor_carries_its_mechanical_reason():
 
 
 def test_the_price_floor_refuses_the_cheap_cohort():
-    """⭐ 0.10 -> 0.45 (2026-09-18). Eighteen live fills below 0.45 cost
-    -$10.38 of a -$16.44 total and the sub-0.35 bucket won 9.1%. The tape says
-    the opposite (its best cell) because it prices at the WS ladder, which
-    overstates cheap fills by +0.17-0.20 and mid fills by ~0. See
-    config.cross_min_price."""
+    """⭐ 0.10 -> 0.45 (2026-09-18), RE-JUSTIFIED 2026-09-19.
+
+    It first shipped on eighteen live fills below 0.45 costing -$10.38. That
+    evidence does not stand: the 231 settled PM-era fills span seven live
+    configs and none of the 139 in-band ones ran under these gates, so a
+    price bucket of live fills measures the configs as much as the price.
+
+    The floor survives anyway, on a mechanism that needs no live outcomes.
+    THE CHEAP BOOK IS NOT FILLABLE: at the replay's own entry instants the
+    quote is 2.4 s old in book [0.02,0.20) and that side's ask is +0.5407
+    two seconds later, against 0.1 s old and +0.0180 in [0.55,0.65). A
+    crossing IS the moment a stale cheap quote reprices, so the replay buys
+    0.06 and the side is at 0.60 before the order could land. Priced at the
+    quoted ask the sub-0.45 cohort is +$58.42; at the ask 2 s later it is
+    -$17.13.  See config.cross_min_price."""
     from btcpredict.config import Settings
     assert Settings().cross_min_price == 0.45
+
+
+def test_the_floor_is_not_an_argument_for_a_HIGHER_one():
+    """The fillability finding explains why cheap is bad; it does not imply
+    dearer is better, and on unseen days it is not: px_lo 0.50 makes
+    +2.29/+10.86 and px [0.55,0.75) makes -3.33/-3.06, against 0.45's
+    +14.34/+19.16. The band is fillable at 0.45 and the edge is inside it."""
+    from btcpredict.config import Settings
+    assert Settings().cross_min_price == 0.45
+    assert Settings().cross_max_fill_px == 0.65
+
+
+def test_the_unfillability_of_the_cheap_book_is_recorded():
+    """The joint search WANTS the floor opened to 0.10 -- it is the best cell
+    on every price sweep. The reason that cell is a mirage has to ride beside
+    the knob or it will be 'fixed' back on the next sweep."""
+    cfg = (ROOT / "btcpredict" / "config.py").read_text()
+    i = cfg.index("cross_min_price: float")
+    block = cfg[max(0, i - 6000):i + 3000]
+    assert "NOT FILLABLE" in block
+    assert "+0.5407" in block, "the 2s repricing move must be stated"
+    assert "seven configs" in block, "the contamination must be stated"
 
 
 def test_the_ladder_artifact_is_recorded_beside_the_floor():
@@ -166,3 +198,44 @@ def test_the_ladder_artifact_is_recorded_beside_the_floor():
     block = cfg[max(0, i - 4000):i]
     assert "WEBSOCKET ladder" in block
     assert "CROSS_MIN_PRICE=0.10" in block, "the revert must be stated"
+
+
+def test_the_margin_ceiling_ships_OFF_because_its_evidence_did_not_survive():
+    """⛔ RETIRED 2026-09-19, the same day it shipped.
+
+    It was chosen by bucketing live fills on their realised margin. The 231
+    settled PM-era fills span SEVEN live configs and NONE of the 139 in the
+    [0.45,0.65] band ran under the gates those buckets were used to justify, so
+    a bucket only contains a fill because the config of the moment admitted it.
+    On the config-independent tape, charged the live-measured ladder, every
+    finite ceiling in a 768-cell joint search loses to no ceiling at both
+    look_s 1.0 and 2.0 -- ceiling off makes +19.00 (t+1.68) against 1.5's
+    +12.53 (t+1.27), and +10.00 against +5.92 on days the choice never saw.
+    The MECHANISM stays in main.py and is exercised below; only the default
+    changes, so re-enabling is one env var.  See config.cross_max_margin_bps."""
+    from btcpredict.config import Settings
+    assert Settings().cross_max_margin_bps == 0.0
+
+
+def test_the_ceiling_mechanism_survives_its_retirement():
+    """0 = off is the repo's convention, so the gate must treat it as off
+    rather than as a ceiling of zero that refuses everything."""
+    src = (ROOT / "btcpredict" / "main.py").read_text()
+    i = src.index('cap = self._ck("max_margin_bps", r)')
+    assert "cap > 0" in src[i:i + 300], "0 must mean OFF, not 'refuse all'"
+
+
+def test_the_ceiling_is_enforced_and_refuses_not_just_logs():
+    src = (ROOT / "btcpredict" / "main.py").read_text()
+    assert 'cap = self._ck("max_margin_bps", r)' in src
+    i = src.index("if abs(margin) > cap:")
+    blk = src[i:i + 700]
+    assert "self._cross_refuse(" in blk and "return" in blk
+
+
+def test_the_ceiling_fires_after_the_floor_and_before_the_slot_is_taken():
+    """Both margin gates must sit before `_cross_fired` is stamped, or a
+    refused crossing still spends the round's only ticket."""
+    src = (ROOT / "btcpredict" / "main.py").read_text()
+    assert src.index("if abs(margin) < floor:") < src.index("if abs(margin) > cap:")
+    assert src.index("if abs(margin) > cap:") < src.index("self._cross_fired[r.slug] = ")

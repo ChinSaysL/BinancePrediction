@@ -3615,6 +3615,23 @@ class Bot:
                         f"(sig={sig_name})",
                         tau=tau, spot=getattr(feed, "price", None))
                     return
+            # ⭐ AND THE CEILING. Past a point a bigger margin is a WARNING: the
+            # price band already caps us at 0.65, so a large margin with the
+            # price still inside it means our forecast and the venue's price
+            # DISAGREE -- and the venue is usually right. Both samples put the
+            # break at 1.5 bps ([1.50,2.00) wins 51.4% on the tape and 50.0%
+            # live, negative in both). See config.cross_max_margin_bps.
+            cap = self._ck("max_margin_bps", r)
+            if side is not None and cap > 0 and level:
+                margin = 1e4 * (sig_px - level) / level
+                if abs(margin) > cap:
+                    self._cross_refuse(
+                        r, side,
+                        f"{margin:+.2f} bps of margin past {level_src} is over "
+                        f"the {cap:.2f} ceiling at tau {tau:.0f}s "
+                        f"(sig={sig_name})",
+                        tau=tau, spot=getattr(feed, "price", None))
+                    return
         if side is None:
             # No crossing this tick: keep a quote WARM for the side the next
             # crossing would buy (see _prefetch_cross_quote). This is the
@@ -4095,7 +4112,21 @@ class Bot:
         cap_pct = settings.cross_max_open_stake_pct
         if cap_pct > 0 and self.bankroll > 0:
             open_stake = self._open_cross_stake()
-            if open_stake + stake > cap_pct * self.bankroll:
+            # ⛔ NEVER REFUSE THE FIRST POSITION. This cap bounds CONCURRENCY --
+            # it exists to stop one macro move opening a position in each of
+            # nine families. With nothing open there is no concurrency to bound,
+            # so refusing here only deadlocks the arm:
+            #   LIVE 2026-09-19 01:52-02:02, bankroll $1.83 and cap 0.35 ->
+            #   $0.64 against a $1.00 venue minimum, so EVERY trigger read
+            #   "open cross exposure $0.00 + $1.00 exceeds 35% of $1.83".
+            #   58 refusals, zero fills, and no trade can settle to rebuild the
+            #   bankroll that would lift the cap -- the deadlock this knob's own
+            #   note warns about, reached by drawdown rather than a stale read.
+            # A LARGER FRACTION IS NOT THE FIX: it only moves the deadlock to
+            # the next drawdown. The exemption is exact -- below
+            # `min_order_usdt / cap_pct` in bankroll the cap can express nothing
+            # BUT a block, and above it this branch never triggers anyway.
+            if open_stake > 0.0 and open_stake + stake > cap_pct * self.bankroll:
                 self._cross_refuse(
                     r, side,
                     f"open cross exposure ${open_stake:.2f} + ${stake:.2f} "

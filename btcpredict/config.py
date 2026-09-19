@@ -1504,7 +1504,21 @@ class Settings(BaseSettings):
     # an artifact of the formula bug -- it survives its correction, and
     # `pm_tau_window.py`'s "honest" and "shipped" sections are now identical
     # line for line.
-    cross_max_tau_s: float = 180.0
+    # RAISED 180 -> 240 on 2026-09-19, on the first sweep of this window that
+    # was both config-independent and scored out of sample. Inside [0.45,0.65),
+    # floor 0.50, ceiling off, charged the live-measured ladder:
+    #                    FULL TAPE (4 days)          TEST DAYS (unseen)
+    #     tau<=180  L1  n= 540 +19.00 t+1.68         n=330 +10.00 t+1.12
+    #               L2  n= 917 +25.28 t+1.71         n=539  +7.93 t+0.69
+    #     tau<=240  L1  n= 885 +24.41 t+1.68         n=519 +14.34 t+1.28
+    #               L2  n=1395 +42.68 t+2.35         n=788 +19.16 t+1.39
+    # Better at both looks, on the full tape and on days the choice never saw.
+    # 300 is worse than 240 at both looks, so this is an interior optimum, not
+    # the edge of the grid.
+    # ⛔ BOUND: the tape is FOUR DAYS (09-16..09-19). The day-clustered t that
+    # this repo's PASS bar asks for is computed on four points, so no cell here
+    # PASSES and none is claimed to. Revert: CROSS_MAX_TAU_S=180 + restart.
+    cross_max_tau_s: float = 240.0
     # RAISED 0.50 -> 0.70 on 2026-09-13. Re-measured by price bucket on live
     # data, one entry per round, priced at the trigger ask:
     #     ask 0.02-0.30  n= 8  win 75.0%  edge +61.1  tot $+64.37
@@ -1601,11 +1615,51 @@ class Settings(BaseSettings):
     # far out of the money while our trigger says otherwise -- i.e. the paid
     # TWAP is nowhere near crossing -- and it is exactly there that our ladder
     # is least able to tell us what we are paying. Wrong twice over.
-    # BOUNDS: 18 fills refused. The tape cannot corroborate (it disagrees for
-    # the measured reason above) so this rests on the live record alone.
+    # ⭐ RE-JUSTIFIED 2026-09-19. The note above shipped this on the live record
+    # alone, and that record turned out to be unusable for the purpose: the 231
+    # settled fills span seven configs and none of the 139 in-band ones ran
+    # under these gates. The floor is still right, for a reason that needs no
+    # live outcomes at all -- THE CHEAP BOOK IS NOT FILLABLE. Quote age at the
+    # replay's own entry instant, and where that side's ask sits 2 s later:
+    #     book [0.02,0.20)  n= 60  age 2.4s   ask +0.5407   win 65.0%
+    #     book [0.20,0.30)  n= 48  age 2.3s   ask +0.3515   win 60.4%
+    #     book [0.30,0.45)  n=123  age 1.0s   ask +0.2174   win 48.0%
+    #     book [0.45,0.55)  n=513  age 0.8s   ask +0.0762   win 58.5%
+    #     book [0.55,0.65)  n=679  age 0.1s   ask +0.0180   win 62.9%
+    # A crossing is precisely the instant a stale cheap quote is about to
+    # reprice, so the replay "buys" 0.06 and two seconds later that side is at
+    # 0.60. Priced at the quoted ask the sub-0.45 cohort is +$58.42; priced at
+    # the ask 2 s later it is -$17.13. Every joint-search cell that wanted the
+    # floor opened to 0.10 was scoring fills that cannot happen.
+    # AND IT IS NOT A CASE FOR GOING HIGHER: on unseen days, px_lo 0.50 makes
+    # +2.29/+10.86 and px [0.55,0.75) makes -3.33/-3.06, against 0.45's
+    # +14.34/+19.16. The band is fillable at 0.45 and the edge is inside it.
     # KILL CRITERION: the [0.45,0.55) cohort turning negative over ~40 fills.
     # Revert: CROSS_MIN_PRICE=0.10 + restart.
     cross_min_price: float = 0.45
+    # ⛔ RETIRED 2026-09-19, THE SAME DAY IT SHIPPED. It was chosen on live
+    # fills bucketed by their realised margin. Those buckets are not a
+    # measurement: the 231 settled PM-era fills span SEVEN distinct live
+    # configs, and ZERO of the 139 in the [0.45,0.65] band were taken under the
+    # gates they were used to justify. A fill is only IN a bucket because the
+    # config at that instant admitted it, so bucketing them confounds the knob
+    # under test with every other knob that moved. The note this replaces said
+    # the live cohort "is essentially ONE DAY" and shipped anyway.
+    #
+    # ON THE TAPE, which is config-independent because `pm_cross_replay.pick`
+    # re-derives entries from the raw quote history under the chain it is
+    # handed, the ceiling is simply a cost. Charged the live-measured ladder,
+    # inside [0.45,0.65), floor 0.50, everything else equal:
+    #                        FULL TAPE (4 days)        TEST DAYS (unseen)
+    #     ceiling 1.5   L1  n=407 +12.53 t+1.27        n=252  +5.92 t+0.76
+    #                   L2  n=769 +18.28 t+1.35        n=449  +8.70 t+0.84
+    #     ceiling off   L1  n=540 +19.00 t+1.68        n=330 +10.00 t+1.12
+    #                   L2  n=917 +25.28 t+1.71        n=539  +7.93 t+0.69
+    # Every finite ceiling in a 768-cell joint search was beaten by no ceiling,
+    # at BOTH look_s 1.0 and the 2.0 the arm does not trade. It costs money and
+    # buys nothing.
+    # 0 = off, the repo's convention. Re-enable: CROSS_MAX_MARGIN_BPS=1.5.
+    cross_max_margin_bps: float = 0.0
     # How far past the strike the cross may already be, in bps. MEASURED
     # 2026-09-13, fill-aware, by depth at the moment of the cross:
     #     0.0-0.5 bps  n=59  tot  +$9.70  $/fill +0.1644  drop1 +4.43

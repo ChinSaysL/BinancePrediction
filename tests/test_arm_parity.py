@@ -70,8 +70,12 @@ BYPASSED_SILENTLY = frozenset({
 #: -- how long the crossed side must hold -- and the train arm never calls that
 #: detector, so there is nothing for it to exempt. See config.cross_hold_s for
 #: why it ships at 0 (the record refuted the hold).
+#: `max_margin_bps` joins for exactly the same reason as the floor: it is the
+#: SAME variable (the crossing detector's own distance past the level), read
+#: from the other end. The train trigger has no level to be far from.
+#: Added 2026-09-19; see config.cross_max_margin_bps.
 INHERENTLY_CROSS_ONLY = frozenset({"look_s", "tick_size", "min_margin_bps",
-                                   "hold_s"})
+                                   "max_margin_bps", "hold_s"})
 
 
 def _ck_names() -> set[str]:

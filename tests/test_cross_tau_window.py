@@ -54,7 +54,14 @@ def _tape(prices, step_ms=1000, newest_ms=None):
 # ---------------------------------------------------------------------------
 
 def test_the_window_ships_the_direction_that_survives_both_halves():
-    assert Settings().cross_max_tau_s == 180.0
+    """⭐ 180 -> 240 on 2026-09-19, on the first sweep of this window that was
+    both config-independent and scored OUT OF SAMPLE. Inside [0.45,0.65),
+    floor 0.50, ceiling off, charged the live-measured ladder: tau<=240 makes
+    +24.41 (t+1.68) against 180's +19.00 (t+1.68) on the full tape, and
+    +14.34 against +10.00 on days the choice never saw -- better at look_s 1.0
+    AND at the 2.0 the arm does not trade. 300 is worse than 240 at both, so
+    it is an interior optimum.  See config.cross_max_tau_s."""
+    assert Settings().cross_max_tau_s == 240.0
 
 
 def test_only_the_upper_bound_moved():
@@ -68,9 +75,9 @@ def test_only_the_upper_bound_moved():
     18% of its fills under tau 60, and under tau 30 they run 1 win in 7 at
     -0.1130/share. Below 30 s more than HALF the settling window is already
     printed and unchangeable, which is arithmetic, not a fitted cell.
-    See config.cross_min_tau_s. The UPPER bound is unchanged at 180."""
+    See config.cross_min_tau_s. The UPPER bound moved to 240 on 09-19."""
     assert Settings().cross_min_tau_s == 30.0
-    assert Settings().cross_max_tau_s == 180.0
+    assert Settings().cross_max_tau_s == 240.0
 
 
 def test_the_width_is_global_no_family_overrides_it():
@@ -79,7 +86,7 @@ def test_the_width_is_global_no_family_overrides_it():
     for prefix, _sym, _iv in MARKETS:
         ov = Settings().cross_overrides.get(prefix) or {}
         assert "max_tau_s" not in ov, prefix
-        assert cross_knob(prefix, "max_tau_s") == 180.0, prefix
+        assert cross_knob(prefix, "max_tau_s") == 240.0, prefix
 
 
 # ---------------------------------------------------------------------------

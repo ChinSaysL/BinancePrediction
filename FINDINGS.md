@@ -13366,3 +13366,104 @@ reinstate the exact defect. Verified on the next split
 `TestThePartialSplitSettlesItsOwnSize`, including that the original object is
 not mutated, and the test fixture now uses a real `Fill` rather than a
 `SimpleNamespace` -- the namespace silently took the fallback path and hid this.
+
+---
+
+## 2026-09-19 — THE LIVE RECORD CANNOT TUNE A KNOB, AND THE TAPE'S BEST CELL CANNOT BE BOUGHT
+
+The operator asked: *"are you sure you're testing on correct data? because
+during those losses and wins i change the config countless times"*. The answer
+was no, and checking it overturned two changes shipped hours earlier — one of
+them mine from the same day.
+
+### The live sample is seven arms, not one
+
+Thirty `.env` rewrites and forty-plus `config.py` commits cover the fill period.
+Mapping each settled fill to the config live at its own timestamp:
+
+| n | pnl | what was live |
+|---:|---:|---|
+| **127** | -26.78 | no `CROSS_*` overrides — price 0.10, tau [5,60], range gate ON |
+| 66 | -0.15 | margin 0.25, tau [5,180] |
+| 12 | -2.91 | + exit ON |
+| 3 | -1.37 | margin 0.50 |
+| 16 | -0.45 | margin 0.50, exit ON |
+| 6 | -2.47 | + price 0.45, tau 30, exit ON |
+| 1 | -1.03 | today's entry gates |
+
+**Zero of the 139 settled in-band fills were taken under the gates they were
+used to justify.** A fill is only IN a price or margin bucket because the config
+of that moment admitted it, so bucketing live fills confounds the knob under
+test with every other knob that moved. `cross_max_margin_bps` and the original
+case for `cross_min_price` were both built that way.
+
+Read by regime instead of pooled, the live record does say one thing cleanly —
+and it is not what the pooled number said. The "-6.7 points below break-even"
+quoted all session was essentially just the n=127 default-config cohort
+(62.2% win vs 68.8% break-even, mean ask 0.621 — the old arm buying too high).
+The only regime above water was margin 0.25 with the exit OFF: 57.6% against a
+56.4% break-even, +0.0123/share. Every exit-ON regime ran 14-16 points below.
+
+### The tape is clean — and its best cell is a stale quote
+
+`pm_cross_replay.pick` re-derives entries from the raw quote history under the
+chain it is handed, so it carries none of that. Swept one knob at a time and
+then jointly (768 cells, both `look_s` 1.0 and the 2.0 the arm does not trade),
+the tape wanted the price floor OPENED to 0.10: best cell on every sweep, at
+both looks, surviving the measured ladder charge at 1x, 1.5x, 2x and a flat
++0.12 below 0.45, and surviving a temporal holdout.
+
+It is a mirage. **Quote age at the replay's own entry instants**, and where that
+side's ask sits two seconds later:
+
+| book at entry | quote age | ask move in 2s | win% |
+|---|---|---|---|
+| 0.02–0.20 | 2.4s | **+0.5407** | 65.0% |
+| 0.20–0.30 | 2.3s | **+0.3515** | 60.4% |
+| 0.30–0.45 | 1.0s | +0.2174 | 48.0% |
+| 0.45–0.55 | 0.8s | +0.0762 | 58.5% |
+| 0.55–0.65 | **0.1s** | **+0.0180** | 62.9% |
+
+A crossing *is* the instant a stale cheap quote is about to reprice. The replay
+buys 0.06 and two seconds later that side is at 0.60. Priced at the quoted ask
+the sub-0.45 cohort is **+$58.42**; priced at the ask 2 s later, **-$17.13**.
+The venue itself is superbly calibrated — `up_ask` 0.037 → P(Up wins) 0.018,
+0.510 → 0.501, 0.970 → 0.974 — so there was never a 45-point mispricing to take.
+
+`cross_min_price = 0.45` therefore **stays**, on this mechanism rather than on
+the live buckets that first bought it. And it is not an argument for going
+higher: on unseen days px_lo 0.50 makes +2.29/+10.86 and px [0.55,0.75) makes
+-3.33/-3.06, against 0.45's +14.34/+19.16.
+
+### What changed
+
+Restricted to the fillable band, charged the live-measured ladder, holdout-scored:
+
+| config | full tape L1 / L2 | unseen days L1 / L2 |
+|---|---|---|
+| shipped that morning | +12.53 / +18.28 | +5.92 / +8.70 |
+| ceiling OFF | +19.00 / +25.28 | +10.00 / +7.93 |
+| **ceiling OFF + tau 240** | **+24.41 / +42.68** | **+14.34 / +19.16** |
+
+- `cross_max_margin_bps` **1.5 → 0 (off)** — retired the day it shipped.
+- `cross_max_tau_s` **180 → 240** — better at both looks, in and out of sample;
+  300 is worse, so it is an interior optimum.
+- `cross_min_margin_bps` 0.50, `cross_max_fill_px` 0.65, `cross_min_tau_s` 30
+  unchanged (the tau floor is inert on the tape but costs nothing).
+
+### ⛔ Bounds, stated rather than buried
+
+**The tape is four days** (09-16..09-19). This repo's PASS bar wants a
+day-clustered t computed on those four points, and **no cell above clears it** —
+the best honest t is ~1.3-1.4 on unseen days. Nothing here is a demonstrated
+edge; it is the least-bad ranking of a small sample. Choosing cells by
+per-share overfits visibly (81.2% win on train → 63.8% on test at look 1.0, and
+72.2% → 56.5% with a NEGATIVE per-share at look 2.0), which is why every choice
+above was made on total and required agreement across both looks.
+
+**The lesson, which is the durable part:** a backtest that re-derives entries is
+config-independent and can tune a knob; a bucket of past fills cannot, however
+large, once the config moved underneath it. And a tape that prices at the book
+the *gate* reads will always prefer the prices that are least fillable — the
+correct check is not "how much do we pay over the book" but "how old is the
+quote, and where does it go next".

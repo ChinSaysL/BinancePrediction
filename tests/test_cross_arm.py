@@ -3513,3 +3513,41 @@ class TestTheFOKToleranceTracksTheCeiling:
         asyncio.run(b.buy(slug="s", side="Down", token_id="t",
                           price=0.40, stake=1.0))
         assert sent.get("slippageBps") == 300
+
+
+_MAIN_SRC = (pathlib.Path(__file__).resolve().parents[1]
+             / "btcpredict" / "main.py")
+
+
+class TestTheExposureCapCannotDeadlock:
+    """⛔ LIVE 2026-09-19 01:52-02:02. Bankroll $1.83, cap 0.35 -> $0.64 against
+    a $1.00 venue minimum, so every trigger read "open cross exposure $0.00 +
+    $1.00 exceeds 35% of $1.83". 58 refusals, zero fills, and no trade can
+    settle to rebuild the bankroll that would lift the cap.
+
+    The cap bounds CONCURRENCY. With nothing open there is no concurrency to
+    bound, so it must never refuse the FIRST position.
+    """
+
+    def test_the_first_position_is_exempt_in_the_source(self):
+        src = _MAIN_SRC.read_text()
+        i = src.index("cap_pct = settings.cross_max_open_stake_pct")
+        blk = src[i:i + 2200]
+        assert "if open_stake > 0.0 and open_stake + stake > cap_pct" in blk, (
+            "the cap must not refuse when open exposure is zero")
+
+    def test_the_stacking_bound_still_applies_once_something_is_open(self):
+        """The exemption must not disarm the cap -- that is what it is for."""
+        src = _MAIN_SRC.read_text()
+        i = src.index("cap_pct = settings.cross_max_open_stake_pct")
+        blk = src[i:i + 2200]
+        assert "open_stake + stake > cap_pct * self.bankroll" in blk
+        assert "_cross_refuse(" in blk, "a breach must still be refused + logged"
+
+    def test_the_deadlock_arithmetic_is_recorded(self):
+        """The revert must not reinstate the trap, so the reason rides along."""
+        src = _MAIN_SRC.read_text()
+        i = src.index("cap_pct = settings.cross_max_open_stake_pct")
+        blk = src[i:i + 2200]
+        assert "min_order_usdt / cap_pct" in blk
+        assert "LARGER FRACTION IS NOT THE FIX" in blk
