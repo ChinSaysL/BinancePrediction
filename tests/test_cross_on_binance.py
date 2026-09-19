@@ -129,3 +129,55 @@ class TestThePadDoesNotBlockBinance:
         i = src.index("async def _prefetch_venue_top")
         j = src.index("def _take_prefetched_venue_top")
         assert "await self._venue_top(token, r)" in src[i:j]
+
+
+class TestTheSettlementModelFollowsTheVenue:
+    """⛔ THE DEEPEST PARITY ISSUE, AND THE ONE THAT IS NOT PLUMBING.
+
+    The arm's signal is `crossed_side(fc, level)` with `level =
+    twap_reference(...)` -- the 60s mean at the OPEN -- and `fc` the projected
+    60s mean. Correct on Polymarket, which pays `TWAP60(bell) >= TWAP60(open)`.
+    Binance pays a POINT comparison. Measured against each venue's own recorded
+    winner, on Binance 1-second bars (tools/pm_venue_settlement.py):
+
+        BINANCE (CHAINLINK)      n=5924   TWAP60 90.4%   point-vs-strike 98.7%
+        POLYMARKET (twap label)  n=4054   TWAP60 98.6%
+
+    8.3 points apart on nearly six thousand rounds. Without the gate the arm
+    would compare the wrong statistic against the wrong level on Binance --
+    a signal error that venue-agnostic order routing cannot fix.
+    """
+
+    def test_polymarket_settles_on_twap(self, monkeypatch) -> None:
+        monkeypatch.setattr("btcpredict.config.settings.venue", "polymarket")
+        assert Bot.__new__(Bot)._settles_on_twap() is True
+
+    def test_binance_settles_on_a_point(self, monkeypatch) -> None:
+        monkeypatch.setattr("btcpredict.config.settings.venue", "binance")
+        assert Bot.__new__(Bot)._settles_on_twap() is False
+
+    def test_the_gate_can_only_turn_twap_OFF_never_on(self) -> None:
+        """An operator who sets CROSS_REF_TWAP=false on Polymarket must still
+        get the point behaviour: the knob wins, the venue only restricts."""
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "btcpredict" / "main.py").read_text()
+        for knob in ('self._ck("ref_twap", r)', 'self._ck("fc_trigger", r)'):
+            i = src.index(knob)
+            assert "and self._settles_on_twap()" in src[i:i+60], (
+                "%s is no longer ANDed with the venue gate" % knob)
+
+    def test_both_book_tops_expose_bid_and_ask(self) -> None:
+        """The arm reads `top.ask(side)` and `top.bid(side)` without knowing
+        which venue it is on."""
+        from btcpredict.feeds.prediction_book import BookTop
+        from btcpredict.venues.polymarket.book import RoundTop, Touch
+        b = BookTop(up_bid=.40, up_ask=.42, up_ask_size=1, up_bid_size=2,
+                    ts_ms=1, recv_ms=2)
+        t = Touch(asset_id="a", bid=.40, bid_size=1, ask=.42, ask_size=2,
+                  ts_ms=1, recv_ms=2)
+        r = RoundTop(up=t, down=t)
+        for top in (b, r):
+            assert callable(top.ask) and callable(top.bid), type(top).__name__
+            assert 0 < top.ask("Up") < 1
+            assert 0 < top.bid("Up") < 1

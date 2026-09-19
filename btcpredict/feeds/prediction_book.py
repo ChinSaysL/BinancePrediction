@@ -107,6 +107,18 @@ class BookTop:
     def age_s(self, now_ms: int | None = None) -> float:
         return ((now_ms or int(time.time() * 1000)) - self.recv_ms) / 1000.0
 
+    def bid(self, side: str) -> float:
+        """The BID for `side`, mirroring `ask`. See `ask_dollars` for why the
+        side flips which leg of the Up book is read.
+
+        ⛔ PARITY WITH `RoundTop.bid`. Polymarket's top exposes `bid(side)` and
+        this one did not, so every caller had to guess:
+            `b = getattr(top, "bid", None); v = b(side) if callable(b) else b`
+        -- which silently returned None on Binance and printed `n/a` where a
+        real bid existed. One surface, one call.
+        """
+        return (self.up_bid if side == "Up" else 1.0 - self.up_ask)
+
     def ask(self, side: str) -> float:
         return self.up_ask if side == "Up" else self.down_ask
 

@@ -46,3 +46,22 @@ def _pin_entry_mode(monkeypatch):
         return None
 
     monkeypatch.setattr("btcpredict.main.venue_top", _unreadable)
+    # ⛔ THE VENUE IS PART OF THE PROFILE, and the cross fixtures were all
+    # written against Polymarket. The two venues pay on DIFFERENT statistics --
+    # measured on each venue's own recorded winner, Binance 1-second bars,
+    # `tools/pm_venue_settlement.py`:
+    #     BINANCE (CHAINLINK)      n=5924   TWAP60 90.4%   point-vs-strike 98.7%
+    #     POLYMARKET (twap label)  n=4054   TWAP60 98.6%
+    # so `Bot._settles_on_twap` gates the TWAP level and the `fc` trigger on it.
+    # Without this pin those fixtures run under the config default
+    # (`venue="binance"`), the TWAP treatment switches off underneath them, and
+    # 17 tests fail for a reason that has nothing to do with what they assert.
+    #
+    # ⭐ AND THE SHIPPED DEFAULTS ARE INCONSISTENT WITH EACH OTHER: `venue`
+    # defaults to "binance" while `cross_ref_twap` and `cross_fc_trigger`
+    # default True, which is a Polymarket-only treatment. That pairing cannot
+    # be right on either venue and is worth resolving in config.py rather than
+    # here; this pin only stops the suite from inheriting the contradiction.
+    # A test about the Binance path sets the venue itself and its own
+    # monkeypatch wins -- see tests/test_cross_on_binance.py.
+    monkeypatch.setattr("btcpredict.config.settings.venue", "polymarket")

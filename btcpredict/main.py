@@ -2555,7 +2555,9 @@ class Bot:
         the code below, and it is not a new risk but a swapped estimator.
         """
         strike = getattr(r, "strike", None)
-        if not self._ck("ref_twap", r):
+        # The level is a 60 s MEAN only where the venue pays on one; on a
+        # point venue `r.strike` IS the thing settled against.
+        if not (self._ck("ref_twap", r) and self._settles_on_twap()):
             return strike, "strike"
         slug = getattr(r, "slug", None)
         cache = getattr(self, "_cross_ref", None)
@@ -2807,7 +2809,9 @@ class Bot:
         post-restart window. If it is ever wanted, it needs its own measurement
         and its own fixtures, not a ride on this one.
         """
-        if not self._ck("fc_trigger", r):
+        # Same gate as the level: forecasting a 60 s mean is only the right
+        # signal on a venue that pays on one.
+        if not (self._ck("fc_trigger", r) and self._settles_on_twap()):
             return ticks, "spot"
         buf = (getattr(self, "_ticks", None) or {}).get(symbol_for_round(r)) or []
         fc = twap_forecast(buf, tau_now_s)
@@ -6329,6 +6333,36 @@ class Bot:
         if spent * 1000.0 >= _SLOW_TICK_MS:
             log.warning("slow settlement backfill: %.2fs OFF the tick (the "
                         "cross arm kept sampling through it)", spent)
+
+    def _settles_on_twap(self) -> bool:
+        """Does the venue we are trading pay on a 60 s TWAP, or on a POINT?
+
+        ⛔ THE TWO VENUES PAY ON DIFFERENT STATISTICS, and the cross arm's whole
+        signal is built on the answer. `_cross_level` uses `twap_reference`
+        (the 60 s mean at the OPEN) and `crossed_side` reads `fc` (the projected
+        60 s mean) -- both correct for Polymarket, both WRONG on a point venue.
+        Neither branched on venue before this, and both knobs default True, so
+        moving the arm to Binance would have compared the wrong statistic
+        against the wrong level. That is a signal error, not plumbing: no amount
+        of venue-agnostic order routing fixes it.
+
+        MEASURED against each venue's OWN recorded winner, on Binance 1-second
+        bars (`tools/pm_venue_settlement.py`):
+
+            era                        rounds  TWAP60vTWAP60  point vs strike
+            BINANCE (CHAINLINK)          5924          90.4%           98.7%
+            POLYMARKET (twap label)      4054          98.6%              --
+
+        8.3 points apart on nearly six thousand rounds. The venue label in the
+        `rounds` table says the same thing: `CHAINLINK` before 2026-09-16,
+        `chainlink-twap-60s-vs-range-start` after.
+
+        The KNOBS still win when they are off -- this can only ever turn the
+        TWAP treatment OFF, never on -- so an operator who sets
+        `CROSS_REF_TWAP=false` on Polymarket still gets the point behaviour.
+        """
+        return registry.normalise(
+            getattr(settings, "venue", "binance")) == "polymarket"
 
     async def _venue_top(self, token: str, r):
         """The VENUE's own top of book, on whichever venue we are trading.
