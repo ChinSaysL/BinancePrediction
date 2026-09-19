@@ -69,7 +69,7 @@ class TestTheWiring:
     def test_every_phase_is_marked(self) -> None:
         """A phase with no mark is invisible exactly when it is the slow one."""
         src = _run_source()
-        for name in ("tick", "backfill", "settle", "claims"):
+        for name in ("tick", "backfill", "housekeep"):
             # `ast.unparse` renders string literals with single quotes.
             assert "ph.append(('%s', time.time()))" % name in src, name
 
@@ -115,7 +115,8 @@ class TestTheBackfillIsOffTheTick:
     def test_it_is_cancelled_on_shutdown(self) -> None:
         """Not awaited on the way in, so it must be cancelled on the way out."""
         src = _run_source()
-        assert "bf.cancel()" in src
+        assert "_t.cancel()" in src
+        assert "(bf, hk)" in src, "the backfill task dropped out of the sweep"
 
     def test_an_exception_does_not_kill_the_task_silently(self) -> None:
         """`live_round()` never returns a settled round, so this call is the
@@ -147,3 +148,131 @@ class TestTheBackfillIsOffTheTick:
         finally:
             lg.removeHandler(h)
         assert any("settlement backfill failed" in m for m in caught), caught
+
+
+def _func_source(name: str) -> str:
+    """RAW source of a method, not `ast.unparse` -- the await-free guard below
+    is about what is WRITTEN, and unparse would happily normalise it away."""
+    tree = ast.parse(MAIN.read_text())
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef)) and n.name == name:
+            lines = MAIN.read_text().splitlines()
+            return "\n".join(lines[n.lineno - 1:n.end_lineno])
+    pytest.fail("%s is gone: this guard would be measuring nothing" % name)
+
+
+class TestHousekeepingIsOffTheTick:
+    """The instrument convicted the other three phases too.
+
+    Across 121 slow ticks: `claims` 472.3s (p90 8939ms, max 31822ms), `settle`
+    171.0s (max 22859ms), `bankroll` 11.0s. 643 seconds inside bookkeeping that
+    decides no trade -- and the cost is not only the cross arm's sampling
+    window. `_cross_exit_check` runs from the tick as well, so every one of
+    those seconds was also a second in which a losing position could not be
+    cut. The worst single tick, 31.8 s, is 13% of a 300 s round.
+    """
+
+    def test_run_dispatches_them_instead_of_awaiting_them(self) -> None:
+        src = _run_source()
+        for call in ("self.settle_due()", "self.sweep_claims()",
+                     "self.refresh_bankroll_if_stale()"):
+            assert "await " + call not in src, (
+                "%s is awaited in the tick again: the loop stops placing AND "
+                "stops exiting for as long as the venue takes" % call)
+        assert "asyncio.create_task(self._housekeeping_async())" in src
+
+    def test_it_is_single_flight(self) -> None:
+        """Two `settle_due`s on the same `open_fills` would DOUBLE-BOOK a
+        settlement -- the ledger, the guard pool and the P&L all move in it.
+        At a 1 s poll against the measured 22.9 s worst case, dropping this
+        guard would put twenty-two of them in flight at once."""
+        src = _run_source()
+        assert "hk is None or hk.done()" in src
+
+    def test_record_mode_still_does_no_housekeeping(self) -> None:
+        src = _run_source()
+        assert "self.mode != 'record' and (hk is None or hk.done())" in src
+
+    def test_the_order_is_load_bearing_and_preserved(self) -> None:
+        """`sweep_claims` is the RETRY CLOCK for the redeem `settle_due` fires,
+        so it must run after it or it duplicates a claim already in flight
+        ("already have a pending claim", 3x on 2026-09-14). The bankroll read
+        is last because the settlement is what moved the number."""
+        src = _func_source("_housekeeping_async")
+        i_settle = src.index("await self.settle_due()")
+        i_claims = src.index("await self.sweep_claims()")
+        i_bank = src.index("await self.refresh_bankroll_if_stale()")
+        assert i_settle < i_claims < i_bank
+
+    def test_a_settlement_is_booked_with_no_await_inside_it(self) -> None:
+        """⭐ THIS IS WHAT MAKES DISPATCHING A MONEY PATH SAFE.
+
+        `_housekeeping_async` is cancelled on shutdown, so a cancel can land at
+        any await in `settle_due`. The booking itself -- DB insert, guard
+        release, P&L, ledger, `del open_fills` -- must therefore be one
+        CONTIGUOUS SYNCHRONOUS run, so a cancel either books all of it or none
+        of it. Put an await in that block and a shutdown at the wrong moment
+        can release a slot without crediting the ledger, or credit it twice on
+        the retry.
+        """
+        src = _func_source("settle_due")
+        start = src.index('self.store.insert("settlements"')
+        end = src.rindex("del self.open_fills[fid]")
+        assert "await" not in src[start:end], (
+            "an await appeared inside the settlement booking block: a cancel "
+            "there can now half-book a settlement")
+
+    def test_cancellation_is_re_raised_not_swallowed(self) -> None:
+        """A cancel that the blanket `except Exception` ate would hang the
+        shutdown and log a settlement failure that never happened."""
+        src = _func_source("_housekeeping_async")
+        i_cancel = src.index("except asyncio.CancelledError:")
+        i_broad = src.index("except Exception as e:")
+        assert i_cancel < i_broad, "CancelledError must be caught FIRST"
+        assert "raise" in src[i_cancel:i_broad]
+
+    def test_an_exception_does_not_kill_the_task_silently(self) -> None:
+        """Worse here than for the backfill: a task that dies quietly stops
+        settling positions, so the guard pool never frees and the ledger never
+        moves -- the bot would go silent rather than wrong, which is harder to
+        notice."""
+        import asyncio
+        import logging
+
+        from btcpredict.main import Bot
+
+        class Fake(Bot):
+            def __init__(self):
+                self.swept = False
+
+            async def settle_due(self) -> None:
+                raise RuntimeError("venue said no")
+
+            async def sweep_claims(self) -> None:
+                self.swept = True
+
+            async def refresh_bankroll_if_stale(self) -> None:
+                pass
+
+        caught: list[str] = []
+
+        class H(logging.Handler):
+            def emit(self, rec):
+                caught.append(rec.getMessage())
+
+        h = H()
+        lg = logging.getLogger("btcpredict")
+        lg.addHandler(h)
+        bot = Fake()
+        try:
+            asyncio.run(bot._housekeeping_async())   # must not raise
+        finally:
+            lg.removeHandler(h)
+        assert any("housekeeping failed" in m for m in caught), caught
+
+    def test_a_slow_pass_is_reported_against_the_same_threshold(self) -> None:
+        """The two numbers have to be comparable in the log, and the message
+        has to say OFF the tick -- that is the whole difference."""
+        src = _func_source("_housekeeping_async")
+        assert "_SLOW_TICK_MS" in src
+        assert "OFF the tick" in src

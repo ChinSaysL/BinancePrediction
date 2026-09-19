@@ -193,6 +193,11 @@ _BANKROLL_REFRESH_S = 60.0
 # `settlement backfill` was the answer, and it is now DISPATCHED rather than
 # awaited (see the call site), so this line should not name it again: a
 # `backfill` mark that is no longer ~0ms means someone put the await back.
+# The same instrument then convicted the other three phases -- `claims` 472.3s,
+# `settle` 171.0s, `bankroll` 11.0s across 121 slow ticks -- and they are now
+# one dispatched task (`_housekeeping_async`). So `housekeep` is held to the
+# same standard: a mark that is no longer ~0ms means someone put THAT await
+# back. What remains awaited here is `tick()`, which is the work itself.
 # `t0`/`elapsed` deliberately EXCLUDE `_idle`, so a tick that is merely waiting
 # on the feed or the clock can never appear here.
 # 2 s is far above the 43 ms median and above the 384 ms max of a clean window,
@@ -6063,6 +6068,77 @@ class Bot:
             log.warning("slow settlement backfill: %.2fs OFF the tick (the "
                         "cross arm kept sampling through it)", spent)
 
+    async def _housekeeping_async(self) -> None:
+        """`settle_due` + `sweep_claims` + the bankroll re-read, OFF the tick.
+
+        ⛔ THE LARGEST REMAINING STALL, and like the backfill before it the
+        instrument named it rather than a theory. Over 121 slow ticks:
+
+            claims    n=121  median 271ms  p90 8939ms  max 31822ms  total 472.3s
+            settle    n=121  median   0ms  p90 4250ms  max 22859ms  total 171.0s
+            bankroll  n=115  median   0ms  p90  262ms  max   291ms  total  11.0s
+
+        643 seconds of the loop's life inside bookkeeping that DECIDES NOTHING.
+        None of it places an order, and every second of it is a second `_idle`
+        does not sample the cross arm: the budget at the bottom of `run` is
+        `max(0.05, 1.0 - elapsed)`, so the 31.8 s claim sweep cost the arm its
+        whole ~960 ms window -- and left any open position UNMANAGED, because
+        `_cross_exit_check` runs from the tick too. A stall is therefore also a
+        window in which a losing position cannot be cut. Against
+        `cross_max_tau_s=240` on a 300 s round, the worst tick is 13% of the
+        tradeable window.
+
+        ONE TASK, NOT THREE, because the ORDER is load-bearing. `settle_due`
+        redeems on the fast path and `sweep_claims` is its retry clock, so the
+        sweep must run after the settle it retries or it fires a duplicate
+        against a claim already in flight ("already have a pending claim", 3x
+        on 09-14). `refresh_bankroll_if_stale` stays last for the reason it is
+        last today: it reads equity after the settlement has moved it.
+
+        ⭐ CANCEL-SAFE AT EVERY AWAIT, which is what makes dispatching a MONEY
+        path acceptable. `settle_due` books a settlement in a contiguous
+        SYNCHRONOUS run -- DB insert, `guard.on_settle`, `pnl.add`, `bankroll
+        +=`, `del open_fills[fid]` -- with no await inside it. So a cancel can
+        only land in one of three places:
+          * before `broker.settle` returns -- nothing booked, the fill is still
+            open, and the next tick retries it;
+          * after that block, at `broker.redeem()` -- fully booked, only the
+            claim is lost, and `sweep_claims` is precisely the retry clock for
+            a dropped claim;
+          * at the trailing `_refresh_bankroll` -- booked, and the 60 s clock
+            in `refresh_bankroll_if_stale` re-reads it.
+        No interleaving double-counts a settlement or leaks a slot. The
+        single-flight guard at the call site rules out the other half of that
+        risk: two overlapping `settle_due`s walking the same `open_fills` WOULD
+        double-book, and at a 1 s poll against a 22.9 s settle there would have
+        been twenty-two of them.
+
+        It must not raise into the loop and must not die quietly -- same
+        contract as `_backfill_async`, and worse consequences: a task that
+        died here would stop settling positions entirely.
+        """
+        t0 = time.time()
+        try:
+            await self.settle_due()
+            # Claims the venue rejected at settlement are retried on this
+            # clock, not on the next win (see sweep_claims).
+            await self.sweep_claims()
+            # AND THE SAME FOR THE BANKROLL. `settle_due` re-reads equity too,
+            # but only when a position settles -- so a bot that has STOPPED
+            # trading never re-reads, and an arm locked out by the exposure cap
+            # (a fraction of that stale number) cannot trade its way out of it.
+            # Measured 2026-09-17: a $5.00 deposit sat invisible for four hours
+            # behind exactly that loop. Self-guarded on a 60 s clock.
+            await self.refresh_bankroll_if_stale()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:                          # noqa: BLE001
+            log.exception("housekeeping failed: %s: %s", type(e).__name__, e)
+        spent = time.time() - t0
+        if spent * 1000.0 >= _SLOW_TICK_MS:
+            log.warning("slow housekeeping: %.2fs OFF the tick (the cross arm "
+                        "kept sampling and the exit gate kept running)", spent)
+
     async def backfill_settlements(self, limit: int = 5) -> int:
         """Fetch outcomes for rounds that have ended but have no recorded winner.
 
@@ -6659,6 +6735,8 @@ class Bot:
         n = 0
         # At most one settlement backfill in flight; see the call site below.
         bf: asyncio.Task | None = None
+        # And at most one housekeeping pass; see `_housekeeping_async`.
+        hk: asyncio.Task | None = None
         while not self._stop.is_set():
             t0 = time.time()
             # Timed phase marks for `_SLOW_TICK_MS`; see that constant for why.
@@ -6702,22 +6780,21 @@ class Bot:
                 if n % 15 == 0 and (bf is None or bf.done()):
                     bf = asyncio.create_task(self._backfill_async())
                 ph.append(("backfill", time.time()))
-                if self.mode != "record":
-                    await self.settle_due()
-                    ph.append(("settle", time.time()))
-                    # Claims the venue rejected at settlement are retried on
-                    # this clock, not on the next win (see sweep_claims).
-                    await self.sweep_claims()
-                    ph.append(("claims", time.time()))
-                    # AND THE SAME FOR THE BANKROLL. `settle_due` re-reads equity
-                    # too, but only when a position settles -- so a bot that has
-                    # STOPPED trading never re-reads, and an arm locked out by
-                    # the exposure cap (a fraction of that stale number) cannot
-                    # trade its way out of it. Measured 2026-09-17: a $5.00
-                    # deposit sat invisible for four hours behind exactly that
-                    # loop. Self-guarded on a 60 s clock.
-                    await self.refresh_bankroll_if_stale()
-                    ph.append(("bankroll", time.time()))
+                # ⛔ DISPATCHED, NEVER AWAITED -- the same fix as the backfill
+                # above, for the same reason, found by the same instrument.
+                # Settlement, the claim sweep and the bankroll re-read cost the
+                # loop 643 s across 121 slow ticks (worst single tick 31.8 s)
+                # and NONE of them decides a trade. See `_housekeeping_async`
+                # for the measurement, for why the three stay in one task and
+                # in this order, and for why cancelling one is safe.
+                # SINGLE-FLIGHT, and that is not decoration: `settle_due`
+                # mutates `open_fills`, the guard pool and the ledger, so two
+                # in flight would double-book a settlement. `done()` is the
+                # whole interlock -- at a 1 s poll against a 22.9 s worst case
+                # there would otherwise be twenty-two concurrent settles.
+                if self.mode != "record" and (hk is None or hk.done()):
+                    hk = asyncio.create_task(self._housekeeping_async())
+                ph.append(("housekeep", time.time()))
             except Exception as e:
                 log.exception("tick failed: %s: %s", type(e).__name__, e)
             n += 1
@@ -6764,14 +6841,18 @@ class Bot:
         wsb = getattr(self, "ws_book", None)
         if wsb is not None:
             wsb.stop()
-        # The backfill task is deliberately not awaited on the way in, so it must
-        # be cancelled on the way out: left pending it would keep a REST call and
-        # a SQLite write running past `stop()`, and "Task was destroyed but it is
-        # pending" is a confusing last word for a clean shutdown.
-        if bf is not None and not bf.done():
-            bf.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await bf
+        # The backfill and housekeeping tasks are deliberately not awaited on
+        # the way in, so they must be cancelled on the way out: left pending
+        # they would keep a REST call and a SQLite write running past `stop()`,
+        # and "Task was destroyed but it is pending" is a confusing last word
+        # for a clean shutdown. Cancelling housekeeping mid-settle is safe by
+        # construction -- `_housekeeping_async` enumerates the three places a
+        # cancel can land and why none of them loses money.
+        for _t in (bf, hk):
+            if _t is not None and not _t.done():
+                _t.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await _t
         task = getattr(self, "_ws_task", None)
         if task is not None and not task.done():
             task.cancel()
