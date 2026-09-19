@@ -1656,6 +1656,9 @@ class Bot:
         # last-trade price, which was observed 2-3 cents away from the mid.
         up_bid = up_ask = down_bid = down_ask = None
         book_age_ms = None
+        # Sizes ride with `book_age_ms`: both are properties of the WEBSOCKET
+        # frame, and both stay None when the REST poll is what answered.
+        up_ask_size = up_bid_size = None
         if self.book and r.market_id and primary:
             # Only the PRIMARY, not every traded family: the REST book costs
             # SAPI quota and we have been rate limited, so six families would
@@ -1704,6 +1707,10 @@ class Bot:
                 up_bid, up_ask = top.up_bid, top.up_ask
                 down_bid, down_ask = top.down_bid, top.down_ask
                 book_age_ms = int(top.age_s() * 1000)
+                # Taken from the SAME BookTop as the prices, never re-read: a
+                # second lookup could land on a different frame and pair a
+                # price with a size that was never quoted beside it.
+                up_ask_size, up_bid_size = top.up_ask_size, top.up_bid_size
         # RECORD-ONLY fallback. The gate above is right for trading, and it also
         # decides what the tape contains -- off-primary that is most of it. Ask
         # coverage was btc-5m ~100% (the primary, which gets the REST book every
@@ -1725,6 +1732,7 @@ class Bot:
                 up_bid, up_ask = stale.up_bid, stale.up_ask
                 down_bid, down_ask = stale.down_bid, stale.down_ask
                 book_age_ms = int(stale.age_s() * 1000)
+                up_ask_size, up_bid_size = stale.up_ask_size, stale.up_bid_size
         buy_up = up_ask if up_ask is not None else up.price
         buy_down = down_ask if down_ask is not None else down.price
         # No spread guess when the ask is the actual executable price.
@@ -1739,6 +1747,7 @@ class Bot:
             "oracle": None, "oracle_ts_ms": None,
             "strike": r.strike,
             "book_age_ms": book_age_ms,
+            "up_ask_size": up_ask_size, "up_bid_size": up_bid_size,
             "up_bid": up_bid, "up_ask": up_ask,
             "down_bid": down_bid, "down_ask": down_ask,
             "fee_rate_bps": r.fee_rate_bps,

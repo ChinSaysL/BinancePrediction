@@ -534,8 +534,13 @@ class TestTheRecorderKeepsAWiderBookWindowThanTrading:
         def best(self, market_id, max_age_s):
             if self._age > max_age_s:
                 return None
+            # SIZES INCLUDED, because the real `BookTop` always carries them
+            # and the recorder now writes them. A fake that omits a field the
+            # production object guarantees does not simplify the test, it just
+            # moves the failure to an AttributeError in the recorder.
             return SimpleNamespace(up_bid=0.40, up_ask=0.42,
                                    down_bid=0.58, down_ask=0.60,
+                                   up_ask_size=350.0, up_bid_size=120.0,
                                    age_s=lambda: self._age)
 
     def _row(self, store, monkeypatch, *, age_s, record_window):
@@ -564,11 +569,36 @@ class TestTheRecorderKeepsAWiderBookWindowThanTrading:
         assert r["up_ask"] == pytest.approx(0.42)
         assert r["book_age_ms"] == pytest.approx(500, abs=50)
 
+    def test_the_size_at_the_touch_is_recorded_beside_the_price(
+            self, store, monkeypatch, no_gates):
+        """⭐ WHAT THE TAPE COULD NEVER ANSWER BEFORE.
+
+        Every recorded row said what the book COST and none said what it HELD,
+        so "was our stake actually there to buy?" was unanswerable for the
+        whole history -- and that is the question underneath every no-fill.
+        `BookTop` has carried these two numbers all along; they were simply
+        never written down.
+        """
+        r = self._row(store, monkeypatch, age_s=0.5, record_window=30.0)
+        assert r["up_ask_size"] == pytest.approx(350.0)
+        assert r["up_bid_size"] == pytest.approx(120.0)
+
+    def test_the_size_is_stamped_even_on_a_stale_recorded_book(
+            self, store, monkeypatch, no_gates):
+        """Same rule as `book_age_ms`: record it with its age and let the
+        replay decide. A stale size is information; a missing one is not."""
+        r = self._row(store, monkeypatch, age_s=9.0, record_window=30.0)
+        assert r["up_ask_size"] == pytest.approx(350.0)
+        assert r["book_age_ms"] == pytest.approx(9000, abs=50)
+
     def test_beyond_the_record_window_nothing_is_written(self, store, monkeypatch,
                                                          no_gates):
         r = self._row(store, monkeypatch, age_s=99.0, record_window=30.0)
         assert r["up_ask"] is None
         assert r["book_age_ms"] is None
+        assert r["up_ask_size"] is None, (
+            "no book means no size: 0 would read as a thin book to a replay")
+        assert r["up_bid_size"] is None
 
     def test_zero_means_off(self, store, monkeypatch, no_gates):
         """0 = OFF falls back to the trading gate, so a 9s book is dropped."""

@@ -24,6 +24,36 @@ def test_fills_gains_the_ev_at_fill_column_on_an_old_database(tmp_path):
     assert Store(path).conn.execute(
         "PRAGMA table_info(fills)").fetchall()             # idempotent
 
+def test_quotes_gains_the_size_columns_on_an_old_database(tmp_path):
+    """The live DB is ~500 MB of rows written before these existed, and it is
+    the whole tape every replay runs on. The migration has to ADD the columns
+    to that table in place -- a fresh-schema-only change would leave the live
+    recorder inserting a key the table has no room for.
+
+    Pinned alongside `book_age_ms`, which arrived the same way, because the
+    failure mode is identical: silently no-op and every later insert is either
+    a crash or a lost measurement.
+    """
+    path = tmp_path / "old.db"
+    s = Store(path)
+    s.conn.execute("DROP TABLE quotes")
+    s.conn.execute("CREATE TABLE quotes (id INTEGER PRIMARY KEY, slug TEXT, "
+                   "ts_ms INTEGER)")
+    s.conn.execute("INSERT INTO quotes (slug, ts_ms) VALUES ('btc-1', 1)")
+    s.conn.commit()
+    s.conn.close()
+
+    again = Store(path)                                   # reopen = migrate
+    cols = {r["name"] for r in again.conn.execute("PRAGMA table_info(quotes)")}
+    assert "up_ask_size" in cols and "up_bid_size" in cols
+    assert "book_age_ms" in cols, "the older migration must still run"
+    rows = again.conn.execute("SELECT * FROM quotes").fetchall()
+    assert len(rows) == 1 and rows[0]["slug"] == "btc-1", (
+        "the migration must ADD a column, never rebuild the tape")
+    assert rows[0]["up_ask_size"] is None, "back-fill is not possible; NULL is"
+    Store(path)                                           # idempotent
+
+
 # A real payload shape captured from the live endpoint, trimmed to what we read.
 SAMPLE = {
     "marketTopicId": 5436179,

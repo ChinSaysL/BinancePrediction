@@ -52,6 +52,8 @@ CREATE TABLE IF NOT EXISTS quotes (
     down_ask      REAL,
     fee_rate_bps  INTEGER,   -- as quoted live; the market metadata overstates it
     book_age_ms   INTEGER,   -- age of the ws book behind the four prices above
+    up_ask_size   REAL,      -- SHARES resting at up_ask; NULL when REST-sourced
+    up_bid_size   REAL,      -- and at up_bid. The Down book mirrors both.
     spot          REAL,      -- Binance spot mid at poll time
     spot_ts_ms    INTEGER,
     oracle        REAL,      -- Chainlink feed price at poll time
@@ -155,7 +157,19 @@ class Store:
                          # config.ws_book_record_max_age_s: the recorder keeps a
                          # wider staleness window than the trading paths, and
                          # this column is what makes that safe to replay.
-                         ("book_age_ms", "INTEGER")):
+                         ("book_age_ms", "INTEGER"),
+                         # SIZE AT THE TOUCH, in shares. The tape recorded what
+                         # the book COST and never what it HELD, so no replay
+                         # could ask the one question every fill depends on:
+                         # was our stake actually there to buy? `BookTop` has
+                         # carried `up_ask_size`/`up_bid_size` all along and
+                         # `ask_dollars()` already turns them into the dollar
+                         # depth on either side -- it simply was never written
+                         # down. NULL where the REST poll supplied the prices
+                         # (`best_prices` returns a pair, no size), so a replay
+                         # must filter on NOT NULL rather than treat 0 as thin.
+                         ("up_ask_size", "REAL"),
+                         ("up_bid_size", "REAL")):
             if col not in have:
                 self.conn.execute(f"ALTER TABLE quotes ADD COLUMN {col} {typ}")
         shave = {r["name"] for r in self.conn.execute("PRAGMA table_info(settlements)")}
