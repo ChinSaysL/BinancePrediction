@@ -46,6 +46,7 @@ def test_quotes_gains_the_size_columns_on_an_old_database(tmp_path):
     again = Store(path)                                   # reopen = migrate
     cols = {r["name"] for r in again.conn.execute("PRAGMA table_info(quotes)")}
     assert "up_ask_size" in cols and "up_bid_size" in cols
+    assert "venue_lag_ms" in cols
     assert "book_age_ms" in cols, "the older migration must still run"
     rows = again.conn.execute("SELECT * FROM quotes").fetchall()
     assert len(rows) == 1 and rows[0]["slug"] == "btc-1", (

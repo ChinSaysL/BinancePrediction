@@ -859,6 +859,32 @@ class RoundTop:
     def down_bid_size(self) -> float:
         return self.down.bid_size if self.down is not None else 0.0
 
+    @property
+    def lag_ms(self) -> float | None:
+        """venue clock -> our clock, in ms. The DELIVERY latency.
+
+        ⛔ NOT `age_s`, and the difference is the whole point. `age_s` measures
+        `now - recv_ms` -- how long since OUR LAST FRAME -- so it says nothing
+        about how long the frame took to arrive and is near zero on a busy
+        book however far away the venue is. This measures `recv_ms - ts_ms`,
+        which is the part geography owns.
+
+        Until now the only samples of it were the ones the lag ALARM logged,
+        and a median taken over those (599 ms, n=1104) is conditioned on the
+        alarm having fired. That number was quoted as the feed's typical
+        latency -- including in `cross_ladder_band_pad`'s own justification --
+        which it never was. Recording it per quote is what settles it.
+
+        Carries the venue's clock against ours, so a constant NTP skew shifts
+        it. The SHAPE and the differences between hosts survive that; a single
+        absolute value does not.
+        """
+        v = [t.recv_ms - t.ts_ms for t in (self.up, self.down)
+             if t is not None and t.ts_ms > 0 and t.recv_ms > 0]
+        # The OLDER side, for the same reason `age_s` takes it: a round with
+        # one prompt side is not a prompt round.
+        return float(max(v)) if v else None
+
 
 class PmBookView:
     """The `PredictionBook` surface over `PmBook`, keyed by the ROUND.

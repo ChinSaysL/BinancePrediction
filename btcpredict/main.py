@@ -1658,7 +1658,7 @@ class Bot:
         book_age_ms = None
         # Sizes ride with `book_age_ms`: both are properties of the WEBSOCKET
         # frame, and both stay None when the REST poll is what answered.
-        up_ask_size = up_bid_size = None
+        up_ask_size = up_bid_size = venue_lag_ms = None
         if self.book and r.market_id and primary:
             # Only the PRIMARY, not every traded family: the REST book costs
             # SAPI quota and we have been rate limited, so six families would
@@ -1711,6 +1711,7 @@ class Bot:
                 # second lookup could land on a different frame and pair a
                 # price with a size that was never quoted beside it.
                 up_ask_size, up_bid_size = top.up_ask_size, top.up_bid_size
+                venue_lag_ms = top.lag_ms
         # RECORD-ONLY fallback. The gate above is right for trading, and it also
         # decides what the tape contains -- off-primary that is most of it. Ask
         # coverage was btc-5m ~100% (the primary, which gets the REST book every
@@ -1733,6 +1734,7 @@ class Bot:
                 down_bid, down_ask = stale.down_bid, stale.down_ask
                 book_age_ms = int(stale.age_s() * 1000)
                 up_ask_size, up_bid_size = stale.up_ask_size, stale.up_bid_size
+                venue_lag_ms = stale.lag_ms
         buy_up = up_ask if up_ask is not None else up.price
         buy_down = down_ask if down_ask is not None else down.price
         # No spread guess when the ask is the actual executable price.
@@ -1748,6 +1750,7 @@ class Bot:
             "strike": r.strike,
             "book_age_ms": book_age_ms,
             "up_ask_size": up_ask_size, "up_bid_size": up_bid_size,
+            "venue_lag_ms": venue_lag_ms,
             "up_bid": up_bid, "up_ask": up_ask,
             "down_bid": down_bid, "down_ask": down_ask,
             "fee_rate_bps": r.fee_rate_bps,
@@ -3907,9 +3910,19 @@ class Bot:
                                tau=tau, spot=spot_now, sigma=sigma_now)
             return
         # ⭐ THE BAND IS CHECKED ON THE BOOK WE PAY, NOT THE ONE WE SEE.
-        # `ask` here is OUR websocket ladder, and that book runs a median 593 ms
-        # behind the venue's (p90 1015 ms), which puts it a median 0.030 BELOW
-        # the venue and 0.130 below it at the tail. Gating the real band on it
+        # `ask` here is OUR websocket ladder, and it runs a median 0.030 BELOW
+        # the venue's ask, 0.130 below it at the tail.
+        # ⛔ THIS USED TO SAY "a median 593 ms behind the venue's (p90 1015 ms)"
+        # AND THAT WAS WRONG. 593/599 ms is the median of `venue lag` over the
+        # 968 occasions the lag ALARM FIRED -- a distribution conditioned on
+        # the alarm, quoted as if it were the feed's typical latency. It never
+        # was. `book_age_ms` (median 24 ms, p90 271 ms) does not settle it
+        # either: that is `now - recv_ms`, time since OUR last frame, which is
+        # near zero on a busy book however far away the venue is.
+        # The PRICE GAP above is unaffected -- it comes from 305 shadow-book
+        # samples that compare our ladder to the venue's own ask at order time,
+        # and never depended on the latency figure. Only the explanation did.
+        # `venue_lag_ms` is now recorded per quote so the real one is knowable. Gating the real band on it
         # selects a different set of trades from the one we then buy.
         # MEASURED, `tools/pm_two_book.py`, which models both books:
         #     band on the ladder  n=743 miss=129 win 57.1% $+160.81 | TEST $+85.61

@@ -541,6 +541,7 @@ class TestTheRecorderKeepsAWiderBookWindowThanTrading:
             return SimpleNamespace(up_bid=0.40, up_ask=0.42,
                                    down_bid=0.58, down_ask=0.60,
                                    up_ask_size=350.0, up_bid_size=120.0,
+                                   lag_ms=210.0,
                                    age_s=lambda: self._age)
 
     def _row(self, store, monkeypatch, *, age_s, record_window):
@@ -591,6 +592,27 @@ class TestTheRecorderKeepsAWiderBookWindowThanTrading:
         assert r["up_ask_size"] == pytest.approx(350.0)
         assert r["book_age_ms"] == pytest.approx(9000, abs=50)
 
+    def test_the_delivery_latency_is_recorded_apart_from_the_staleness(
+            self, store, monkeypatch, no_gates):
+        """⛔ TWO DIFFERENT NUMBERS, AND CONFUSING THEM COST A WRONG CLAIM.
+
+        `book_age_ms` is `now - recv_ms`: time since OUR last frame. On a busy
+        book it is near zero however far away the venue is, so it cannot answer
+        "how long did this take to reach us".
+
+        `venue_lag_ms` is `recv_ms - venue ts_ms`: the part geography owns, and
+        the only number that can say whether the box is well placed. Before
+        this the only samples of it were the ones the lag ALARM logged, so its
+        median was conditioned on the alarm firing -- and was quoted as the
+        feed's typical latency in `cross_ladder_band_pad`'s own justification.
+        """
+        r = self._row(store, monkeypatch, age_s=0.5, record_window=30.0)
+        assert r["venue_lag_ms"] == pytest.approx(210.0)
+        assert r["book_age_ms"] == pytest.approx(500, abs=50)
+        assert r["venue_lag_ms"] != r["book_age_ms"], (
+            "if these two ever agree by construction, one of them is not "
+            "measuring what its name says")
+
     def test_beyond_the_record_window_nothing_is_written(self, store, monkeypatch,
                                                          no_gates):
         r = self._row(store, monkeypatch, age_s=99.0, record_window=30.0)
@@ -599,6 +621,7 @@ class TestTheRecorderKeepsAWiderBookWindowThanTrading:
         assert r["up_ask_size"] is None, (
             "no book means no size: 0 would read as a thin book to a replay")
         assert r["up_bid_size"] is None
+        assert r["venue_lag_ms"] is None, "no frame, no delivery to measure"
 
     def test_zero_means_off(self, store, monkeypatch, no_gates):
         """0 = OFF falls back to the trading gate, so a 9s book is dropped."""

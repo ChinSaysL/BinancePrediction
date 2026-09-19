@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS quotes (
     book_age_ms   INTEGER,   -- age of the ws book behind the four prices above
     up_ask_size   REAL,      -- SHARES resting at up_ask; NULL when REST-sourced
     up_bid_size   REAL,      -- and at up_bid. The Down book mirrors both.
+    venue_lag_ms  REAL,      -- recv_ms - venue ts_ms: DELIVERY, not staleness
     spot          REAL,      -- Binance spot mid at poll time
     spot_ts_ms    INTEGER,
     oracle        REAL,      -- Chainlink feed price at poll time
@@ -169,7 +170,17 @@ class Store:
                          # (`best_prices` returns a pair, no size), so a replay
                          # must filter on NOT NULL rather than treat 0 as thin.
                          ("up_ask_size", "REAL"),
-                         ("up_bid_size", "REAL")):
+                         ("up_bid_size", "REAL"),
+                         # DELIVERY LATENCY, the part geography owns. Distinct
+                         # from `book_age_ms`, which is `now - recv_ms` (time
+                         # since OUR last frame) and is near zero on a busy
+                         # book however far the venue is. The only samples of
+                         # this before now were the ones the lag ALARM logged,
+                         # so its median (599 ms, n=1104) was conditioned on
+                         # the alarm firing -- and was being quoted as the
+                         # feed's typical latency. Carries venue clock vs ours,
+                         # so a constant NTP skew shifts it.
+                         ("venue_lag_ms", "REAL")):
             if col not in have:
                 self.conn.execute(f"ALTER TABLE quotes ADD COLUMN {col} {typ}")
         shave = {r["name"] for r in self.conn.execute("PRAGMA table_info(settlements)")}
