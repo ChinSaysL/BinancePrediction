@@ -3204,7 +3204,7 @@ class Bot:
         task.add_done_callback(tasks.discard)
         return task
 
-    async def _prefetch_venue_top(self, r, up, down, feed):
+    async def _prefetch_venue_top(self, r, up, down, feed, margin_bps=None):
         """Keep the VENUE's own ask WARM for the side the next crossing buys.
 
         ⛔ THE LARGEST REMAINING COST ON THE ORDER PATH, and it is the only one
@@ -3246,6 +3246,23 @@ class Bot:
         max_age = float(settings.cross_venue_prefetch_max_age_s)
         if max_age <= 0:                       # ships OFF
             return None
+        # ⛔ IMMINENCE. The first version of this had no such gate and fired on
+        # EVERY no-crossing tick, which is what made it 19 probes a second. The
+        # tau window and the `_cross_fired` slot are already spent by the time
+        # we get here, so the only thing left to ask is whether a crossing is
+        # actually near -- and `|margin|` is exactly that question.
+        # MEASURED over 1,060,056 replay ticks, share of ticks kept against
+        # share of the ticks that IMMEDIATELY PRECEDE a crossing:
+        #     <=1 bps   12.75% of ticks   63.3% of pre-crossings
+        #     <=2 bps   24.06% of ticks   84.9% of pre-crossings
+        #     <=5 bps   50.39% of ticks   96.9% of pre-crossings
+        # 2 bps keeps 85% of the value for a quarter of the traffic.
+        band = float(settings.cross_venue_prefetch_margin_bps)
+        if band > 0:
+            if margin_bps is None:
+                return None            # cannot tell: do not spend a round trip
+            if abs(float(margin_bps)) > band:
+                return None
         broker = getattr(self, "broker", None)
         if broker is None or getattr(broker, "mode", None) != "live":
             return None
@@ -3261,9 +3278,13 @@ class Bot:
         cache = getattr(self, "_vtop_pre", None)
         if not isinstance(cache, dict):
             cache = self._vtop_pre = {}
-        # Already warm and still fresh: a second fetch would only add load.
+        # ⛔ ITS OWN KNOB, NOT `max_age * 0.5`. Tying the refresh to the
+        # freshness bound meant a 0.35s bound refetched every 0.175s -- twice a
+        # second per family, for a REST call, forever. The two are unrelated
+        # questions: how old may a warm ask BE, and how often may we ASK.
+        refresh = float(settings.cross_venue_prefetch_refresh_s)
         e = cache.get(token)
-        if e is not None and time.monotonic() - e[0] <= max_age * 0.5:
+        if e is not None and time.monotonic() - e[0] < refresh:
             return None
 
         async def _go():
@@ -3284,6 +3305,20 @@ class Bot:
                     for k in sorted(cache, key=lambda x: cache[x][0])[:-32]:
                         cache.pop(k, None)
 
+        # ⭐ COUNTED, because the whole reason the first version shipped and
+        # came straight back off is that I ESTIMATED this rate instead of
+        # measuring it. The log now says what it actually is.
+        n = self._vtop_pre_n = getattr(self, "_vtop_pre_n", 0) + 1
+        t0 = getattr(self, "_vtop_pre_t0", None)
+        if t0 is None:
+            t0 = self._vtop_pre_t0 = time.monotonic()
+        if n % 200 == 0:
+            el = max(1e-6, time.monotonic() - t0)
+            log.info("venue prefetch: %d probes in %.0fs = %.2f/s (%.0f/hr) | "
+                     "consumed %d, expired-or-unused %d",
+                     n, el, n / el, 3600.0 * n / el,
+                     getattr(self, "_vtop_hit_n", 0),
+                     n - getattr(self, "_vtop_hit_n", 0))
         task = asyncio.create_task(_go())
         tasks = getattr(self, "_vtop_pre_tasks", None)
         if not isinstance(tasks, set):
@@ -3313,6 +3348,7 @@ class Bot:
         if age > max_age:
             return None
         self._vtop_warm_age_s = age
+        self._vtop_hit_n = getattr(self, "_vtop_hit_n", 0) + 1
         return float(ask)
 
     def _take_prefetched_quote(self, token: str, stake: float) -> dict | None:
@@ -3769,7 +3805,10 @@ class Bot:
             # AND THE VENUE'S OWN ASK, for the same reason and from the same
             # fact: the side is knowable before the crossing. This is the
             # ~292ms that `venue_top` costs inside the order path.
-            await self._prefetch_venue_top(r, up, down, feed)
+            await self._prefetch_venue_top(
+                r, up, down, feed,
+                margin_bps=(1e4 * (sig_px - level) / level)
+                if (level and sig_px) else None)
             return
         # WHIPSAW. Stamped on the CROSSING, before any gate, because that is the
         # hole `cross_allow_reversal` leaves: it arms on the ENTRY, so a crossing

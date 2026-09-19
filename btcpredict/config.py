@@ -2370,6 +2370,24 @@ class Settings(BaseSettings):
     # venue ever gets slower or the drift ever gets steeper, this is ready and
     # the two numbers to re-check are named above.
     cross_venue_prefetch_max_age_s: float = 0.0
+    # How near a crossing must be before the prefetch spends a round trip, in
+    # bps of the signal's margin past its level. 0 = no gate, which is what the
+    # first version effectively had and why it was 19 probes a second.
+    # MEASURED over 1,060,056 replay ticks -- share of ticks kept against share
+    # of the ticks that IMMEDIATELY PRECEDE a crossing:
+    #     <=1 bps   12.75% of ticks   63.3% of pre-crossings
+    #     <=2 bps   24.06% of ticks   84.9% of pre-crossings
+    #     <=5 bps   50.39% of ticks   96.9% of pre-crossings
+    # 2.0 keeps 85% of the value for a quarter of the traffic. The tau window
+    # and the `_cross_fired` slot are ALREADY spent before the prefetch runs,
+    # so this is the only remaining question worth asking.
+    cross_venue_prefetch_margin_bps: float = 2.0
+    # Minimum seconds between two probes for the same token. ITS OWN KNOB: the
+    # first version reused `max_age * 0.5`, so a 0.35s freshness bound refetched
+    # every 0.175s, forever, per family. "How old may a warm ask be" and "how
+    # often may we ask" are unrelated questions and conflating them is what
+    # produced the traffic.
+    cross_venue_prefetch_refresh_s: float = 1.0
     # ---- TRAIN entry trigger: DISTANCE from the strike, not a crossing ----
     # Explicitly an OVERRIDE of three of the arm's gates, taken as a risk
     # decision by the operator on 2026-09-15. The strike IS the round's open, so

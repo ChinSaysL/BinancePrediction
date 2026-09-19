@@ -123,7 +123,8 @@ class TestFillingTheCache:
             "btcpredict.config.settings.cross_venue_prefetch_max_age_s", 0.0)
         b = Bot.__new__(Bot)
         b.broker = type("B", (), {"mode": "live"})()
-        out = asyncio.run(b._prefetch_venue_top(None, None, None, None))
+        out = asyncio.run(b._prefetch_venue_top(None, None, None, None,
+                                                margin_bps=0.0))
         assert out is None
 
     def test_it_does_nothing_when_venue_take_is_off(self, monkeypatch) -> None:
@@ -134,7 +135,8 @@ class TestFillingTheCache:
         monkeypatch.setattr("btcpredict.config.settings.cross_venue_take", False)
         b = Bot.__new__(Bot)
         b.broker = type("B", (), {"mode": "live"})()
-        out = asyncio.run(b._prefetch_venue_top(None, None, None, None))
+        out = asyncio.run(b._prefetch_venue_top(None, None, None, None,
+                                                margin_bps=0.0))
         assert out is None
 
     def test_paper_mode_never_probes_the_live_venue(self, monkeypatch) -> None:
@@ -171,9 +173,10 @@ class TestItActuallyFetches:
         feed = NS(price=spot)
         return b, r, up, down, feed, calls
 
-    def _run(self, b, r, up, down, feed):
+    def _run(self, b, r, up, down, feed, margin=0.0):
         async def go():
-            t = await b._prefetch_venue_top(r, up, down, feed)
+            t = await b._prefetch_venue_top(r, up, down, feed,
+                                            margin_bps=margin)
             if t is not None:
                 await t
         asyncio.run(go())
@@ -251,3 +254,146 @@ class TestItActuallyFetches:
             b._vtop_pre["tok%d" % i] = (now - i, 0.5)
         self._run(b, r, up, down, feed)
         assert len(b._vtop_pre) <= 64
+
+
+class TestTheImminenceGate:
+    """⛔ THE DEFECT THAT SENT v1 STRAIGHT BACK OFF.
+
+    v1 had no such gate: it fired on EVERY no-crossing tick, at a dedup of
+    `max_age * 0.5` = 0.175s, which is ~19 REST probes a second against the
+    ~9-12 an HOUR the order path pays. The tau window and the `_cross_fired`
+    slot are already spent before the prefetch runs, so the only question left
+    is whether a crossing is actually NEAR -- and the margin is that question.
+    """
+
+    def _bot(self, monkeypatch, *, band, calls):
+        from types import SimpleNamespace as NS
+        monkeypatch.setattr(
+            "btcpredict.config.settings.cross_venue_prefetch_max_age_s", 0.5)
+        monkeypatch.setattr("btcpredict.config.settings.cross_venue_take", True)
+        monkeypatch.setattr(
+            "btcpredict.config.settings.cross_venue_prefetch_margin_bps", band)
+
+        async def fake_top(token):
+            calls.append(token)
+            return NS(ask=0.61, bid=0.60)
+
+        monkeypatch.setattr("btcpredict.main.venue_top", fake_top)
+        b = Bot.__new__(Bot)
+        b.broker = type("B", (), {"mode": "live"})()
+        b._vtop_pre = {}
+        return b, NS(strike=100.0, slug="s"), NS(token_id="UP"), NS(token_id="DOWN"), NS(price=99.0)
+
+    def _run(self, b, r, up, down, feed, margin):
+        async def go():
+            t = await b._prefetch_venue_top(r, up, down, feed, margin_bps=margin)
+            if t is not None:
+                await t
+        asyncio.run(go())
+
+    def test_a_near_crossing_is_prefetched(self, monkeypatch) -> None:
+        calls = []
+        b, r, up, down, feed = self._bot(monkeypatch, band=2.0, calls=calls)
+        self._run(b, r, up, down, feed, margin=1.5)
+        assert calls == ["UP"]
+
+    def test_a_far_signal_is_not(self, monkeypatch) -> None:
+        """This is the traffic v1 spent: 76% of ticks sit outside 2 bps."""
+        calls = []
+        b, r, up, down, feed = self._bot(monkeypatch, band=2.0, calls=calls)
+        self._run(b, r, up, down, feed, margin=25.0)
+        assert calls == []
+
+    def test_the_band_is_two_sided(self, monkeypatch) -> None:
+        """A crossing is near from either side of the level."""
+        calls = []
+        b, r, up, down, feed = self._bot(monkeypatch, band=2.0, calls=calls)
+        self._run(b, r, up, down, feed, margin=-1.5)
+        assert calls == ["UP"]
+
+    def test_an_unknown_margin_does_not_spend_a_round_trip(self, monkeypatch) -> None:
+        """No level, no answer -- and 'I cannot tell' must not mean 'probe'."""
+        calls = []
+        b, r, up, down, feed = self._bot(monkeypatch, band=2.0, calls=calls)
+        self._run(b, r, up, down, feed, margin=None)
+        assert calls == []
+
+    def test_band_zero_means_no_gate(self, monkeypatch) -> None:
+        """Explicitly recoverable, but it is what v1 did. The default is 2.0."""
+        calls = []
+        b, r, up, down, feed = self._bot(monkeypatch, band=0.0, calls=calls)
+        self._run(b, r, up, down, feed, margin=999.0)
+        assert calls == ["UP"]
+
+    def test_the_shipped_band_is_not_zero(self) -> None:
+        assert Settings.model_fields[
+            "cross_venue_prefetch_margin_bps"].default == 2.0
+
+
+class TestTheRefreshInterval:
+    def test_it_is_its_own_knob_not_half_the_freshness_bound(self) -> None:
+        """v1 reused `max_age * 0.5`, so a 0.35s bound refetched every 0.175s.
+        'How old may a warm ask be' and 'how often may we ask' are unrelated."""
+        import pathlib
+        text = (pathlib.Path(__file__).resolve().parents[1]
+                / "btcpredict" / "main.py").read_text()
+        # The CODE, not the prose: the comment above it names the old bug on
+        # purpose, so a bare substring search matches its own explanation.
+        i = text.index("refresh = float(settings.cross_venue_prefetch_refresh_s)")
+        window = text[i:i + 220]
+        assert "time.monotonic() - e[0] < refresh" in window, (
+            "the dedup no longer compares against the refresh interval")
+        assert "max_age" not in window, (
+            "the refresh interval is tied to the freshness bound again")
+        assert Settings.model_fields[
+            "cross_venue_prefetch_refresh_s"].default == 1.0
+
+    def test_a_second_probe_inside_the_interval_is_refused(self, monkeypatch) -> None:
+        from types import SimpleNamespace as NS
+        calls = []
+        monkeypatch.setattr(
+            "btcpredict.config.settings.cross_venue_prefetch_max_age_s", 5.0)
+        monkeypatch.setattr("btcpredict.config.settings.cross_venue_take", True)
+        monkeypatch.setattr(
+            "btcpredict.config.settings.cross_venue_prefetch_margin_bps", 2.0)
+        monkeypatch.setattr(
+            "btcpredict.config.settings.cross_venue_prefetch_refresh_s", 60.0)
+
+        async def fake_top(token):
+            calls.append(token)
+            return NS(ask=0.61, bid=0.60)
+
+        monkeypatch.setattr("btcpredict.main.venue_top", fake_top)
+        b = Bot.__new__(Bot)
+        b.broker = type("B", (), {"mode": "live"})()
+        b._vtop_pre = {}
+
+        async def go():
+            for _ in range(5):
+                t = await b._prefetch_venue_top(
+                    NS(strike=100.0, slug="s"), NS(token_id="UP"),
+                    NS(token_id="DOWN"), NS(price=99.0), margin_bps=0.5)
+                if t is not None:
+                    await t
+        asyncio.run(go())
+        assert calls == ["UP"], "one probe per refresh interval, not per tick"
+
+
+class TestTheRateIsMeasuredNotEstimated:
+    def test_the_probe_count_is_logged(self) -> None:
+        """⭐ v1 shipped on an ESTIMATED rate and came back off when the
+        estimate turned out to be 19/s. The log states it now."""
+        import pathlib
+        text = (pathlib.Path(__file__).resolve().parents[1]
+                / "btcpredict" / "main.py").read_text()
+        assert "venue prefetch: %d probes" in text
+        assert "/hr" in text[text.index("venue prefetch: %d probes"):
+                             text.index("venue prefetch: %d probes") + 400]
+
+    def test_consumption_is_counted_too(self) -> None:
+        """Probes with no hits is the signature of a prefetch that is pure
+        cost -- exactly what v1 was for the five minutes it ran."""
+        import pathlib
+        text = (pathlib.Path(__file__).resolve().parents[1]
+                / "btcpredict" / "main.py").read_text()
+        assert "_vtop_hit_n" in text
