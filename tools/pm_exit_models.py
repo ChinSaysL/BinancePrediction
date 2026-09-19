@@ -73,6 +73,7 @@ def exit_at(ticks, i0, held, pay, rule, prm, floor_bps, slip, min_tau,
     armed = None
     best_bid = None
     draws = []
+    seen = []
     for k in range(i0 + 1, len(ticks)):
         ts, tau, ev, margin, ub, db = ticks[k]
         if tau <= min_tau:
@@ -105,6 +106,22 @@ def exit_at(ticks, i0, held, pay, rule, prm, floor_bps, slip, min_tau,
                    and best_bid - bid >= prm and best_bid > pay)
         elif rule == "margin":
             hit = adverse and abs(margin) >= prm
+        elif rule == "adapt":
+            # ⭐ THE THRESHOLD SCALED BY WHAT THIS ROUND IS ACTUALLY DOING,
+            # instead of a flat number that means 41% of a typical btc-5m round
+            # and 15% of an eth-15m one. ONE parameter, not nine: a per-family
+            # table would be ~23 exits per cell on a four-day tape, which is
+            # fitting noise. Scaling per ROUND is also strictly better than per
+            # COIN -- it tracks the conditions in front of it rather than a
+            # static family average.
+            #
+            # The scale is the round's own |margin| dispersion since the entry,
+            # which needs no new data: the margin series is already the thing
+            # the rule reads.
+            seen.append(abs(margin))
+            if len(seen) >= 8:
+                sc = (sum(seen) / len(seen)) or 0.0
+                hit = adverse and abs(margin) >= prm * sc
         elif rule == "either":
             # MARGIN **OR** A PRICE STOP. The margin rule invalidates the
             # SIGNAL; it cannot cut a loss the signal never invalidates, and
@@ -193,8 +210,8 @@ MODELS = [("off", [None]),
           ("trail", [0.05, 0.08, 0.12]),
           ("margin", [0.5, 1.0, 2.0, 4.0]),
           ("late", [30.0, 60.0, 90.0]),
-          ("either", [(4.0, 0.15), (4.0, 0.20), (4.0, 0.25), (4.0, 0.30),
-                      (2.0, 0.20), (2.0, 0.25)])]
+          ("either", [(4.0, 0.20), (4.0, 0.30)]),
+          ("adapt", [1.5, 2.0, 2.5, 3.0, 4.0, 5.0])]
 
 
 def main():
