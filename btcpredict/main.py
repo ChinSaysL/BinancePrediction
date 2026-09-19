@@ -4447,16 +4447,41 @@ class Bot:
         """Sell the position when the SAME trigger that opened it reads the
         other side. Returns True when this tick was spent on the exit.
 
-        MEASURED, `tools/pm_exit_flip.py`, 766-768 PM-era entries: the trigger
-        turns on **62.9% of entries, median 1.0 s after the entry**, and the
-        turn is violently informative -- P(win | turned) 42.2% against 94.4%
-        for the rest. Exiting into the bid there takes the cohort from +0.0773
-        to +0.1372 per share (t +4.32 -> +13.69), and it is not the floor
-        cohort in disguise (+0.1389 -> +0.2083 with a 1.0 bps floor).
+        ⛔ SHIPS OFF (`cross_exit_enabled=False`), AND THE NUMBERS THAT ONCE
+        JUSTIFIED IT ARE RETRACTED. This docstring used to claim the exit took
+        the cohort "from +0.0773 to +0.1372 per share (t +4.32 -> +13.69)" on
+        766-768 entries, with the flip arriving at "median 1.0 s after the
+        entry". Every one of those came from `tools/pm_exit_flip.py:walk()`,
+        which latched its exit candidate on the FIRST TICK AFTER THE ENTRY and
+        never advanced it -- so it priced every exit at roughly the ENTRY
+        price, and the median 1.0 s was the 1 Hz tape's own spacing, never a
+        property of the flip. Do not restore them.
 
-        The flip must PERSIST `cross_exit_confirm_s` before we leave; 3/5/10 s
-        all measured as good or better than acting on the first print, so the
-        window is a whipsaw guard rather than a fitted parameter.
+        WHAT REPLACED THEM, `tools/pm_exit_chain.py`: the exit re-swept under
+        the full live gate chain, with the freed SLOT credited (an exited
+        position gives its slot back at the exit instant, which at $5.11 and
+        two concurrent positions is worth ~100 extra entries) and the sale
+        priced at the BID, which is where all three real live sales landed:
+            EXIT OFF       L1 n=689 win 63.1% $+64.12 t+2.70 | TEST $+19.17
+                           L2 n=756 win 63.0% $+63.25 t+2.48 | TEST $+18.29
+            best exit      L1 n=781 win 43.3% $+39.20 t+1.86 | TEST $+13.10
+            (3 s / 60 s)   L2 n=869 win 44.5% $+49.44 t+2.25 | TEST $+13.56
+        The failure is one column: WIN RATE 63% -> 43-47%. It fires on ~55% of
+        positions and is a losing trade ~57% of the time -- it sells winners,
+        and ~100 extra entries cannot cover that.
+
+        THE LIVE RECORD SAYS THE SAME, HARDER. Ten completed sales against ~40
+        attempts (23 size-downs, 8 UNVERIFIED, 7 confirm-pending, 7 confirmed
+        late, 5 fak_unfilled, 5 sell_no_shares, 5 refused). Three of the ten
+        were DUST (4.3e-05, 9.7e-05, 0.039 shares). Seven of ten sold at
+        `tau 0 s` through the late-confirm path, dumping at 0.28-0.45 into the
+        bell on a position about to settle at 0 or 1. ALL TEN LOST, -$3.04
+        total, not one winner.
+
+        The flip must PERSIST `cross_exit_confirm_s` before we leave, and the
+        sweep still prefers 3 s with `cross_exit_min_tau_s` at 60 -- longer
+        min_tau is monotonically better at both looks. That gradient is real;
+        it simply points downhill from OFF.
         """
         if not settings.cross_exit_enabled:
             return False

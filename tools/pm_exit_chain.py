@@ -174,8 +174,28 @@ def claim(cands, *, floor, ceil, px_lo, px_hi, tau_lo, tau_hi):
     return None
 
 
-def walk_exit(ticks, i0, held, floor, confirm_s, min_tau, slip):
-    """main.py's rule. Returns (exit_ts, exit_price) or None."""
+def walk_exit(ticks, i0, held, floor, confirm_s, min_tau, slip,
+              sale_px="bid", tick=0.01):
+    """main.py's exit rule, then THE BROKER'S OWN SELL PATH.
+
+    The sale is not "the bid minus slip". `_sell_fak_body` derives a FLOOR of
+    round_up(bid - slip) and sends a FAK with min_price=floor; the floor is a
+    LOWER BOUND, and the fill comes back at the venue's own price. Every real
+    sale on the live record landed at or above the BID, never at the floor:
+        eth-1789750200  floor 0.33  bid 0.36  sold 0.36
+        btc-1789767000  floor 0.31  bid 0.34  sold 0.34
+        xrp-1789767300  floor 0.18  bid 0.21  sold 0.33
+    Pricing exits at bid-slip therefore charged ~0.03 a share that the venue
+    never took -- against ~400 exits at ~1.7 shares that is ~$20, which is most
+    of the gap the exit was being judged on. `sale_px="floor"` keeps the old,
+    pessimistic convention for comparison.
+
+    The broker's two refusals are modelled, because both leave the position
+    riding to settlement rather than exiting:
+      * no fresh bid  -- "the book goes one-sided near the bell";
+      * floor not strictly inside (0, bid) -- "nothing to take", which is what
+        happens once the bid is at or under the slip.
+    """
     armed = None
     for k in range(i0 + 1, len(ticks)):
         ts, tau, ev, margin, ub, db = ticks[k]
@@ -195,13 +215,17 @@ def walk_exit(ticks, i0, held, floor, confirm_s, min_tau, slip):
         if ts - armed < confirm_s * 1000:
             continue
         bid = ub if held == "Up" else db
-        if bid <= 0:
+        if bid <= 0:                            # no fresh bid -> refused
             continue
-        return ts, max(0.01, bid - slip)
+        fl = math.ceil((bid - max(0.0, slip)) / tick - 1e-9) * tick
+        if not (0.0 < fl < bid):                # "nothing to take" -> refused
+            continue
+        return ts, (bid if sale_px == "bid" else fl)
     return None
 
 
-def sim(R, *, bankroll, expo, exit_on, confirm_s, min_tau, stake=1.0, days=None, **gk):
+def sim(R, *, bankroll, expo, exit_on, confirm_s, min_tau, sale_px="bid",
+        stake=1.0, days=None, **gk):
     fc = gk.pop("fill_cap")
     ev = []
     for end, cands, ticks in R:
@@ -227,7 +251,7 @@ def sim(R, *, bankroll, expo, exit_on, confirm_s, min_tau, stake=1.0, days=None,
         free_at = end
         if exit_on:
             x = walk_exit(ticks, ti, side, gk["floor"], confirm_s, min_tau,
-                          LIVE["cross_exit_slip"])
+                          LIVE["cross_exit_slip"], sale_px=sale_px)
             if x:
                 xts, xpx = x
                 tot += (xpx - pay) * sh - FEE(pay) * sh
@@ -274,21 +298,25 @@ def main():
         print(f"\n  EXIT OFF (ships today)   full: n={off_f['n']:4d} blk={off_f['blk']:4d} "
               f"win{off_f['win']:5.1f}% ${off_f['d']:+7.2f} t{off_f['t']:+5.2f}"
               f" | TEST ${off_t['d']:+7.2f} win{off_t['win']:5.1f}%")
-        print("\n  EXIT ON -- sweeping confirm_s x min_tau_s")
-        print("  %-9s %-9s %s" % ("confirm", "min_tau", "full tape / TEST"))
-        for cs_ in (1.0, 3.0, 5.0, 10.0):
-            for mt in (8.0, 30.0, 60.0):
-                f = sim(R, bankroll=B, expo=E, exit_on=True, confirm_s=cs_,
-                        min_tau=mt, **G)
-                t = sim(R, bankroll=B, expo=E, exit_on=True, confirm_s=cs_,
-                        min_tau=mt, days=TE, **G)
-                if not f:
-                    continue
-                mark = "*" if (cs_ == LIVE["cross_exit_confirm_s"]
-                               and mt == LIVE["cross_exit_min_tau_s"]) else " "
-                print(f"  {mark}{cs_:<8.0f} {mt:<9.0f} n={f['n']:4d} exits={f['exits']:4d} "
-                      f"blk={f['blk']:4d} win{f['win']:5.1f}% ${f['d']:+7.2f} "
-                      f"t{f['t']:+5.2f} | TEST ${t['d']:+7.2f}" if t else "")
+        for spx, lab in (("bid", "sale at the BID (measured: 3/3 live sales)"),
+                         ("floor", "sale at bid-slip (the old, pessimistic run)")):
+            print(f"\n  EXIT ON -- {lab}")
+            print("  %-9s %-9s %s" % ("confirm", "min_tau", "full tape / TEST"))
+            for cs_ in (1.0, 3.0, 5.0, 10.0):
+                for mt in (8.0, 30.0, 60.0):
+                    f = sim(R, bankroll=B, expo=E, exit_on=True, confirm_s=cs_,
+                            min_tau=mt, sale_px=spx, **G)
+                    t = sim(R, bankroll=B, expo=E, exit_on=True, confirm_s=cs_,
+                            min_tau=mt, sale_px=spx, days=TE, **G)
+                    if not f or not t:
+                        continue
+                    mark = "*" if (cs_ == LIVE["cross_exit_confirm_s"]
+                                   and mt == LIVE["cross_exit_min_tau_s"]) else " "
+                    beat = "  <-- BEATS OFF" if t["d"] > off_t["d"] else ""
+                    print(f"  {mark}{cs_:<8.0f} {mt:<9.0f} n={f['n']:4d} "
+                          f"exits={f['exits']:4d} blk={f['blk']:4d} "
+                          f"win{f['win']:5.1f}% ${f['d']:+7.2f} t{f['t']:+5.2f}"
+                          f" | TEST ${t['d']:+7.2f}{beat}")
 
 
 if __name__ == "__main__":
