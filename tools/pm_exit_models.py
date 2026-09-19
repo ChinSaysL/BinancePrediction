@@ -192,7 +192,8 @@ def sim(R, *, bankroll, expo, rule, prm, min_tau, p_fill=1.0,
         s = stake * len(slots)
         if s > 0 and s + stake > expo * bankroll:
             blk += 1; continue
-        (ts, tau, side, am, ask, won, age, dok, dbps, flip, gap, ti, rng) = c
+        (ts, tau, side, am, ask, won, age, dok, dbps, flip, gap, ti, rng,
+         _bage) = c
         if ask > fc:
             continue
         pay = min(max(ask + EXEC, 0.01), 0.99)

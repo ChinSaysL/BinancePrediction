@@ -65,7 +65,7 @@ def load():
     r = pd.read_sql_query("""select slug,start_ms,end_ms,strike,winner,feed_provider
         from rounds where strike is not null and winner is not null""", con)
     q = pd.read_sql_query("""select slug,ts_ms,tau_s,spot,spot_ts_ms,
-        up_ask,down_ask,up_bid,down_bid from quotes
+        up_ask,down_ask,up_bid,down_bid,book_age_ms from quotes
         where spot is not null and ts_ms is not null order by ts_ms""", con)
     con.close()
     r = r[r.feed_provider.fillna("").str.contains("twap", case=False)]
@@ -97,6 +97,7 @@ def _one(args):
     tail = max(10, int((hold + look + 2.0) * 1.6) + 6)
     ticks, cands, prev = [], [], None
     lo = hi = None
+    bages = (rows.book_age_ms.to_numpy() if "book_age_ms" in rows else None)
     for i, (ts, tau, ua, da, ub, db, sp) in enumerate(zip(
             rows.ts_ms, rows.tau_s, rows.up_ask, rows.down_ask,
             rows.up_bid, rows.down_bid, rows.spot)):
@@ -127,14 +128,25 @@ def _one(args):
                       bool(row.winner == ev), age,
                       bool(passes_depth_floor(float(sp), lvl, mk)),
                       1e4 * abs(float(sp) - lvl) / lvl, flip, gap, len(ticks) - 1,
-                      1e4 * (hi - lo) / lvl if lo and hi else 0.0))
+                      1e4 * (hi - lo) / lvl if lo and hi else 0.0,
+                      # STALENESS OF THE BOOK THIS ASK CAME FROM, in ms, or
+                      # None where the REST poll supplied it. pm_two_book draws
+                      # its ladder gap conditioned on this: the gap IS the
+                      # staleness, so drawing one unconditional distribution
+                      # gives a 17 ms book the same handicap as a 1.8 s one.
+                      (float(bages[i]) if bages is not None
+                       and bages[i] is not None
+                       and np.isfinite(bages[i]) else None)))
     if not cands:
         return None
     return (int(row.end_ms), cands, ticks, str(row.slug))
 
 
 def build(look, hold, jobs):
-    cache = os.path.join(ROOT, "data", f".exit2-look{look:.1f}.pkl")
+    # v3: the candidate tuple gained `book_age_ms`. A stale v2 pickle would
+    # unpack one field short and fail far from here, so the NAME changes with
+    # the shape rather than relying on anyone remembering to delete it.
+    cache = os.path.join(ROOT, "data", f".exit3-look{look:.1f}.pkl")
     if os.path.exists(cache):
         return pickle.load(open(cache, "rb"))
     r, q = load()
@@ -158,7 +170,8 @@ def claim(cands, *, floor, ceil, px_lo, px_hi, tau_lo, tau_hi):
     switched on would have made this tool silently replay a different arm.
     """
     for c in cands:
-        (ts, tau, side, am, ask, won, age, dok, dbps, flip, gap, ti, rng) = c
+        (ts, tau, side, am, ask, won, age, dok, dbps, flip, gap, ti, rng,
+         _bage) = c
         if not (tau_lo <= tau <= tau_hi):                    continue  # 3552
         if age > LIVE["max_spot_age_s"]:                     continue  # 3568
         if floor > 0 and am < floor:                         continue  # 3611
@@ -243,7 +256,8 @@ def sim(R, *, bankroll, expo, exit_on, confirm_s, min_tau, sale_px="bid",
         s = stake * len(slots)
         if s > 0 and s + stake > expo * bankroll:
             blk += 1; continue
-        (ts, tau, side, am, ask, won, age, dok, dbps, flip, gap, ti, rng) = c
+        (ts, tau, side, am, ask, won, age, dok, dbps, flip, gap, ti, rng,
+         _bage) = c
         if ask > fc:
             continue
         pay = min(max(ask + EXEC, 0.01), 0.99)
