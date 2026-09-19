@@ -3703,6 +3703,35 @@ class Settings(BaseSettings):
     # RE-NARROW: cross_disabled_families="xrp-updown-5m,sol-updown-5m,
     # doge-updown-5m,eth-updown-15m,btc-updown-15m,bnb-updown-15m" + restart.
     cross_disabled_families: str = ""
+    #: Families the MODEL arm may trade. Empty = every family in
+    #: `active_markets()`, which is the behaviour from 2026-09-19 when the arm
+    #: was widened past `MARKETS[0]` at the operator's request.
+    #:
+    #: WHY IT EXISTS. Re-measured the same day with every decision knob pinned
+    #: to the live host (min_quote 0.55, max_quote 0.80, min_edge 0.01,
+    #: edge_haircut 1.0, tau 60-210, per-symbol sigma, measured taker fee), the
+    #: widening was trading two families that lose:
+    #:
+    #:     family          fills     WR     EV/$   day-t     tot$
+    #:     btc-updown-5m   1,467  72.5%  +0.0300   +1.55  +$44.01
+    #:     eth-updown-5m     528  69.5%  -0.0038   +0.05   -$2.01
+    #:     bnb-updown-5m     142  73.2%  -0.0093   +0.36   -$1.32
+    #:
+    #: ETH also fails its own calibration independently of P&L: scaling
+    #: realised moves by the predicted sd gives std(z) = 1.525 over 354,939
+    #: observations, against BTC 0.999 and BNB 1.017. It is not a feed mismatch
+    #: (median |end_price - last spot| is 0.00 bps for both) -- ETH trends
+    #: within a round faster than sqrt-time implies, so the model is
+    #: structurally overconfident there. Two independent lines of evidence.
+    #:
+    #: BNB is n=142 over 3 days and is NOT established either way; it is off
+    #: because it is unmeasured, not because it is proven bad.
+    #:
+    #: This narrows TRADING only. Every family in `active_markets()` is still
+    #: recorded and still has its book followed, so re-enabling one costs
+    #: nothing but the edit -- the same separation `CROSS_TRADED` keeps from
+    #: `MARKETS`, and for the same reason.
+    model_families: str = ""
     # May a cross entry take the side OPPOSITE a position already held in this
     # round? No. Buying both sides is not a hedge: with the first position sunk,
     #     EV(take) - EV(decline) = stake_B * [ (1 - p)/b - 1 ]
@@ -3905,6 +3934,24 @@ def cross_disabled() -> frozenset[str]:
     """
     raw = settings.cross_disabled_families or ""
     return frozenset(p.strip() for p in raw.split(",") if p.strip())
+
+
+def model_families() -> frozenset[str]:
+    """Families the MODEL arm may order in; empty means no restriction."""
+    raw = settings.model_families or ""
+    return frozenset(p.strip() for p in raw.split(",") if p.strip())
+
+
+def model_traded(prefix: str | None) -> bool:
+    """May the model arm ORDER in this family?
+
+    An empty `model_families` means every active family, so the widened
+    behaviour is what you get by default and narrowing is the explicit act.
+    """
+    allowed = model_families()
+    if not allowed:
+        return True
+    return bool(prefix) and prefix in allowed
 
 
 def cross_traded(prefix: str | None) -> bool:

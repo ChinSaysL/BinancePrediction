@@ -31,7 +31,8 @@ from btcpredict.calibration.report import PnLSummary
 from btcpredict.edge.impulse import impulse_bps, impulse_side
 from btcpredict.config import (CROSS_TRADED, MARKETS, SYMBOL_BY_PREFIX,
                                TRAIN_P_WIN, active_markets, cross_knob,
-                               cross_traded, market_prefix, settings)
+                               cross_traded, market_prefix, model_traded,
+                               settings)
 from btcpredict.edge.signal import (FLOOR_MAX_BANKROLL_FRACTION, FeeModel,
                                     Signal, evaluate,
                                     evaluate_hybrid, expected_value,
@@ -1942,6 +1943,18 @@ class Bot:
         # Guarded lookup: fixtures build a Bot without running __init__, and the
         # tick buffer must not be the thing that breaks them.
         ticks = (getattr(self, "_ticks", None) or {}).get(symbol) or []
+
+        # `model_families` narrows the MODEL arm to named families. Placed
+        # AFTER the history tick above, deliberately and for the same reason
+        # entry_mode "off" is: a family that is switched off keeps its price
+        # history warm, so switching it back on does not start from a cold
+        # estimator. It also keeps recording -- this narrows TRADING only.
+        #
+        # Empty means every active family, so the widened behaviour is the
+        # default and narrowing is the explicit act. See config.model_families
+        # for the measurement that put eth and bnb behind it.
+        if not model_traded(market_prefix(r.slug)):
+            return
 
         # entry_mode "off" stops the MAIN arm here: the cross and double ticks
         # above have already run, the tape is already recorded, and the history
