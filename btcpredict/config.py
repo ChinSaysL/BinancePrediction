@@ -660,6 +660,32 @@ class Settings(BaseSettings):
     # transfer to Binance (see the weekend/corpus work). Below 0.30 the arm
     # collapses ($0.24/day at 0.20).
     #
+    # ⛔ RE-TUNED AFTER THE CHANGE (2026-09-20). One factor at a time from the
+    # new baseline, weekday cohort, range gate on -- NOTHING else should move:
+    #
+    #     BASELINE (live)  n=526 WR 76.8% EV +0.0835 day-t +4.45  $6.28/day
+    #     min_edge 0.02    n=502            -0.0026  day-t +4.40  $5.80
+    #     min_edge 0.03    n=382            -0.0142  day-t +2.43  $3.78
+    #     min_edge 0.06    n=105            -0.0687  day-t +0.68  $0.22
+    #     persistence 1    n=626            -0.0290
+    #     persistence 3    n=447            -0.0157
+    #     max_quote 0.85   n=600            -0.0156  day-t +4.32
+    #     tau 60-240       n=724            -0.0223
+    #     sigma x1.25      n=237            -0.0337
+    #   (max_quote 0.75 is +0.0019, i.e. noise, at day-t +2.88 and -$0.90/day)
+    #   NULL best-of-18: mean +0.0630 -> best real p = 0.151
+    #
+    # Every perturbation degrades, so this is a well-behaved optimum rather than
+    # a knife-edge -- which is the independent check the isolated day-t peak at
+    # 0.50 needed. min_edge in particular does NOT need to move: the HURDLE
+    # (~0.02) binds at min_edge 0.01, and halving the haircut already doubled
+    # the raw edge needed to clear it (0.02 -> 0.04). That is what took 674
+    # trades to 526; min_edge never bound.
+    #
+    # The weekend settings all HURT here (sigma x1.25 -0.0337, persistence 3
+    # -0.0157, max_quote 0.85 -0.0156), which is the premise weekend_overrides
+    # rests on: the two regimes want different configs.
+    #
     # ⛔ min_edge IS COMPARED POST-HAIRCUT -- verified in signal.py:
     # `p = q + haircut*(p_model-q)`, `edge = p - q`, `edge >= min_edge`. So the
     # haircut scales the edge linearly and the pair MUST move together. At
