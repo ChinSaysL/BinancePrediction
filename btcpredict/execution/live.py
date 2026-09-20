@@ -61,6 +61,13 @@ ACTIVE_ORDERS = f"{P}/order/list"
 BATCH_CANCEL = f"{P}/trade/batch-cancel"
 
 
+#: The venue refuses MARKET orders under roughly this notional (its own
+#: schema: "For `MARKET` orders, minimum is approximately 1.5 USDT (varies by
+#: market depth)"). At $1-$2 positions this is the binding constraint on
+#: selling at all, not the book.
+SELL_MIN_NOTIONAL_USDT = 1.5
+
+
 def derived_slip_bps(default_bps: int, max_px: float | None,
                      avg_px: float) -> int:
     """The `slippageBps` to send, given the caller's own price ceiling.
@@ -929,6 +936,142 @@ class LiveBroker:
             # fill is provisional and settle() will re-verify and void it if
             # the venue never actually filled anything.
             unverified=(status is None),
+        )
+
+    async def sell_fak(self, *, slug: str, side: str, token_id: str,
+                       shares: float, min_px: float | None = None,
+                       slip: float = 0.03,
+                       quote: dict | None = None) -> Fill | None:
+        """Sell `shares` of an outcome token. Mirrors `PmBroker.sell_fak`.
+
+        THE FIRST SELL PATH ON THIS VENUE. `main.py` has called
+        `self.broker.sell_fak` since the cross exit shipped, but this class
+        never defined it -- so `_arm_exit_watch`'s `hasattr(self.broker,
+        "sell_fak")` was False on Binance and the watcher silently returned,
+        with no error and no log line. Every exit rule was inert here for that
+        reason alone, whatever its config said.
+
+        UNITS. For a SELL `amountIn` is SHARES in wei, not USDT: the venue's
+        own schema states it for the blocktrade endpoint --
+            | `SELL` | shares (wei)  | USDT (wei)    |
+        -- and `side` is the same BUY/SELL enum on trade/get-quote. Sending
+        USDT here would ask to sell ~`price` times too few shares.
+
+        `stake` ON THE RETURNED FILL IS PROCEEDS, NOT AN OUTLAY -- cash coming
+        IN. Do NOT hand it to `settle()`: that pays a position out against the
+        round's winner and this position no longer exists. The caller books the
+        sale itself (see `Bot._cross_exit_execute`).
+
+        ⛔ THE VENUE'S MARKET MINIMUM IS ~1.5 USDT of notional, and this bot
+        trades $1-$2 positions. A sale whose proceeds fall under that is
+        refused outright, so the common case for THIS account is that a sell
+        cannot be placed at all. Checked below and reported as
+        `sell_below_venue_minimum` rather than sent and rejected.
+
+        NOT WIRED TO ANY AUTOMATIC RULE. The cross exit that would call it
+        ships off with a retracted justification and a 0-for-10 live record,
+        and the three exit rules measured on 2026-09-19 (stop, take, late spot)
+        all lost to holding. This is execution capability, deliberately inert.
+        """
+        if not self.enabled:
+            raise LiveBrokerError("wallet not configured; call discover_wallet() first")
+        self.last_failure = None
+        self.last_order_error = None
+        self.last_sell_size = 0.0
+        shares = float(shares or 0.0)
+        if shares <= 0.0 or not token_id:
+            # Nothing to sell, or a position with no token: either would only
+            # produce a venue error naming the wrong cause.
+            self.last_failure = "sell_no_shares"
+            return None
+
+        q = quote or await self.get_quote(token_id, shares, side="SELL",
+                                          order_type="MARKET")
+        if not q or not q.get("quoteId"):
+            self.last_failure = "no_sell_quote"
+            log.warning("no SELL quote for %s %s (%.4f shares)", slug, side, shares)
+            return None
+
+        # What the venue says this sale is worth. `amountOut` is USDT for a
+        # SELL; `averagePrice` is per share. Either alone is enough to decide
+        # whether the venue minimum is reachable.
+        out_usdt = amount_usdt(q.get("amountOut"))
+        avg_px = float(q.get("averagePrice") or 0.0)
+        if out_usdt <= 0.0 and avg_px > 0.0:
+            out_usdt = avg_px * shares
+        if 0.0 < out_usdt < SELL_MIN_NOTIONAL_USDT:
+            # The refusal that matters for this account. Reported by name so it
+            # is never mistaken for a book or latency problem.
+            self.last_failure = "sell_below_venue_minimum"
+            log.info("sell %s %s: proceeds $%.4f under the venue's ~$%.2f "
+                     "MARKET minimum (%.4f shares @ %.4f) -- not sent",
+                     slug, side, out_usdt, SELL_MIN_NOTIONAL_USDT, shares, avg_px)
+            return None
+
+        # A FLOOR ON WHAT WE RECEIVE. `min_px` is the caller's worst acceptable
+        # price per share; the venue enforces it through slippageBps against
+        # the quote, the same mechanism the buy path uses for its ceiling.
+        # Without a floor the caller gets the configured default unchanged.
+        slip_bps = int(round(max(1.0, min(10_000.0, slip * 10_000.0))))
+        if min_px is not None and avg_px > 0.0:
+            give = max(0.0, (avg_px - float(min_px)) / avg_px)
+            slip_bps = int(round(max(1.0, min(10_000.0, give * 10_000.0))))
+
+        t_ack = time.monotonic()
+        resp = await self._request("POST", PLACE_ORDER, {
+            "walletAddress": self.wallet_address,
+            "walletId": self.wallet_id,
+            "quoteId": q["quoteId"],
+            "timeInForce": "FOK",
+            "accountType": self.account_type,
+            "orderType": "MARKET",
+            "slippageBps": slip_bps,
+        })
+        log.info("venue ack SELL %s %s: %.0fms, quote %.4f slip %d%s",
+                 slug, side, (time.monotonic() - t_ack) * 1000.0, avg_px,
+                 slip_bps, "" if min_px is None else f", floor {min_px:.3f}")
+        if not resp:
+            refused = (not self._transport_error
+                       and 400 <= self._last_status < 500)
+            self.last_failure = "rejected" if refused else "unknown"
+            return None
+
+        # Same discipline as `buy`: HTTP 200 + {orderId} does NOT mean filled.
+        # A phantom SALE is worse than a phantom buy -- it books proceeds that
+        # never arrived AND releases a position the venue still holds, so the
+        # round then settles against a position the ledger thinks is gone.
+        order_id = str(resp.get("orderId") or resp.get("bundleId") or "")
+        rec = await self.order_record(order_id, tries=6, delay=0.6) if order_id else None
+        filled = float((rec or {}).get("fillPercentage") or 0.0)
+        if rec is None:
+            # Unreadable. NOT retryable: re-sending on weak evidence would sell
+            # a position twice, and the second sale has nothing behind it.
+            self.last_failure = "sell_unconfirmed"
+            log.warning("sell %s %s: order %s status unreadable -- NOT retried; "
+                        "the position rides to settlement", slug, side, order_id)
+            return None
+        if filled <= 0.0:
+            self.last_failure = "fak_unfilled"
+            log.info("sell %s %s: FAK found nothing at or above the floor (%s)",
+                     slug, side, order_id)
+            return None
+
+        sold = amount_usdt(rec.get("filledShareQty")) or (shares * filled)
+        proceeds = amount_usdt(rec.get("filledUsdtAmount"))
+        px = (proceeds / sold) if sold > 0 else avg_px
+        fee = amount_usdt(rec.get("marketProviderFee"))
+        self.last_sell_size = float(sold)
+        log.info("SELL %s %s FILLED %.0f%% @%.4f (%.4f shares -> $%.4f, fee $%.4f)",
+                 slug, side, filled * 100, px, sold, proceeds, fee)
+        return Fill(
+            slug=slug, side=side,
+            requested_px=float(min_px) if min_px is not None else px,
+            filled_px=px, shares=sold,
+            # PROCEEDS, not an outlay. See the docstring.
+            stake=proceeds, fee_paid=fee,
+            order_id=order_id or str(q["quoteId"]),
+            ts_ms=int(time.time() * 1000), raw=str(resp)[:2000],
+            token_id=token_id,
         )
 
     async def _confirm_by_position(self, token_id: str, tries: int = 6,
