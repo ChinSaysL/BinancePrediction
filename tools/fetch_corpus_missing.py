@@ -90,12 +90,13 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--urls", default="data/btc5m_urls.txt")
     ap.add_argument("--only", default="metadata",
-                    choices=["metadata", "ticks", "all"])
+                    choices=["metadata", "ticks", "trades", "all"])
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args()
 
     want = {"metadata": ["metadata.json"], "ticks": ["ticks_dense.parquet"],
+            "trades": ["trades_raw.json"],
             "all": ["metadata.json", "ticks_dense.parquet"]}[args.only]
     with open(args.urls) as f:
         urls = [u.strip() for u in f if u.strip()]

@@ -467,6 +467,13 @@ def ws_follow_rounds(round_cache, mkt, primary, follow_all) -> list:
     return [r0] if r0 is not None else []
 
 
+def is_weekend_utc(ts_ms: int | None = None) -> bool:
+    """Saturday or Sunday in UTC. See config.weekend_overrides."""
+    if ts_ms is None:
+        return time.gmtime().tm_wday >= 5
+    return time.gmtime(ts_ms / 1000.0).tm_wday >= 5
+
+
 def crossed_side(ticks, strike: float, look_s: float,
                  slack_s: float = 2.0, hold_s: float = 0.0) -> str | None:
     """Which side did the spot just cross INTO, or None if it did not.
@@ -1833,6 +1840,12 @@ class Bot:
 
         spot = feed.price
         sigma = vol.sigma_1m()
+        # Weekend sigma correction: rolling vol on a weekend is fitted purely
+        # on weekend rounds, so it is too small and the model is overconfident
+        # about an in-the-money side. See config.weekend_overrides.
+        _sm = self._wk("sigma_mult")
+        if _sm and _sm != 1.0 and sigma:
+            sigma = sigma * _sm
 
         # Buy prices come from the real book (the ask), not the displayed
         # last-trade price, which was observed 2-3 cents away from the mid.
@@ -2136,9 +2149,9 @@ class Bot:
                 half_spread=half_spread,
                 safety_margin=settings.safety_margin,
                 fee_model=FeeModel.NOTIONAL,
-                max_quote=settings.max_quote,
-                min_quote=settings.min_quote,
-                min_edge=settings.min_edge,
+                max_quote=self._wk("max_quote"),
+                min_quote=self._wk("min_quote"),
+                min_edge=self._wk("min_edge"),
                 edge_haircut=settings.edge_haircut,
             )
             # Rising-regime gate (see config.up_regime_gate): when the last hour is
@@ -2181,15 +2194,17 @@ class Bot:
         # With candle-open gating the final candle opens at tau ~= 59.9s, just
         # under min_tau_s=60. The allowance lets that open stand for its own
         # time; mid-candle ticks are blocked by the candle gate itself.
-        min_tau_eff = (settings.min_tau_s - settings.candle_open_window_s
-                       if settings.trade_on_candle_open else settings.min_tau_s)
+        min_tau_eff = (self._wk("min_tau_s") - settings.candle_open_window_s
+                       if settings.trade_on_candle_open
+                       else self._wk("min_tau_s"))
         # Impulse entries are deliberately NOT subject to the persistence rule:
         # the dislocation is the event, and waiting two polls for it to repeat
         # is exactly how the venue's book catches up. The rule was validated with
         # one entry per round on the first qualifying tick.
         if (sig.act and not from_impulse
-                and streak < settings.signal_persistence):
-            gate_reason = f"signal held {streak}/{settings.signal_persistence} polls"
+                and streak < self._wk("signal_persistence")):
+            gate_reason = (f"signal held {streak}/"
+                           f"{self._wk('signal_persistence')} polls")
         elif (settings.side_filter != "both"
               and sig.act and sig.side != settings.side_filter):
             gate_reason = (f"side {sig.side} filtered "
@@ -2202,7 +2217,7 @@ class Bot:
               and round(tau / 60.0) not in settings.trade_candle_opens):
             gate_reason = (f"candle {round(tau / 60.0)} not in "
                            f"{settings.trade_candle_opens}")
-        elif not (min_tau_eff <= tau <= settings.max_tau_s):
+        elif not (min_tau_eff <= tau <= self._wk("max_tau_s")):
             gate_reason = f"tau {tau:.0f}s outside window"
         elif (settings.model_max_round_range_bps > 0
               and (rng := self._round_range_bps(r)) is not None
@@ -2702,6 +2717,24 @@ class Bot:
                               # not which broker, and check_pool/on_open would
                               # otherwise disagree about which budget it spends.
                               mode="impulse")
+
+    def _wk(self, name: str):
+        """A model knob, weekend-aware.
+
+        Returns `settings.weekend_<name>` on Saturday/Sunday UTC when
+        `weekend_overrides` is on, else `settings.<name>`. UTC because the
+        round slugs and every measurement in config.weekend_overrides are UTC;
+        a local-time weekend would shift the cohort by hours and score a
+        different set of rounds than the one that was measured.
+
+        getattr with a default on both lookups: this sits on the decision path
+        and a stub settings object in a test must not raise here.
+        """
+        if getattr(settings, "weekend_overrides", False) and is_weekend_utc():
+            v = getattr(settings, f"weekend_{name}", None)
+            if v is not None:
+                return v
+        return getattr(settings, name, None)
 
     def _ck(self, name: str, r=None):
         """A cross knob for ONE round.

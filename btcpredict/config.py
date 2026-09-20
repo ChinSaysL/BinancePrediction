@@ -3964,6 +3964,40 @@ class Settings(BaseSettings):
     # (+$17.32 / +$7.99); 0.09/3/210's newest half is already negative.
     signal_persistence: int = 2
 
+    # --- WEEKEND OVERRIDES -------------------------------------------------
+    # ⛔ SHIPPED ON THE OPERATOR'S EXPLICIT INSTRUCTION, NOT ON EVIDENCE.
+    #
+    # The model arm LOSES on weekends at the shipped knobs: measured 2026-09-20
+    # on the September record, real quotes, 4 weekend days --
+    #     WEEKEND n=112 ask 0.672 WR 64.3% EV -0.0500 day-t -0.95
+    # against weekday n=895 EV +0.0392 day-t +1.73. The edge inverts: on
+    # weekdays the win rate runs 3.8 pts ABOVE the ask, on weekends 2.9 pts
+    # BELOW.
+    #
+    # A 480-cell weekend-only tune of the real arm found a best cell at
+    # EV +0.2573, day-t +2.75, n=62, all 4 leave-one-day-out folds positive --
+    # and it is NOT SIGNIFICANT: the calibrated best-of-296 null averages
+    # +0.2561, so p = 0.4195. With 4 days and a large grid, day-t and holdout
+    # are both fooled; only the multiplicity-honest null is informative.
+    #
+    # The DIRECTION is at least mechanically motivated and agrees across every
+    # top cell: `rolling_sigma` on a weekend is fitted purely on weekend rounds,
+    # so it is too small and the model is overconfident about an in-the-money
+    # side -- hence a sigma multiplier > 1, a higher edge hurdle, and a lower
+    # price floor. That is a HYPOTHESIS being bought with live money, and the
+    # defaults below keep it OFF.
+    #
+    # Turn on with WEEKEND_OVERRIDES=true. Kill with WEEKEND_OVERRIDES=false.
+    weekend_overrides: bool = False
+    # Inflate sigma on Saturday/Sunday (UTC). 1.0 = shipped behaviour.
+    weekend_sigma_mult: float = 1.50
+    weekend_min_edge: float = 0.06
+    weekend_min_quote: float = 0.45
+    weekend_max_quote: float = 0.72
+    weekend_min_tau_s: float = 60.0
+    weekend_max_tau_s: float = 240.0
+    weekend_signal_persistence: int = 2
+
     # --- execution timing ---------------------------------------------------
     # OFF: the candle-open gate lost to the price-catcher on every robustness
     # metric (see min_edge above). Instead of restricting WHEN to act, the bot
