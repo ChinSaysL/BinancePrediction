@@ -1068,7 +1068,11 @@ class Settings(BaseSettings):
     # bar) once today is dropped. Shipped live because $1 x 10/day is a bounded
     # way to buy the sample, NOT because it is proven. Kill it if EV/$1 <= 0
     # after ~150 booked entries.
-    cross_enabled: bool = False
+    cross_enabled: bool = True
+    # Restrict CROSS arm execution to weekdays only (Monday-Friday UTC FX week).
+    # Backtests show cross arm is strongly profitable on weekdays (+0.0925 EV/$1)
+    # and loses money on weekends (-0.0430 EV/$1).
+    cross_weekdays_only: bool = True
     # How far back to look for the flip. 2s and 3s measure the same (+0.1421 /
     # +0.1441); 1s finds almost nothing on a 1 Hz tape.
     # RE-SWEPT 2026-09-13 with FILL-AWARE scoring (a trigger only counts if the

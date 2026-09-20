@@ -3798,6 +3798,8 @@ class Bot:
         this falls back to the single-market path so the arm behaves exactly as
         it did before it was widened.
         """
+        if getattr(settings, "cross_weekdays_only", False) and is_weekend_utc():
+            return
         mkt = getattr(self, "_mkt", None)
         if not mkt:
             await self._cross_tick()
@@ -3849,6 +3851,8 @@ class Bot:
             primary = ctx.get("primary", False)
         asks = (getattr(self, "_asks", (None, None)) if ctx is None
                 else ctx.get("asks", (None, None)))
+        if getattr(settings, "cross_weekdays_only", False) and is_weekend_utc():
+            return
         if not self._ck("enabled", r):
             return
         ticks = getattr(feed, "ticks", None)
@@ -5943,7 +5947,9 @@ class Bot:
         # Both arms trade off `feed.ticks`, so both belong on the feed's clock.
         want_impulse = (settings.entry_mode in ("impulse", "both")
                         and settings.impulse_on_tick)
-        want_cross = settings.cross_enabled
+        want_cross = (settings.cross_enabled
+                      and not (getattr(settings, "cross_weekdays_only", False)
+                               and is_weekend_utc()))
         if not (want_impulse or want_cross):
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self._stop.wait(), timeout=budget)
