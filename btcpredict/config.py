@@ -3878,6 +3878,21 @@ class Settings(BaseSettings):
     #:
     #: `stake_cap_usdt` still binds LAST and will clamp the boost, so raise it
     #: with the multiplier or the reweight silently does nothing.
+    #: Seconds the venue position list may be reused for the pre-order
+    #: unbooked-position check. 0 = always refetch (the old behaviour).
+    #:
+    #: That check is a signed GET on the ORDER'S CRITICAL PATH -- measured 60 ms
+    #: median against an 8 ms network RTT, so it is signing and venue
+    #: processing, not distance. The full decision -> venue createTime is
+    #: 290 ms: ~60 here, ~52 for get_quote, ~60 for place-order, the rest
+    #: python and the poll loop. An arm racing a crossing has its edge inside
+    #: ~100 ms, so this alone is a fifth of the budget.
+    #:
+    #: Reusing it costs no real freshness: the gate runs once per 1 s poll, so
+    #: a value this old is no staler than the poll consuming it. The cache is
+    #: dropped on every booked fill, so the case it exists for -- an order that
+    #: filled without being booked -- still reads a fresh list next attempt.
+    venue_position_cache_s: float = 0.0
     model_stake_boost_bands: str = ""
     model_stake_boost_mult: float = 1.0
     # May a cross entry take the side OPPOSITE a position already held in this

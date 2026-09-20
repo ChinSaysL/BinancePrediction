@@ -1370,13 +1370,48 @@ class Bot:
         if rows:
             log.info("restored %d unsettled position(s): %s",
                      len(rows), ", ".join(r["slug"] for r in rows))
-    async def _venue_position_tokens(self) -> set[str] | None:
-        """Tokens the venue currently holds a position in (ground truth)."""
+    async def _venue_position_tokens(self, *, max_age_s: float | None = None
+                                     ) -> set[str] | None:
+        """Tokens the venue currently holds a position in (ground truth).
+
+        ⛔ THIS SAT ON THE ORDER'S CRITICAL PATH. `_unbooked_round_tokens`
+        calls it from the gate chain, immediately before the order is sent, and
+        it is a signed GET: measured 60 ms median against an 8 ms network RTT,
+        so almost all of it is signing and venue processing rather than
+        distance. Decision -> venue createTime measured 290 ms total, of which
+        this was ~60, `get_quote` ~52 and place-order ~60.
+        
+        That matters because an arm racing a crossing event has its whole edge
+        inside ~100 ms (Binance: +0.8 pts at the tick, -2.7 pts at 100 ms), so
+        60 ms of safety check is a fifth of the budget.
+
+        CACHING COSTS NO REAL FRESHNESS. The gate that reads this runs once per
+        1 s poll, so a value up to `settings.venue_position_cache_s` old is no
+        staler than the poll that consumes it. `max_age_s=0` forces a refetch
+        for callers that must have ground truth (settlement, claim sweeps).
+
+        The cache is INVALIDATED on every fill we book, so the one case it must
+        never miss -- an order that filled without being booked -- still reads
+        a fresh list on the next attempt.
+        """
+        ttl = (float(getattr(settings, "venue_position_cache_s", 0.0) or 0.0)
+               if max_age_s is None else float(max_age_s))
+        now = time.monotonic()
+        cached = getattr(self, "_vpos_cache", None)
+        if ttl > 0 and cached is not None and (now - cached[0]) <= ttl:
+            return cached[1]
         try:
             pos = await self.broker.positions()
         except Exception:
             return None
-        return {p.get("tokenId") for p in pos or []}
+        toks = {p.get("tokenId") for p in pos or []}
+        self._vpos_cache = (now, toks)
+        return toks
+
+    def _invalidate_venue_positions(self) -> None:
+        """Drop the cached position list. Called whenever we book a fill, so a
+        stale list can never hide a position we just opened."""
+        self._vpos_cache = None
 
     async def _unbooked_round_tokens(self, r, up, down) -> set[str] | None:
         """Tokens in THIS round the venue holds that our ledger cannot explain.
@@ -2383,6 +2418,10 @@ class Bot:
                          mode: str | None = None) -> None:
         """Record a fill: guard, decision promotion, fill row, P&L log.
 
+        Invalidates the cached venue position list first: a position we just
+        opened must never be hidden from the pre-order unbooked check by a list
+        fetched before it existed. See `_venue_position_tokens`.
+
         `token` is passed explicitly rather than read off the broker's Fill:
         450 of 455 live fills were persisted with token_id NULL although both
         call sites and the broker do carry it, which left the venue-position
@@ -2396,6 +2435,7 @@ class Bot:
         the two cannot drift. A fill booked on one path and not the other is
         exactly how the risk guard loses track of the exposure it is guarding.
         """
+        self._invalidate_venue_positions()
         # The cross arm holds the RESERVED slot, not the main one. The model
         # arm enters at tau 60-210 and holds to settlement, covering the cross
         # arm's whole window, so sharing one slot let the model crowd it out of
