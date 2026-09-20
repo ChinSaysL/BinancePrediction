@@ -32,7 +32,8 @@ from btcpredict.edge.impulse import impulse_bps, impulse_side
 from btcpredict.config import (CROSS_TRADED, MARKETS, SYMBOL_BY_PREFIX,
                                TRAIN_P_WIN, active_markets, cross_knob,
                                cross_traded, market_prefix, model_traded,
-                               stake_boosted, settings)
+                               shot15_observed, stake_boosted, settings)
+import btcpredict.edge.shot15 as edge_shot15
 import btcpredict.edge.signal as edge_signal
 from btcpredict.edge.signal import (FLOOR_MAX_BANKROLL_FRACTION, FeeModel,
                                     Signal, evaluate,
@@ -1995,6 +1996,13 @@ class Bot:
         if r.strike is None:
             return
 
+        # THE 15m ITM CELL, ABOVE THE RECORD-MODE RETURN ON PURPOSE. It never
+        # orders, so there is nothing for `--mode record` to protect against,
+        # and observing it in record mode is the entire point of it existing.
+        # It is also above the `trade` gate: `cross_traded` narrows which
+        # families may RISK MONEY, and this one cannot.
+        await self._shot15(r, spot, tau, sigma, buy_up, buy_down, now_ms)
+
         if self.mode == "record" or not trade or spot is None or tau <= 0:
             return
 
@@ -2385,6 +2393,77 @@ class Bot:
             return
         await self._book_fill(r, sig, fill, did=did, up=up,
                               spot=spot, sigma=sigma, tau=tau, token=token)
+
+    async def _shot15(self, r, spot, tau, sigma, buy_up, buy_down,
+                      now_ms: int) -> None:
+        """Evaluate the 15m ITM cell and write a decision row. NEVER orders.
+
+        There is deliberately no order path in this method and no branch that
+        could grow one by configuration -- `shot15_mode` is `off` or `shadow`,
+        nothing else. The arm is below its own evidence bar (day-clustered
+        t +1.64 on 4 dates against a t>=2 bar; see `edge/shot15.py`), so it
+        exists to accumulate dates, not to trade them.
+
+        Rows are written for REFUSALS too, with `acted=0` and the refusing
+        reason. That is what makes the funnel recoverable from the database
+        later, and the funnel is what localised the Impulse Lag failure to a
+        single gate -- an EV column alone could not have.
+
+        Failures here are swallowed: a shadow arm that has never risked a cent
+        must not be able to take down the live loop that has.
+        """
+        if settings.shot15_mode == "off":
+            return
+        if not shot15_observed(market_prefix(r.slug)):
+            return
+        try:
+            # ⛔ NOT the `sigma` argument. That is `VolEstimator.sigma_1m()` --
+            # an EWMA over 1-minute bars, times the weekend multiplier -- and
+            # this cell's evidence was measured on a 900s rolling std of
+            # 1-SECOND returns. Replayed over the same rounds the EWMA turns
+            # n=121 / EV +0.0555 / day-t +1.64 into n=25 / EV -0.1025 / +0.18,
+            # so passing it through would shadow a different rule than the one
+            # config.shot15_* documents. See edge/shot15.sigma_from_ticks.
+            ticks = (getattr(self, "_ticks", None) or {}).get(r.symbol) or []
+            cell_sigma = edge_shot15.sigma_from_ticks(ticks, now_ms)
+            sig = edge_shot15.evaluate(
+                spot, r.strike, tau, cell_sigma, buy_up, buy_down,
+                min_tau_s=settings.shot15_min_tau_s,
+                max_tau_s=settings.shot15_max_tau_s,
+                min_edge=settings.shot15_min_edge,
+                min_quote=settings.shot15_min_quote,
+                max_quote=settings.shot15_max_quote,
+            )
+            # Outside the tau window is the overwhelming majority of polls (a
+            # 15m round spends 300 of its 900 seconds in the window and the bot
+            # polls every second), so logging those would add ~600 rows a round
+            # that say nothing. Every refusal INSIDE the window is kept.
+            if not sig.act and sig.reason.startswith("tau "):
+                return
+            self.store.insert("decisions", {
+                "slug": r.slug, "ts_ms": now_ms, "tau_s": tau,
+                "side": sig.side or "NONE",
+                "fair": sig.pstar, "quote": sig.ask, "edge": sig.edge,
+                # No hurdle: this cell gates on a raw edge threshold, not on a
+                # fee-and-spread hurdle. Writing one would invite a comparison
+                # against the model arm's rows that does not hold.
+                # The CELL's sigma, not the bot's -- so a later analysis of
+                # these rows reads the estimator the fires were made with.
+                "hurdle": None, "sigma_1m": cell_sigma,
+                "spot": spot, "oracle": None, "strike": r.strike,
+                # Always 0 and always will be: `acted` means an order was
+                # attempted, and this arm cannot attempt one.
+                "stake": 0.0, "acted": 0,
+                "reason": f"shot15[{settings.shot15_mode}] {sig.reason}",
+            })
+            if sig.act:
+                log.info("SHOT15 %s %s | would enter @%.3f (P*=%.3f edge=%+.3f) "
+                         "tau=%.0fs sigma=%.5f -- SHADOW, no order",
+                         r.slug, sig.side, sig.ask, sig.pstar, sig.edge, tau,
+                         cell_sigma)
+        except Exception:
+            log.exception("shot15 evaluation failed for %s (shadow arm, "
+                          "ignored)", r.slug)
 
     async def _probe(self, r, sig, *, gate_reason: str, up, down,
                      spot: float, sigma: float, tau: float) -> None:

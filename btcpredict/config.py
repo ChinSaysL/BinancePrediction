@@ -3848,6 +3848,56 @@ class Settings(BaseSettings):
     #: nothing but the edit -- the same separation `CROSS_TRADED` keeps from
     #: `MARKETS`, and for the same reason.
     model_families: str = ""
+
+    # --- shot15: the 15-minute ITM cell, PRE-REGISTERED AND OBSERVED ---------
+    #: How the 15m ITM cell runs. `shadow` evaluates it on every poll and writes
+    #: a decision row, and NEVER places an order -- there is no order path in
+    #: `Bot._shot15` at all, deliberately, so this cannot cost money by
+    #: misconfiguration. `off` skips the evaluation entirely.
+    #:
+    #: It runs in `--mode record` too, because observing is the whole point.
+    #:
+    #: The rule is in `btcpredict/edge/shot15.py`; that docstring carries the
+    #: mechanism and the argument. The numbers, on the only venue we can trade
+    #: (feed_provider='CHAINLINK'; the TWAP rows are POLYMARKET and carry no
+    #: market_id, so they are unreachable from this account):
+    #:
+    #:     n=121 over 4 dates, 4/4 positive
+    #:     hit 0.752   mean ask 0.714   EV +0.0555/$1   day-clustered t +1.64
+    #:
+    #: ⛔ +1.64 is BELOW the t>=2 bar, and one 12-trade date (+0.2516) carries
+    #: much of it: dropping it takes the mean of day means +0.0913 -> +0.0379.
+    #:
+    #: ⛔ DO NOT TUNE THESE KNOBS ON THE CURRENT SAMPLE. A 288-cell sweep was
+    #: run on 2026-09-20 and its winner (tau 180-600, sigma 1800s, edge 0.16,
+    #: ask 0.50-0.80) scored EV +0.2673, day-t +2.85, 4/4 dates, and survived
+    #: EVERY leave-one-date-out fold. A best-of-grid null -- resampling each
+    #: ROUND's outcome from the venue's own implied probability and re-running
+    #: the whole grid -- put the best noise cell at a median of +0.2023, giving
+    #: the winner p = 0.225. LODO cannot see selection; only that null can.
+    #: The values below are therefore the PRE-SPECIFIED ones, not the swept
+    #: ones, and they stay that way until they clear t>=2 on dates they were
+    #: not chosen on.
+    #:
+    #: Before this is ever funded, measure whether it overlaps the MODEL arm's
+    #: rounds. Both buy favourites; it may not be a second edge at all.
+    shot15_mode: Literal["off", "shadow"] = "shadow"
+    #: Families the cell is evaluated on. 15m ONLY -- `max_tau_s` below exceeds
+    #: a 5m round's entire life, so pointing this at a 5m family would evaluate
+    #: nothing and quietly log zero rows.
+    shot15_families: str = "btc-updown-15m"
+    #: Entry window, seconds to expiry. Pre-specified 300-600.
+    shot15_min_tau_s: float = 300.0
+    shot15_max_tau_s: float = 600.0
+    #: P* - ask must reach this. Pre-specified 0.10.
+    shot15_min_edge: float = 0.10
+    #: Ask band. Pre-specified wide (0.05, 0.99]: the sweep showed the ceiling
+    #: was not binding -- cells at 0.80, 0.90 and 0.99 returned byte-identical
+    #: results -- so a tighter one would be a knob that does nothing while
+    #: looking like a risk control.
+    shot15_min_quote: float = 0.05
+    shot15_max_quote: float = 0.99
+
     #: Skip this many of the MODEL arm's next signals after one of its trades
     #: settles a LOSS. 0 = off, which is the shipped default.
     #:
@@ -4326,6 +4376,21 @@ def model_traded(prefix: str | None) -> bool:
     allowed = model_families()
     if not allowed:
         return True
+    return bool(prefix) and prefix in allowed
+
+
+def shot15_observed(prefix: str | None) -> bool:
+    """Is the 15m ITM cell EVALUATED in this family?
+
+    Unlike `model_traded`, an empty list means NO family, not every family. The
+    cell's tau window (300-600s) is longer than a whole 5m round, so a default
+    of "everything" would silently evaluate families it can never fire in and
+    fill the decisions table with `tau outside window` rows.
+
+    "Observed" and not "traded" on purpose: there is no order path behind this.
+    """
+    raw = settings.shot15_families or ""
+    allowed = frozenset(p.strip() for p in raw.replace(",", " ").split() if p.strip())
     return bool(prefix) and prefix in allowed
 
 
