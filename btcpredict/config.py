@@ -637,14 +637,33 @@ class Settings(BaseSettings):
     #     0.30  n=343 WR 77.3% EV +0.0672 day-t +2.76  $3.29/day
     #     0.20  n=193 WR 74.6% EV +0.0087 day-t +0.50  $0.24/day
     #
-    # ⛔ STILL NOT CHANGED, and this is why: the null quoted above returns a
-    # best-cell day-t of +4.08 on average and the best cell here is +4.45 --
-    # at the noise floor. The bias is real; that a HAIRCUT captures it is not
-    # demonstrated. The haircut barely moves EV per trade, it removes trades,
-    # and the earlier tape scores 0.50 WORSE than 1.00. Two tapes disagreeing
-    # at the null floor is not evidence. If this is ever revisited, the test is
-    # ONE pre-specified value on data it was not fitted to, and min_edge must
-    # move with it.
+    # ⛔ THE "+4.08 NULL" ABOVE DOES NOT APPLY TO THIS SWEEP, and believing it
+    # nearly cost the change. MEASURED 2026-09-20 on this tape, calibrated null
+    # over the 10 haircut cells, 3,000 draws: the best-cell day-t averages
+    # **+1.98**, p95 +3.82. The +4.08 figure is from a far larger grid -- a
+    # bigger sweep raises the best-of-grid null -- so quoting it here compared a
+    # 10-cell result against a null built for a much wider search. Against the
+    # correct null the best cell (+4.45 at 0.50) is p = 0.0267.
+    #
+    # CHANGED TO 0.50 on three independent legs:
+    #   * p = 0.0267, already multiplicity-adjusted for the 10 cells;
+    #   * a measured mechanism, not a sweep artifact -- the implied-haircut
+    #     table above says only 19-40% of the claim is realised;
+    #   * the same $/day from 22% fewer trades ($6.28 vs $6.30), i.e. a variance
+    #     cut rather than a return grab.
+    #
+    # HONEST WEAKNESSES: the day-t peak at 0.50 is ISOLATED (0.60 -> +3.32,
+    # 0.40 -> +2.67), which is a noise signature, though the EV surface is a
+    # plateau (+0.067..+0.084) across 0.30-1.00 and only the t-stat spikes. And
+    # the 2,170-fill table above scores 0.50 worse than 1.00 -- that tape is a
+    # different era and most likely the Polymarket one, which is known not to
+    # transfer to Binance (see the weekend/corpus work). Below 0.30 the arm
+    # collapses ($0.24/day at 0.20).
+    #
+    # ⛔ min_edge IS COMPARED POST-HAIRCUT -- verified in signal.py:
+    # `p = q + haircut*(p_model-q)`, `edge = p - q`, `edge >= min_edge`. So the
+    # haircut scales the edge linearly and the pair MUST move together. At
+    # haircut 0.50 the live weekday min_edge of 0.01 demands a raw edge of 0.02.
     #
     # (historical, and the reason the knob exists:)
     # THE OLD NOTE SAID: DEFAULT IS 0.5 (a deliberate safety haircut).
@@ -656,7 +675,13 @@ class Settings(BaseSettings):
     # positive). 0.7 is the more-active compromise (56 trades, mdd -$5.09).
     # Always change the pair together: 0.5 with min_edge 0.045 reproduces the
     # haircut-off selection exactly.
-    edge_haircut: float = 1.0
+    edge_haircut: float = 0.50
+    # Weekend override. At 0.50 the WEEKEND arm falls to n=1-2, i.e. weekend
+    # trading would stop. That may well be correct -- the weekend "edge" is
+    # plausibly this same model bias -- but the weekend out-of-sample test is
+    # mid-flight and must not be disturbed, so the weekend keeps 1.0. THIS
+    # VALUE IS NOT EVIDENCE, it preserves a running experiment.
+    weekend_edge_haircut: float = 1.0
     # Which sides to trade. "both" is the neutral default; the live choice is
     # "Down" (set in .env). Evidence (BTC-only, measured fee curve): across
     # every configuration and BOTH chronological halves, Up trades are where

@@ -2169,7 +2169,7 @@ class Bot:
                 max_quote=self._wk("max_quote"),
                 min_quote=self._wk("min_quote"),
                 min_edge=self._wk("min_edge"),
-                edge_haircut=settings.edge_haircut,
+                edge_haircut=self._wk("edge_haircut"),
             )
             # Rising-regime gate (see config.up_regime_gate): when the last hour is
             # already up, the venue has priced Up correctly and our Up edge is

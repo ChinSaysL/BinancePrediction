@@ -127,3 +127,35 @@ def test_sigma_mult_is_a_multiplier_not_a_replacement(monkeypatch, bot):
     _cfg(monkeypatch, weekend_overrides=True, weekend_sigma_mult=1.5)
     sigma = 0.0004
     assert sigma * bot._wk("sigma_mult") == pytest.approx(0.0006)
+
+
+class TestEdgeHaircutIsWeekendAware:
+    """The haircut is 0.50 on weekdays and 1.0 on weekends.
+
+    0.50 is measured (p=0.0267 against the correct best-of-10 null, plus an
+    implied-haircut table showing only 19-40% of the claim is realised). The
+    weekend 1.0 is NOT evidence -- it keeps a running out-of-sample test
+    undisturbed. See config.edge_haircut.
+    """
+
+    def test_weekday_uses_the_measured_haircut(self, monkeypatch, bot):
+        _window(monkeypatch)
+        _freeze(monkeypatch, 2, 12)                  # Wednesday
+        _cfg(monkeypatch, weekend_overrides=True,
+             edge_haircut=0.50, weekend_edge_haircut=1.0)
+        assert bot._wk("edge_haircut") == 0.50
+
+    def test_weekend_keeps_the_experiment_undisturbed(self, monkeypatch, bot):
+        _window(monkeypatch)
+        _freeze(monkeypatch, 5, 12)                  # Saturday
+        _cfg(monkeypatch, weekend_overrides=True,
+             edge_haircut=0.50, weekend_edge_haircut=1.0)
+        assert bot._wk("edge_haircut") == 1.0
+
+    def test_overrides_off_means_the_haircut_applies_everywhere(
+            self, monkeypatch, bot):
+        _window(monkeypatch)
+        _freeze(monkeypatch, 5, 12)
+        _cfg(monkeypatch, weekend_overrides=False,
+             edge_haircut=0.50, weekend_edge_haircut=1.0)
+        assert bot._wk("edge_haircut") == 0.50
