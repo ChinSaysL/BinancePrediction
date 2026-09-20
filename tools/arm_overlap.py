@@ -184,10 +184,41 @@ def arm_model(rnd: dict, sigma: float, persistence: int,
               max_quote: float | None = None,
               min_quote: float | None = None,
               min_tau: float | None = None,
-              max_tau: float | None = None) -> dict | None:
-    """The live model gate: real `evaluate`, real quote band, real persistence."""
+              max_tau: float | None = None,
+              apply_range_gate: bool = True) -> dict | None:
+    """The live model gate: real `evaluate`, real quote band, real persistence.
+
+    ⛔ THE ROUND-RANGE GATE IS LIVE AND WAS MISSING HERE, exactly as it was
+    missing from `tools/arms_recorded.py` before that tool was fixed.
+    `Bot._record` refuses unless the round has travelled
+    `model_min_round_range_bps`..`model_max_round_range_bps` since its open
+    (5-16 bps as shipped), and it is the DOMINANT refusal reason in the live
+    log -- so every EV, win rate and trade count this function produced was
+    scored on a population the bot will not trade. Measured 2026-09-20 on the
+    weekend cohort, the gate MATTERS and helps: at sigma x0.90 the weekend arm
+    goes -0.0027/$1 (day-t +0.39) ungated to +0.0296 (day-t +0.98) gated, and
+    at x1.00 from -0.0311 to +0.0452.
+
+    Semantics copied from `Bot._round_range_bps`: the RUNNING range of the spot
+    from the round's open to THIS tick, in bps of the strike, so it grows
+    through the round. Fewer than two samples means "no opinion" and must NOT
+    refuse, or a cold start silently disables the arm.
+
+    `apply_range_gate=False` restores the old ungated behaviour for callers
+    that deliberately want the unfiltered population.
+    """
     streak_side, streak = None, 0
+    lo = hi = None
+    rlo = getattr(settings, "model_min_round_range_bps", 0.0) or 0.0
+    rhi = getattr(settings, "model_max_round_range_bps", 0.0) or 0.0
+    strike = rnd.get("strike") or 0.0
     for i, (ts_ms, tau, spot, up_px, dn_px, up_ask, dn_ask) in enumerate(rnd["rows"]):
+        # The range accumulates over EVERY tick since the open, including ones
+        # the tau window rejects -- the live buffer is appended once per poll
+        # and is not filtered by the decision gates.
+        if spot is not None and spot > 0:
+            lo = spot if lo is None else min(lo, spot)
+            hi = spot if hi is None else max(hi, spot)
         if (spot is None or not 0 < tau <= 300
                 or up_ask is None or dn_ask is None):
             streak_side, streak = None, 0
@@ -195,6 +226,10 @@ def arm_model(rnd: dict, sigma: float, persistence: int,
         if not ((settings.min_tau_s if min_tau is None else min_tau) <= tau
                 <= (settings.max_tau_s if max_tau is None else max_tau)):
             continue
+        if apply_range_gate and rhi > 0 and strike > 0 and lo is not None and hi > lo:
+            if not (rlo <= 1e4 * (hi - lo) / strike <= rhi):
+                streak_side, streak = None, 0
+                continue
         fair_up = fair_value(spot, rnd["strike"], tau, sigma)
         sig = evaluate(
             fair_up, up_ask, dn_ask, fee=None, half_spread=0.0,
