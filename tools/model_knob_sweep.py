@@ -168,8 +168,16 @@ def main() -> None:
                     help="default: settings.signal_persistence (live)")
     ap.add_argument("--mode", default="all",
                     choices=["all", "ofat", "joint", "live", "halves",
-                             "fair"],
+                             "fair", "size"],
                     help="which grid to run")
+    ap.add_argument("--weight-low-fair", type=float, default=2.0,
+                    help="stake MULTIPLIER for entries with fair <= the cut "
+                         "(the shipped `model_low_fair_stake_mult`). Scored at "
+                         "EQUAL CAPITAL, because the claim is that the same "
+                         "money spent on the cheap bucket earns more -- not "
+                         "that staking more money earns more.")
+    ap.add_argument("--fair-cut", type=float, default=None,
+                    help="default: settings.model_low_fair_cut (the live cut)")
     ap.add_argument("--since-ms", type=int, default=0,
                     help="only rounds starting at/after this epoch ms -- for "
                          "reconciling the replay against a live run")
@@ -230,6 +238,39 @@ def main() -> None:
             if e:
                 out.append(e)
         return out
+
+    if args.mode == "size":
+        cut = (settings.model_low_fair_cut if args.fair_cut is None
+               else args.fair_cut)
+        mult = args.weight_low_fair
+        ent = [e for e in run2() if e.get("fair") is not None]
+        ent.sort(key=lambda e: e["day"])
+        n, mid = len(ent), len(ent) // 2
+        wt = [mult if e["fair"] <= cut else 1.0 for e in ent]
+        n_lo = sum(1 for e in ent if e["fair"] <= cut)
+        print(f"\n=== SIZE-BY-FAIR: {mult:g}x on fair <= {cut:g} "
+              f"({n_lo} of {n} entries) ===")
+        print(f"  capital: flat ${n}  ->  weighted ${sum(wt):.0f} "
+              f"({sum(wt)/n:.2f}x). Both columns below are scaled to the SAME "
+              f"capital, so a difference is allocation, not leverage.")
+        print(f"  {'':22} {'train':>9} {'test':>9} {'TOTAL':>9}")
+        for lbl, ws in (("flat 1x", [1.0] * n),
+                        (f"{mult:g}x <= {cut:g}", wt)):
+            sc = n / sum(ws)
+            tr = sc * sum(w * e["ret"] for w, e in zip(ws[:mid], ent[:mid]))
+            te = sc * sum(w * e["ret"] for w, e in zip(ws[mid:], ent[mid:]))
+            print(f"  {lbl:22} {tr:+9.2f} {te:+9.2f} {tr + te:+9.2f}")
+        for lbl, ws in (("flat 1x", [1.0] * n),
+                        (f"{mult:g}x <= {cut:g}", wt)):
+            cap = n / sum(ws)                      # equal-capital scale factor
+            peak = run = dd = 0.0
+            for w, e in zip(ws, ent):
+                run += cap * w * e["ret"]
+                peak = max(peak, run)
+                dd = min(dd, run - peak)
+            print(f"  {lbl:22} max drawdown ${dd:+7.2f} on that capital, "
+                  f"largest single entry ${cap * max(ws):.2f}")
+        return
 
     if args.mode == "fair":
         # Is a `fair` cut a FILTER worth shipping, or noise? Two questions, and
