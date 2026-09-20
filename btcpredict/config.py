@@ -676,11 +676,27 @@ class Settings(BaseSettings):
     # Always change the pair together: 0.5 with min_edge 0.045 reproduces the
     # haircut-off selection exactly.
     edge_haircut: float = 0.50
-    # Weekend override. At 0.50 the WEEKEND arm falls to n=1-2, i.e. weekend
-    # trading would stop. That may well be correct -- the weekend "edge" is
-    # plausibly this same model bias -- but the weekend out-of-sample test is
-    # mid-flight and must not be disturbed, so the weekend keeps 1.0. THIS
-    # VALUE IS NOT EVIDENCE, it preserves a running experiment.
+    # Weekend override, and it is 1.0 because the haircut is a NO-OP here, not
+    # because the weekend is untested. MEASURED 2026-09-20, haircut x min_edge
+    # swept together (they must move together -- min_edge is compared
+    # post-haircut), weekend cohort, live cfg, range gate on:
+    #
+    #     haircut  min_edge  raw edge req   n    WR      EV       day-t
+    #       1.00     0.060      0.060      16  87.5%  +0.2080    +1.68   <- live
+    #       0.50     0.030      0.060      16  87.5%  +0.2080    +1.68   identical
+    #       0.70     0.045      0.064      16  87.5%  +0.2059    +1.66
+    #     NULL best-of-14: mean +0.2180 -> the best real cell is p = 0.55
+    #
+    # Selection depends ONLY on the raw-edge bar (min_edge / haircut), so moving
+    # the pair reproduces the same 16 trades to four decimals. The haircut bites
+    # through `edge > hurdle`, and that binds only when min_edge is near the
+    # hurdle: weekdays min_edge 0.01 vs hurdle ~0.02 (hurdle binds -- halving the
+    # haircut doubles the raw edge needed, 674 trades -> 526), weekends min_edge
+    # 0.06 vs hurdle ~0.02 (min_edge dominates 3x, nothing to filter).
+    #
+    # Setting 0.50 here WITHOUT halving weekend_min_edge sets the raw bar to
+    # 0.12 and stops weekend trading at n=1. The raw bar is already at its
+    # optimum: 0.060 -> +0.2080, 0.064 -> +0.2059, 0.030-0.045 clearly worse.
     weekend_edge_haircut: float = 1.0
     # Which sides to trade. "both" is the neutral default; the live choice is
     # "Down" (set in .env). Evidence (BTC-only, measured fee curve): across
