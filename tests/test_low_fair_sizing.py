@@ -36,6 +36,12 @@ def _flat(monkeypatch):
     monkeypatch.setattr(cfg.settings, "max_stake_usdt", 1.0)
     monkeypatch.setattr(cfg.settings, "stake_cap_usdt", 2.0)
     monkeypatch.setattr(cfg.settings, "stake_tilt", "none")
+    # Bands SUPERSEDE the legacy cut, so they must be cleared for this file to
+    # be testing what it says. The live .env sets them, which is why only the
+    # live-config profile caught this -- the local one leaves them empty and
+    # the file passed while asserting nothing.
+    monkeypatch.setattr(cfg.settings, "model_stake_boost_bands", "")
+    monkeypatch.setattr(cfg.settings, "model_stake_boost_mult", 1.0)
     monkeypatch.setattr(cfg.settings, "model_low_fair_cut", 0.70)
     monkeypatch.setattr(cfg.settings, "model_low_fair_stake_mult", 2.0)
     yield
