@@ -2416,6 +2416,17 @@ class Bot:
             return
         if not shot15_observed(market_prefix(r.slug)):
             return
+        # ONE ENTRY PER ROUND, matching the measurement. The cell was replayed
+        # taking the FIRST fire in a round and stopping, which is also what a
+        # live arm gets (one position per round). Without this the window fires
+        # on every poll for its whole 300s -- ~300 rows a round, ~28k a day --
+        # and any later count of "trades" would be counting polls, the same
+        # tick-vs-round error that once read a 5m arm as +6.8%.
+        fired = getattr(self, "_shot15_fired", None)
+        if fired is None:
+            fired = self._shot15_fired = set()
+        if r.slug in fired:
+            return
         try:
             # ⛔ NOT the `sigma` argument. That is `VolEstimator.sigma_1m()` --
             # an EWMA over 1-minute bars, times the weekend multiplier -- and
@@ -2457,6 +2468,12 @@ class Bot:
                 "reason": f"shot15[{settings.shot15_mode}] {sig.reason}",
             })
             if sig.act:
+                # Mark BEFORE logging so a logging failure cannot leave the
+                # round armed to fire again on the next poll. Bounded: rounds
+                # roll every 15 minutes and the process runs for days.
+                fired.add(r.slug)
+                if len(fired) > 4096:
+                    self._shot15_fired = set(list(fired)[-2048:])
                 log.info("SHOT15 %s %s | would enter @%.3f (P*=%.3f edge=%+.3f) "
                          "tau=%.0fs sigma=%.5f -- SHADOW, no order",
                          r.slug, sig.side, sig.ask, sig.pstar, sig.edge, tau,

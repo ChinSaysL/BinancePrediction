@@ -173,11 +173,14 @@ def test_refusals_inside_the_window_are_recorded(store):
     """The refusals are the funnel, and the funnel is what localised the
     Impulse Lag failure to one gate. An EV column alone could not have."""
     bot = make_bot(store, mode="record")
-    run(bot, make_round(up=0.79, down=0.24))     # coherent, but edge too small
+    # Coherent (1.04) but priced too near fair to clear min_edge. Asserted on
+    # the "<" that only a REFUSAL carries: a firing reason also contains the
+    # word "edge", so a substring match on it passes for the wrong reason.
+    run(bot, make_round(up=0.95, down=0.09))
     rows = shot_rows(store)
     assert len(rows) == 1
     assert rows[0]["acted"] == 0
-    assert "edge" in rows[0]["reason"]
+    assert "<" in rows[0]["reason"], rows[0]["reason"]
 
 
 def test_tau_outside_the_window_is_not_logged(store):
@@ -214,3 +217,37 @@ def test_an_exception_in_the_arm_does_not_break_recording(store, monkeypatch):
     run(bot, make_round())                       # must not raise
     assert shot_rows(store) == []
     assert store.counts()["quotes"] == 1, "the tape is still written"
+
+
+# --- one entry per round ----------------------------------------------------
+
+def test_a_round_fires_at_most_once(store):
+    """⛔ The cell was MEASURED taking the first fire in a round and stopping,
+    and a live arm gets one position per round anyway. Firing every poll would
+    write ~300 rows a round and make any later trade count a count of POLLS --
+    the tick-vs-round error that once read a 5m arm as +6.8%."""
+    bot = make_bot(store, mode="record")
+    rnd = make_round()
+    for _ in range(5):
+        run(bot, rnd)
+    assert len(shot_rows(store)) == 1
+
+
+def test_a_second_round_still_fires(store):
+    """Deduplication is per slug, not a global latch."""
+    bot = make_bot(store, mode="record")
+    run(bot, make_round(slug="btc-updown-15m-1789000000"))
+    run(bot, make_round(slug="btc-updown-15m-1789000900"))
+    assert len(shot_rows(store)) == 2
+
+
+def test_refusals_do_not_arm_the_latch(store):
+    """A round that refused must still be able to fire later in its life."""
+    bot = make_bot(store, mode="record")
+    slug = "btc-updown-15m-1789000000"
+    run(bot, make_round(slug=slug, up=0.95, down=0.09))   # refuses: edge small
+    run(bot, make_round(slug=slug))                        # now it qualifies
+    rows = shot_rows(store)
+    assert len(rows) == 2
+    assert "<" in rows[0]["reason"], "first was a refusal"
+    assert rows[-1]["acted"] == 0 and "<" not in rows[-1]["reason"]
