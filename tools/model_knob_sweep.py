@@ -37,17 +37,34 @@ import statistics as st
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# tools/ LAST so it wins: an earlier stray copy of `arm_overlap.py` at the repo
+# root (the host had one, dated 2026-09-12) shadows this one when the root is
+# inserted last, and the tool then replays a DIFFERENT rule than the file
+# sitting next to it. Measured 2026-09-20: a new field added to every entry came
+# back None from all 459 entries while the source on disk was correct.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import arm_overlap as ao                                     # noqa: E402
+
+if Path(ao.__file__).resolve().parent != Path(__file__).resolve().parent:
+    raise SystemExit(
+        f"arm_overlap loaded from {ao.__file__}, not from this tool's own "
+        f"directory {Path(__file__).resolve().parent} -- a stray copy is "
+        f"shadowing it; delete the stray, do not edit around it")
 from btcpredict.config import settings                        # noqa: E402
 from btcpredict.edge.signal import (                          # noqa: E402
     FeeModel, evaluate)
 from btcpredict.pricing.digital import fair_value, moneyness_sd  # noqa: E402
 
-LIVE = dict(max_tau=210.0, min_tau=None, min_quote=0.45, max_quote=0.80,
-            min_range=5.0, max_range=12.0)
+# The live gate values, read from config rather than typed here. A sweep that
+# pins its own copy ranks a system nobody runs: this file carried max_tau 210 /
+# min_quote 0.45 / range 5-12 while the host ran 180 / 0.55 / 5-16 (measured
+# 2026-09-20), and nothing in the output said so.
+LIVE = dict(max_tau=settings.max_tau_s, min_tau=settings.min_tau_s,
+            min_quote=settings.min_quote, max_quote=settings.max_quote,
+            min_range=settings.model_min_round_range_bps,
+            max_range=settings.model_max_round_range_bps)
 
 
 def replay(rnd: dict, sigma: float, *, persistence: int,
@@ -150,7 +167,8 @@ def main() -> None:
     ap.add_argument("--persistence", type=int, default=None,
                     help="default: settings.signal_persistence (live)")
     ap.add_argument("--mode", default="all",
-                    choices=["all", "ofat", "joint", "live", "halves"],
+                    choices=["all", "ofat", "joint", "live", "halves",
+                             "fair"],
                     help="which grid to run")
     ap.add_argument("--since-ms", type=int, default=0,
                     help="only rounds starting at/after this epoch ms -- for "
@@ -212,6 +230,37 @@ def main() -> None:
             if e:
                 out.append(e)
         return out
+
+    if args.mode == "fair":
+        # Is a `fair` cut a FILTER worth shipping, or noise? Two questions, and
+        # they are not the same one: (a) does the LOW bucket rank above the
+        # HIGH one in BOTH halves (a parameter must rank the same twice, or it
+        # is a fitted split of one sample), and (b) what does the HIGH bucket
+        # earn on its own -- if it is positive at a flat stake, skipping it
+        # destroys money however good the per-dollar comparison looks.
+        print("\n=== FAIR BUCKETS (the model's fair for the side bought) ===")
+        ent = [e for e in run2() if e.get("fair") is not None]
+        print("  both buckets are scored on their OWN ret, so `tot $` is what a "
+              "flat $1 stake actually earned there.")
+        for cut in (0.60, 0.65, 0.70, 0.75, 0.80):
+            lo = [e for e in ent if e["fair"] <= cut]
+            hi = [e for e in ent if e["fair"] > cut]
+            for lab, g in ((f"fair <= {cut:.2f}", lo), (f"fair >  {cut:.2f}", hi)):
+                if len(g) < 5:
+                    print(f"  {lab:<14} n={len(g)} too few")
+                    continue
+                order = sorted(g, key=lambda e: e["day"])
+                h = len(order) // 2
+                print(f"  {lab:<14} n={len(g):<5} WR "
+                      f"{100*sum(1 for e in g if e['won'])/len(g):5.1f}%  "
+                      f"EV {st.fmean([e['ret'] for e in g]):+.4f}/$1  "
+                      f"t {ao.tstat([e['ret'] for e in g]):+5.2f}  "
+                      f"H {st.fmean([e['ret'] for e in order[:h]]):+.3f}/"
+                      f"{st.fmean([e['ret'] for e in order[h:]]):+.3f}  "
+                      f"dDay {drop_best_day(g):+.4f}  "
+                      f"tot ${sum(e['ret'] for e in g):+7.2f}")
+            print()
+        return
 
     print("\n=== BASELINE (live knobs) ===")
     row("live", run2(), len(rs), days)

@@ -82,12 +82,13 @@ def _cost_per_share(px: float) -> float:
 
 
 def enter(slug: str, rnd: dict, ts_ms: int, tau: float, side: str, px: float,
-          ev: float, why: str, mz: float = 0.0) -> dict:
+          ev: float, why: str, mz: float = 0.0,
+          fair: float | None = None) -> dict:
     cost = _cost_per_share(px)
     won = side == rnd["winner"]
     return {"slug": slug, "ts_ms": ts_ms, "tau": tau, "side": side, "px": px,
             "cost": cost, "won": won, "ev": ev, "why": why,
-            "day": rnd["day"], "mz": mz,
+            "day": rnd["day"], "mz": mz, "fair": fair,
             "ret": ((1.0 if won else 0.0) - cost) / cost}
 
 
@@ -154,13 +155,13 @@ def _execute(rnd: dict, i: int, side: str, fair_side: float, ev: float,
         return None
     if exec_mode == "market":
         return enter(rnd["slug"], rnd, t1, tau1, side, ask, ev,
-                     f"{why} [market]", mz)
+                     f"{why} [market]", mz, fair=fair_side)
     limit = take_limit_px(fair_side,
                           settings.limit_take_margin if margin is None else margin,
                           ask, settings.limit_ask_tick, take_px)
     if limit >= ask - 1e-9:
         return enter(rnd["slug"], rnd, t1, tau1, side, ask, ev,
-                     f"{why} [limit {limit:.2f} crosses]", mz)
+                     f"{why} [limit {limit:.2f} crosses]", mz, fair=fair_side)
     for later in rows[k + 1:]:
         t2, tau2, _s2, _u2, _d2, lua, lda = later
         if t2 - t1 > settings.limit_wait_s * 1000:
@@ -170,7 +171,8 @@ def _execute(rnd: dict, i: int, side: str, fair_side: float, ev: float,
         ref = lua if side == "Up" else lda
         if ref and ref <= limit:
             return enter(rnd["slug"], rnd, t2, tau2, side, limit, ev,
-                         f"{why} [limit {limit:.2f} resting]", mz)
+                         f"{why} [limit {limit:.2f} resting]", mz,
+                         fair=fair_side)
     return None              # rested the whole window: MISSED, not traded
 
 
