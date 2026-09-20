@@ -4112,6 +4112,26 @@ class Settings(BaseSettings):
     weekend_end_dow: int = 6            # Sunday
     weekend_end_hour_utc: int = 21      # Sydney open
     # Inflate sigma on Saturday/Sunday (UTC). 1.0 = shipped behaviour.
+    #
+    # ⛔ THE ORIGINAL TUNE FOR THIS KNOB WAS RUN ON A CONSTANT SIGMA.
+    # `arm_overlap.load` dropped end_price, so rolling_sigma returned its 0.0004
+    # fallback for every round; multiplying a CONSTANT is not the operation the
+    # live bot performs. Re-measured after the fix (weekend, live cfg, range
+    # gate [5,16] on):
+    #
+    #     sigma x    n    ask     WR       EV    day-t  Lstreak
+    #       0.90   118  0.733  76.3%  +0.0338   +0.82      3
+    #       1.00   103  0.737  76.7%  +0.0323   +0.44      2
+    #       1.25    69  0.744  79.7%  +0.0738   +0.68      2   <- live
+    #       1.50    41  0.733  78.0%  +0.0674   +0.53      2
+    #
+    # not the +0.2080 at n=16 the buggy run reported. EVERY multiplier now has
+    # day-t < 1.0, so none is distinguishable from another; 1.25 is kept because
+    # re-tuning inside noise is churn and it has the fewest trades and shortest
+    # losing streak, which is the operator's stated preference. It is NOT proven.
+    #
+    # The range gate is what matters here: with it OFF every multiplier is
+    # NEGATIVE (-0.008..-0.023), with it ON every one is positive.
     weekend_sigma_mult: float = 1.50
     weekend_min_edge: float = 0.06
     weekend_min_quote: float = 0.45
