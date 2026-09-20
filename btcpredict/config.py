@@ -3827,6 +3827,59 @@ class Settings(BaseSettings):
     #: be raised with the multiplier or the reweight silently does nothing.
     model_low_fair_cut: float = 0.0
     model_low_fair_stake_mult: float = 1.0
+    #: BANDS of `fair` that get `model_stake_boost_mult` times the base stake,
+    #: as "lo-hi,lo-hi" (e.g. "0.50-0.60,0.70-0.80"). Empty = off. When set it
+    #: SUPERSEDES `model_low_fair_cut`, which is a single cut and cannot
+    #: express a gap.
+    #:
+    #: ⛔ THE GAP IS THE POINT. A single cut at 0.70 -- shipped 2026-09-19 and
+    #: reverted the same night -- spends the multiplier on a DEAD ZONE. The
+    #: model arm's `fair` bands on btc-updown-5m, 649 entries over 11.65 days,
+    #: PM-era excluded, live recorded sigma, replayed through the live gate
+    #: chain and the limit_take fill path (a limit that does not cross is a
+    #: MISSED round, not a trade):
+    #:
+    #:     band         n     WR    EV/$1   day-t   H1      H2      tot$
+    #:     0.50-0.60   27   77.8%  +0.3468  +4.30  +0.358  +0.337   +9.36
+    #:     0.60-0.65   90   57.8%  -0.0312  -0.01  -0.150  +0.048   -2.81
+    #:     0.65-0.70   72   66.7%  +0.0419  +0.00  +0.072  +0.008   +3.02
+    #:     0.70-0.75   97   76.3%  +0.1100  +0.69  +0.099  +0.118  +10.67
+    #:     0.75-0.80  129   78.3%  +0.0754  +2.34  +0.055  +0.092   +9.73
+    #:     0.80-0.85  143   74.1%  -0.0371  -1.08  +0.035  -0.108   -5.30
+    #:     0.85-0.90   72   81.9%  +0.0449  -0.35  +0.009  +0.081   +3.23
+    #:     0.90+       18   72.2%  -0.0750  -0.57  -0.182  +0.010   -1.35
+    #:
+    #: 0.60-0.70 contributes +$0.21 across 162 trades. A cut at 0.70 boosts it.
+    #:
+    #: At CONSTANT total capital (weights normalised to mean 1, so this is
+    #: allocation and not leverage), fit on the first half, scored on the
+    #: second:
+    #:
+    #:     candidate                  train tot$   test tot$   test vs flat
+    #:     flat                          +10.46      +16.59          +0.00
+    #:     2x <=0.70 (the reverted one)   +9.64      +19.06          +2.47
+    #:     2x 0.50-0.60                  +14.48      +20.48          +3.89
+    #:     2x 0.70-0.80                  +13.29      +21.82          +5.23
+    #:     2x 0.50-0.60 + 0.70-0.80      +16.26      +24.54          +7.95  <- ships
+    #:     2x <=0.80                     +12.13      +22.81          +6.22
+    #:
+    #: Against a calibrated null at constant capital (outcome ~ Bernoulli(price
+    #: paid), 3000 draws) the split band is the ONLY candidate under p<0.05:
+    #:     0.50-0.60             real +3.89  null -0.10 sd 2.94  p = 0.091
+    #:     0.70-0.80             real +5.23  null -0.02 sd 4.37  p = 0.118
+    #:     0.50-0.60 + 0.70-0.80 real +7.95  null +0.04 sd 4.38  p = 0.036
+    #:
+    #: ⛔ STATED PLAINLY: p=0.036 is ONE candidate of six examined, so a crude
+    #: multiplicity adjustment puts it past 0.2. What carries it is the
+    #: holdout -- train and test both improve -- and that the bands were
+    #: identified before this test rather than fitted by it. 0.50-0.60 rests on
+    #: 14 test trades. Shipped at the operator's explicit instruction after
+    #: that was said; the recommendation was to fund the account first.
+    #:
+    #: `stake_cap_usdt` still binds LAST and will clamp the boost, so raise it
+    #: with the multiplier or the reweight silently does nothing.
+    model_stake_boost_bands: str = ""
+    model_stake_boost_mult: float = 1.0
     # May a cross entry take the side OPPOSITE a position already held in this
     # round? No. Buying both sides is not a hedge: with the first position sunk,
     #     EV(take) - EV(decline) = stake_B * [ (1 - p)/b - 1 ]
@@ -4029,6 +4082,36 @@ def cross_disabled() -> frozenset[str]:
     """
     raw = settings.cross_disabled_families or ""
     return frozenset(p.strip() for p in raw.split(",") if p.strip())
+
+
+def stake_boost_bands() -> tuple[tuple[float, float], ...]:
+    """Parsed `model_stake_boost_bands`. Malformed entries are DROPPED, never
+    guessed: a typo must cost the boost, not silently widen it onto a band the
+    measurement never covered."""
+    out = []
+    for part in str(getattr(settings, "model_stake_boost_bands", "") or "").split(","):
+        part = part.strip()
+        if not part or "-" not in part:
+            continue
+        lo, _, hi = part.partition("-")
+        try:
+            a2, b2 = float(lo), float(hi)
+        except ValueError:
+            continue
+        if 0.0 < a2 < b2 <= 1.0:
+            out.append((a2, b2))
+    return tuple(out)
+
+
+def stake_boosted(fair: float | None) -> bool:
+    """Is this `fair` inside a boost band? Half-open [lo, hi)."""
+    if fair is None:
+        return False
+    try:
+        f = float(fair)
+    except (TypeError, ValueError):
+        return False
+    return any(lo <= f < hi for lo, hi in stake_boost_bands())
 
 
 def model_families() -> frozenset[str]:

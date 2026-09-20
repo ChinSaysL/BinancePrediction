@@ -32,7 +32,7 @@ from btcpredict.edge.impulse import impulse_bps, impulse_side
 from btcpredict.config import (CROSS_TRADED, MARKETS, SYMBOL_BY_PREFIX,
                                TRAIN_P_WIN, active_markets, cross_knob,
                                cross_traded, market_prefix, model_traded,
-                               settings)
+                               stake_boosted, settings)
 from btcpredict.edge.signal import (FLOOR_MAX_BANKROLL_FRACTION, FeeModel,
                                     Signal, evaluate,
                                     evaluate_hybrid, expected_value,
@@ -5811,12 +5811,24 @@ class Bot:
         # raise there and, worse, could be swallowed in production and silently
         # change sizing. Third time this pattern has bitten today -- histories,
         # _model_cooldown, and now this.
-        _cut = float(getattr(settings, "model_low_fair_cut", 0.0) or 0.0)
-        _mult = float(getattr(settings, "model_low_fair_stake_mult", 1.0) or 1.0)
-        if base > 0 and _cut > 0 and _mult != 1.0 and arm_of(sig) == "MODEL":
-            f = getattr(sig, "fair", None)
-            if f is not None and 0.0 < float(f) <= _cut:
-                base *= _mult
+        # BANDS FIRST. `model_stake_boost_bands` supersedes the single cut,
+        # because the measured structure has a GAP -- 0.60-0.70 contributes
+        # +$0.21 across 162 entries -- and a cut cannot express that. The cut
+        # shipped 2026-09-19 and was reverted the same night for spending the
+        # multiplier on exactly that dead zone. See config.model_stake_boost_bands.
+        _bmult = float(getattr(settings, "model_stake_boost_mult", 1.0) or 1.0)
+        if base > 0 and _bmult != 1.0 and arm_of(sig) == "MODEL":
+            if stake_boosted(getattr(sig, "fair", None)):
+                base *= _bmult
+        elif base > 0 and arm_of(sig) == "MODEL":
+            # Legacy single cut, kept so an existing deployment does not change
+            # behaviour on upgrade. Inert once bands are set.
+            _cut = float(getattr(settings, "model_low_fair_cut", 0.0) or 0.0)
+            _mult = float(getattr(settings, "model_low_fair_stake_mult", 1.0) or 1.0)
+            if _cut > 0 and _mult != 1.0:
+                f = getattr(sig, "fair", None)
+                if f is not None and 0.0 < float(f) <= _cut:
+                    base *= _mult
         if base > 0 and settings.stake_tilt == "inv_z":
             t = tilt_factor(moneyness_sd, reference=settings.tilt_reference_z,
                             lo=settings.tilt_min, hi=settings.tilt_max)

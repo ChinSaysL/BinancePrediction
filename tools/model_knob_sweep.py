@@ -227,6 +227,11 @@ def main() -> None:
     ap.add_argument("--since-ms", type=int, default=0,
                     help="only rounds starting at/after this epoch ms -- for "
                          "reconciling the replay against a live run")
+    ap.add_argument("--family", default=None,
+                    help="score ONLY this slug prefix, e.g. btc-updown-5m. "
+                         "The live bot trades `model_families`; without this "
+                         "the tool scores every family in the DB, so a table "
+                         "can be dominated by rounds the bot never trades.")
     ap.add_argument("--exclude-pm", action="store_true",
                     help="drop Polymarket-era rounds (a different settlement "
                          "rule, and the arm was switched off then) so a "
@@ -259,6 +264,10 @@ def main() -> None:
         before = len(rs)
         rs = [r for r in rs if r["slug"] not in pm]
         print(f"excluded {before - len(rs)} Polymarket-era rounds")
+    if args.family:
+        before = len(rs)
+        rs = [r for r in rs if r["slug"].rsplit("-", 1)[0] == args.family]
+        print(f"family filter {args.family}: kept {len(rs)} of {before} rounds")
     print(f"loaded {len(rs)} settled rounds with a quote tape "
           f"({rs[0]['slug']} .. {rs[-1]['slug']})")
     fam: dict[str, int] = {}
