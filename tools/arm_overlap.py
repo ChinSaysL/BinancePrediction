@@ -61,6 +61,12 @@ def load(con: sqlite3.Connection) -> list[dict]:
             continue
         out.append({"slug": slug, "start_ms": start_ms, "end_ms": end_ms,
                     "strike": strike, "winner": winner, "rows": rows,
+                    # ⛔ end_price WAS SELECTED AND THEN DROPPED. `rolling_sigma`
+                    # reads it, so every caller silently got the 0.0004 fallback
+                    # -- a CONSTANT volatility for every round, against a live
+                    # median near 0.00028. Fair value is a function of sigma, so
+                    # this changed which trades fire in every replay.
+                    "end_price": end_price,
                     "day": start_ms // 86400000})
     return out
 
