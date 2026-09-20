@@ -33,6 +33,7 @@ from btcpredict.config import (CROSS_TRADED, MARKETS, SYMBOL_BY_PREFIX,
                                TRAIN_P_WIN, active_markets, cross_knob,
                                cross_traded, market_prefix, model_traded,
                                stake_boosted, settings)
+import btcpredict.edge.signal as edge_signal
 from btcpredict.edge.signal import (FLOOR_MAX_BANKROLL_FRACTION, FeeModel,
                                     Signal, evaluate,
                                     evaluate_hybrid, expected_value,
@@ -1061,6 +1062,15 @@ class Bot:
             self._store_bars(sym, klines[:-1])   # seed the bars table too
         self.vol = self.vols["BTCUSDT"]
         self._last_vol_refresh = time.time()
+        # The fee fraction lives in the pure signal module (no config import
+        # there), so the knob is wired in at startup and logged -- an
+        # unannounced change to what a fill is assumed to cost would move the
+        # hurdle for every decision.
+        _ff = getattr(settings, "fee_realised_fraction", None)
+        if _ff is not None:
+            edge_signal.FEE_REALISED_FRACTION = float(_ff)
+        log.info("taker fee: %.3f x the measured curve (charged on PARTIAL "
+                 "fills only)", edge_signal.FEE_REALISED_FRACTION)
         log.info("pricing model: %s", self.model.name)
         if self.up_model is not None:
             log.info("per-side gate: Down=%s Up=%s",

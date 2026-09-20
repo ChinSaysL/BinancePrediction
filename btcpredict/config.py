@@ -701,6 +701,12 @@ class Settings(BaseSettings):
     # positive). 0.7 is the more-active compromise (56 trades, mdd -$5.09).
     # Always change the pair together: 0.5 with min_edge 0.045 reproduces the
     # haircut-off selection exactly.
+    # Fraction of the modelled taker fee we actually pay. The venue charges
+    # only on PARTIAL fills -- see signal.FEE_REALISED_FRACTION for the 762-fill
+    # measurement and the replay. 1.0 reverts to charging every fill the
+    # partial-fill rate, which is what shipped and which overstates the hurdle.
+    fee_realised_fraction: float = 0.445
+
     edge_haircut: float = 0.50
     # Weekend override, and it is 1.0 because the haircut is a NO-OP here, not
     # because the weekend is untested. MEASURED 2026-09-20, haircut x min_edge

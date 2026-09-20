@@ -104,8 +104,48 @@ def fee_bps_for_price(px: float) -> float:
     return min(TAKER_FEE_MAX_BPS, taker_fee_k(px) * (1.0 - px) / px)
 
 
+#: WHAT FRACTION OF THE CURVE IS ACTUALLY PAID.
+#:
+#: ⛔ THE VENUE CHARGES THE FEE ONLY ON PARTIAL FILLS. Measured 2026-09-20 on
+#: 762 live fills:
+#:
+#:     fillPercentage >= 0.999   n=193   91.2% pay ZERO   mean   4.1 bps
+#:     fillPercentage <  0.999   n=272    0.0% pay zero   mean 157.4 bps
+#:
+#: so the curve above describes what is charged WHEN it is charged, and the
+#: EXPECTED charge is 0.445x that. Stable across price: by band the realised /
+#: curve ratio is 0.41 / 0.52 / 0.53 / 0.61 / 0.67 / 0.52 from 0.45 to 0.95.
+#: Overall 96.5 bps actual against 216.6 bps modelled.
+#:
+#: This is not cosmetic: `evaluate` builds the HURDLE from this rate, so an
+#: overstated fee makes the bot refuse trades whose true edge clears the true
+#: bar. Replayed on the weekday cohort with the corrected rate applied to both
+#: the decision and the settlement, live config, range gate on:
+#:
+#:     fee x   n    ask     WR    EV/$1   day-t   $/day  |  train    test
+#:     1.000  306  0.702  74.5%  +0.0477  +1.80  +2.09   | +0.0367  +0.0666
+#:     0.445  390  0.686  73.8%  +0.0743  +2.50  +4.14   | +0.0699  +0.0808
+#:     0.300  416  0.685  72.1%  +0.0508  +2.08  +3.02   | +0.0537  +0.0466
+#:
+#: +56% EV per trade and double the daily P/L, positive on BOTH halves, and the
+#: optimum sits at the measured value rather than at the lowest fee -- 0.300 is
+#: clearly worse, so this is not "assume a smaller cost and the numbers rise".
+#:
+#: ⚠ RESIDUAL RISK: the marginal trades this unlocks may fill less completely
+#: than average (thinner liquidity at the edge of the band), which would push
+#: their realised fee above 0.445. The measurement cannot see trades the bot
+#: never took. Set to 1.0 to revert to charging every fill the partial rate.
+FEE_REALISED_FRACTION = 0.445
+
+
+def expected_fee_bps_for_price(px: float) -> float:
+    """The fee we EXPECT to pay: the curve, times the realised fraction."""
+    return fee_bps_for_price(px) * FEE_REALISED_FRACTION
+
+
 def fee_rate_for_price(px: float) -> float:
-    return fee_bps_for_price(px) / 10_000.0
+    """Expected fee as a RATE, for hurdles, EV and broker accounting."""
+    return expected_fee_bps_for_price(px) / 10_000.0
 
 
 class FeeModel(str, Enum):
