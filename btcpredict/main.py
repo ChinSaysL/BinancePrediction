@@ -468,10 +468,27 @@ def ws_follow_rounds(round_cache, mkt, primary, follow_all) -> list:
 
 
 def is_weekend_utc(ts_ms: int | None = None) -> bool:
-    """Saturday or Sunday in UTC. See config.weekend_overrides."""
-    if ts_ms is None:
-        return time.gmtime().tm_wday >= 5
-    return time.gmtime(ts_ms / 1000.0).tm_wday >= 5
+    """Is this instant inside the configured weekend window (UTC)?
+
+    NOT "Saturday or Sunday": the boundary is the FX week, Friday's NY close to
+    Sunday's Sydney open, because that is where the measured regime actually
+    turns. See config.weekend_start_dow for the hour-by-hour table.
+
+    Works in hour-of-week (0 = Monday 00:00 .. 167 = Sunday 23:00) and supports
+    a window that WRAPS past Sunday, so a configuration like Sat->Fri is not
+    silently inverted.
+    """
+    g = time.gmtime() if ts_ms is None else time.gmtime(ts_ms / 1000.0)
+    now = g.tm_wday * 24 + g.tm_hour
+    start = (getattr(settings, "weekend_start_dow", 5) * 24
+             + getattr(settings, "weekend_start_hour_utc", 0))
+    end = (getattr(settings, "weekend_end_dow", 6) * 24
+           + getattr(settings, "weekend_end_hour_utc", 24))
+    if start == end:
+        return False
+    if start < end:
+        return start <= now < end
+    return now >= start or now < end        # the window wraps the week end
 
 
 def crossed_side(ticks, strike: float, look_s: float,

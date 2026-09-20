@@ -3989,6 +3989,32 @@ class Settings(BaseSettings):
     #
     # Turn on with WEEKEND_OVERRIDES=true. Kill with WEEKEND_OVERRIDES=false.
     weekend_overrides: bool = False
+    # WHERE THE WEEKEND STARTS AND ENDS, in UTC hour-of-week. NOT midnight:
+    # crypto's regime boundary is TradFi's, because that is when institutional
+    # flow stops and restarts. MEASURED 2026-09-20 on the September record --
+    # median round range (bps) and the share of rounds inside the arm's own
+    # [5,16] activity gate:
+    #
+    #     Sun 18:00  2.6 bps   8%      Fri 20:00   9.4 bps  75%
+    #     Sun 19:00  4.3 bps  25%      Fri 21:00   6.7 bps  75%
+    #     Sun 20:00  1.6 bps   0%      Fri 22:00  13.5 bps  67%
+    #     Sun 22:00 12.3 bps  58%      Fri 23:00   4.6 bps  33%
+    #     Sun 23:00 10.7 bps  75%
+    #
+    #   reference: weekday median 11.5 bps (63% in band), weekend 4.4 (38%)
+    #
+    # Sunday is dead until ~20:00 and weekday-like by 22:00 -- the Sydney open
+    # at 21:00 UTC. Friday holds up through 22:00 and collapses at 23:00. Both
+    # match the FX week (NY close -> Sydney open) rather than UTC midnight.
+    #
+    # dow is Python's: 0=Mon .. 6=Sun. The window may wrap the week end.
+    # ⛔ THESE ARE UTC AND MUST STAY UTC: every measurement behind the weekend
+    # knobs is bucketed by UTC hour-of-week, so a local-time boundary would
+    # score a different cohort than the one that was tuned.
+    weekend_start_dow: int = 4          # Friday
+    weekend_start_hour_utc: int = 22    # NY close
+    weekend_end_dow: int = 6            # Sunday
+    weekend_end_hour_utc: int = 21      # Sydney open
     # Inflate sigma on Saturday/Sunday (UTC). 1.0 = shipped behaviour.
     weekend_sigma_mult: float = 1.50
     weekend_min_edge: float = 0.06
