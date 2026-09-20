@@ -87,6 +87,49 @@ def _cost_per_share(px: float) -> float:
     return px * (1.0 + fee_rate_for_price(px))
 
 
+def minute_closes(rs: list[dict]) -> dict[int, float]:
+    """{minute index -> last spot in that minute}, across the WHOLE tape.
+
+    Feeds `one_hour_return`, which feeds the live `up_regime_gate`. Built once
+    from every round rather than per round, because an hour of history reaches
+    back through ~12 rounds and a per-round view would always be too short.
+    """
+    out: dict[int, float] = {}
+    for r in rs:
+        for row in r["rows"]:
+            ts, spot = row[0], row[2]
+            if spot and spot > 0:
+                out[ts // 60_000] = float(spot)          # last write wins
+    return out
+
+
+def one_hour_return(closes: dict[int, float], ts_ms: int) -> float | None:
+    """Mirror of `models.base.PriceHistory.one_hour_return`.
+
+    Live reads COMPLETED 1m bars: the newest is the minute before this tick,
+    and the reference is the newest bar at or before `newest - 60`. Reading the
+    CURRENT minute instead would use a bar that has not closed yet -- a look
+    ahead of up to 59 seconds on the exact quantity the gate keys on.
+    """
+    if not closes:
+        return None
+    newest = ts_ms // 60_000 - 1
+    c0 = closes.get(newest)
+    if c0 is None:                                        # gap: nearest before
+        prior = [m for m in closes if m <= newest]
+        if not prior:
+            return None
+        newest = max(prior)
+        c0 = closes[newest]
+    past = [m for m in closes if m <= newest - 60]
+    if not past:
+        return None
+    c1 = closes[max(past)]
+    if c0 <= 0 or c1 <= 0:
+        return None
+    return math.log(c0 / c1)
+
+
 def enter(slug: str, rnd: dict, ts_ms: int, tau: float, side: str, px: float,
           ev: float, why: str, mz: float = 0.0,
           fair: float | None = None) -> dict:
@@ -191,7 +234,9 @@ def arm_model(rnd: dict, sigma: float, persistence: int,
               min_quote: float | None = None,
               min_tau: float | None = None,
               max_tau: float | None = None,
-              apply_range_gate: bool = True) -> dict | None:
+              apply_range_gate: bool = True,
+              closes: dict[int, float] | None = None,
+              up_gate: float | None = None) -> dict | None:
     """The live model gate: real `evaluate`, real quote band, real persistence.
 
     ⛔ THE ROUND-RANGE GATE IS LIVE AND WAS MISSING HERE, exactly as it was
@@ -212,8 +257,29 @@ def arm_model(rnd: dict, sigma: float, persistence: int,
 
     `apply_range_gate=False` restores the old ungated behaviour for callers
     that deliberately want the unfiltered population.
+
+    ⛔ TWO MORE LIVE GATES WERE MISSING HERE (added 2026-09-20), both of which
+    made this replay more permissive than the bot it models:
+
+      * THE STREAK RESETS AT EVERY 1-MINUTE CANDLE OPEN. `main.py` pops the
+        streak whenever `now_ms // 60_000` changes -- unconditionally, NOT only
+        when `trade_on_candle_open` is set, which is off here. A signal that
+        straddles a minute boundary starts again from 1 live and did not here,
+        so every persistence value above 1 was measured too generously, and
+        the higher the persistence the bigger the gift.
+      * `up_regime_gate`. When the 1h return exceeds it, live removes the Up
+        candidate BEFORE the side pick by passing `quote_up=None`, so a Down
+        candidate on the same quote still stands. It refused 410 live decisions
+        in two hours on 2026-09-20 and nothing here reproduced it.
+
+    `closes` is `minute_closes(rounds)`; without it the up gate cannot be
+    evaluated and is skipped, which is the old behaviour and is why callers
+    that want live parity must pass it.
     """
     streak_side, streak = None, 0
+    candle = None
+    if up_gate is None:
+        up_gate = getattr(settings, "up_regime_gate", 0.0) or 0.0
     lo = hi = None
     rlo = getattr(settings, "model_min_round_range_bps", 0.0) or 0.0
     rhi = getattr(settings, "model_max_round_range_bps", 0.0) or 0.0
@@ -237,13 +303,29 @@ def arm_model(rnd: dict, sigma: float, persistence: int,
                 streak_side, streak = None, 0
                 continue
         fair_up = fair_value(spot, rnd["strike"], tau, sigma)
+        # The rising-regime gate, applied the way live applies it: the Up quote
+        # is withdrawn BEFORE the pick, so a Down candidate on this same quote
+        # survives. Dropping the signal afterwards instead would discard a side
+        # that had already qualified.
+        up_q = up_ask
+        if up_gate > 0 and closes:
+            hr = one_hour_return(closes, ts_ms)
+            if hr is not None and hr > up_gate:
+                up_q = None
         sig = evaluate(
-            fair_up, up_ask, dn_ask, fee=None, half_spread=0.0,
+            fair_up, up_q, dn_ask, fee=None, half_spread=0.0,
             safety_margin=settings.safety_margin, fee_model=FeeModel.NOTIONAL,
             max_quote=(settings.max_quote if max_quote is None else max_quote),
             min_quote=(settings.min_quote if min_quote is None else min_quote),
             min_edge=settings.min_edge,
             edge_haircut=(settings.edge_haircut if haircut is None else haircut))
+        # Live pops the streak on a new candle BEFORE folding this poll in, so
+        # the current poll counts as 1 in the fresh candle rather than being
+        # discarded. Order matters: resetting after the update would lose it.
+        ci = ts_ms // 60_000
+        if candle != ci:
+            candle = ci
+            streak_side, streak = None, 0
         if not sig.act or sig.side is None:
             streak_side, streak = None, 0
             continue
