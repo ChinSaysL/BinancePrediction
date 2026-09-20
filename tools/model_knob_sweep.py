@@ -67,14 +67,59 @@ LIVE = dict(max_tau=settings.max_tau_s, min_tau=settings.min_tau_s,
             max_range=settings.model_max_round_range_bps)
 
 
+def load_live_sigma(con) -> dict[str, list[tuple[int, float]]]:
+    """The sigma the BOT used, per round: (ts_ms, sigma_1m) from `decisions`.
+
+    The replay's own `rolling_sigma` is a different estimator AND a different
+    level: measured on 1,790 Binance rounds the live/rolling ratio runs 0.37 to
+    6.0 (median 0.84 pooled, 0.71 after the duplicate-bar fix). Any claim whose
+    sign depends on the sigma level -- the `fair` split, and the 2x sizing rule
+    that is monotone in it, crossing zero at ~1.24 -- has to be scored with the
+    sigma the arm actually had, or it is ranking a system nobody runs.
+
+    Forward-filled because `refresh_vol_if_stale` only updates the estimate once
+    a minute, so the last recorded value is the value in force at every tick
+    between decisions.
+    """
+    out: dict[str, list[tuple[int, float]]] = {}
+    for slug, ts, s in con.execute(
+            "SELECT slug, ts_ms, sigma_1m FROM decisions "
+            "WHERE sigma_1m IS NOT NULL ORDER BY slug, ts_ms"):
+        out.setdefault(slug, []).append((ts, s))
+    return out
+
+
+def _sig_at(series: list[tuple[int, float]] | None, ts: int,
+            default: float) -> float:
+    """The live sigma in force at `ts` (last value at or before it)."""
+    if not series:
+        return default
+    if ts < series[0][0]:
+        return series[0][1]
+    lo, hi = 0, len(series) - 1
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if series[mid][0] <= ts:
+            lo = mid
+        else:
+            hi = mid - 1
+    return series[lo][1]
+
+
 def replay(rnd: dict, sigma: float, *, persistence: int,
            max_tau: float, min_tau: float | None,
            min_quote: float, max_quote: float,
            min_range: float, max_range: float,
            exec_mode: str = "limit_take", latency_s: float = 1.0,
            margin: float | None = None,
-           haircut: float | None = None) -> dict | None:
-    """The first round-qualifying entry under these knobs, or None."""
+           haircut: float | None = None,
+           live_sig: list[tuple[int, float]] | None = None) -> dict | None:
+    """The first round-qualifying entry under these knobs, or None.
+
+    With `live_sig` the fair value at each tick uses the sigma the BOT recorded
+    at that moment, so the replay reproduces the live rule rather than a
+    parallel one; without it, the round's scalar `sigma`.
+    """
     lo_tau = settings.min_tau_s if min_tau is None else min_tau
     hc = settings.edge_haircut if haircut is None else haircut
     strike = rnd["strike"]
@@ -89,13 +134,14 @@ def replay(rnd: dict, sigma: float, *, persistence: int,
             continue
         if not (lo_tau <= tau <= max_tau):
             continue
+        sg_i = _sig_at(live_sig, ts_ms, sigma)
         # main.Bot._round_range_bps: the round's TRAVEL so far, and None (no
         # opinion) until there are two samples -- never a refusal.
         if max_range > 0 and len(seen) >= 2:
             rng = 1e4 * (max(seen) - min(seen)) / strike
             if not (min_range <= rng <= max_range):
                 continue
-        fair_up = fair_value(spot, strike, tau, sigma)
+        fair_up = fair_value(spot, strike, tau, sg_i)
         sig = evaluate(
             fair_up, up_ask, dn_ask, fee=None, half_spread=0.0,
             safety_margin=settings.safety_margin, fee_model=FeeModel.NOTIONAL,
@@ -114,7 +160,7 @@ def replay(rnd: dict, sigma: float, *, persistence: int,
         return ao._execute(rnd, i, sig.side, fair_side,
                            sig.ev_per_dollar or 0.0,
                            f"model edge {sig.edge:+.3f}", margin=margin,
-                           mz=moneyness_sd(spot, strike, tau, sigma),
+                           mz=moneyness_sd(spot, strike, tau, sg_i),
                            exec_mode=exec_mode, latency_s=latency_s)
     return None
 
@@ -187,6 +233,13 @@ def main() -> None:
                          "halves test spans ONE rule")
     ap.add_argument("--dump", type=int, default=0,
                     help="print the first N entries (slug, tau, side, px)")
+    ap.add_argument("--use-live-sigma", action="store_true",
+                    help="price EVERY tick with the sigma the bot RECORDED "
+                         "(decisions.sigma_1m, forward-filled) instead of the "
+                         "replay's own rolling_sigma. The two disagree by a "
+                         "factor that runs 0.37-6.0, and a claim whose sign "
+                         "depends on the sigma level must be scored on the "
+                         "sigma the arm actually had.")
     ap.add_argument("--sigma-scale", type=float, default=1.0,
                     help="multiply the out-of-sample sigma by this factor. The "
                          "live estimator applies an hour-of-day seasonality "
@@ -222,7 +275,13 @@ def main() -> None:
           f"latency {args.latency_s:g}s")
     sigmas = [ao.rolling_sigma(rs, i) * args.sigma_scale
               for i in range(len(rs))]
-    if args.sigma_scale != 1.0:
+    live_sig = load_live_sigma(con) if args.use_live_sigma else {}
+    if args.use_live_sigma:
+        have = sum(1 for r in rs if r["slug"] in live_sig)
+        print(f"  sigma source: LIVE per tick -- {have}/{len(rs)} rounds have "
+              f"a recorded series ({100*have/len(rs):.0f}%); the rest fall "
+              f"back to rolling_sigma x{args.sigma_scale:g}")
+    if args.sigma_scale != 1.0 and not args.use_live_sigma:
         print(f"sigma scaled x{args.sigma_scale:g} "
               f"(mean {sum(sigmas)/len(sigmas)*1e4:.2f} bps/min)")
 
@@ -234,7 +293,9 @@ def main() -> None:
         kw.update(over)
         out = []
         for r, sg in zip(rs, sigmas):
-            e = replay(r, sg, **base, **kw)
+            e = replay(r, sg, **base, **kw,
+                       live_sig=(live_sig.get(r["slug"])
+                                 if args.use_live_sigma else None))
             if e:
                 out.append(e)
         return out
