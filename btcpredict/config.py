@@ -617,6 +617,35 @@ class Settings(BaseSettings):
     # evidence. If it is ever changed, change `min_edge` with it -- min_edge is
     # compared against the HAIRCUT edge.
     #
+    # RE-MEASURED 2026-09-20 on 148,296 Binance weekday ticks in the arm's band
+    # (tau 60-240, quote 0.55-0.85), as (realised - venue) / (model - venue):
+    #
+    #     claimed edge   n        venue   model   real   implied haircut
+    #     0.02-0.04      12,765   0.686   0.723   0.740      1.45
+    #     0.04-0.06       9,565   0.692   0.749   0.733      0.72
+    #     0.06-0.09      10,079   0.701   0.783   0.724      0.28
+    #     0.09-0.12       6,875   0.718   0.829   0.759      0.37
+    #     0.12+          13,499   0.728   0.908   0.763      0.19
+    #
+    # So above min_edge the model realises only ~20-40% of its claim, and the
+    # shortfall GROWS with the claim exactly as evaluate()'s docstring says.
+    # The arm across haircuts (weekday config, live range gate):
+    #
+    #     1.00  n=674 WR 74.8% EV +0.0654 day-t +3.52  $6.30/day
+    #     0.70  n=614 WR 75.6% EV +0.0708 day-t +2.84  $6.21/day
+    #     0.50  n=526 WR 76.8% EV +0.0835 day-t +4.45  $6.28/day
+    #     0.30  n=343 WR 77.3% EV +0.0672 day-t +2.76  $3.29/day
+    #     0.20  n=193 WR 74.6% EV +0.0087 day-t +0.50  $0.24/day
+    #
+    # ⛔ STILL NOT CHANGED, and this is why: the null quoted above returns a
+    # best-cell day-t of +4.08 on average and the best cell here is +4.45 --
+    # at the noise floor. The bias is real; that a HAIRCUT captures it is not
+    # demonstrated. The haircut barely moves EV per trade, it removes trades,
+    # and the earlier tape scores 0.50 WORSE than 1.00. Two tapes disagreeing
+    # at the null floor is not evidence. If this is ever revisited, the test is
+    # ONE pre-specified value on data it was not fitted to, and min_edge must
+    # move with it.
+    #
     # (historical, and the reason the knob exists:)
     # THE OLD NOTE SAID: DEFAULT IS 0.5 (a deliberate safety haircut).
     # Measured on 31h of live btc-5m recordings the realised edge is roughly
