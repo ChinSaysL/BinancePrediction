@@ -5719,8 +5719,8 @@ class Bot:
 
         now_ms = int(time.time() * 1000)
         tau_15 = r_15.tau_s(now_ms)
-        min_tau_15 = getattr(settings, "reversal_15m_min_tau_s", 120.0)
-        max_tau_15 = getattr(settings, "reversal_15m_max_tau_s", 750.0)
+        min_tau_15 = getattr(settings, "reversal_15m_min_tau_s", 240.0)
+        max_tau_15 = getattr(settings, "reversal_15m_max_tau_s", 850.0)
         if not (min_tau_15 <= tau_15 <= max_tau_15):
             return
 
@@ -5937,7 +5937,8 @@ class Bot:
         """
         buf = max(0.01, min(self._ck("limit_buffer", r),
                             self._ck("limit_buffer_inv", r) * (1.0 - base_px)))
-        cap = min(self._ck("max_price", r), round(base_px + buf, 2))
+        max_p = fill_cap if fill_cap is not None else self._ck("max_price", r)
+        cap = min(max_p, round(base_px + buf, 2))
         mult = self._ck("max_fill_multiple", r)
         if mult and mult > 0:
             cap = min(cap, math.floor(base_px * mult * 100) / 100)

@@ -272,6 +272,21 @@ def test_the_fill_cap_override_still_wins(monkeypatch):
     assert bot._take_cap_for(r, 0.80, 0.20) == pytest.approx(0.20)
 
 
+def test_fill_cap_overrides_lower_cross_max_price(monkeypatch):
+    """fill_cap must override cross_max_price when caller authorizes a higher ceiling (e.g. reversal_15m)."""
+    monkeypatch.setattr("btcpredict.config.settings.cross_limit_buffer", 0.25)
+    monkeypatch.setattr("btcpredict.config.settings.cross_limit_buffer_inv", 0.20)
+    monkeypatch.setattr("btcpredict.config.settings.cross_max_price", 0.65)
+    monkeypatch.setattr("btcpredict.config.settings.cross_max_fill_px", 0.65)
+    monkeypatch.setattr("btcpredict.config.settings.cross_max_fill_multiple", 0.0)
+    bot, r, _sig = make_bot()
+    # Without fill_cap override, venue ask 0.70 would be clamped to cross_max_price 0.65
+    assert bot._take_cap_for(r, 0.70, None) == pytest.approx(0.65)
+    # With fill_cap=0.75, take cap must reach 0.75 rather than clamping to 0.65
+    assert bot._take_cap_for(r, 0.70, 0.75) == pytest.approx(0.75)
+
+
+
 # ---------------------------------------------------------------------------
 # the retry
 # ---------------------------------------------------------------------------

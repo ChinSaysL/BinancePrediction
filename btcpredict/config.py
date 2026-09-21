@@ -3911,8 +3911,8 @@ class Settings(BaseSettings):
     reversal_15m_enabled: bool = True
     reversal_15m_families: str = "btc-updown-15m,eth-updown-15m"
     reversal_15m_min_wait_s: float = 25.0
-    reversal_15m_min_tau_s: float = 120.0
-    reversal_15m_max_tau_s: float = 360.0
+    reversal_15m_min_tau_s: float = 240.0
+    reversal_15m_max_tau_s: float = 850.0
     reversal_15m_max_round_range_bps: float = 25.0
     reversal_15m_min_quote: float = 0.45
     reversal_15m_max_quote: float = 0.75
