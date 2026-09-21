@@ -312,6 +312,7 @@ def test_model_mode_does_not_run_the_trigger_on_the_feed_clock(store, monkeypatc
     # `CROSS_ENABLED=true`, so this assertion was reading the cross arm rather
     # than the impulse switch it names. It ships False.
     monkeypatch.setattr("btcpredict.config.settings.cross_enabled", False)
+    monkeypatch.setattr("btcpredict.config.settings.reversal_15m_enabled", False)
     bot = make_bot(store, moving_ticks(1.0))
 
     async def boom():

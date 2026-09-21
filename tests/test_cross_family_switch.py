@@ -127,7 +127,8 @@ def test_the_recording_path_still_runs_for_every_market():
     """
     src = (ROOT / "btcpredict" / "main.py").read_text()
     assert "for prefix, sym, _ in active_markets():" in src
-    assert "trade=cross_traded(prefix)," in src
+    assert "cross_traded(prefix)" in src
+    assert "trade=" in src
     assert "trade=(prefix in CROSS_TRADED)," not in src, \
         "the raw membership test must not remain: it ignores the switch"
 

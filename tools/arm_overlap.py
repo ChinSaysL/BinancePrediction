@@ -43,7 +43,11 @@ from btcpredict.edge.signal import (                         # noqa: E402
     FeeModel, evaluate, fee_rate_for_price, take_limit_px)
 from btcpredict.pricing.digital import fair_value, moneyness_sd  # noqa: E402
 
-ARMS = ("model", "impulse", "ticket")
+# The ticket arm was DELETED from the bot (its settings no longer exist), so it
+# is no longer reconstructable here. Leaving it in ARMS made this tool crash on
+# `settings.ticket_min_price` -- a stale reference to a removed arm is worth
+# deleting, not guarding, because a guarded arm would silently report nothing.
+ARMS = ("model", "impulse")
 
 
 def load(con: sqlite3.Connection) -> list[dict]:
@@ -293,6 +297,17 @@ def arm_model(rnd: dict, sigma: float, persistence: int,
             hi = spot if hi is None else max(hi, spot)
         if (spot is None or not 0 < tau <= 300
                 or up_ask is None or dn_ask is None):
+            streak_side, streak = None, 0
+            continue
+        # ⛔ THE COHERENCE INVARIANT. Two complementary asks must sum at least
+        # $1.00 (~1.02 live). A pair summing strictly below it is free arbitrage -- i.e.
+        # corrupt data, not a tradeable quote -- and any price filter selects
+        # exactly those rows. That is how a +0.5821/$1 "edge" which passed
+        # 23-fold LODO at p=0.0125 was once manufactured here; gating on this
+        # cut it to +0.16 at p=1.0. The live book cannot be incoherent, so this
+        # costs nothing on recorded live quotes, but 21.6% of the Apr-Jun
+        # corpus's books fail it and that corpus cannot be replayed without it.
+        if up_ask + dn_ask < 0.999:
             streak_side, streak = None, 0
             continue
         if not ((settings.min_tau_s if min_tau is None else min_tau) <= tau
@@ -603,10 +618,7 @@ def main() -> None:
     print(f"live gate: entry_mode={settings.entry_mode} pricing={settings.pricing_model}"
           f" min_edge={settings.min_edge} quotes {settings.min_quote}-"
           f"{settings.max_quote} tau {settings.min_tau_s:.0f}-{settings.max_tau_s:.0f}"
-          f" impulse {settings.impulse_window_s:.0f}s>={settings.impulse_bps:.0f}bps"
-          f" ticket {settings.ticket_min_price}-{settings.ticket_max_price}"
-          f" tau {settings.ticket_min_tau_s:.0f}-{settings.ticket_max_tau_s:.0f}s"
-          f" div>={settings.ticket_min_div} z>={settings.ticket_min_z}")
+          f" impulse {settings.impulse_window_s:.0f}s>={settings.impulse_bps:.0f}bps")
     print(f"execution: order_type={settings.order_type} mode={args.exec} "
           f"latency={args.latency_s:.1f}s margin={settings.limit_take_margin} "
           f"tick={settings.limit_ask_tick} wait={settings.limit_wait_s:.0f}s")
@@ -626,9 +638,6 @@ def main() -> None:
         got = arm_impulse(rnd, sigma, args.exec, 0.0)
         if got:
             hits["impulse"] = got
-        got = arm_ticket(rnd, sigma)
-        if got:
-            hits["ticket"] = got
         for a, e in hits.items():
             picks[a].append(e)
         # The union: ONE position per round, awarded to whichever arm fires
