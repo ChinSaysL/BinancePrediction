@@ -1187,9 +1187,9 @@ class Bot:
         # that exists to catch this could not see it -- that test now asserts
         # the reserved-pool labels directly.
         return (("live", "double", "maker", "stale_maker", "cross", "train",
-                 "impulse")
+                 "impulse", "reversal_15m")
                 if self.broker.mode == "live"
-                else ("paper", "impulse", "maker"))
+                else ("paper", "impulse", "maker", "reversal_15m"))
 
     def _seed_cross_count(self) -> None:
         """Carry today's cross ATTEMPTS into the fresh counter.
