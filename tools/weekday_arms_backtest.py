@@ -56,15 +56,22 @@ def load_data(db_path: str = DB_PATH) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 def run_model_arm(rounds: pd.DataFrame, quotes: pd.DataFrame,
                   *, edge_haircut: float = 0.50, min_edge: float = 0.04,
-                  min_quote: float = 0.45, max_quote: float = 0.80,
-                  min_tau: float = 60.0, max_tau: float = 240.0) -> pd.DataFrame:
+                  min_quote: float = 0.65, max_quote: float = 0.80,
+                  min_tau: float = 60.0, max_tau: float = 240.0,
+                  max_rng: float = 25.0, cooldown_len: int = 0) -> pd.DataFrame:
     """Replay Model Arm on quotes."""
     idx = rounds.set_index("slug")
     fills = []
     
     # Group quotes by round slug
+    cooldown = 0
     for slug, g in quotes.groupby("slug", sort=False):
+        if not slug.startswith("btc-updown-5m"):
+            continue
         if slug not in idx.index:
+            continue
+        if cooldown > 0:
+            cooldown -= 1
             continue
         rr = idx.loc[slug]
         if isinstance(rr, pd.DataFrame):
@@ -76,10 +83,15 @@ def run_model_arm(rounds: pd.DataFrame, quotes: pd.DataFrame,
         # Sort by tau descending
         g = g.sort_values("tau_s", ascending=False)
         
-        # Calculate 1m vol rolling estimate from spot series
+        # Range gate: check travel in bps
         spots = g.spot.to_numpy()
         if len(spots) < 10:
             continue
+        rng_bps = 1e4 * (np.max(spots) - np.min(spots)) / strike
+        if not (5.0 <= rng_bps <= max_rng):
+            continue
+            
+        # Calculate 1m vol rolling estimate from spot series
         rets = np.diff(spots) / spots[:-1]
         vol_1m = np.std(rets) * math.sqrt(60) if len(rets) > 0 else 0.0004
         if not np.isfinite(vol_1m) or vol_1m <= 0:
@@ -120,6 +132,8 @@ def run_model_arm(rounds: pd.DataFrame, quotes: pd.DataFrame,
             fee = fee_rate_for_price(paid)
             won = int(rr.winner == sig.side)
             ret = (1.0 if won else 0.0) / paid - 1.0 - fee
+            if not won:
+                cooldown = cooldown_len
             
             ts_ms = int(row.ts_ms)
             is_wknd = is_weekend_utc(ts_ms)

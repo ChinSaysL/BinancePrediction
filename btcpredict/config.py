@@ -835,7 +835,7 @@ class Settings(BaseSettings):
     # where it stops paying. Note the arm is only MARGINALLY positive even here
     # (+0.018/$1 under the harsher slippage model) -- it is a supporting arm,
     # not a driver.
-    model_min_round_range_bps: float = 5.0
+    model_min_round_range_bps: float = 0.0
     # ⛔ 12.0 -> 16.0 on 2026-09-19. The 12 above was fitted with a replay that
     # was wrong five ways: it priced every Up fill at the BID, used BTCUSDT's
     # sigma for every family, modelled the taker fee at ~60% of the charge,
@@ -3911,8 +3911,8 @@ class Settings(BaseSettings):
     reversal_15m_enabled: bool = True
     reversal_15m_families: str = "btc-updown-15m,eth-updown-15m"
     reversal_15m_min_wait_s: float = 25.0
-    reversal_15m_min_tau_s: float = 240.0
-    reversal_15m_max_tau_s: float = 850.0
+    reversal_15m_min_tau_s: float = 270.0
+    reversal_15m_max_tau_s: float = 660.0
     reversal_15m_max_round_range_bps: float = 25.0
     reversal_15m_min_quote: float = 0.45
     reversal_15m_max_quote: float = 0.75

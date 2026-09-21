@@ -418,7 +418,8 @@ def main() -> None:
               % (args.since or "-", args.until or "-", len(rounds)))
     print(f"{args.db}\n  {len(rounds):,} settled rounds with quotes | "
           f"{sum(len(quotes[r['slug']]) for r in rounds):,} book rows | "
-          f"sigma from {len(opens):,} 1m bars")
+          f"sigma from {len(fallback[0]):,} 1m bars "
+          f"({len(sigma_series)} symbol series)")
     print(f"  bands: impulse [{S.impulse_min_price},{S.impulse_max_price}] "
           f"cross [{S.cross_min_price},{S.cross_max_price}] "
           f"model [{S.min_quote},{S.max_quote}] | tau: impulse/model "

@@ -165,3 +165,32 @@ def test_gate_is_skipped_without_closes(monkeypatch):
     got = ao.arm_model(_gate_round(), 0.0004, 1, exec_mode="market",
                        latency_s=0.0, apply_range_gate=False, up_gate=0.005)
     assert got is not None and got["side"] == "Up"
+
+
+# --- the coherence invariant ------------------------------------------------
+
+def test_incoherent_book_is_refused(monkeypatch):
+    """⛔ up_ask + down_ask <= $1.00 is free arbitrage, i.e. corrupt data. A
+    price filter selects exactly those rows, which is how a +0.5821/$1 edge
+    that passed 23-fold LODO at p=0.0125 was once manufactured here."""
+    monkeypatch.setattr(ao.settings, "min_edge", 0.0)
+    monkeypatch.setattr(ao.settings, "min_quote", 0.05)
+    monkeypatch.setattr(ao.settings, "max_quote", 0.99)
+    monkeypatch.setattr(ao.settings, "model_max_round_range_bps", 0.0)
+    monkeypatch.setattr(ao.settings, "up_regime_gate", 0.0)
+    bad = [(61_000 + i * 1000, 120.0, 100.6, 0.55, 0.40) for i in range(4)]
+    assert ao.arm_model(_round(bad), 0.0004, 1, exec_mode="market",
+                        latency_s=0.0, apply_range_gate=False) is None
+
+
+def test_a_coherent_book_at_the_same_prices_fires(monkeypatch):
+    """Same Up ask, only the complementary side differs -- so the refusal above
+    is the SUM, not the price band."""
+    monkeypatch.setattr(ao.settings, "min_edge", 0.0)
+    monkeypatch.setattr(ao.settings, "min_quote", 0.05)
+    monkeypatch.setattr(ao.settings, "max_quote", 0.99)
+    monkeypatch.setattr(ao.settings, "model_max_round_range_bps", 0.0)
+    monkeypatch.setattr(ao.settings, "up_regime_gate", 0.0)
+    ok = [(61_000 + i * 1000, 120.0, 100.6, 0.55, 0.50) for i in range(4)]
+    assert ao.arm_model(_round(ok), 0.0004, 1, exec_mode="market",
+                        latency_s=0.0, apply_range_gate=False) is not None

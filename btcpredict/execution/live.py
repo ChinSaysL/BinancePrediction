@@ -190,6 +190,8 @@ class LiveBrokerError(RuntimeError):
 # never be re-placed. See `LiveBroker.last_failure`.
 RETRYABLE_FAILURES = frozenset({"no_quote", "quote_expired", "rejected",
                                 "venue_failed"})
+TERMINAL_FAIL_STATUSES = frozenset({"FAILED", "CANCELLED", "CANCELED",
+                                   "EXPIRED", "REJECTED"})
 
 
 class LiveBroker:
@@ -365,8 +367,6 @@ class LiveBroker:
         be reached at all (unverifiable), which the caller treats separately.
         """
         in_flight = {"SUBMITTED", "PENDING", "NEW", "FILLING", "PARTIAL_FILL"}
-        terminal_fail = {"FAILED", "CANCELLED", "CANCELED", "EXPIRED",
-                         "REJECTED"}
         for i in range(tries):
             resp = await self._request("GET", ORDER_HISTORY, {
                 "walletAddress": self.wallet_address,
@@ -383,12 +383,15 @@ class LiveBroker:
                         err = o.get("errorMessage")
                         if err:
                             self.last_order_error = str(err)
-                        if status == "FILLED" or status in terminal_fail:
-                            if status in terminal_fail:
+                        if status == "FILLED" or status in TERMINAL_FAIL_STATUSES:
+                            if status in TERMINAL_FAIL_STATUSES:
                                 log.error("order %s %s: %s", order_id, status,
                                           err or "(venue gave no reason)")
                             return status
-                        # SUBMITTED etc.: still in flight, retry below.
+                        # SUBMITTED etc.: still in flight on-chain, retry below.
+                        if i >= 5 and (i % 5 == 0 or i == tries - 1):
+                            log.info("order %s still %s (try %d/%d)",
+                                     order_id, status, i + 1, tries)
                         break
             if i < tries - 1:
                 await asyncio.sleep(delay)
@@ -866,13 +869,37 @@ class LiveBroker:
                 # re-entry anyway, and redeem() claims ALL claimable tokens
                 # rather than only the ones this bot booked, so winnings are
                 # not stranded.
-                self.last_failure = "unconfirmed"
-                log.error("order %s unverifiable and the venue holds no "
-                          "position in %s; NOT booking and NOT retrying%s",
-                          order_id, slug,
-                          f" (venue said: {self.last_order_error})"
-                          if self.last_order_error else "")
-                return None
+                #
+                # SAFETY NET: _confirm_by_position just spent ~4s checking the
+                # position list. In case the on-chain execution concluded while
+                # that poll was running, check order_record one final time: if
+                # the order has now reached a terminal failure state (FAILED,
+                # CANCELLED, etc.), classify it as venue_failed so the caller
+                # can cleanly retry or skip without a 30s penalty lock.
+                rec = await self.order_record(order_id, tries=2, delay=0.5)
+                if rec:
+                    final_st = rec.get("status") or ""
+                    if final_st in TERMINAL_FAIL_STATUSES:
+                        self.last_failure = "venue_failed"
+                        self.last_order_error = str(rec.get("errorMessage") or "")
+                        log.error("order %s status=%s confirmed by late history check; "
+                                  "treating as failed (%s): %s",
+                                  order_id, final_st, slug,
+                                  self.last_order_error or "no reason given")
+                        return None
+                    elif final_st == "FILLED":
+                        log.info("order %s confirmed FILLED by late history check (%s)",
+                                 order_id, slug)
+                        status = "FILLED"
+
+                if status != "FILLED":
+                    self.last_failure = "unconfirmed"
+                    log.error("order %s unverifiable and the venue holds no "
+                              "position in %s; NOT booking and NOT retrying%s",
+                              order_id, slug,
+                              f" (venue said: {self.last_order_error})"
+                              if self.last_order_error else "")
+                    return None
             if held is True:
                 log.info("order %s confirmed by the venue's position list (%s)",
                          order_id, slug)

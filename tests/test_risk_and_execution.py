@@ -844,7 +844,8 @@ def test_verified_fill_skips_verification_entirely():
 # 19:26-20:23 logged "proceeding unverified". Booking on assumption is how the
 # trade record and the venue drift apart.
 
-def _buy_broker(*, status=None, held=None, positions_readable=True):
+def _buy_broker(*, status=None, held=None, positions_readable=True,
+                order_record_resp=None):
     """LiveBroker whose place-order succeeds but whose status read fails."""
     from btcpredict.execution import live
 
@@ -867,6 +868,10 @@ def _buy_broker(*, status=None, held=None, positions_readable=True):
     b._request = request
     b._order_status = _status
     b._position_token_ids = _positions
+    if order_record_resp is not None:
+        async def _record(order_id, **kw):
+            return order_record_resp
+        b.order_record = _record
     return b
 
 
@@ -885,6 +890,31 @@ def test_unreadable_status_with_no_position_is_not_booked():
     # weak evidence, so a second order could double the exposure.
     from btcpredict.execution import live
     assert b.last_failure not in live.RETRYABLE_FAILURES
+
+
+def test_late_history_check_catches_failed_order():
+    """When _order_status times out but position check took 4s, a late history
+    check catching FAILED converts unconfirmed into retryable venue_failed."""
+    from btcpredict.execution import live
+    b = _buy_broker(status=None, held=set(),
+                    order_record_resp={"orderId": "o1", "status": "FAILED",
+                                       "errorMessage": "Failed to execute the market order"})
+    assert _buy(b) is None
+    assert b.last_failure == "venue_failed"
+    assert b.last_order_error == "Failed to execute the market order"
+    assert b.last_failure in live.RETRYABLE_FAILURES
+
+
+def test_late_history_check_catches_filled_order():
+    """When _order_status times out and position check lagged, late history
+    confirming FILLED books the verified trade."""
+    b = _buy_broker(status=None, held=set(),
+                    order_record_resp={"orderId": "o1", "status": "FILLED",
+                                       "fillPercentage": "1"})
+    fill = _buy(b)
+    assert fill is not None
+    assert not fill.unverified
+    assert fill.order_id == "o1"
 
 
 def test_unreadable_status_with_a_position_is_booked_as_verified():
