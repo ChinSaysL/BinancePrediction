@@ -32,6 +32,7 @@ from btcpredict.edge.impulse import impulse_bps, impulse_side
 from btcpredict.config import (CROSS_TRADED, MARKETS, SYMBOL_BY_PREFIX,
                                TRAIN_P_WIN, active_markets, cross_knob,
                                cross_traded, market_prefix, model_traded,
+                               reversal_15m_families, reversal_15m_traded,
                                shot15_observed, stake_boosted, settings)
 import btcpredict.edge.shot15 as edge_shot15
 import btcpredict.edge.signal as edge_signal
@@ -304,7 +305,7 @@ def stale_maker_px(display: float | None, ask: float | None, fair_side: float,
 #: here is its own. Listing the others rather than the broker's mode keeps a
 #: new broker mode from silently reading as "not the model arm".
 OTHER_ARM_MODES = frozenset({"cross", "train", "double", "maker",
-                             "stale_maker", "ticket"})
+                             "stale_maker", "ticket", "reversal_15m"})
 
 
 def _is_main_arm_mode(mode: str | None) -> bool:
@@ -334,6 +335,8 @@ def pool_for_mode(mode: str | None) -> tuple[bool, str | None]:
         return True, None
     if mode in ("impulse", "maker"):
         return False, "impulse"
+    if mode == "reversal_15m":
+        return False, "reversal_15m"
     return False, None
 
 
@@ -352,6 +355,8 @@ def arm_of(sig) -> str:
         return "CROSS"
     if r.startswith("impulse"):
         return "IMPULSE"
+    if r.startswith("reversal"):
+        return "REVERSAL_15M"
     # Anything else came from `evaluate`/`evaluate_hybrid`, i.e. the model arm.
     # This used to fall through to "CROSS", so with the cross arm DISABLED the
     # log still read `CROSS no fill for ...` on every model order -- which cost
@@ -1605,8 +1610,11 @@ class Bot:
         for prefix, sym, _ in active_markets():
             r = cache.get(prefix)
             if r:
+                is_trade = (cross_traded(prefix)
+                            or model_traded(prefix)
+                            or reversal_15m_traded(prefix))
                 await self._record(r, sym,
-                                   trade=cross_traded(prefix),
+                                   trade=is_trade,
                                    primary=(prefix == primary))
         # The websocket book follows EVERY market, not just the traded one. The
         # recorded-only families had no book at all (the REST fetch in _record
@@ -1712,6 +1720,8 @@ class Bot:
         # poll in which a newly-appeared family could have traded -- and on a
         # round roll that is every family at once.
         await self._cross_all()
+        if getattr(settings, "reversal_15m_enabled", False):
+            await self._reversal_15m_all()
 
     async def _refresh_rounds(self, prefixes: list[str]) -> None:
         """Re-sweep rolled families off the poll's critical path.
@@ -2630,8 +2640,9 @@ class Bot:
         # Down. A missing Up quote must not take down the tick after the fill
         # has already been booked and stored.
         try:
-            iv = implied_sigma(up.price, spot, r.strike, tau)
-        except (TypeError, ValueError):
+            iv = (implied_sigma(up.price, spot, r.strike, tau)
+                  if getattr(up, "price", None) is not None else None)
+        except (TypeError, ValueError, AttributeError):
             iv = None
         # Tag the arm and stop inventing an EV for it. The Train arm has no model
         # valuation -- its trigger is the underlying's move off the strike -- so
@@ -5671,6 +5682,230 @@ class Bot:
             self._pending_stake = max(
                 0.0, getattr(self, "_pending_stake", stake) - stake)
 
+    async def _reversal_15m_all(self) -> None:
+        """Run the 15m reversal arm across configured families."""
+        if not getattr(settings, "reversal_15m_enabled", False):
+            return
+        if getattr(settings, "reversal_15m_weekdays_only", False) and is_weekend_utc():
+            return
+        if getattr(self, "mode", None) not in ("live", "paper"):
+            return
+        mkt = getattr(self, "_mkt", None)
+        if not mkt:
+            return
+
+        for prefix_15 in reversal_15m_families():
+            try:
+                await self._reversal_15m_tick(prefix_15)
+            except Exception as e:
+                log.exception("reversal_15m tick failed for %s: %s: %s",
+                              prefix_15, type(e).__name__, e)
+
+    async def _reversal_15m_tick(self, prefix_15: str) -> None:
+        """Evaluate 5m reversal signal for asset, and enter corresponding 15m contract."""
+        asset = prefix_15.split("-")[0]
+        prefix_5 = f"{asset}-updown-5m"
+
+        mkt = getattr(self, "_mkt", None) or {}
+        ctx_15 = mkt.get(prefix_15)
+        ctx_5 = mkt.get(prefix_5)
+        if not ctx_15 or not ctx_5:
+            return
+
+        r_15 = ctx_15.get("round")
+        r_5 = ctx_5.get("round")
+        if not r_15 or not r_5 or not r_5.strike:
+            return
+
+        now_ms = int(time.time() * 1000)
+        tau_15 = r_15.tau_s(now_ms)
+        min_tau_15 = getattr(settings, "reversal_15m_min_tau_s", 120.0)
+        max_tau_15 = getattr(settings, "reversal_15m_max_tau_s", 750.0)
+        if not (min_tau_15 <= tau_15 <= max_tau_15):
+            return
+
+        # Prune dead rounds from tracking maps
+        live_slugs = {c["round"].slug for c in mkt.values() if c.get("round") is not None} | {r_15.slug, r_5.slug}
+        if not isinstance(getattr(self, "_reversal_15m_fired", None), dict):
+            self._reversal_15m_fired = {}
+        if not isinstance(getattr(self, "_reversal_15m_5m_fired", None), set):
+            self._reversal_15m_5m_fired = set()
+        self._reversal_15m_fired = {k: v for k, v in self._reversal_15m_fired.items() if k in live_slugs}
+        self._reversal_15m_5m_fired = {k for k in self._reversal_15m_5m_fired if k in live_slugs}
+
+        if self._reversal_15m_fired.get(r_15.slug, 0) >= 1:
+            return
+        if r_5.slug in self._reversal_15m_5m_fired:
+            return
+
+        # Gather spot ticks for the 5m round
+        feed_5 = ctx_5.get("feed")
+        sym = ctx_5.get("symbol") or symbol_for_round(r_5)
+        buf = (getattr(self, "_ticks", None) or {}).get(sym) or []
+        ticks_5 = [(t, p) for t, p in buf if t >= r_5.start_ms and p > 0]
+        curr_p = getattr(feed_5, "price", None)
+        if curr_p and curr_p > 0:
+            if not ticks_5 or ticks_5[-1][0] < now_ms:
+                ticks_5.append((now_ms, curr_p))
+
+        if len(ticks_5) < 2:
+            return
+
+        # Detect first cross in the 5m round (between tau 60s and 270s)
+        strike_5 = r_5.strike
+        first_cross = None
+        first_cross_ts = None
+        for i in range(1, len(ticks_5)):
+            ts_i, px_i = ticks_5[i]
+            tau_5_i = (r_5.end_ms - ts_i) / 1000.0
+            if not (60.0 <= tau_5_i <= 270.0):
+                continue
+            prev_s = "Up" if ticks_5[i-1][1] > strike_5 else "Down"
+            curr_s = "Up" if px_i > strike_5 else "Down"
+            if prev_s != curr_s:
+                first_cross = curr_s
+                first_cross_ts = ts_i
+                break
+
+        if first_cross is None or first_cross_ts is None:
+            return
+
+        # Check confirmation wait time
+        wait_s = (now_ms - first_cross_ts) / 1000.0
+        if wait_s < getattr(settings, "reversal_15m_min_wait_s", 25.0):
+            return
+
+        # Check current 5m tau
+        tau_5 = (r_5.end_ms - now_ms) / 1000.0
+        if not (30.0 <= tau_5 <= 240.0):
+            return
+
+        # Check if current spot flipped to reversal side
+        rev_side = "Down" if first_cross == "Up" else "Up"
+        latest_p = ticks_5[-1][1]
+        curr_side = "Up" if latest_p > strike_5 else "Down"
+        if curr_side != rev_side:
+            return
+
+        # Check round range / volatility gate
+        max_rng = getattr(settings, "reversal_15m_max_round_range_bps", 25.0)
+        if max_rng > 0:
+            rng_5 = self._round_range_bps(r_5)
+            if rng_5 is not None and rng_5 > max_rng:
+                log.info("reversal_15m skip %s: 5m round range %.1fbps is above %.1fbps ceiling",
+                         r_15.slug, rng_5, max_rng)
+                return
+            rng_15 = self._round_range_bps(r_15)
+            if rng_15 is not None and rng_15 > max_rng:
+                log.info("reversal_15m skip %s: 15m round range %.1fbps is above %.1fbps ceiling",
+                         r_15.slug, rng_15, max_rng)
+                return
+
+        # Check risk guard
+        max_open = getattr(settings, "reversal_15m_max_open_positions", 2)
+        allowed, why = self.guard.check_pool(r_15.slug, pool="reversal_15m", max_open=max_open)
+        if not allowed:
+            return
+
+        # Check 15m book / quote
+        wsb = getattr(self, "ws_book", None)
+        top = wsb.best(r_15, settings.ws_book_max_age_s) if wsb is not None else None
+        if top is not None:
+            ask = top.ask(rev_side)
+        else:
+            asks = ctx_15.get("asks", (None, None))
+            ask = asks[0] if rev_side == "Up" else asks[1]
+
+        if ask is None or not (ask > 0):
+            return
+
+        min_q = getattr(settings, "reversal_15m_min_quote", 0.45)
+        max_q = getattr(settings, "reversal_15m_max_quote", 0.75)
+        if not (min_q <= ask <= max_q):
+            return
+
+        stake = getattr(settings, "reversal_15m_stake_usdt", 1.0)
+        if self.bankroll < stake:
+            return
+
+        if top is not None:
+            sweep_px, fillable = top.sweep(rev_side, stake)
+            if fillable < settings.min_order_usdt or sweep_px <= 0:
+                return
+            if not (min_q <= sweep_px <= max_q):
+                return
+            ask = sweep_px
+
+        up_obj = r_15.up
+        down_obj = r_15.down
+        token = up_obj.token_id if rev_side == "Up" else down_obj.token_id
+        if not token:
+            return
+
+        inflight = getattr(self, "_reversal_15m_inflight", None)
+        if not isinstance(inflight, set):
+            inflight = self._reversal_15m_inflight = set()
+        if r_15.slug in inflight:
+            return
+        inflight.add(r_15.slug)
+        try:
+            self._reversal_15m_fired[r_15.slug] = 1
+            self._reversal_15m_5m_fired.add(r_5.slug)
+
+            log.info("REVERSAL_15M trigger %s %s: 5m %s first_cross %s held %.1fs -> 15m ask %.4f, tau %.0fs",
+                     r_15.slug, rev_side, r_5.slug, first_cross, wait_s, ask, tau_15)
+
+            sig = Signal(side=rev_side, quote=ask, fair=0.66, edge=0.10, hurdle=0.0,
+                         ev_per_dollar=0.10, act=True, reason=f"reversal_15m into {r_15.slug}")
+
+            did = self.store.insert("decisions", {
+                "slug": r_15.slug, "ts_ms": now_ms, "tau_s": tau_15, "side": rev_side,
+                "fair": ask, "quote": ask, "edge": 0.10, "hurdle": 0.0,
+                "sigma_1m": ctx_15.get("sigma") or 0.0, "spot": latest_p, "oracle": None,
+                "strike": r_15.strike, "stake": stake, "acted": 0,
+                "reason": sig.reason,
+            })
+
+            task = asyncio.create_task(self._reversal_15m_execute(
+                r=r_15, sig=sig, side=rev_side, token=token, stake=stake, ask=ask,
+                ceil_side=max_q, did=did, up=up_obj, spot=latest_p,
+                sigma=ctx_15.get("sigma") or 0.0, tau=tau_15, wsb=wsb
+            ))
+            tasks = getattr(self, "_order_tasks", None)
+            if tasks is None:
+                tasks = self._order_tasks = set()
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+        finally:
+            inflight.discard(r_15.slug)
+
+    async def _reversal_15m_execute(self, *, r, sig, side, token, stake, ask,
+                                    ceil_side, did, up, spot, sigma, tau, wsb) -> None:
+        try:
+            t_send = time.monotonic()
+            fill = await self._place_order(
+                r, sig,
+                fair_up=(ceil_side if side == "Up" else 1.0 - ceil_side),
+                token=token, stake=stake, skip_pretrade_gates=True, take_px=ask,
+                limit_ceiling=ceil_side, fill_cap=ceil_side,
+                venue_token=token)
+            elapsed = time.monotonic() - t_send
+            got = getattr(fill, "filled_px", None) if fill else None
+            log.info("REVERSAL_15M exec %s %s: decided %.4f limit %.2f -> %s in %.2fs",
+                     r.slug, side, ask, ceil_side,
+                     ("%.4f" % got) if got else "NO FILL", elapsed)
+            if not fill:
+                fired = getattr(self, "_reversal_15m_fired", None)
+                if isinstance(fired, dict) and r.slug in fired:
+                    fired[r.slug] = max(0, fired[r.slug] - 1)
+                return
+            await self._book_fill(r, sig, fill, did=did, up=up, spot=spot,
+                                  sigma=sigma, tau=tau, token=token,
+                                  mode="reversal_15m")
+        except Exception as e:
+            log.exception("reversal_15m order path raised for %s %s: %s: %s",
+                          r.slug, side, type(e).__name__, e)
+
     def _take_cap_for(self, r, base_px: float, fill_cap: float | None) -> float:
         """The most a TAKE may pay when the best price that EXISTS is `base_px`.
 
@@ -5950,7 +6185,10 @@ class Bot:
         want_cross = (settings.cross_enabled
                       and not (getattr(settings, "cross_weekdays_only", False)
                                and is_weekend_utc()))
-        if not (want_impulse or want_cross):
+        want_reversal_15m = (getattr(settings, "reversal_15m_enabled", False)
+                             and not (getattr(settings, "reversal_15m_weekdays_only", False)
+                                      and is_weekend_utc()))
+        if not (want_impulse or want_cross or want_reversal_15m):
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self._stop.wait(), timeout=budget)
             return
@@ -5964,10 +6202,12 @@ class Bot:
                     await self._impulse_tick()
                 if want_cross:
                     await self._cross_all()
+                if want_reversal_15m:
+                    await self._reversal_15m_all()
             except Exception as e:                      # noqa: BLE001
                 # Never let a trigger bug take down the loop: recording,
                 # settlement and the risk guard all live in the poll.
-                log.exception("impulse trigger failed: %s: %s",
+                log.exception("trigger loop failed: %s: %s",
                               type(e).__name__, e)
             left = deadline - time.time()
             if left <= 0:
@@ -6159,6 +6399,32 @@ class Bot:
                              "floor is %.1fs", r.slug, sig.side, _tau_left,
                              _floor)
                     break
+
+                # Confirm directional validity on retry: if latency or venue delay
+                # allowed spot to cross back to the opposing side of the strike/reference,
+                # retrying would enter a stale, losing trade into an adverse move.
+                if getattr(r, "strike", None) is not None and arm_of(sig) in ("CROSS", "REVERSAL_15M", "TRAIN"):
+                    sym = symbol_for_round(r)
+                    feed = (getattr(self, "spots", None) or {}).get(sym)
+                    curr_spot = getattr(feed, "price", None)
+                    if curr_spot is not None and curr_spot > 0:
+                        level = r.strike
+                        if arm_of(sig) == "CROSS" and hasattr(self, "_cross_level"):
+                            lvl, _ = self._cross_level(r)
+                            if lvl is not None:
+                                level = lvl
+                        if sig.side == "Down" and curr_spot > level:
+                            log.warning("aborting %s retry %s %s (attempt %d/%d): "
+                                        "spot %.3f crossed back above ref %.3f",
+                                        arm_of(sig), r.slug, sig.side,
+                                        attempt + 1, attempts, curr_spot, level)
+                            break
+                        elif sig.side == "Up" and curr_spot < level:
+                            log.warning("aborting %s retry %s %s (attempt %d/%d): "
+                                        "spot %.3f crossed back below ref %.3f",
+                                        arm_of(sig), r.slug, sig.side,
+                                        attempt + 1, attempts, curr_spot, level)
+                            break
                 # Last line of defence against double exposure. Whatever the
                 # previous attempt reported -- including a status the venue
                 # called FAILED -- ask the venue what it actually holds before

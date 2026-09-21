@@ -386,8 +386,13 @@ class Settings(BaseSettings):
     # demonstrably processes fills into the close (live fills booked with
     # 0.0-0.6s of round left). The 07:39:50 eth retry was refused at 3.3s left
     # by the old floor, and the venue never saw a second order.
+    # RAISED 2026-09-20 from 9.0 to 15.0: BSC block times fluctuate and 3-block
+    # relayer executions routinely take 9.5-11.0s (measured live on order
+    # ...884275: terminalTime 9.902s after createTime). A 9s budget gave up
+    # 500ms before the venue's FAILED verdict, misclassifying it as unconfirmed.
+    # Quick fills return immediately, so 15s adds zero latency to successful orders.
     order_min_tau_s: float = 5.0
-    order_status_wait_s: float = 9.0
+    order_status_wait_s: float = 15.0
     order_max_attempts: int = 3
     # Small pause between attempts: re-quoting into the same instant that just
     # failed tends to fail the same way.
@@ -3902,6 +3907,19 @@ class Settings(BaseSettings):
     shot15_min_quote: float = 0.05
     shot15_max_quote: float = 0.99
 
+    # --- reversal_15m: 15m Reversal Arm driven by 5m reversals -------------
+    reversal_15m_enabled: bool = True
+    reversal_15m_families: str = "btc-updown-15m,eth-updown-15m"
+    reversal_15m_min_wait_s: float = 25.0
+    reversal_15m_min_tau_s: float = 120.0
+    reversal_15m_max_tau_s: float = 360.0
+    reversal_15m_max_round_range_bps: float = 25.0
+    reversal_15m_min_quote: float = 0.45
+    reversal_15m_max_quote: float = 0.75
+    reversal_15m_stake_usdt: float = 1.0
+    reversal_15m_max_open_positions: int = 2
+    reversal_15m_weekdays_only: bool = True
+
     #: Skip this many of the MODEL arm's next signals after one of its trades
     #: settles a LOSS. 0 = off, which is the shipped default.
     #:
@@ -4396,6 +4414,19 @@ def shot15_observed(prefix: str | None) -> bool:
     raw = settings.shot15_families or ""
     allowed = frozenset(p.strip() for p in raw.replace(",", " ").split() if p.strip())
     return bool(prefix) and prefix in allowed
+
+
+def reversal_15m_families() -> frozenset[str]:
+    """Families the 15m REVERSAL arm may order in."""
+    raw = getattr(settings, "reversal_15m_families", "") or ""
+    return frozenset(p.strip() for p in raw.split(",") if p.strip())
+
+
+def reversal_15m_traded(prefix: str | None) -> bool:
+    """May the 15m reversal arm ORDER in this family?"""
+    if not prefix or not getattr(settings, "reversal_15m_enabled", False):
+        return False
+    return prefix in reversal_15m_families()
 
 
 def cross_traded(prefix: str | None) -> bool:
