@@ -1238,6 +1238,8 @@ def main() -> None:
             ("ev_hi 0.12->0.20", {}, dict(hi=0.20), True),
             ("max_stake 3->2", {}, dict(max_stake=2.0), True),
             ("max_stake 3->5", {}, dict(max_stake=5.0), True),
+            ("flat $1", {}, dict(min_stake=1.0, max_stake=1.0), True),
+            ("flat $1.5", {}, dict(min_stake=1.5, max_stake=1.5), True),
             ("flat $2", {}, dict(min_stake=2.0, max_stake=2.0), True),
             ("min_stake 1->1.5", {}, dict(min_stake=1.5), True),
             ("boost x2 (bands)", {}, dict(boost=2.0), True),
