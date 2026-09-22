@@ -101,12 +101,19 @@ def sell(b, **kw):
 
 def test_the_amount_sent_for_a_sell_is_SHARES_not_usdt():
     """Sending USDT would ask to sell ~price x too few shares, and the venue
-    would accept it -- a quiet under-sell with no error anywhere."""
+    would accept it -- a quiet under-sell with no error anywhere.
+
+    The ask is FLOORED to the venue's own step on the way out (hundredths --
+    an order record reports the executed quantity as "3.24", and a real
+    holding is therefore always a multiple of 0.01). So the `SHARES` constant
+    below is not sent verbatim any more: the invariant pinned here is the
+    UNITS, and that the ask is never LARGER than the holding."""
     b = make_broker()
     sell(b, shares=SHARES, limit_px=0.53)
     q = b.rec.quotes[0]
     assert q["side"] == "SELL"
-    assert q["amount"] == pytest.approx(SHARES), "amountIn must be the SHARES"
+    assert q["amount"] <= SHARES, "amountIn must never exceed the holding"
+    assert q["amount"] == pytest.approx(SHARES, abs=0.01), "amountIn must be the SHARES"
     assert abs(q["amount"] - PROCEEDS) > 0.1, "it must NOT be the USDT proceeds"
     assert q["order_type"] == "LIMIT"
     assert q["price_limit"] == pytest.approx(0.53)

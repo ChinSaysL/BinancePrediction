@@ -1009,7 +1009,34 @@ class LiveBroker:
                           order_id, status, slug)
                 return None
 
-        shares = shares_gross - fee_shares
+        # ⛔ BOOK THE VENUE'S EXECUTED QUANTITY, NOT THE QUOTE'S PROMISE.
+        # `shares_gross`/`fee_shares` come from the QUOTE (`amountOut`,
+        # `feeAmount`); the venue reports what it actually credited on its own
+        # order record as `filledShareQty`, a 2-DECIMAL number. Measured live
+        # 2026-09-22, booked versus venue:
+        #   order ...586724   quote net 3.2442222   venue 3.24   -> SELL REFUSED
+        #   order ...430243   quote net 9.6000000   venue 9.62   -> sell fine
+        # The first asked the venue to sell 0.0042 shares MORE than the position
+        # held: -9000 "You have exceeded your available shares", no sale, and
+        # the reaction exit never fired. The second only worked because the
+        # quote happened to round BELOW the credit.
+        _rec = await self.order_record(order_id, tries=2, delay=0.4) \
+            if order_id else None
+        _ex = amount_usdt((_rec or {}).get("filledShareQty"))
+        if _ex and _ex > 0.0:
+            if abs(_ex - (shares_gross - fee_shares)) > 0.005:
+                log.info("buy %s %s: venue credited %.4f shares, the quote "
+                         "promised %.4f -- booking the venue's number",
+                         slug, side, _ex, shares_gross - fee_shares)
+            shares = _ex
+        else:
+            # Unreadable record: keep the quote's arithmetic, which is only ever
+            # off in the third decimal -- but say so, because that number is
+            # what a later SELL will ask for.
+            log.warning("buy %s %s: no executed quantity readable for order %s "
+                        "-- booking the quote's %.4f shares", slug, side,
+                        order_id, shares_gross - fee_shares)
+            shares = shares_gross - fee_shares
         # The fee is quoted in outcome-token units; express it in USDT so PnL
         # accounting stays in one currency.
         fee_usdt = fee_shares * avg_px
@@ -1026,6 +1053,43 @@ class LiveBroker:
             # the venue never actually filled anything.
             unverified=(status is None),
         )
+
+    async def _sell_quote(self, slug: str, side: str, token_id: str,
+                          shares: float,
+                          quote: dict | None = None) -> tuple[dict | None, float]:
+        """A SELL quote, STEPPING THE SIZE DOWN when the venue refuses.
+
+        ⛔ A REFUSED SELL QUOTE IS USUALLY A SIZE MISMATCH, NOT A DEAD BOOK.
+        Positions are whole HUNDREDTHS (`filledShareQty` reads "3.24") while a
+        quote's `amountOut` is a float, so an ask a hair above the holding is
+        refused with -9000 "You have exceeded your available shares". Measured
+        live 2026-09-22 22:43: that refusal killed the reaction exit outright --
+        no sale, position to the bell.
+        QUOTES ARE READ-ONLY, so a retry places no order and can only cost time;
+        selling FEWER shares is always accepted. A short pause also absorbs a
+        credit that has not landed yet.
+        """
+        if quote:
+            return quote, shares
+        attempts = (1.0, 0.99, 0.95, 0.90)
+        for step in attempts:
+            ask = shares if step == 1.0 else int(shares * step * 100) / 100.0
+            if ask <= 0.0:
+                break
+            q = await self.get_quote(token_id, ask, side="SELL",
+                                     order_type="MARKET")
+            if q and q.get("quoteId"):
+                if ask != shares:
+                    log.warning("sell %s %s: venue refused %.2f shares (status "
+                                "%s) -- quoting %.2f instead", slug, side,
+                                shares, self._last_status, ask)
+                return q, ask
+            if step != attempts[-1]:
+                log.warning("sell %s %s: no quote for %.2f shares (status %s) "
+                            "-- retrying smaller", slug, side, ask,
+                            self._last_status)
+                await asyncio.sleep(0.4)
+        return None, shares
 
     async def sell_fak(self, *, slug: str, side: str, token_id: str,
                        shares: float, min_px: float | None = None,
@@ -1068,17 +1132,28 @@ class LiveBroker:
         self.last_order_error = None
         self.last_sell_size = 0.0
         shares = float(shares or 0.0)
+        # ⛔ FLOOR TO THE VENUE'S OWN STEP -- HUNDREDTHS OF A SHARE. An order
+        # record reports `filledShareQty` as "3.24"; asking for the quote's
+        # 3.2442222 is refused (-9000, exceeded your available shares) and the
+        # exit dies. Selling FEWER is always accepted, so floor and never round
+        # up. This is also what makes a percentage exit behave like the venue's
+        # own UI: 100% of 3.24 is 3.24, 50% is 1.62.
+        _asked = shares
+        shares = int(shares * 100) / 100.0
         if shares <= 0.0 or not token_id:
             # Nothing to sell, or a position with no token: either would only
             # produce a venue error naming the wrong cause.
             self.last_failure = "sell_no_shares"
             return None
+        if shares != _asked:
+            log.info("sell %s %s: flooring %.6f -> %.2f shares (the venue "
+                     "steps in 0.01)", slug, side, _asked, shares)
 
-        q = quote or await self.get_quote(token_id, shares, side="SELL",
-                                          order_type="MARKET")
+        q, shares = await self._sell_quote(slug, side, token_id, shares, quote)
         if not q or not q.get("quoteId"):
             self.last_failure = "no_sell_quote"
-            log.warning("no SELL quote for %s %s (%.4f shares)", slug, side, shares)
+            log.warning("no SELL quote for %s %s (asked %.4f shares, tried down "
+                        "to 90%%)", slug, side, shares)
             return None
 
         # What the venue says this sale is worth. `amountOut` is USDT for a
@@ -1213,11 +1288,21 @@ class LiveBroker:
         self.last_order_error = None
         self.last_sell_size = 0.0
         shares = float(shares or 0.0)
+        # FLOORED FOR THE SAME REASON AS `sell_fak` -- see the note there. An
+        # order history record reports the executed quantity as "3.24", so a
+        # position booked by an older fill (3.2442222) and asked for verbatim is
+        # refused -9000. Applies to the reference MARKET quote below and to the
+        # LIMIT quote alike, hence once, here.
+        _asked = shares
+        shares = int(shares * 100) / 100.0
         if shares <= 0.0 or not token_id:
             # Nothing to sell, or a position with no token: either would only
             # produce a venue error naming the wrong cause.
             self.last_failure = "sell_no_shares"
             return None
+        if shares != _asked:
+            log.info("sell limit %s %s: flooring %.6f -> %.2f shares (the "
+                     "venue steps in 0.01)", slug, side, _asked, shares)
 
         if limit_px is None:
             mk = await self.get_quote(token_id, shares, side="SELL",
