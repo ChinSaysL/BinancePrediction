@@ -97,7 +97,7 @@ if Path(ao.__file__).resolve().parent != Path(__file__).resolve().parent:
         f"shadowing it; delete the stray, do not edit around it")
 from btcpredict.config import settings                        # noqa: E402
 from btcpredict.edge.signal import (                          # noqa: E402
-    FeeModel, evaluate, fee_rate_for_price, stake_for_edge)
+    FeeModel, evaluate, fee_rate_for_price, stake_for_edge, tilt_factor)
 from btcpredict.pricing.digital import fair_value, moneyness_sd  # noqa: E402
 
 # The live gate values, read from config rather than typed here. A sweep that
@@ -451,7 +451,8 @@ def main() -> None:
                     choices=["all", "ofat", "joint", "live", "halves",
                              "fair", "size", "sure", "price", "zone",
                              "exit", "struct", "predict", "react",
-                             "crossings", "funnel", "count", "stakeband"],
+                             "crossings", "funnel", "count", "ship",
+                             "stakeband"],
                     help="which grid to run")
     ap.add_argument("--weight-low-fair", type=float, default=2.0,
                     help="stake MULTIPLIER for entries with fair <= the cut "
@@ -1037,6 +1038,191 @@ def main() -> None:
                   f"({len(added)/max(days,1):4.1f}/day) at EV {ev_a:+.4f}/$1  "
                   f"WR {wr_a:5.1f}%  t {ao.tstat(added) if added else 0:+5.2f}"
                   f"   | lost {len(gone)} at EV {ev_g:+.4f}/$1")
+
+    if args.mode == "ship":
+        # ======= WHAT ACTUALLY SHIPS: ENTRY + SIZING + THE LIVE EXIT =======
+        # An entry table is in EV/$1 at a constant stake, so it CANNOT rank a
+        # sizing change: `stake_for_edge` pays between min_stake and max_stake as
+        # a function of ev/$1, so a knob that adds high-EV trades adds the
+        # LARGEST positions, and one that lowers EV/trade lowers the stake on
+        # every trade it keeps. Everything below is DOLLARS, and the exit is
+        # applied on top of the entry.
+        #
+        # THE SIZING SPEC, verbatim from `Bot._stake_for` / `_base_stake_for`:
+        #   value = ev_per_dollar                    (sizing_metric == "ev")
+        #   stake = stake_for_edge(value, min_edge=stake_ev_lo,
+        #           min_stake=min_stake_usdt, max_stake=max_stake_usdt,
+        #           edge_at_max=stake_ev_hi)         -> LINEAR ramp, clipped
+        #   * model_stake_boost_mult if stake_boosted(fair)   (MODEL arm only)
+        #   * tilt_factor(mz) if stake_tilt == "inv_z"
+        #   min(stake, stake_cap_usdt) if cap > 0
+        # and a stake under min_order_usdt is SKIPPED, never rounded up.
+        #
+        # THE EXIT, verbatim from `_arm_exit_watch` (`react`): sell
+        # model_exit_frac of the position at the RECORDED BID (minus one tick of
+        # slip and the fee) the first time the spot has moved
+        # model_exit_rev_bps against us over model_exit_look_s, subject to
+        # tau > model_exit_min_tau_s and a model_exit_min_hold_s hold, and ONE
+        # sale per position.
+        S = settings
+        SLIP, XFEE = 0.01, 0.005
+        # ⛔ NOT `st.fmean` HERE. `main()` assigns a local `st` somewhere below
+        # (a stake temporary), so `st` is a LOCAL of main for the whole
+        # function body and the nested helpers below see it as an unbound
+        # closure variable: "cannot access free variable 'st' where it is not
+        # associated with a value". Bind the function instead.
+        from statistics import fmean as _fmean
+        SZ = dict(lo=S.stake_ev_lo, hi=S.stake_ev_hi,
+                  min_stake=S.min_stake_usdt, max_stake=S.max_stake_usdt,
+                  tilt=S.stake_tilt, cap=S.stake_cap_usdt,
+                  boost=S.model_stake_boost_mult)
+        _sz = [SZ]                       # the sizing spec in force
+
+        def _stake_of(e: dict) -> float:
+            z = _sz[0]
+            s = stake_for_edge(float(e.get("ev") or 0.0), min_edge=z["lo"],
+                               min_stake=z["min_stake"],
+                               max_stake=z["max_stake"],
+                               edge_at_max=z["hi"])
+            if abs(z["boost"] - 1.0) > 1e-9:
+                try:
+                    from btcpredict.config import stake_boosted
+                    if stake_boosted(e.get("fair")):
+                        s *= z["boost"]
+                except Exception:               # stub configs in tests
+                    pass
+            if z["tilt"] == "inv_z":
+                s = max(s * tilt_factor(float(e.get("mz") or 0.0),
+                                        reference=S.tilt_reference_z,
+                                        lo=S.tilt_min, hi=S.tilt_max),
+                        S.min_order_usdt)
+            if z["cap"] > 0:
+                s = min(s, z["cap"])
+            return 0.0 if s < S.min_order_usdt else s
+
+        def _bids_for(ent: list[dict]) -> dict:
+            out: dict[str, dict] = {}
+            for s in {e["slug"] for e in ent}:
+                out[s] = {t: (u, d) for t, u, d in con.execute(
+                    "SELECT ts_ms, up_bid, down_bid FROM quotes "
+                    "WHERE slug=? AND up_bid IS NOT NULL ORDER BY ts_ms",
+                    (s,))}
+            return out
+
+        def _ret_exited(e: dict, rnd: dict, bidmap: dict) -> tuple[float, bool]:
+            """(the per-$1 return with the shipped exit applied, did it exit)."""
+            rows = rnd["rows"]
+            j = next((k for k, rr in enumerate(rows) if rr[0] >= e["ts_ms"]),
+                     None)
+            if j is None:
+                return e["ret"], False
+            sgn = 1.0 if e["side"] == "Up" else -1.0
+            seen = [(rr[0], rr[2]) for rr in rows[:j + 1]
+                    if rr[2] and rr[2] > 0]
+            look_ms = S.model_exit_look_s * 1000.0
+            for rr in rows[j + 1:]:
+                ts, tau, spot = rr[0], rr[1], rr[2]
+                if ts - e["ts_ms"] < S.model_exit_min_hold_s * 1000:
+                    continue
+                if tau is None or tau <= S.model_exit_min_tau_s:
+                    break            # the book goes one-sided at the bell
+                if not spot or spot <= 0:
+                    continue
+                seen.append((ts, spot))
+                past = [s for t, s in seen if t <= ts - look_ms]
+                if not past:
+                    continue
+                if math.log(spot / past[-1]) * 1e4 * sgn > -S.model_exit_rev_bps:
+                    continue
+                px = None                          # the recorded bid, that tick
+                for t in sorted(bidmap, reverse=True):
+                    if t <= ts:
+                        u, d = bidmap[t]
+                        px = u if e["side"] == "Up" else d
+                        break
+                if not px:
+                    continue
+                frac = float(S.model_exit_frac)
+                sh = 1.0 / ao._cost_per_share(e["px"])     # shares per $1
+                got = sh * frac * max(0.0, px - SLIP) * (1.0 - XFEE)
+                rest = sh * (1.0 - frac) * (1.0 if e["won"] else 0.0)
+                return got + rest - 1.0, True
+            return e["ret"], False
+
+        def _battery(ent: list[dict], rmap: dict, *, use_exit: bool,
+                     tag: str) -> tuple[float, float]:
+            bmap = _bids_for(ent) if use_exit else {}
+            cash, n_exit = [], 0
+            for e in ent:
+                stake = _stake_of(e)
+                if stake <= 0:
+                    continue
+                if use_exit:
+                    r, did = _ret_exited(e, rmap[e["slug"]], bmap.get(
+                        e["slug"], {}))
+                    n_exit += 1 if did else 0
+                else:
+                    r = e["ret"]
+                cash.append((e["ts_ms"], e["day"], stake, stake * r, r))
+            if not cash:
+                print(f"      {tag}: no trades")
+                return 0.0, 0.0
+            cash.sort()
+            tot = sum(c[3] for c in cash)
+            curve = peak = dd = 0.0
+            for c in cash:
+                curve += c[3]
+                peak = max(peak, curve)
+                dd = min(dd, curve - peak)
+            half = len(cash) // 2
+            h1 = sum(c[3] for c in cash[:half]) / max(half, 1)
+            h2 = sum(c[3] for c in cash[half:]) / max(len(cash) - half, 1)
+            print(f"      {tag:<12} ${tot:+8.2f}  ${tot/max(days,1):+7.2f}/day  "
+                  f"n={len(cash):<4} ${tot/len(cash):+.3f}/trade  "
+                  f"stake ${_fmean([c[2] for c in cash]):.2f}  "
+                  f"maxDD ${dd:+7.2f}  tot/|DD| {tot/max(abs(dd),1e-9):5.2f}  "
+                  f"halves ${h1:+.3f}/${h2:+.3f}"
+                  + (f"  exits {n_exit}/{len(cash)}" if use_exit else ""))
+            return tot, dd
+
+        print("\n=== SHIP: DOLLARS on the live sizing spec, with the live exit ===")
+        print(f"  sizing {S.sizing_mode}/{S.sizing_metric}: "
+              f"${S.min_stake_usdt:g}->${S.max_stake_usdt:g} at ev "
+              f"{S.stake_ev_lo:g}->{S.stake_ev_hi:g}, tilt {S.stake_tilt}, "
+              f"cap {S.stake_cap_usdt:g}, boost x{S.model_stake_boost_mult:g}")
+        print(f"  exit react: frac {S.model_exit_frac:g} at "
+              f"{-S.model_exit_rev_bps:g}bps/{S.model_exit_look_s:g}s, "
+              f"tau>{S.model_exit_min_tau_s:g}s, hold>{S.model_exit_min_hold_s:g}s"
+              f"  (sell at bid - {SLIP:g} - {XFEE*100:g}bp)")
+        rmap = {r["slug"]: r for r in rs}
+        L = dict(min_edge=S.min_edge, min_quote=S.min_quote,
+                 max_quote=S.max_quote,
+                 min_range=S.model_min_round_range_bps,
+                 max_range=S.model_max_round_range_bps, max_tau=S.max_tau_s)
+        ship_cands = [
+            ("live entry", {}, None, True),
+            (f"max_quote {L['max_quote']:g}->0.80", dict(max_quote=0.80), None,
+             True),
+            (f"max_quote {L['max_quote']:g}->0.90", dict(max_quote=0.90), None,
+             True),
+            ("ev_hi 0.12->0.07", {}, dict(hi=0.07), True),
+            ("ev_hi 0.12->0.20", {}, dict(hi=0.20), True),
+            ("max_stake 3->2", {}, dict(max_stake=2.0), True),
+            ("max_stake 3->5", {}, dict(max_stake=5.0), True),
+            ("flat $2", {}, dict(min_stake=2.0, max_stake=2.0), True),
+            ("min_stake 1->1.5", {}, dict(min_stake=1.5), True),
+            ("boost x2 (bands)", {}, dict(boost=2.0), True),
+            ("tilt inv_z", {}, dict(tilt="inv_z"), True),
+        ]
+        for label, over, sz, use_exit in ship_cands:
+            _sz[0] = {**SZ, **(sz or {})}
+            ent = run2(**over)
+            print(f"  {label:<24} n={len(ent)}"
+                  + (f"   sizing={sz}" if sz else ""))
+            _battery(ent, rmap, use_exit=use_exit, tag="with exit")
+            if label.startswith("live entry") and use_exit:
+                _battery(ent, rmap, use_exit=False, tag="exit OFF")
+        _sz[0] = SZ
 
     if args.mode == "exit":
         # ================== EARLY EXIT ("price reacting") ==================
