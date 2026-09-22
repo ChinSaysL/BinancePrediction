@@ -217,15 +217,27 @@ def replay(rnd: dict, sigma: float, *, persistence: int,
            exec_mode: str = "limit_take", latency_s: float = 1.0,
            margin: float | None = None,
            haircut: float | None = None,
+           min_edge: float | None = None,
            zone_min_margin: float = 0.0, zone_max_cross: int = 0,
            zone_band_k: float = 0.5, max_strike_crossings: int = 0,
            entry_rev_bps: float = 0.0, entry_look_s: float = 20.0,
-           live_sig: list[tuple[int, float]] | None = None) -> dict | None:
+           live_sig: list[tuple[int, float]] | None = None,
+           funnel: dict | None = None) -> dict | None:
     """The first round-qualifying entry under these knobs, or None.
 
     With `live_sig` the fair value at each tick uses the sigma the BOT recorded
     at that moment, so the replay reproduces the live rule rather than a
     parallel one; without it, the round's scalar `sigma`.
+
+    With `funnel` (a dict) the furthest GATE STAGE each round reached is written
+    into it: the index is the last door the round got through, so a round with no
+    entry died at `funnel[slug] + 1`. Stages:
+        1 tick usable   2 tau window   3 travel band   4 signal agrees
+        5 zone          6 crossings    7 entry-side reversal
+        8 persistence   9 ENTERED
+    The chain is this function's own, so the funnel cannot drift from the rule
+    it is measuring (see the note on `strike_crossings`: a parallel copy of a
+    gate that only samples post-gate ticks is inert and prints a fake null).
     """
     lo_tau = settings.min_tau_s if min_tau is None else min_tau
     hc = settings.edge_haircut if haircut is None else haircut
@@ -235,6 +247,13 @@ def replay(rnd: dict, sigma: float, *, persistence: int,
     streak_side, streak = None, 0
     seen: list[float] = []
     seen_ts: list[tuple[int, float]] = []
+    _deep: dict = funnel if funnel is not None else {}
+    _slug = rnd.get("slug", "?")
+
+    def _mark(st: int) -> None:
+        if funnel is not None and st > _deep.get(_slug, 0):
+            _deep[_slug] = st
+
     for i, (ts_ms, tau, spot, _up_px, _dn_px, up_ask, dn_ask) in enumerate(rnd["rows"]):
         if spot is not None and spot > 0:
             seen.append(spot)
@@ -254,8 +273,10 @@ def replay(rnd: dict, sigma: float, *, persistence: int,
         if (spot is None or not 0 < tau <= 300
                 or up_ask is None or dn_ask is None):
             streak_side, streak = None, 0
+            _mark(1)
             continue
         if not (lo_tau <= tau <= max_tau):
+            _mark(2)
             continue
         sg_i = _sig_at(live_sig, ts_ms, sigma)
         # main.Bot._round_range_bps: the round's TRAVEL so far, and None (no
@@ -263,15 +284,18 @@ def replay(rnd: dict, sigma: float, *, persistence: int,
         if max_range > 0 and len(seen) >= 2:
             rng = 1e4 * (max(seen) - min(seen)) / strike
             if not (min_range <= rng <= max_range):
+                _mark(3)
                 continue
         fair_up = fair_value(spot, strike, tau, sg_i)
         sig = evaluate(
             fair_up, up_ask, dn_ask, fee=None, half_spread=0.0,
             safety_margin=settings.safety_margin, fee_model=FeeModel.NOTIONAL,
             max_quote=max_quote, min_quote=min_quote,
-            min_edge=settings.min_edge, edge_haircut=hc)
+            min_edge=(settings.min_edge if min_edge is None else min_edge),
+            edge_haircut=hc)
         if not sig.act or sig.side is None:
             streak_side, streak = None, 0
+            _mark(4)
             continue
         if sig.side == streak_side:
             streak += 1
@@ -297,12 +321,14 @@ def replay(rnd: dict, sigma: float, *, persistence: int,
             if (zone_min_margin > 0
                     and (not math.isfinite(z_fav)
                          or z_fav < zone_min_margin)):
+                _mark(5)
                 continue
             if zone_max_cross > 0 and len(seen) >= 3:
                 # see `crossings`: the band is what makes this a property of the
                 # path rather than of the sampler.
                 if crossings(seen, strike,
                              zone_band_k * sg_i * strike) >= zone_max_cross:
+                    _mark(5)
                     continue
         # ================= THE LIVE CROSSINGS GATE =================
         # ⛔ THIS IS `Bot._strike_crossings`, THE RULE THAT WENT LIVE ON
@@ -313,6 +339,7 @@ def replay(rnd: dict, sigma: float, *, persistence: int,
         if max_strike_crossings > 0:
             xc = strike_crossings(sec_last, strike)
             if xc is not None and xc >= max_strike_crossings:
+                _mark(6)
                 continue
         # ============ THE ENTRY-SIDE MIRROR OF THE EXIT RULE ============
         # ⭐ THIS COMES FROM THE EXIT'S OWN DATA, not from a hunch. The tau
@@ -331,10 +358,13 @@ def replay(rnd: dict, sigma: float, *, persistence: int,
             if past:
                 mv = math.log(spot / past[-1]) * 1e4 * sgn_e
                 if mv <= -entry_rev_bps:
+                    _mark(7)
                     continue
         # ================================================================
         if streak < persistence:
+            _mark(8)
             continue
+        _mark(9)
         fair_side = fair_up if sig.side == "Up" else 1.0 - fair_up
         return ao._execute(rnd, i, sig.side, fair_side,
                            sig.ev_per_dollar or 0.0,
@@ -421,7 +451,7 @@ def main() -> None:
                     choices=["all", "ofat", "joint", "live", "halves",
                              "fair", "size", "sure", "price", "zone",
                              "exit", "struct", "predict", "react",
-                             "crossings", "stakeband"],
+                             "crossings", "funnel", "count", "stakeband"],
                     help="which grid to run")
     ap.add_argument("--weight-low-fair", type=float, default=2.0,
                     help="stake MULTIPLIER for entries with fair <= the cut "
@@ -571,11 +601,13 @@ def main() -> None:
                 latency_s=args.latency_s)
 
     def run2(**over) -> list[dict]:
-        kw = dict(LIVE)
-        kw.update(over)
+        # ⛔ FOLD `base` IN, DO NOT PASS IT SEPARATELY. `replay(r, sg, **base,
+        # **kw)` raised "got multiple values for keyword argument 'persistence'"
+        # the moment a mode swept a knob that both dicts carry. Overrides win.
+        kw = {**base, **LIVE, **over}
         out = []
         for r, sg in zip(rs, sigmas):
-            e = replay(r, sg, **base, **kw,
+            e = replay(r, sg, **kw,
                        live_sig=(live_sig.get(r["slug"])
                                  if args.use_live_sigma else None))
             if e:
@@ -909,6 +941,102 @@ def main() -> None:
         print("  -- and the whole thing vs OFF --")
         print(f"     OFF gives {len(off_ret)} rounds; the shipped rule (3) keeps "
               f"{len(ent[3])} ({100*len(ent[3])/max(len(off_ret),1):.0f}%)")
+
+    if args.mode == "funnel":
+        # =============== WHERE THE ROUNDS ACTUALLY DIE ===============
+        # 288 rounds open on btc-5m every day and the arm enters ~15, so the
+        # question "can we trade more without losing quality" is a question
+        # about which DOOR is shut. The distinction that decides everything:
+        # stages 2/3/5/6/7 are KNOBS (loosening one admits rounds that the
+        # signal already liked), stage 4 is OUR OWN SIGNAL -- if rounds die
+        # there, no gate can be opened, because the fair value never disagreed
+        # with the quote by `min_edge`, and the only lever is a smaller edge
+        # requirement, i.e. a different (worse) trade.
+        # ⭐ The stage index is the LAST door the round got through, so a round
+        # with no entry died at stage+1.
+        print("\n=== FUNNEL: how far each round gets (live knobs) ===")
+        names = {1: "tick usable (spot + 2 quotes)",
+                 2: "tau window (min_tau..max_tau)",
+                 3: "travel band (min..max range)",
+                 4: "signal agrees (min_edge)",
+                 5: "zone",
+                 6: "crossings",
+                 7: "entry-side reversal",
+                 8: "persistence",
+                 9: "ENTERED"}
+        fun: dict = {}
+        ent = run2(funnel=fun)
+        n = len(rs)
+        reach = {s: 0 for s in names}
+        died = {s: 0 for s in names}
+        for st in fun.values():
+            for s in names:
+                if st >= s:
+                    reach[s] += 1
+            died[st] = died.get(st, 0) + 1
+        print(f"  rounds on the tape: {n} over {days:.1f} days "
+              f"({n/max(days,1):.0f}/day)")
+        print(f"  {'stage':<38}{'reached':>8}{'%':>6}{'died here':>11}")
+        for s in sorted(names):
+            print(f"  {s}. {names[s]:<35}{reach[s]:>8}"
+                  f"{100*reach[s]/max(n,1):>5.0f}%{died[s]:>11}")
+        print(f"  entries: {len(ent)} ({len(ent)/max(days,1):.1f}/day)  "
+              f"-- must equal the stage-9 count")
+        if n - len(fun):
+            print(f"  (!) {n - len(fun)} rounds never had one usable tick")
+        # The conversion that matters: of the rounds the SIGNAL liked, how many
+        # the gates then threw away.
+        if reach[5]:
+            print(f"  signal-to-entry: {reach[9]}/{reach[5]} of the rounds where "
+                  f"the signal ever agreed "
+                  f"({100*reach[9]/max(reach[5],1):.0f}%)")
+
+    if args.mode == "count":
+        # ================ MORE TRADES, SAME QUALITY? ================
+        # 288 rounds open on btc-5m a day and the arm enters ~15. `--mode
+        # funnel` says where the rest die; this mode PRICES the doors. Run the
+        # shipped rule, then open ONE door and read the rounds that walk in.
+        # ⭐ READ THE DOOR'S OWN NUMBERS, NOT THE HEADLINE. A loosening that adds
+        # 100 trades at +0.04/$1 to a book running +0.13 is a 35% decline in
+        # quality whatever the total does, and the halves columns are what say
+        # whether the direction repeats rather than the exact value winning on
+        # one sample.
+        L = dict(min_edge=settings.min_edge, min_quote=settings.min_quote,
+                 max_quote=settings.max_quote,
+                 min_range=settings.model_min_round_range_bps,
+                 max_range=settings.model_max_round_range_bps,
+                 max_tau=settings.max_tau_s)
+        print("\n=== MORE TRADES: open one door, price what walks in ===")
+        base_e = run2()
+        row("live (shipped)", base_e, len(rs), days)
+        bmap = {e["slug"]: e["ret"] for e in base_e}
+        cands = [
+            (f"min_edge {L['min_edge']:g} -> 0.05", dict(min_edge=0.05)),
+            (f"min_edge {L['min_edge']:g} -> 0.03", dict(min_edge=0.03)),
+            (f"min_edge {L['min_edge']:g} -> 0.02", dict(min_edge=0.02)),
+            (f"min_edge {L['min_edge']:g} -> 0.00", dict(min_edge=0.00)),
+            (f"persistence {persist} -> 1", dict(persistence=1)),
+            (f"min_range {L['min_range']:g} -> 3.0", dict(min_range=3.0)),
+            (f"max_range {L['max_range']:g} -> 20.0", dict(max_range=20.0)),
+            (f"min_quote {L['min_quote']:g} -> 0.45", dict(min_quote=0.45)),
+            (f"max_quote {L['max_quote']:g} -> 0.80", dict(max_quote=0.80)),
+            (f"max_quote {L['max_quote']:g} -> 0.90", dict(max_quote=0.90)),
+            (f"max_tau {L['max_tau']:g} -> 300", dict(max_tau=300.0)),
+        ]
+        for label, over in cands:
+            e = run2(**over)
+            row(label, e, len(rs), days)
+            nmap = {x["slug"]: x["ret"] for x in e}
+            added = [v for k, v in nmap.items() if k not in bmap]
+            gone = [v for k, v in bmap.items() if k not in nmap]
+            ev_a = (sum(added) / len(added)) if added else float("nan")
+            ev_g = (sum(gone) / len(gone)) if gone else float("nan")
+            wr_a = (100 * sum(1 for v in added if v > 0) / len(added)
+                    if added else float("nan"))
+            print(f"      door: +{len(added)} rounds "
+                  f"({len(added)/max(days,1):4.1f}/day) at EV {ev_a:+.4f}/$1  "
+                  f"WR {wr_a:5.1f}%  t {ao.tstat(added) if added else 0:+5.2f}"
+                  f"   | lost {len(gone)} at EV {ev_g:+.4f}/$1")
 
     if args.mode == "exit":
         # ================== EARLY EXIT ("price reacting") ==================
