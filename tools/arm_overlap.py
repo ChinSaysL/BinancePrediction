@@ -50,12 +50,30 @@ from btcpredict.pricing.digital import fair_value, moneyness_sd  # noqa: E402
 ARMS = ("model", "impulse")
 
 
-def load(con: sqlite3.Connection) -> list[dict]:
-    """Settled rounds with a Chainlink verdict and their recorded quote tape."""
+def load(con: sqlite3.Connection, family: str | None = None) -> list[dict]:
+    """Settled rounds with a Chainlink verdict and their recorded quote tape.
+
+    ⛔ `symbol='BTCUSDT'` MADE THIS TOOL BTC-ONLY, SILENTLY. It was written while
+    `rounds.symbol` held the lie that EVERY family was BTCUSDT (fixed 2026-09-16
+    by `_stamp_symbol`); after that fix the filter kept selecting exactly the
+    btc rows and nothing else, and asking for another family returned ZERO
+    rounds with no error -- `--family eth-updown-5m` printed "kept 0 of 3249
+    rounds", which reads as "there are no eth rounds" rather than "the loader
+    cannot see them". Every measurement built on this loader (this tool,
+    `model_knob_sweep`, `arms_recorded`) was therefore btc-only.
+
+    Scope by SLUG, not by symbol: it is the only key that is reliable here
+    (`quotes` has no symbol column at all, and `rounds.symbol` is wrong for
+    every pre-2026-09-16 row). `family=None` keeps the original btc behaviour.
+    """
+    if family:
+        where, args = "slug LIKE ? AND", (f"{family}-%",)
+    else:
+        where, args = "symbol='BTCUSDT' AND", ()
     rounds = con.execute(
         "SELECT slug, start_ms, end_ms, strike, winner, end_price FROM rounds "
-        "WHERE symbol='BTCUSDT' AND winner IN ('Up','Down') AND strike > 0 "
-        "ORDER BY start_ms").fetchall()
+        f"WHERE {where} winner IN ('Up','Down') AND strike > 0 "
+        "ORDER BY start_ms", args).fetchall()
     out = []
     for slug, start_ms, end_ms, strike, winner, end_price in rounds:
         rows = con.execute(
@@ -76,9 +94,28 @@ def load(con: sqlite3.Connection) -> list[dict]:
 
 
 def rolling_sigma(rs: list[dict], idx: int, window: int = 48) -> float:
-    """Out-of-sample sigma_1m from the `window` rounds settled BEFORE idx."""
+    """Out-of-sample sigma_1m from the `window` rounds settled BEFORE idx.
+
+    ⛔ THE SCALING WAS HARDCODED `sqrt(5.0)`, i.e. "this displacement happened
+    over 5 minutes". That is right for a 5m family and wrong by sqrt(3) for a
+    15m one: a 15m round travels sqrt(3) further, so dividing by sqrt(5) reports
+    a sigma **1.73x too high**, which drags every fair value toward 0.50 and
+    suppresses exactly the entries a 15m sweep is trying to count. It also
+    mattered on the DEFAULT load, which mixes btc-5m and btc-15m rounds in one
+    series (`symbol='BTCUSDT'` matches both), so each 15m displacement was being
+    fed to a 5m estimate.
+
+    Scale by the ROUND'S OWN duration. 5m families are unaffected (300_000 ms ->
+    sqrt(5.0)), so no existing 5m number moves.
+    """
     lo = max(0, idx - window)
-    rets = [math.log(r["end_price"] / r["strike"]) / math.sqrt(5.0)
+
+    def per_min(r: dict) -> float:
+        ms = (r.get("end_ms") or 0) - (r.get("start_ms") or 0)
+        dur = ms / 60_000.0 if ms > 0 else 5.0
+        return math.sqrt(max(dur, 0.1))
+
+    rets = [math.log(r["end_price"] / r["strike"]) / per_min(r)
             for r in rs[lo:idx]
             if r.get("end_price") and r["strike"] > 0 and r["end_price"] > 0]
     if len(rets) < 20:

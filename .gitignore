@@ -13,3 +13,4 @@ reports/
 *.parquet
 *.zip
 .live-config.json
+.env*

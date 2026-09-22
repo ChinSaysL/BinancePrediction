@@ -26,10 +26,26 @@ from btcpredict.risk.guards import RiskGuard
 from btcpredict.store.db import Store
 
 
-def test_reversal_15m_config():
-    assert settings.reversal_15m_enabled is True
+def test_reversal_15m_config(monkeypatch):
+    """The arm SHIPS OFF.
+
+    It was originally shipped enabled with no measurement. The first
+    measurement on our own venue (Binance, live DB, the live rule replayed one
+    entry per 15m round, n=119 / 6 days) gives EV +0.0290/$1, pooled t +0.67,
+    day-clustered t +0.66, halves +0.064/-0.005 and drop-best-day -0.0192 --
+    it fails the battery outright, and an earlier +0.0868 (t 2.29) was the
+    POLYMARKET window, not our venue. Re-enable only on a fresh measurement
+    that clears the battery, and in PAPER first.
+    """
+    assert settings.reversal_15m_enabled is False, \
+        "the arm ships OFF until a measurement clears the four-check battery"
     assert "btc-updown-15m" in reversal_15m_families()
     assert "eth-updown-15m" in reversal_15m_families()
+    assert reversal_15m_traded("doge-updown-15m") is False
+
+    # the family gate is what `reversal_15m_traded` adds on top of the switch,
+    # so it is only observable with the arm enabled
+    monkeypatch.setattr(settings, "reversal_15m_enabled", True)
     assert reversal_15m_traded("btc-updown-15m") is True
     assert reversal_15m_traded("eth-updown-15m") is True
     assert reversal_15m_traded("doge-updown-15m") is False

@@ -141,7 +141,7 @@ def test_every_per_symbol_lookup_goes_through_the_helper():
     import pathlib
     src = pathlib.Path("btcpredict/main.py").read_text()
     assert src.count('getattr(r, "symbol", "")') == 1
-    # `_round_range_bps`, `_train_is_fresh`, `_train_age_ms`, `_cross_level`
-    # and `_cross_signal` are the readers; every one of them asks the helper
-    # for the symbol.
-    assert src.count(").get(symbol_for_round(r)) or []") == 5
+    # `_round_range_bps`, `_train_is_fresh`, `_train_age_ms`, `_cross_level`,
+    # `_cross_signal`, `_strike_crossings` and `_reaction_against` are the
+    # readers; every one of them asks the helper for the symbol.
+    assert src.count(").get(symbol_for_round(r)) or []") == 7

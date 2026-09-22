@@ -327,8 +327,19 @@ class PredictionBook:
                     self._live.add(mid)
                     self.connected = True
                     backoff = 1.0
-                    log.info("book ws connected: %s (%d live)", mid,
-                             len(self._live))
+                    # INFO once per process, DEBUG after -- the same treatment
+                    # as the spot feed, for the same reason. Nine markets
+                    # reconnect at every round roll, so this was 2,464 lines
+                    # (3.0% of live.log). The first line still proves the book
+                    # feed came up at all, which is the only thing about it
+                    # that is ever news.
+                    if getattr(self, "_connected_once", False):
+                        log.debug("book ws connected: %s (%d live)", mid,
+                                  len(self._live))
+                    else:
+                        self._connected_once = True
+                        log.info("book ws connected: %s (%d live)", mid,
+                                 len(self._live))
                     while not self._stop.is_set():
                         # NOT `async for msg in ws`: a market goes SILENT the
                         # moment its round ends, and a blocking iterator would

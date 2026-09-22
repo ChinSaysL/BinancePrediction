@@ -16,6 +16,23 @@ Five shapes, roughly half the file, none of them a trading event -- and between
 them they drown the ones that are (`CROSS`, `pm FAK FILL`, `cross exec`,
 `settled`, and every WARNING).
 
+RE-MEASURED 2026-09-22 over 5.6 days / 83,209 lines, which found a bigger one
+that no census of 3 hours could see. The file was dominated not by chatty
+successes but by TWO REPEATING CONDITIONS:
+
+  14,801  17.8%  ERROR `live POST .../get-quote -> HTTP 400: -9000`
+   ~15,000 18%   the startup banner, re-emitted on ~1,542 process starts
+   3,075   3.7%  `settled <slug> -> Up`      (six per 5-minute roll)
+   2,464   3.0%  `book ws connected: N (M live)`
+   5,817   7.0%  `stats: rounds=... | no trades`
+
+That is why the fix is not only levels. A condition that repeats is collapsed by
+`_RepeatFilter` into one line per 5 minutes carrying its own count, and the
+`families:` alarm above was firing on 100% of ticks. The lesson the 3-hour
+census could not teach: THE LARGEST LINE ITEM IN AN OPS LOG IS USUALLY THE SAME
+SENTENCE MANY TIMES, and its cost is not disk -- it is that `grep -i error`
+returns 14,801 hits and the one error that is new is invisible.
+
 The risk in removing noise is removing the ALARM with it, so each is pinned in
 BOTH directions: silent when healthy, loud when it is not. `_quiet_libraries`
 goes further and gives httpx back wholesale at `log_level=DEBUG`, because a
@@ -162,12 +179,27 @@ def _flat(fn: str) -> str:
 
 
 class TestTheAlarmsSurvive:
-    def test_the_liveness_line_shouts_only_when_a_family_is_missing(self) -> None:
+    def test_the_liveness_line_shouts_on_a_transition_not_every_minute(self) -> None:
         """It exists for the ABSENCE case -- a family with no quote, no book and
-        no decision can be dead for hours while the log says only "no trades"."""
+        no decision can be dead for hours while the log says only "no trades".
+
+        IT USED TO FIRE ON EVERY TICK THAT WAS BAD, AND `active_markets()` LISTS
+        SIX FAMILIES WHILE THIS DEPLOYMENT TRADES TWO, so `not live` was
+        PERMANENTLY non-empty: the alarm was on 100% of the time. Measured
+        2026-09-22 over 5.6 days of live.log: 960 identical WARNINGs, and a
+        warning that is always on is not a warning -- it buried the 17.8% of the
+        file that was one repeating ERROR.
+
+        THE ALARM SURVIVES, because the condition it guards -- a family that is
+        SUPPOSED to trade having gone dark -- arrives as a CHANGE. This pin
+        holds both halves: the warning must still be reachable, and it must be
+        gated on the state changing or on the 30-minute reminder.
+        """
         body = _flat("tick")
-        assert "if miss or dead: log.warning(pat, *fargs) else: log.debug(pat, *fargs)" \
-            in body, body[-1200:]
+        assert ("(miss or dead) and (flag != prev or now_s - last_warn "
+                ">= 1800.0)") in body, body[-1400:]
+        assert "log.warning(pat, *fargs)" in body, body[-1400:]
+        assert "else: log.debug(pat, *fargs)" in body, body[-1400:]
 
     def test_the_cadence_line_shouts_only_when_a_tick_was_bad(self) -> None:
         """A widened websocket book is measured to take the cadence 1.00s ->

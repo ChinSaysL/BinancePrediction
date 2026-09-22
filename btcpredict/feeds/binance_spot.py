@@ -115,7 +115,18 @@ class SpotFeed:
                 async with self.session.ws_connect(
                     stream, heartbeat=20, timeout=aiohttp.ClientTimeout(total=15)
                 ) as ws:
-                    log.info("spot ws connected: %s", self.symbol)
+                    # INFO once per process, DEBUG after. The FIRST connect is
+                    # worth keeping -- it is the only line that proves the spot
+                    # feed ever came up, and a silently dead feed prices every
+                    # signal off a stale mid. After that it re-fires on every
+                    # reconnect: measured 1,542 lines PER SYMBOL over 5.6 days
+                    # of live.log (5.6% of the whole file) for a fact that had
+                    # not changed.
+                    if getattr(self, "_connected_once", False):
+                        log.debug("spot ws connected: %s", self.symbol)
+                    else:
+                        self._connected_once = True
+                        log.info("spot ws connected: %s", self.symbol)
                     backoff = 1.0
                     async for msg in ws:
                         if self._stop.is_set():

@@ -55,6 +55,7 @@ from btcpredict.feeds.binance_spot import SpotFeed, fetch_klines
 from btcpredict.feeds.prediction_book import PredictionBook
 from btcpredict.feeds.market_feed import MarketFeed, Round
 from btcpredict.models import PriceHistory, build_model
+from btcpredict.notify import TelegramNotifier
 from btcpredict.pricing.digital import fair_value, implied_sigma, moneyness_sd
 from btcpredict.pricing.vol import VolEstimator
 from btcpredict.risk.guards import RiskGuard
@@ -907,6 +908,23 @@ def round_row(r: Round) -> dict:
 
 
 class Bot:
+    #: A DISABLED notifier as a CLASS attribute, not an `__init__` local, so
+    #: `self.telegram.<event>()` needs no guard at any of its call sites --
+    #: including in a fixture that builds a Bot with `object.__new__(Bot)` or a
+    #: hand-rolled stub and never runs `__init__`. This repo's tests do exactly
+    #: that.
+    #:
+    #: MEASURED 2026-09-22: creating it only in `__init__` failed 54 tests with
+    #: `AttributeError: 'Bot' object has no attribute 'telegram'`, every one of
+    #: them ON THE ORDER PATH -- the hooks in `_book_fill`, `_place_order` and
+    #: `_cross_exit_execute`. A notification must never be able to do that.
+    #:
+    #: A disabled notifier is inert: `notify()` returns before it touches the
+    #: queue or the session, so sharing one instance costs nothing. `setup()`
+    #: installs the configured one, and that instance attribute shadows this.
+    telegram: TelegramNotifier = TelegramNotifier(token="", chat_id="",
+                                                  session=None, enabled=False)
+
     def __init__(self, mode: str, store: Store, session: aiohttp.ClientSession):
         self.mode = mode
         self.store = store
@@ -1077,10 +1095,10 @@ class Bot:
             edge_signal.FEE_REALISED_FRACTION = float(_ff)
         log.info("taker fee: %.3f x the measured curve (charged on PARTIAL "
                  "fills only)", edge_signal.FEE_REALISED_FRACTION)
-        log.info("pricing model: %s", self.model.name)
+        log.debug("pricing model: %s", self.model.name)
         if self.up_model is not None:
-            log.info("per-side gate: Down=%s Up=%s",
-                     self.model.name, self.up_model.name)
+            log.debug("per-side gate: Down=%s Up=%s",
+                      self.model.name, self.up_model.name)
 
         venue = registry.normalise(getattr(settings, "venue", "binance"))
         if venue == "polymarket":
@@ -1101,9 +1119,9 @@ class Bot:
                         api_secret=settings.binance_api_secret,
                         session=self.session, signer=book)
                     self._ws_task = asyncio.create_task(self.ws_book.run())
-                    log.info("prediction book websocket enabled "
-                             "(max age %.1fs, REST fallback on staleness)",
-                             settings.ws_book_max_age_s)
+                    log.debug("prediction book websocket enabled "
+                              "(max age %.1fs, REST fallback on staleness)",
+                              settings.ws_book_max_age_s)
             else:
                 log.warning("no prediction wallet; falling back to displayed prices")
 
@@ -1135,6 +1153,40 @@ class Bot:
             if bal < settings.min_order_usdt:
                 raise SystemExit(f"balance ${bal:.4f} below the venue minimum "
                                  f"${settings.min_order_usdt:.2f}")
+
+        # NOTIFICATIONS. Configured at the END of setup, after the broker and
+        # the wallet are known -- and started for PAPER as well as live, because
+        # the arm that most needs watching is the one being tested.
+        # `retry_entry` is the RETRY NOW handler: it is the one thing the
+        # operator can trigger that places an order, so it goes through a
+        # method that re-checks the round is still open and still ours.
+        # Stop any PREVIOUS notifier BEFORE replacing it. `setup()` is also
+        # called by tests, sometimes twice on one object: without this, the old
+        # notifier's two tasks are orphaned -- and the orphaned poller keeps
+        # competing for `getUpdates`, so the new one gets HTTP 409 forever.
+        with contextlib.suppress(Exception):
+            await self.telegram.stop()
+        self.telegram = TelegramNotifier(
+            token=settings.telegram_bot_token,
+            chat_id=settings.telegram_chat_id,
+            session=self.session,
+            chart_url=settings.telegram_chart_url,
+            enabled=(settings.telegram_enabled
+                     and self.mode in ("live", "paper")),
+            on_retry=self.retry_entry,
+            timeout_s=settings.telegram_timeout_s,
+        )
+        if settings.telegram_enabled and not self.telegram.enabled:
+            log.warning("telegram_enabled is set but the token or chat_id is "
+                        "missing; notifications stay OFF")
+        await self.telegram.start()
+        if self.telegram.enabled:
+            # ONE line, once per process: it is the only proof the feature is
+            # armed, and an unarmed notifier is otherwise indistinguishable
+            # from a quiet day -- the same argument as `pm book ws connected`.
+            log.info("telegram notifications on (chat %s, chart button %s)",
+                     settings.telegram_chat_id,
+                     "on" if settings.telegram_chart_url else "off")
 
         if self.mode != "record":
             self._restore_open_positions()
@@ -1399,14 +1451,23 @@ class Bot:
             # two fills booked 33 s before the flag was enabled rode to the
             # bell unprotected. `entry_ms` is the ORIGINAL fill time, so the
             # watcher's own clock is not reset by a restart.
-            if row["mode"] == "cross":
+            # ⛔ THE MODEL ARM NEEDS IT TOO, and it was missed: this armed only
+            # `mode == "cross"`, so a restart mid-round silently dropped the
+            # reaction exit from every open model position -- the same class of
+            # gap this block was added to close for the cross arm. Keyed on the
+            # fill's own `mode` (`live` is what the model arm records): cross ->
+            # flip, model -> react, and the impulse/stale-maker fills keep the
+            # behaviour they had, which is no watcher.
+            _rule = ("flip" if row["mode"] == "cross"
+                     else "react" if row["mode"] in ("live", "model") else None)
+            if _rule:
                 self._arm_exit_watch(
                     fid=row["id"], slug=row["slug"], side=row["side"],
                     token=row["token_id"], shares=row["shares"],
                     stake=row["stake"], fee=row["fee_paid"],
                     entry_ms=row["ts_ms"], did=row["decision_id"],
                     px=row["filled_px"], req=row["requested_px"],
-                    oid=row["order_id"])
+                    oid=row["order_id"], rule=_rule)
         if rows:
             log.info("restored %d unsettled position(s): %s",
                      len(rows), ", ".join(r["slug"] for r in rows))
@@ -1610,6 +1671,12 @@ class Bot:
         for prefix, sym, _ in active_markets():
             r = cache.get(prefix)
             if r:
+                # THE MODEL ARM'S EXIT. It runs here, in the per-market loop
+                # every tick already walks, and it does not spend the tick --
+                # it spends the POSITION. Placing it in the decision block below
+                # would skip it on every tick the model does not emit, which is
+                # precisely when a dying thesis has to be sold.
+                await self._model_exit_check(r)
                 is_trade = (cross_traded(prefix)
                             or model_traded(prefix)
                             or reversal_15m_traded(prefix))
@@ -1701,17 +1768,28 @@ class Bot:
             warm = getattr(getattr(self, "_pm_broker", None), "warm_calls", None)
             miss = [p for p, _, _ in active_markets() if p not in cached]
             dead = [p for p, _, _ in active_markets() if p not in live]
-            # WARNING when a family is missing, DEBUG when all nine are fine.
-            # The line exists for the FAILURE case: a family that is not in
-            # `_mkt` gets no quote, no book and no decision, and every one of
-            # those is an ABSENCE, so a whole family can be dead for hours with
-            # nothing in the log. Healthy it only repeats itself -- measured 135
-            # of the ~1,600 lines in a 3-hour window, all of them "no change".
+            # WARNING on the TRANSITION into a bad state, then at most one
+            # reminder every 30 min while it persists -- never once a minute.
+            #
+            # MEASURED 2026-09-22: this fired every single minute for the whole
+            # life of the log (960 identical WARNINGs in the 83k-line window),
+            # because `active_markets()` lists all six families while this
+            # deployment trades two, so `not live` is PERMANENTLY non-empty.
+            # The condition the line exists to catch -- a family that is
+            # SUPPOSED to trade having gone dark -- arrives as a CHANGE, and a
+            # warn-on-every-tick alarm is one nobody reads. It is also what
+            # buried the real errors: the alarm was on 100% of the time.
             pat = ("families: %d/%d cached, %d live | missing cache: %s | "
                    "not live: %s | warm %s")
             fargs = (len(cached), len(active_markets()), len(live), miss or "-",
                      dead or "-", "n/a" if warm is None else warm)
-            if miss or dead:
+            flag = (tuple(miss), tuple(dead))
+            prev = getattr(self, "_liveness_state", None)
+            self._liveness_state = flag
+            last_warn = getattr(self, "_liveness_warn", 0.0)
+            if (miss or dead) and (flag != prev
+                                   or now_s - last_warn >= 1800.0):
+                self._liveness_warn = now_s
                 log.warning(pat, *fargs)
             else:
                 log.debug(pat, *fargs)
@@ -2274,6 +2352,19 @@ class Bot:
             gate_reason = (f"round range {rng:.1f}bps outside "
                            f"[{settings.model_min_round_range_bps:.0f},"
                            f"{settings.model_max_round_range_bps:.0f}]")
+        elif (settings.model_max_strike_crossings > 0
+              and (xc := self._strike_crossings(r)) is not None
+              and xc >= settings.model_max_strike_crossings):
+            # REACTION ZONE. The strike is the level the payout is written
+            # against, so a round that has already been through it this many
+            # times is a round where the price is bouncing off the level rather
+            # than leaving it. Measured at -0.156/$1 for the refused cohort
+            # against +0.126 for the kept one; see the config comment for the
+            # halves check, and for the two look-alike rules that are NOT this.
+            # None means "not enough history" and is NOT a refusal.
+            gate_reason = (f"spot crossed the strike {xc} times "
+                           f"(>= {settings.model_max_strike_crossings}: the "
+                           f"price is bouncing off the level)")
         elif not self.spot.is_fresh(settings.max_spot_age_s):
             gate_reason = f"spot stale ({self.spot.age_s:.1f}s)"
         elif self.broker.mode == "live" and sig.act and self.book:
@@ -2402,7 +2493,8 @@ class Bot:
         if not fill:
             return
         await self._book_fill(r, sig, fill, did=did, up=up,
-                              spot=spot, sigma=sigma, tau=tau, token=token)
+                              spot=spot, sigma=sigma, tau=tau, token=token,
+                              arm="model")
 
     async def _shot15(self, r, spot, tau, sigma, buy_up, buy_down,
                       now_ms: int) -> None:
@@ -2563,7 +2655,8 @@ class Bot:
     async def _book_fill(self, r, sig, fill, *, did: int, up,
                          spot: float, sigma: float, tau: float,
                          token: str | None = None,
-                         mode: str | None = None) -> None:
+                         mode: str | None = None,
+                         arm: str | None = None) -> None:
         """Record a fill: guard, decision promotion, fill row, P&L log.
 
         Invalidates the cached venue position list first: a position we just
@@ -2625,7 +2718,7 @@ class Bot:
         # Cross arm only, live only, and only when the broker can actually
         # sell: `sell_fak` is new, so a paper broker or an older one must
         # simply not get a watcher rather than fail at the first flip.
-        if (mode or self.broker.mode) == "cross":
+        if (mode or self.broker.mode) == "cross" or arm == "model":
             # All the guards live in `_arm_exit_watch`, so the booking path and
             # the restart-restore path cannot drift apart (the audit found they
             # had: a restart left every live position unwatched).
@@ -2634,7 +2727,8 @@ class Bot:
                 token=token or getattr(fill, "token_id", None),
                 shares=fill.shares, stake=fill.stake, fee=fill.fee_paid,
                 entry_ms=fill.ts_ms, did=did, px=fill.filled_px,
-                req=fill.requested_px, oid=fill.order_id)
+                req=fill.requested_px, oid=fill.order_id,
+                rule=("react" if arm == "model" else "flip"))
         # implied_sigma inverts P(up), so it must always be fed the Up quote --
         # passing the chosen side's quote breaks the inversion when that side is
         # Down. A missing Up quote must not take down the tick after the fill
@@ -2668,6 +2762,209 @@ class Bot:
                  f"{sig.ev_per_dollar:+.4f}"
                  if (sig.ev_valid and sig.edge) else "n/a",
                  f"{ev_at_fill:+.4f}" if ev_at_fill is not None else "n/a")
+        # The notification quotes the same two valuations the log does, under
+        # the same condition -- `ev_valid` is False for the arms that build a
+        # synthetic Signal from the ask they are about to pay, where edge is a
+        # structural zero. A notification is read on a phone, away from the
+        # charts, so a fabricated "+0.0000" is worse there than in the log.
+        _priced = bool(sig.ev_valid and sig.edge)
+        self.telegram.entry(
+            slug=r.slug, side=fill.side, stake=float(fill.stake or 0.0),
+            px=float(fill.filled_px or 0.0), shares=float(fill.shares or 0.0),
+            edge=float(sig.edge) if _priced else None,
+            ev=float(sig.ev_per_dollar) if _priced else None,
+            tau=float(tau or 0.0),
+            spot=float(spot) if spot else None,
+            strike=float(r.strike) if getattr(r, "strike", None) else None,
+            arm=arm)
+
+    def _decision_id_for(self, slug: str, side: str) -> int | None:
+        """The most recent decision row for this slug+side, for a retry button.
+
+        `_place_order` is called by four different arms and never receives the
+        decision id, so it is looked up here rather than threaded through every
+        signature. `decisions` is indexed on `slug` and this runs once per
+        FAILED order, not per tick. None means "no button": a missing id must
+        degrade to a text-only notification, never to an exception inside the
+        order path.
+
+        `AND stake > 0` IS THE POINT OF THE QUERY. This runs the instant an
+        order fails, and by then the round may hold SEVERAL decision rows for
+        the same slug and side: earlier refusals, this attempt, and -- on the
+        next poll -- further rows with `acted=0` and no size. Taking the newest
+        row unconditionally therefore hands the button a decision that never
+        tried to trade, whose `stake` is 0.0 and whose side may be stale. Only
+        an ATTEMPT has a stake (`_place_order` is reached only when
+        `stake >= min_order_usdt`), so this selects the attempt and nothing
+        else.
+        """
+        try:
+            row = self.store.conn.execute(
+                "SELECT id FROM decisions WHERE slug=? AND side=? "
+                "AND stake > 0 ORDER BY id DESC LIMIT 1",
+                (slug, side)).fetchone()
+            return int(row[0]) if row else None
+        except Exception as e:                                   # noqa: BLE001
+            log.debug("no decision id for %s %s: %s", slug, side, e)
+            return None
+
+    async def retry_entry(self, did: int) -> str:
+        """RETRY NOW: re-place a refused entry as a MARKET order, same side.
+
+        A MANUAL OVERRIDE, AND A NARROW ONE. It re-fires exactly the trade the
+        gate already chose -- `decisions.side` and `decisions.stake` -- and it
+        TAKES liquidity at the current book (`broker.buy` is orderType MARKET,
+        a FOK take; see live.py). It does NOT re-run the model: the operator's
+        question is "did the ORDER fail", not "is the signal still good", and
+        re-deciding would sometimes place the OPPOSITE side, or nothing, under
+        a button labelled RETRY. For the same reason it skips the decision
+        gates -- those already ran and refused nothing.
+
+        IT DOES NOT SKIP THE THINGS THAT ARE ABOUT MONEY, because a button is
+        not a licence to trade a dead round, a halted account, or any price at
+        all:
+          * the slug must still be the CURRENT round for its prefix (if the
+            venue rolled, the market in the decision no longer exists),
+          * tau must clear `order_min_tau_s`, the venue floor the normal path
+            also honours,
+          * `guard.check` must allow it -- the DAILY LOSS CAP, the loss streak,
+            `max_open_rounds` and "already positioned in this round". These are
+            the RISK controls, not the strategy gates: the gates already ran
+            and refused nothing, but a button must not be able to push a trade
+            through a risk halt,
+          * the venue's position list must be READ, FRESH, and must not already
+            hold this round's token -- re-placing there would double the
+            exposure, and that is the one irreversible mistake available from
+            this method,
+          * the ask must sit inside the traded band `[min_quote, max_quote]`,
+            and that same ceiling is passed as `max_px` to the order. A MARKET
+            order with NO ceiling is not "the same side" -- it is the same side
+            at ANY price, and `slippage_bps` is 300 (3%), so a drifted book
+            would fill up to 3% through a quote the arm's own band would have
+            refused. Retrying the ORDER is the operator's call; overruling the
+            PRICE BAND is not what the button says,
+          * live mode only, the bot must not be shutting down, and the stake
+            must clear the venue minimum.
+
+        The fill is booked through `_book_fill`, the same path every other
+        fill uses, so the guard slot, the ledger, the exit watcher and the
+        ENTRY notification all behave identically. Returns a line for the chat.
+        """
+        try:
+            row = self.store.conn.execute(
+                "SELECT slug, side, stake, fair, quote, edge, sigma_1m, spot, "
+                "tau_s FROM decisions WHERE id=?", (int(did),)).fetchone()
+        except Exception as e:                                   # noqa: BLE001
+            return f"cannot read decision {did} ({type(e).__name__})"
+        if row is None:
+            return f"decision {did} not found"
+        (slug, side, stake, fair, quote, edge, sigma, spot,
+         tau_dec) = (row[0], row[1] or "", float(row[2] or 0.0),
+                     row[3], row[4], row[5], row[6], row[7], row[8])
+        if side not in ("Up", "Down"):
+            return f"decision {did} chose no side; there is nothing to retry"
+        if self.broker.mode != "live":
+            return f"not in live mode ({self.broker.mode}); not placing"
+        if self._stop.is_set():
+            # A tap can land during shutdown. Placing an order then risks a
+            # fill the process never lives to book -- a phantom position, the
+            # worst failure mode in this codebase.
+            return "the bot is shutting down; not placing"
+
+        r = (getattr(self, "_mkt", None) or {}).get(str(slug).rsplit("-", 1)[0])
+        if r is None or getattr(r, "slug", None) != slug:
+            now = getattr(r, "slug", None)
+            return (f"{slug} is no longer the open round"
+                    + (f" (now {now})" if now else ""))
+
+        now_ms = int(time.time() * 1000)
+        tau = (int(getattr(r, "end_ms", 0) or 0) - now_ms) / 1000.0
+        floor = float(getattr(settings, "order_min_tau_s", 0.0) or 0.0)
+        if tau <= floor:
+            return (f"{slug}: only {tau:.0f}s left (floor {floor:.0f}s); "
+                    "not placing")
+
+        up = next((o for o in (getattr(r, "outcomes", None) or [])
+                   if o.name == "Up"), None)
+        dn = next((o for o in (getattr(r, "outcomes", None) or [])
+                   if o.name == "Down"), None)
+        obj = up if side == "Up" else dn
+        token = getattr(obj, "token_id", None) if obj is not None else None
+        if not token:
+            return f"{slug}: the round carries no {side} token"
+
+        # DOUBLE EXPOSURE IS THE DANGEROUS ONE. An unreadable position list is
+        # not evidence of "nothing held" -- it is the absence of evidence, and
+        # on this exact class of failure the earlier design bought the same
+        # round twice (see `_place_order`'s re-read comment).
+        #
+        # `max_age_s=0.0` FORCES A FRESH READ, deliberately overriding the
+        # `venue_position_cache_s` cache that the gate chain uses: that cache is
+        # there to keep 60ms off the ORDER's critical path on every poll, and
+        # this is a manual, money-moving action where staleness buys nothing.
+        # The case it exists for -- an order that filled at the venue without
+        # being booked here -- is precisely the case a cached list can hide.
+        try:
+            held = await self._venue_position_tokens(max_age_s=0.0)
+        except Exception as e:                                   # noqa: BLE001
+            log.warning("retry %s: position read failed: %s", did, e)
+            held = None
+        if held is None:
+            return "cannot read the venue's positions; not re-placing"
+        if token in held:
+            return (f"the venue already holds {side} in {slug}; not "
+                    "re-placing")
+
+        if stake < float(getattr(settings, "min_order_usdt", 0.0) or 0.0):
+            return (f"stake ${stake:.2f} is under the venue minimum "
+                    f"${float(settings.min_order_usdt):.2f}")
+
+        # THE RISK CONTROLS, which a manual override must not bypass. Not the
+        # strategy gates (`tau`, `spot` freshness, the edge re-check): those
+        # already ran and refused nothing, and re-running them would sometimes
+        # place the OPPOSITE side under a button labelled RETRY.
+        allowed, why = self.guard.check(slug)
+        if not allowed:
+            log.warning("MANUAL RETRY decision=%s refused by the guard: %s",
+                        did, why)
+            return f"refused: {why}"
+
+        price = None
+        _book = getattr(self, "book", None)
+        if _book is not None:
+            with contextlib.suppress(Exception):
+                bp = await _book.best_prices(token, getattr(r, "market_id", 0))
+                if bp and float(bp[1] or 0.0) > 0.0:
+                    price = float(bp[1])
+        if not price:
+            return f"{slug}: no ask to take; not placing"
+        lo = float(getattr(settings, "min_quote", 0.0) or 0.0)
+        hi = float(getattr(settings, "max_quote", 1.0) or 1.0)
+        if not (lo <= price <= hi):
+            return (f"{slug}: the ask is {price:.4f}, outside the traded band "
+                    f"[{lo:.2f},{hi:.2f}]; not placing")
+
+        log.warning("MANUAL RETRY decision=%s %s %s stake=$%.2f take %.4f "
+                    "(ceiling %.2f)", did, slug, side, stake, price, hi)
+        fill = await self.broker.buy(slug=slug, side=side, token_id=token,
+                                     price=price, stake=stake,
+                                     max_px=hi)
+        if not fill:
+            why = getattr(self.broker, "last_failure", None)
+            log.warning("MANUAL RETRY failed: %s %s (%s)", slug, side, why)
+            return f"still failed: {why or 'no reason reported'}"
+
+        sig = edge_signal.Signal(
+            side=side, fair=float(fair or 0.0), quote=float(quote or 0.0),
+            edge=float(edge or 0.0), hurdle=0.0,
+            ev_per_dollar=float("nan"), act=True,
+            reason=f"manual retry of decision {did}", ev_valid=False)
+        await self._book_fill(r, sig, fill, did=int(did), up=up,
+                              spot=float(spot or 0.0),
+                              sigma=float(sigma or 0.0), tau=tau,
+                              token=token, arm="model")
+        return (f"placed {side} {fill.shares:g} sh @ {fill.filled_px:.4f} "
+                f"(stake ${float(fill.stake or 0.0):.2f})")
 
     async def _impulse_tick(self) -> None:
         """Impulse entry, evaluated on every price update instead of on the poll.
@@ -2907,6 +3204,175 @@ class Bot:
         if len(seen) < 2:
             return None
         return 1e4 * (max(seen) - min(seen)) / r.strike
+
+    def _reaction_against(self, r, side: str) -> tuple[bool, float]:
+        """Has the price just REACTED against `side`? (hit, move_bps).
+
+        True when the spot is still on `side`'s side of the strike (so we are
+        AHEAD and there is something to protect) but has moved AGAINST it by at
+        least `model_exit_rev_bps` over the last `model_exit_look_s`.
+
+        WHY THIS AND NOT A PRICE STOP. Measured on the Binance tape
+        (2026-09-22, 44,056 ticks / 301 rounds): where the price has just reacted
+        against us the venue's BID sits ABOVE the realised win rate -- 0.7652
+        against 0.7011 at 5bps/20s, i.e. the venue is STILL paying 6.4c more than
+        the position is worth, so selling is the profit. Everywhere else the bid
+        sits BELOW it and holding is the profit. A take-profit and a price stop
+        both failed because the price alone says nothing about the settlement;
+        this says something because it is the venue LAGGING the spot -- the same
+        mispricing the entry harvests.
+
+        Reads `self._ticks`, not `feed.ticks`, for the reason `_round_range_bps`
+        gives: the feed deque's span is a burst rate, not a duration. Returns
+        (False, 0.0) when there is nothing to judge -- callers must treat that as
+        "no opinion", never as a refusal.
+        """
+        strike = getattr(r, "strike", None)
+        if not strike or strike <= 0 or side not in ("Up", "Down"):
+            return False, 0.0
+        buf = (getattr(self, "_ticks", None) or {}).get(symbol_for_round(r)) or []
+        now = [px for t, px in buf if px and px > 0 and t >= r.start_ms]
+        if len(now) < 3:
+            return False, 0.0
+        spot = now[-1]
+        sgn = 1.0 if side == "Up" else -1.0
+        if math.log(spot / strike) * sgn <= 0:
+            return False, 0.0        # behind: there is nothing to protect here
+        cut = int(time.time() * 1000) - int(settings.model_exit_look_s * 1000)
+        # ⛔ THE ROUND BOUND, ON BOTH SIDES. `now` is bounded but `past` was not,
+        # so the reference price could come from the PREVIOUS round -- whose spot
+        # can be arbitrarily far away -- and the first measured move would be a
+        # phantom reaction at every round open. Caught by
+        # `test_ticks_before_the_round_are_ignored`.
+        past = [px for t, px in buf
+                if px and px > 0 and r.start_ms <= t <= cut]
+        if not past:
+            return False, 0.0
+        mv = math.log(spot / past[-1]) * 1e4 * sgn
+        return (mv <= -settings.model_exit_rev_bps), mv
+
+    async def _model_exit_check(self, r) -> bool:
+        """Sell a MODEL position when the price reacts against it. True = sold.
+
+        ADDITIVE ON PURPOSE. It reuses `_cross_exit_execute` for the sale -- the
+        ledger write, the partial-split and the late confirmation are the same
+        problem -- and NOTHING else. The cross watcher's flip/margin/confirm
+        state machine is a different trigger and is left untouched, so a defect
+        here cannot break the cross arm's exit and vice versa.
+
+        Called from the per-market loop that every tick already walks, so it is
+        judged on EVERY tick. It deliberately does NOT live in the decision
+        block: that block returns whenever the model does not emit, and those are
+        exactly the ticks on which a dying thesis must still be sold.
+        """
+        if not settings.model_exit_on_reaction:
+            return False
+        watch = getattr(self, "_exit_watch", None)
+        if not watch or r is None or not getattr(r, "slug", None):
+            return False
+        w = watch.get(r.slug)
+        if w is None or w.get("halted") or w.get("rule") != "react":
+            return False
+        end_ms = int(getattr(r, "end_ms", 0) or 0)
+        if not end_ms:
+            return False
+        # ⛔ A SALE WE ALREADY PLACED MUST BE CONFIRMED, NEVER REPEATED.
+        # `_cross_exit_execute` leaves the fill in `open_fills` and sets
+        # `w["pending"]` when the venue has not shown the sale yet. Without this
+        # branch the next tick's reaction -- which by construction is still true,
+        # because the rule is a STATE -- would call it again and send a SECOND
+        # sell for shares we may no longer hold. That is a naked short, and it is
+        # the exact failure `_cross_exit_execute` documents for the UNVERIFIED
+        # path. This branch MUST sit above the `open_fills` check below, or that
+        # check pops the watch first and the confirmation can never run.
+        if w.get("pending"):
+            got = self._confirm_pending_sale(r, w)
+            if got is not None:
+                tau_p = (end_ms - int(time.time() * 1000)) / 1000.0
+                await self._cross_exit_execute(r, w, tau=tau_p,
+                                               sig_name="react-confirm",
+                                               confirmed=got)
+            return True
+        # THE ONE-ORDER-PER-POSITION RAIL, shared with the cross arm: a position
+        # gets one sale, and a refused one does not become an endless retry.
+        if w.get("done", 0) >= settings.cross_exit_max_per_position:
+            watch.pop(r.slug, None)
+            return False
+        if w["fid"] not in getattr(self, "open_fills", {}):
+            watch.pop(r.slug, None)      # settled or sold the normal way
+            return False
+        tau = (end_ms - int(time.time() * 1000)) / 1000.0
+        if tau <= settings.model_exit_min_tau_s:
+            return False                 # the book goes one-sided at the bell
+        entry_ms = int(w.get("entry_ms") or 0)
+        if entry_ms and int(time.time() * 1000) - entry_ms < \
+                int(settings.model_exit_min_hold_s * 1000):
+            return False
+        hit, mv = self._reaction_against(r, w["side"])
+        if not hit:
+            return False
+        log.info("MODEL exit %s: price reacted %.1fbps against %s over %.0fs "
+                 "(tau %.0fs) -- selling %.0f%%", r.slug, mv, w["side"],
+                 settings.model_exit_look_s, tau,
+                 100.0 * float(settings.model_exit_frac))
+        _frac = float(settings.model_exit_frac)
+        _before = float(w.get("shares") or 0.0)
+        await self._cross_exit_execute(
+            r, w, tau=tau, sig_name="react",
+            shares=(_before * _frac if _frac < 1.0 else None))
+        # ⛔ ONE SALE PER POSITION, OR THE FRACTION IS A LIE. A partial sale
+        # SPLITS the fill and leaves the remainder in `open_fills`, so the
+        # reaction -- still true, it is a STATE -- would fire again on the next
+        # tick and sell the rest, quietly turning a 25% exit into the 100% exit
+        # the fraction exists to avoid. Retire the watch for whatever is left:
+        # the remainder then rides to the bell and settles normally.
+        if float(w.get("shares") or 0.0) > 1e-9:
+            w["done"] = settings.cross_exit_max_per_position
+        return True
+
+    def _strike_crossings(self, r, resample_ms: int = 1000) -> int | None:
+        """How many times this round's spot has crossed its STRIKE so far.
+
+        THE STRIKE IS THE REACTION LEVEL. The payout is written against it, so a
+        round whose price keeps flipping across it is a round where the price is
+        BOUNCING OFF the level instead of leaving it, and entries taken there
+        are the avoidable ones (see config.model_max_strike_crossings for the
+        measurement).
+
+        ⛔ THE COUNT MUST NOT BE TAKEN ON THE POLL GRID. `self._ticks` holds one
+        sample per poll and the poll runs at a median 58 ms, so `spot > strike`
+        flips on jitter many times per real crossing: the same round that scores
+        3 crossings on the 1 Hz `quotes` tape this value was measured on scores
+        dozens here, and a threshold of 3 taken straight from the replay would
+        refuse nearly every round. RESAMPLING to 1 Hz first -- the LAST tick in
+        each whole second since the round opened -- puts this on the same grid
+        as the measurement, which is the only reason the number transfers at
+        all. The residual bias is stated in the config comment.
+
+        Reads `self._ticks` rather than `feed.ticks` for the reason
+        `_round_range_bps` gives: the feed deque's span is a burst rate, not a
+        duration.
+
+        Returns None when there is not enough history to judge. Callers must
+        treat that as "no opinion" and NOT as a refusal, or a cold start would
+        silently disable the arm.
+        """
+        if not r or not getattr(r, "strike", None) or r.strike <= 0:
+            return None
+        buf = (getattr(self, "_ticks", None) or {}).get(symbol_for_round(r)) or []
+        latest: dict[int, float] = {}
+        for t_ms, px in buf:
+            if px and px > 0 and t_ms >= r.start_ms:
+                latest[(t_ms - r.start_ms) // resample_ms] = px
+        if len(latest) < 3:
+            return None
+        cr, up = 0, None
+        for sec in sorted(latest):
+            now_up = latest[sec] > r.strike
+            if up is not None and now_up != up:
+                cr += 1
+            up = now_up
+        return cr
 
     def _cross_level(self, r) -> tuple[float | None, str]:
         """(level, source) the cross arm measures its crossing AGAINST.
@@ -5037,7 +5503,7 @@ class Bot:
 
     def _arm_exit_watch(self, *, fid, slug, side, token, shares, stake, fee,
                         entry_ms, did=None, px=None, req=None,
-                        oid=None) -> bool:
+                        oid=None, rule: str | None = None) -> bool:
         """Register a held cross position with the exit watcher.
 
         ONE construction site, called from `_book_fill` AND from
@@ -5050,14 +5516,40 @@ class Bot:
         cannot sell must simply get no watcher instead of failing at the first
         flip.
         """
-        if not (settings.cross_exit_enabled
-                and getattr(self.broker, "mode", None) == "live"
-                and hasattr(self.broker, "sell_fak")):
+        enabled = (settings.model_exit_on_reaction if rule == "react"
+                   else settings.cross_exit_enabled)
+        # ⭐ ARMING MUST BE AUDIBLE, BECAUSE A DEAD WATCH IS INDISTINGUISHABLE
+        # FROM A QUIET ONE. The model exit's log line fires only when the rule
+        # TRIGGERS, and every guard below returns False silently -- so with 0
+        # fires in the log there is no way to tell "armed, and the price never
+        # reacted" from "never armed". That matters more than usual here: the
+        # `rule` tag is a discriminator added on 2026-09-22, and a position whose
+        # watch carried the wrong tag would be unprotected FOREVER while looking
+        # exactly like the expected quiet case. The kill criterion is ~40 exits,
+        # i.e. ~11 days at 9.7 entries/day, which is far too long to spend blind.
+        # `_react` gates the noise: the cross arm is off (`cross_exit_enabled`
+        # False) and must not start printing MODEL lines if it is ever turned on.
+        _react = rule == "react"
+        if (not enabled
+                or getattr(self.broker, "mode", None) != "live"
+                or not hasattr(self.broker, "sell_fak")):
+            if _react:
+                log.warning(
+                    "MODEL exit watch NOT armed for %s: enabled=%s broker=%s "
+                    "sell_fak=%s -- this position has NO early exit and will "
+                    "run to the bell", slug, enabled,
+                    getattr(self.broker, "mode", None),
+                    hasattr(self.broker, "sell_fak"))
             return False
         if not token or not shares or float(shares) <= 0.0:
             # No token means the position could never be sold, and zero shares
             # means there is nothing to sell: either would only produce one
             # refusal line per tick.
+            if _react:
+                log.warning(
+                    "MODEL exit watch NOT armed for %s: has_token=%s shares=%r "
+                    "-- nothing sellable, this position runs to the bell",
+                    slug, bool(token), shares)
             return False
         watch = getattr(self, "_exit_watch", None)
         if not isinstance(watch, dict):
@@ -5070,7 +5562,26 @@ class Bot:
             # lookup the DB layer does not offer.
             "did": did, "px": px, "req": req, "oid": oid,
             "flip_ms": None, "done": 0, "halted": False,
+            # WHICH RULE OWNS THIS POSITION. The exit path is shared, the trigger
+            # is not: "flip" is the cross arm's state machine, "react" the model
+            # arm's reaction rule. Without this the two would read each other's
+            # thresholds.
+            "rule": rule or "flip",
         }
+        if _react:
+            # ONE LINE PER POSITION, and it is the only evidence that the rule
+            # is live on a day with no exits. `grep -c "exit watch armed"`
+            # answers "was it even armed"; the trigger line answers "did it
+            # fire". Do not make this a debug line.
+            log.info(
+                "MODEL exit watch armed %s: rule=%s side=%s shares=%.4f "
+                "entry_ms=%s | selling %.0f%% on a %.1fbps move against over "
+                "%.0fs, min_tau %.0fs, min_hold %.0fs",
+                slug, "react", side, float(shares), entry_ms,
+                100.0 * float(settings.model_exit_frac),
+                settings.model_exit_rev_bps, settings.model_exit_look_s,
+                settings.model_exit_min_tau_s,
+                settings.model_exit_min_hold_s)
         return True
 
     async def _cross_exit_check(self, r, level, ticks) -> bool:
@@ -5120,6 +5631,17 @@ class Bot:
             return False
         w = watch.get(r.slug)
         if w is None or w.get("halted"):
+            return False
+        # ⛔ THE TWO ARMS SHARE THE SALE PATH BUT NOT THE TRIGGER. A model
+        # position's watch is tagged "react" and carries model thresholds; let
+        # the cross state machine read it and it would sell on the cross arm's
+        # `min_margin_bps`/`confirm_s` instead. Inert today (cross is off) and a
+        # live-money bug the day it is switched back on.
+        # A MISSING tag means "flip": every watch armed before this existed, and
+        # every watch the cross arm builds, carries no rule at all. Testing
+        # `!= "flip"` straight made the cross exit refuse everything -- 29 tests
+        # said so.
+        if w.get("rule", "flip") != "flip":
             return False
         # ---- A SALE WE PLACED BUT COULD NOT SEE YET IS CONFIRMED HERE --------
         # This MUST come before the `done` check below: a pending sale has
@@ -5324,7 +5846,8 @@ class Bot:
         return got
 
     async def _cross_exit_execute(self, r, w, *, tau, sig_name,
-                                  confirmed: tuple | None = None) -> None:
+                                  confirmed: tuple | None = None,
+                                  shares: float | None = None) -> None:
         """Sell `w`'s position and close it in the ledger.
 
         THE SALE IS BOOKED AS A SETTLEMENT ROW for the entry's fill, and that
@@ -5351,9 +5874,14 @@ class Bot:
         # is the venue's own "nothing to take".
         fill = None
         if confirmed is None:
+            # `shares` lets a caller sell a PART of the position. The split
+            # below already handles `sold < w["shares"]` -- it settles the sold
+            # leg and leaves the remainder as a real open fill -- so a partial
+            # exit needs no new booking path, only a smaller request.
             fill = await self.broker.sell_fak(
                 slug=slug, side=held, token_id=w["token"],
-                shares=w["shares"], slip=settings.cross_exit_slip)
+                shares=float(shares if shares else w["shares"]),
+                slip=settings.cross_exit_slip)
         if confirmed is not None:
             # A sale placed on an earlier tick and confirmed LATE by
             # `confirm_sale`: book it here with the venue's own numbers. NO
@@ -5376,6 +5904,18 @@ class Bot:
             # A FAK kill is a no-fill, not an error: try again next tick.
             log.info("cross exit %s: sell did not fill (%s) -- retrying next "
                      "tick", slug, getattr(self.broker, "last_failure", "?"))
+            # Some no-fills are conditions rather than moments. The venue's
+            # ~$1.5 minimum NOTIONAL refuses to BUY a near-worthless position
+            # at all, so a position whose proceeds fell under it is retried
+            # every tick for the rest of the round and can never succeed.
+            # That is the `unsellable` column in the exit research, and it is
+            # worth one message -- `exit_stuck` dedupes per slug, so the
+            # per-tick retry does not become one message per tick.
+            _why = getattr(self.broker, "last_failure", None)
+            if _why:
+                self.telegram.exit_stuck(
+                    slug=slug, side=w["side"], shares=float(w["shares"] or 0.0),
+                    reason=_why)
             return
         elif getattr(fill, "pending", False):
             # ⛔ PLACED BUT NOT YET VISIBLE -- AND THIS IS NOT A HALT. The
@@ -5494,6 +6034,14 @@ class Bot:
                  float(getattr(fill, "requested_px", None)
                        or w.get("_floor_seen") or 0.0),
                  proceeds, pnl, tau, sig_name, self.pnl)
+        # The exit notification. `sig_name` is the RULE that fired -- "react"
+        # on the model arm's reaction exit, "flip" on the cross arm -- and it
+        # is carried into the message because "we sold" and "the reason we
+        # sold" are the two facts that need to arrive together.
+        self.telegram.exit(
+            slug=slug, side=held, shares=sold, px=px, proceeds=proceeds,
+            pnl=pnl, tau=tau, rule=sig_name, running=str(self.pnl),
+            partial=not fully_closed, frac=frac)
 
     async def _cross_execute(self, *, r, sig, side, token, stake, ask,
                              ceil_side, did, up, spot, sigma, tau, wsb,
@@ -6977,11 +7525,37 @@ class Bot:
                 log.info("%s no fill for %s %s: %s (not a venue failure; "
                          "no cooldown)", arm_of(sig), r.slug, sig.side,
                          self.broker.last_failure)
+                # A BOUND REFUSING IS STILL AN ENTRY THE OPERATOR EXPECTED, so
+                # the ones where a retry could plausibly differ are reported.
+                # The transient quote-data reasons are NOT: `quote_stale`,
+                # `quote_price_missing` and `quote_unfillable` are re-quoted
+                # immediately by the next attempt, and notifying on them would
+                # train the operator to ignore the alert.
+                if self.broker.last_failure in ("limit_unfilled", "fak_unfilled",
+                                                "quote_above_ceiling",
+                                                "px_below_floor",
+                                                "size_above_cap"):
+                    self.telegram.entry_failed(
+                        slug=r.slug, side=sig.side, stake=float(stake or 0.0),
+                        reason=self.broker.last_failure, attempts=attempt + 1,
+                        did=self._decision_id_for(r.slug, sig.side),
+                        arm=arm_of(sig))
                 return fill
             self._order_cooldown_until = time.time() + settings.order_cooldown_s
             log.warning("%s order failed for %s %s after %d attempt(s); "
                         "pausing orders for %.0fs", arm_of(sig), r.slug, sig.side,
                         attempt + 1, settings.order_cooldown_s)
+            # This is the terminal failure: every attempt was made and the
+            # venue refused all of them. It is the case the RETRY NOW button
+            # exists for -- a persistent-looking refusal that a human may know
+            # is transient (a deposit that just landed, a book that just came
+            # back).
+            self.telegram.entry_failed(
+                slug=r.slug, side=sig.side, stake=float(stake or 0.0),
+                reason=getattr(self.broker, "last_failure", None),
+                attempts=attempt + 1,
+                did=self._decision_id_for(r.slug, sig.side),
+                arm=arm_of(sig))
         return fill
 
     # -- settlement ---------------------------------------------------------
@@ -7453,8 +8027,12 @@ class Bot:
                     (int(time.time() * 1000), fresh.slug))
                 self.store.conn.commit()
                 done += 1
-                log.info("settled %s -> %s (end_price=%s)",
-                         fresh.slug, fresh.winner_name, fresh.end_price)
+                # DEBUG: six lines per 5-minute roll (~3,075 in the measured
+                # window, 3.7% of the file) confirming a database write. The
+                # outcome of a round is already where it matters -- in the
+                # ledger line for the position that was actually held.
+                log.debug("settled %s -> %s (end_price=%s)",
+                          fresh.slug, fresh.winner_name, fresh.end_price)
         return done
 
     async def _resolve_round(self, row):
@@ -7913,6 +8491,13 @@ class Bot:
             # made a win look like a loss (see _reconcile_bankroll).
             self.bankroll += s.pnl
             del self.open_fills[fid]
+            # WIN / LOSS. Sent after `self.bankroll += s.pnl` so the message
+            # quotes the post-settlement equity rather than the pre.
+            self.telegram.settled(
+                slug=slug, side=fill.side, stake=float(fill.stake or 0.0),
+                payout=float(getattr(s, "payout", 0.0) or 0.0),
+                pnl=float(s.pnl or 0.0), won=bool(s.won),
+                bankroll=float(self.bankroll))
             # Live winnings sit as a claimable position until redeemed; they do
             # not credit the wallet on their own. This is the FAST path -- the
             # venue sometimes rejects a not-yet-final position here, and
@@ -8072,8 +8657,25 @@ class Bot:
             n += 1
             if n % 60 == 0:
                 c = self.store.counts()
-                log.info("stats: rounds=%d quotes=%d decisions=%d fills=%d | %s",
-                         c["rounds"], c["quotes"], c["decisions"], c["fills"], self.pnl)
+                # INFO when a FILL has arrived since the last tick, and once
+                # every 30 min so that a silent log is still distinguishable
+                # from a dead one; DEBUG otherwise.
+                #
+                # MEASURED 2026-09-22: this heartbeat was 5,817 of 83,209 lines
+                # (7.0%), and 2,342 of those said only "no trades". The counters
+                # move every minute BY CONSTRUCTION, so "something changed" was
+                # never a signal -- every minute was identical in content. The
+                # one field that means money moved is `fills`.
+                moved = c["fills"] != getattr(self, "_stats_fills", None)
+                self._stats_fills = c["fills"]
+                if moved or n % 1800 == 0:
+                    log.info("stats: rounds=%d quotes=%d decisions=%d fills=%d | %s",
+                             c["rounds"], c["quotes"], c["decisions"],
+                             c["fills"], self.pnl)
+                else:
+                    log.debug("stats: rounds=%d quotes=%d decisions=%d fills=%d | %s",
+                              c["rounds"], c["quotes"], c["decisions"],
+                              c["fills"], self.pnl)
             elapsed = time.time() - t0
             if elapsed * 1000.0 >= _SLOW_TICK_MS:
                 log.warning("slow tick %.2fs: %s", elapsed,
@@ -8130,10 +8732,108 @@ class Bot:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+        # The notifier last, and deliberately NOT awaited on the way in -- a
+        # shutdown that waits on api.telegram.org is a shutdown that can hang
+        # on a Telegram outage. `stop()` has already set `_stop`, so anything
+        # still queued is dropped and the in-flight send is cancelled.
+        with contextlib.suppress(Exception):
+            await self.telegram.stop()
         log.info("stopped. final: %s", self.pnl)
 
     def stop(self) -> None:
         self._stop.set()
+
+
+class _RepeatFilter(logging.Filter):
+    """Collapse a WARNING/ERROR that repeats in a loop to one line per window.
+
+    MEASURED 2026-09-22 over `data/live.log` (83,209 lines, 5.6 days): ONE
+    condition -- the venue refusing a quote with `-9000 Please ensure your
+    account has enough USDT`, and later `-9000 The market lacks enough liquidity
+    for this trade` -- accounted for **14,801 lines, 17.8% of the entire file**,
+    one per attempted trade at every round roll, for three days.
+
+    It is a real condition, and the FIRST occurrence is worth an ERROR. The
+    fourteen-thousandth is not: its only effect is that `grep -i error` returns
+    14,801 hits, so the one error that is new and different is invisible. That
+    is the whole argument -- this is not about disk, it is about what an
+    operator can still see.
+
+    The first occurrence always passes, at its own level, with `exc_info`
+    intact. Identical repeats within `window_s` are dropped, and the condition
+    re-announces itself once per window carrying its running count and how long
+    it has lasted -- so a condition that is STILL happening can never go
+    silent. It stops repeating itself, which is a different thing. The
+    re-emission drops `exc_info`: a traceback every five minutes for a fault
+    that has not changed is the same noise in a longer format.
+
+    Keyed on (logger, level, fully-formatted message), so two different errors
+    are never merged into one line. `log_level=DEBUG` bypasses it entirely, on
+    the same principle as `_quiet_libraries`.
+    """
+
+    def __init__(self, window_s: float = 300.0, max_keys: int = 256) -> None:
+        super().__init__()
+        self.window_s = window_s
+        self.max_keys = max_keys
+        # key -> [first_seen, last_emitted, count]
+        self._state: dict[tuple, list] = {}
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+        if record.levelno < logging.WARNING:
+            return True
+        # THE KEY COMES FROM THE ORIGINAL TEXT, computed once and stashed on the
+        # record. A re-emission below REWRITES `record.msg`/`record.args`, and
+        # the same record object is handed to each root handler in turn, so
+        # calling `getMessage()` again in a second handler would hash the
+        # mutated text -- counting one event as two different ones. Stashing
+        # gives a stable key: the first handler decides, and any further handler
+        # sees the key already emitted inside the window and drops the line.
+        # This filter therefore assumes the single handler `basicConfig`
+        # installs, which is what `_quiet_repeats` finds on the root logger.
+        text = getattr(record, "_rp_text", None)
+        if text is None:
+            try:
+                text = record.getMessage()
+            except Exception:                               # noqa: BLE001
+                return True
+            record._rp_text = text
+        key = (record.name, record.levelno, text)
+        now = time.time()
+        st = self._state.get(key)
+        if st is None:
+            if len(self._state) >= self.max_keys:
+                # Drop the coldest half rather than grow without bound: a bot
+                # that runs for months must not leak one entry per distinct
+                # error string.
+                coldest = sorted(self._state, key=lambda k: self._state[k][1])
+                for k in coldest[:self.max_keys // 2]:
+                    self._state.pop(k, None)
+            self._state[key] = [now, now, 1]
+            return True
+        st[2] += 1
+        if now - st[1] < self.window_s:
+            return False
+        st[1] = now
+        record.msg = "%s  [repeated %d times over %.0fs]"
+        record.args = (text, st[2], now - st[0])
+        record.exc_info = None
+        record.exc_text = None
+        return True
+
+
+def _quiet_repeats(window_s: float = 300.0) -> None:
+    """Install `_RepeatFilter` on the root HANDLERS.
+
+    On the handlers, not on the root logger: a filter attached to a logger only
+    sees records logged THROUGH that logger, and every line worth suppressing
+    here comes from a child (`btcpredict.execution.live`), which reaches the
+    handler by propagation and never touches the root logger's own filters.
+    """
+    if settings.log_level.upper() == "DEBUG":
+        return
+    for h in logging.getLogger().handlers:
+        h.addFilter(_RepeatFilter(window_s))
 
 
 def _quiet_libraries() -> None:
@@ -8176,6 +8876,7 @@ async def amain() -> None:
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
     _quiet_libraries()
+    _quiet_repeats()
     store = Store(settings.db_path)
     async with aiohttp.ClientSession() as session:
         bot = Bot(args.mode, store, session)

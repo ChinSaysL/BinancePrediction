@@ -499,7 +499,38 @@ class Settings(BaseSettings):
     limit_ask_tick: float = 0.01
     # Never buy a favourite richer than this: the payoff asymmetry out there
     # exceeds what the model's calibration can support.
-    max_quote: float = 0.90
+    #
+    # 0.90 -> 0.70 on 2026-09-21, from the arm's OWN entries bucketed by the
+    # price actually paid (`tools/model_knob_sweep.py --mode price`, btc-updown-5m,
+    # Binance only, 2,736 rounds / 13.26 days, cost = fill + fee). The TOP of the
+    # band is the only slice that loses, and capping there removes it:
+    #   cost band      n    win    be=cost   gap      EV/$cost   tot $
+    #   0.55-0.65     68  69.1%   0.603   +0.088   +0.1513    +10.3
+    #   0.65-0.70     59  79.7%   0.675   +0.122   +0.1770    +10.4
+    #   0.70-0.75     70  78.6%   0.727   +0.058   +0.0798     +5.6
+    #   0.75-0.80     62  80.6%   0.774   +0.032   +0.0412     +2.6
+    #   0.80-0.85     65  75.4%   0.822   -0.069   -0.0832     -5.4  <- the loss
+    #   0.85-1.01     94  90.4%   0.880   +0.024   +0.0257     +2.4
+    # CUMULATIVE -- `max_quote` against the whole arm:
+    #   0.95  33.6/d  WR 78.4%  EV +0.0689  t +2.43  day-t +2.93  dDay +0.061  $30.7
+    #   0.85  30.5/d  WR 76.7%  EV +0.0759  t +2.44  day-t +2.80  dDay +0.068  $30.7
+    #   0.80  28.0/d  WR 74.9%  EV +0.0814  t +2.40  day-t +3.02  dDay +0.074  $30.2
+    #   0.70  20.1/d  WR 71.1%  EV +0.1115  t +2.48  day-t +3.35  dDay +0.100  $29.6
+    #   0.65  15.6/d  WR 68.6%  EV +0.1407  t +2.56  day-t +3.68  dDay +0.128  $29.1
+    # ⛔ THE TOTAL DOLLARS ARE FLAT from 0.65 to 0.95. The cap does not add money;
+    # it removes the worst third of the trades at the same P&L, i.e. the same
+    # profit on a third less exposure (which at a fixed stake is a smaller
+    # drawdown). 0.70 over 0.65: 0.65 keeps only half the trades for ~2% more
+    # dollars and a win rate below the arm's own mean.
+    # WHAT CARRIES IT is the direction test -- both halves improve at 0.70
+    # (+0.123/+0.100) against 0.85 (+0.080/+0.072) -- not the pooled level.
+    # Caveat: 13.26 days, and the 0.80-0.85 band on its own is t -1.27.
+    # ⛔ THIS CAP IS NOW BELOW `impulse_max_price` (0.75), which inverts the
+    # ordering `tests/test_limit_execution.py` used to assert. Nothing is broken
+    # by it -- the two arms have independent, separately measured bands and the
+    # impulse arm is off (`entry_mode=model`) -- but if it is ever re-enabled its
+    # band must be re-measured against this cap rather than inherited from 0.90.
+    max_quote: float = 0.70
     # Fee is per-price: fee_bps = 180 * min(1, (1-px)/px), capped at 180 bps
     # below px 0.50. Cheap longshots pay the cap; favourites are cheap. This
     # floor and the re-sweep under the true curve agree on 0.25 (+$8.98 vs
@@ -835,7 +866,16 @@ class Settings(BaseSettings):
     # where it stops paying. Note the arm is only MARGINALLY positive even here
     # (+0.018/$1 under the harsher slippage model) -- it is a supporting arm,
     # not a driver.
-    model_min_round_range_bps: float = 0.0
+    #
+    # RESTORED to 5.0 on 2026-09-21. It had been opened to 0.0, which this table
+    # already refutes. Re-swept with `tools/model_knob_sweep.py --mode all
+    # --exclude-pm --family btc-updown-5m`, live band [0.50,0.85] tau [60,210],
+    # 2,292 Binance rounds / 8.13 d, 1 s latency:
+    #   min_range 5  n=298  36.6/d  WR 76.5%  paid 0.717  EV +0.0766  t +2.09  day-t +3.02  H +0.105/+0.048  dDay +0.0691
+    #   min_range 0  n=442  54.4/d  WR 72.9%  paid 0.700  EV +0.0455  t +1.41  day-t +2.36  H +0.058/+0.033  dDay +0.0398
+    # 5.0 wins every statistic and the direction repeats in BOTH halves, so it
+    # is not a fitted spike: it buys 33% FEWER trades at 68% MORE per trade.
+    model_min_round_range_bps: float = 5.0
     # ⛔ 12.0 -> 16.0 on 2026-09-19. The 12 above was fitted with a replay that
     # was wrong five ways: it priced every Up fill at the BID, used BTCUSDT's
     # sigma for every family, modelled the taker fee at ~60% of the charge,
@@ -851,6 +891,343 @@ class Settings(BaseSettings):
     # shipped cell tests at p = 0.0017 PRE-SPECIFIED, and best-of-grid at
     # p = 0.0017 multiplicity-honest.
     model_max_round_range_bps: float = 16.0
+    # ============================ REACTION ZONE ============================
+    # THE STRIKE IS THE REACTION LEVEL: the payout is written against it, so a
+    # round whose price keeps flipping across it is one where the price is
+    # BOUNCING OFF the level rather than leaving it, and an entry there is a
+    # coin flip dressed as a favourite. Refuse when the spot has already crossed
+    # the strike this many times. 0 = off.
+    #
+    # MEASURED 2026-09-22, `tools/model_knob_sweep.py --mode zone --family
+    # btc-updown-5m --exclude-pm --use-live-sigma`: 2,750 Binance rounds /
+    # 13.69 days, live band [0.50,0.70] tau [60,210] persistence 2, the LIVE
+    # per-tick sigma, one entry per round, fills at the executable ask.
+    # The arm's own entries (n=181) split by how many times the spot had crossed
+    # the strike BEFORE the entry tick, counted on the 1 Hz tape the replay has:
+    #     crossings   n    win    be=cost   gap      EV/$cost   tot $      t
+    #     0-2       138  71.0%   0.631   +0.079   +0.1264   +17.44   +2.01
+    #     3-4        33  54.5%   0.626   -0.081   -0.1556    -5.13   -1.13
+    # The bad cohort is a 33-entry hole worth -$5.13 and it is NOT the
+    # distance filter in disguise: its mean margin over the strike is 0.67 sigma
+    # against 0.64 for the good one, i.e. the two are the SAME average distance
+    # from the strike and differ only in how often they had been through it.
+    # ⭐ ON DRAWDOWN (2026-09-22, same command + the maxDD columns): this gate
+    # costs NOTHING in pain. baseline maxDD -14.84 / return-per-pain 1.79 vs
+    # keep<=3 -15.93 / 1.79, keep<=2 -13.02 / 1.53, @k0.5 deadband -14.84 / 1.91.
+    # The @k0.5 direction still FLIPS, so the shipped value's PLATEAU is what is
+    # being defended -- not a fitted cell.
+    # As a gate, applied INSIDE the loop (a refused tick still extends the
+    # persistence streak, as the live chain does):
+    #     baseline            n=181  13.2/d  WR 68.0%  EV +0.0732  t +1.31  day-t +0.46  dDay +0.0468
+    #     keep <=4 crossings  n=162  11.8/d  WR 68.5%  EV +0.0848  t +1.43  day-t +1.67  dDay +0.0731
+    #     keep <=3 crossings  n=140  10.2/d  WR 70.0%  EV +0.1015  t +1.62  day-t +1.70  dDay +0.0883
+    #     keep <=2 crossings  n= 98   7.2/d  WR 70.4%  EV +0.1017  t +1.37  day-t +2.26  dDay +0.0891
+    # DIRECTION (the ranking must repeat in both halves, the only check that
+    # separates a rule from a fitted split):
+    #     off  vs <=3   h1 +0.0162 -> +0.0277   h2 +0.1284 -> +0.1843   REPEATS
+    #     <=4  vs <=3   h1 +0.0091 -> +0.0277   h2 +0.1684 -> +0.1843   REPEATS
+    #     <=3  vs <=2   h1 +0.0277 -> +0.0293   h2 +0.1843 -> +0.1835   FLIPS
+    #     off  vs <=4   h1 +0.0162 -> +0.0091   h2 +0.1284 -> +0.1684   FLIPS
+    # So the effect SATURATES between 2 and 3 (identical EV, +0.1015 against
+    # +0.1017), and 4 is simply too loose to reach it -- 3 is the loose end of
+    # the flat part, chosen to keep the 42 extra trades.
+    # ⛔ NOT AT THIS REPO'S t>=2 BAR (t +1.62) and the pooled gain leans on the
+    # second half. Shipped ON because the direction repeats in both halves, the
+    # count is 23% lower and drop-best-day nearly doubles (+0.047 -> +0.088).
+    # ⛔ THE SAME TWO CLAIMS THAT LOOKED LIKE REACTION ZONES AND ARE NOT:
+    #   * the DISTANCE form (`min_moneyness_sd`, or "do not buy a favourite that
+    #     leads the strike by less than X sigma"): every floor from 0.30 to 1.00
+    #     was swept and `margin 0.0 vs 0.60` FLIPS between halves (+0.0162 ->
+    #     +0.0565 in h1, +0.1284 -> +0.1213 in h2) -- a fitted split, not a
+    #     finding. It also agrees with the older walk-forward sweep of
+    #     `min_moneyness_sd` (floors 0.25-1.50 all score worse than 0.0).
+    #     ⛔ RE-RUN 2026-09-22 AS A DRAWDOWN CHECK AND IT CAME BACK `REPEATS`
+    #     (h1 +0.0049 -> +0.0389, h2 +0.1408 -> +0.1409) on the SAME command --
+    #     so two replays of one comparison DISAGREE, which is what a coin flip
+    #     looks like when you rerun it. A margin floor is also unmeasurable on
+    #     the Binance era (every margin bucket n<8). DO NOT SHIP on this. It is
+    #     one line in .env (`MIN_MONEYNESS_SD=0.30`) if a later run makes the
+    #     two agree. On drawdown it looks free (margin>=0.3: maxDD -14.71 with
+    #     return-per-pain 2.38 against baseline -14.84 / 1.79) -- which is
+    #     exactly the shape that tempts you to ship a coin flip. Do not.
+    #     Our
+    #     edge comes from the venue's quote lagging spot, which is LARGEST when
+    #     the move is small; refusing small moves removes the edge with the risk.
+    #   * a crossings count read WITHOUT resampling. See
+    #     `main.Bot._strike_crossings`: the live poll grid is a median 58 ms
+    #     against the 1 Hz tape this value was fitted on, and jitter around the
+    #     strike flips a raw `spot > strike` dozens of times per real crossing.
+    # WHAT TO WATCH, stated before the fact: the replay says the entry rate goes
+    # 13.2/day -> 10.2/day and EV +0.073 -> +0.102 per $1. If the refused cohort
+    # is NOT worse than the kept one over the first ~100 live fills, the venue
+    # has repriced what the tape says it had not -- put this back to 0.
+    # REVERT = 0 here plus `model_max_strike_crossings=0` in .env, then restart.
+    model_max_strike_crossings: int = 3
+    # ===================== MODEL ARM: EXIT ON REACTION =====================
+    # SELL a model position when the price has just REACTED against it. This is
+    # the first exit rule in this repo that measurably beats holding, and it is
+    # the only form that can: see the `predict` measurement -- exit beats holding
+    # iff the bid exceeds the position's true worth, our model's own fair is
+    # WORSE at predicting the settlement than the market's bid (Brier 0.2140 vs
+    # 0.2096), so every rule keyed on it is noise plus a spread.
+    #
+    # MEASURED 2026-09-22, `tools/model_knob_sweep.py --mode react --family
+    # btc-updown-5m --since-ms 1789880000000 --use-live-sigma`, i.e. the
+    # BINANCE ERA ONLY (301 rounds / 2.06 days; `--exclude-pm` alone pools eras,
+    # which produced a set of tables that had to be retracted). 44,056 ticks in
+    # the decision window. `d = bid - outcome`, so E[d] IS the sell edge:
+    #   state                        n     E[bid-p]   bid    win rate
+    #   all in-window             44,056    -0.0166   0.7618   0.7783
+    #   REACTION 20s >= 3bps       2,240    +0.0317   0.7397   0.7080
+    #   REACTION 20s >= 5bps         783    +0.0641   0.7652   0.7011
+    #   REACTION 10s >= 5bps         322    +0.0564   0.8017   0.7453
+    #   REACTION 40s >= 8bps         286    +0.0414   0.7757   0.7343
+    #   *mirror* (moved FOR us)    5,333    -0.0148   0.8258   0.8406
+    # READ THE BID AGAINST THE WIN RATE. On average the venue UNDERPAYS our side
+    # by 1.7c, so holding is right. When the price has just reacted against us
+    # the venue still pays 0.7652 for something worth 0.7011 -- it pays 6.4c
+    # MORE than the position is worth -- and the mirror bucket is negative. The
+    # edge rises monotonically with the trigger across lookbacks 10/20/40s.
+    # WHY IT WORKS WHEN A STOP DOES NOT: this is the venue LAGGING the spot, the
+    # same mispricing the entry harvests, caught on the way out. A take-profit
+    # and a price stop both failed because price alone carries no information
+    # (the stop takes the win rate from 68% to 24%); this carries information.
+    #
+    # 5bps over 20s is chosen over 3bps because the TOTAL is the same
+    # (fires in 66 vs 144 of 301 rounds at +0.064 vs +0.032 per share), and 5
+    # has the better round-clustered t (+1.98), the larger edge that survives
+    # even a 2c slippage assumption, and a smaller sample of sales to execute.
+    #
+    # ⛔ NOT AT THIS REPO'S BAR: round-clustered t +1.98 sits ON the t>=2 line,
+    # on 2 days. The >=8bps cell flips negative (n=148, 22 rounds), so the
+    # plateau's edge is noisy. And the STRATEGY gain is P(fires) x edge, not the
+    # per-tick edge, i.e. ~+0.014 per share, ~2% of stake.
+    # KILL CRITERION, stated before the fact: over ~40 exits, if the realised
+    # P&L of the exits is NOT better than holding those same positions, set this
+    # to False and restart. REVERT = `MODEL_EXIT_ON_REACTION=false` in .env.
+    model_exit_on_reaction: bool = True
+    # HOW MUCH of the position to sell on the reaction. 1.0 = all of it.
+    #
+    # ⛔ 1.0 WAS THE WRONG QUESTION, and the objective was mis-stated. The point
+    # is not EV, it is the LOSS TAIL: on a binary held to the bell, 32% of the
+    # arm's trades lose the ENTIRE stake, and that is the outcome that hurts.
+    # Measured 2026-09-22 (`--mode exit`, btc-5m; `whole-stake` = share of trades
+    # that lose 100% of the stake, `worst` = the single worst trade):
+    #   variant              whole-stake   WR     EV/$1    tot@$2
+    #   HOLD                    32.0%     68.0%  +0.0732   +$26.50
+    #   reaction, sell 100%     24.9%     58.0%  +0.0409   +$14.82
+    #   reaction, sell  25%     24.9%     68.0%  +0.0651   +$23.58
+    #   reaction, sell  50%     24.9%     68.0%  +0.0571   +$20.66
+    #   reaction, sell  75%     24.9%     63.5%  +0.0490   +$17.74
+    # THE FULL-LOSS RATE IS IDENTICAL AT EVERY FRACTION, because it is set by
+    # the positions the rule never fires on -- they still settle at 0. So 25%
+    # DOMINATES 50% and 75%: same tail protection, more money kept. And `worst`
+    # is -1.00 in EVERY row including the partials -- a partial exit cannot
+    # remove a full loss, it can only shrink the ones it catches.
+    # WHY 25% AND NOT LESS: the money saved on the tail is `frac x (1 + the exit
+    # loss)` per rescued trade, so a token fraction flips the COUNT without
+    # saving a meaningful amount. At 25% the arm gives up ~$2.9 of EV to save
+    # ~$6.1 of tail -- a favourable rate for an account that does not want to
+    # take a full loss. Binance-era only (13 entries, unreadable):
+    #   HOLD         whole-stake 30.8%  EV +0.1190  tot +$3.09
+    #   reaction 25% whole-stake 15.4%  EV +0.1206  tot +$3.14
+    # i.e. HALF the full losses at the same P&L.
+    # ⭐ DRAWDOWN, ADDED 2026-09-22 (`--mode exit`, columns maxDD / tot|maxDD|):
+    # the loss-tail table above is about the SHAPE of the distribution and the
+    # total is nearly blind to it, so every rule tried was re-scored on the
+    # equity curve. Pooled 181 entries, $2 flat:
+    #   rule                 tot@$2   maxDD   tot/|maxDD|  worst streak  5 worst
+    #   HOLD                 +$26.50  -14.84     1.79         3          -10.00
+    #   fair drops -0.20     +$26.34  -11.24     2.34         4          -10.00
+    #   tp +35%              +$21.66  -11.25     1.93         3          -10.00
+    #   tp +20%              +$21.61  -12.14     1.78         3          -10.00
+    #   bid >= fair -0.02    +$14.11   -7.69     1.84         5          -10.00
+    #   react 25% (SHIPPED)  +$23.58  -15.04     1.57         3          -10.00
+    #   react 100%           +$14.82  -15.62     0.95         6          -10.00
+    #   stop -0.02 (bid)      +$0.46  -10.97     0.04        16          -10.00
+    #   stop -10% (bid)       +$1.34  -13.33     0.10        12          -10.00
+    # Binance era only (13 entries): HOLD -$4.00 maxDD / 0.77 / tail -0.716 vs
+    # react 25% -$3.54 / 0.89 / -0.645 -- the partial exit IS shallower here.
+    # WHAT THIS SETTLES. (1) The SHIPPED exit is worse than HOLD on pooled
+    # drawdown (-15.04 vs -14.84) and better on the clean era; it converts
+    # winners into small losses, which lengthens streaks (6 for the full exit).
+    # (2) EVERY STOP IS CATASTROPHIC on both axes (16 and 12 losers in a row,
+    # return per unit of pain 0.04 and 0.10) -- stops are CLOSED, do not re-run.
+    # (3) The 5-worst column is -1.0000 in EVERY pooled row: no rule tried
+    # changes the five worst trades at all. Only the middle moves.
+    # (4) `fair drops -0.20` is the only strict dominance (same money, 24%
+    # shallower) but it sells at 0.531 against 0.632 paid -- exitPnL>0 on 9.8%
+    # of exits, i.e. a stop in disguise -- t +1.49, and the full-loss rate only
+    # goes 32.0% -> 21.5%. NOT SHIPPED.
+    #
+    # ⭐ TWO FAMILIES ADDED 2026-09-22 TO TEST (3), i.e. CAN THE TAIL BE REMOVED:
+    # the CLOCK exit (`sell everything at tau <= T`, the only rule that removes
+    # the -100% by construction) and the TRAILING exit (sell after the bid gives
+    # back X from its own high-water mark -- no constant to fit). `halfDD` is the
+    # maxDD of each half separately, because maxDD is a whole-curve statistic and
+    # the both-halves EV test does not transfer to it.
+    #   rule                tot@$2   maxDD   pain  halfDD h1/h2  full-loss  streak
+    #   HOLD                +$26.50  -14.84  1.79  -14.84/-4.79    32.0%       3
+    #   trail 0.12           +$14.37   -6.13  2.34   -6.13/-4.28     9.9%       6
+    #   bid >= fair -0.02    +$14.11   -7.69  1.84   -7.69/-4.08    11.0%       5
+    #   trail 0.08            +$3.23   -8.88  0.36   -8.88/-3.65     8.3%       6
+    #   tp +10%               +$4.98   -8.56  0.58   -8.56/-6.83    15.5%       2
+    #   clock tau<=10        +$20.00  -14.22  1.41  -14.22/-5.68    26.5%       3
+    #   clock tau<=60         +$6.81  -10.19  0.67   -8.16/-10.19   13.3%       4
+    #   clock tau<=180       -$17.60  -17.66 -1.00  -12.89/-9.04     2.2%       8
+    #   clock tau<=210       -$19.81  -20.25 -0.98  -14.18/-8.40     2.2%      10
+    # THE TAIL IS NOT REMOVABLE, and the floor is STRUCTURAL, not tunable: 4 of
+    # the 181 positions die whole at tau<=210 because the venue's 1.5 USDT
+    # minimum NOTIONAL refuses to buy a position that is already nearly
+    # worthless (the `unsellable` column). No exit can reach those. And buying
+    # the rest out costs the entire profit and then some: 32.0% -> 2.2% for
+    # +$26.50 -> -$19.81, i.e. $46.31 to remove 29.8 points, 1.75x what the arm
+    # earns. The clock exit is bad on the clean era too (Binance: -$0.16 against
+    # +$3.09, and a DEEPER maxDD, -4.46 vs -4.00). CLOCK EXIT IS CLOSED.
+    # THE TRAIL FAMILY is the only thing in this whole programme that cuts the
+    # drawdown in BOTH halves (-14.84/-4.79 -> -6.13/-4.28 at 0.12), and on the
+    # clean era it moves maxDD -4.00 -> -2.0..-2.5 and the 5-worst tail
+    # -0.716 -> -0.33..-0.56 in EVERY setting. But: (a) its EV H column FLIPS in
+    # 4 of 5 distances (-0.04, -0.08, -0.20 flip; -0.12 and -0.30 repeat) and
+    # 0.12 is simultaneously the maxDD minimum -- a fitted cell, not a plateau;
+    # (b) it is a PRICE rule: at 0.12 the win rate falls 68.0% -> 48.6% and
+    # exitPnL>0 is 25.7%, i.e. it realises a LOSS on 3 of 4 exits; (c) it costs
+    # 46% of the P&L. NOT SHIPPED. Re-open only if the 0.12 basin survives on
+    # the Binance era at >=40 exits.
+    # ⛔ NOT AT THE t>=2 BAR: the Binance sample is 13 entries / 5 exits. The
+    # pooled sample above is era-contaminated (168 earlier-era + 13 Binance).
+    # ============ THE SAMPLE MAP, CORRECTED 2026-09-22 =======================
+    # ⛔ I HAD BEEN REPORTING ON A 2.07-DAY SLICE AND CALLING THE REST
+    # "ERA-CONTAMINATED". That was wrong twice over:
+    #   * the DB holds 15 days of btc-updown-5m (3,473 rounds, ALL Binance).
+    #     `--exclude-pm` ALREADY handles the venue. `--since-ms 1789880000000`
+    #     is the start of the CURRENT CONFIG regime, not a venue boundary --
+    #     it was written to reconcile a replay against a live run, and I had
+    #     been reading it as "the era".
+    #   * the real boundary is the TAPE, and it is measurable:
+    #     `quotes.book_age_ms` is **0.0% populated on 09-08..09-14** and
+    #     88.9% on 09-15 rising to ~95% after. Two recording regimes.
+    # THE BLOCKS, and the shipped exit measured on each ($2 flat, live band):
+    #   block                          n     HOLD      react25%   delta    full-loss
+    #   era1 CHAINLINK 09-08..09-14   ~100   (see pooled remainder)        --
+    #   era2 CHAINLINK 09-15..09-22     77  +$19.46    +$17.18   -$2.28   28.6->22.1
+    #   era2 twap      09-16..09-19    127  -$26.68    -$25.69   +$0.99   45.7->40.9
+    #   pooled 181 (era1+era2, CHAINLINK)   +$26.50    +$23.58   -$2.92   32.0->24.9
+    # SO THE SHIPPED EXIT COSTS MONEY IN 3 OF 4 BLOCKS and reduces the full-loss
+    # rate in ALL of them. era1 is -$1.63 by subtraction. The rule is a genuine
+    # tail trade, not a P&L win, and `tot|maxDD|` says the same on era2 CHAINLINK
+    # (4.87 -> 4.30): it is not even a drawdown-adjusted win there.
+    # ⭐ THE ONE DIRECTION THAT SURVIVES THE PROPER SAMPLE: `rev_bps 5 -> 3` is
+    # the ONLY setting whose drawdown is SHALLOWER THAN HOLDING, and it does it
+    # on two blocks independently:
+    #   pooled        maxDD -14.84 -> -14.57, full-loss 32.0% -> 17.1% (best)
+    #   era2 CHAINLINK maxDD  -4.00 ->  -3.62, full-loss 28.6% -> 14.3% (best)
+    # at ~20% of the P&L. It FAILS on the twap block (-27.57 against -25.69), so
+    # it is 2 of 3 and NOT SHIPPED. Re-check when era2 has more entries.
+    # ⚠️ ALSO CONSISTENT ON THE PROPER SAMPLE: `frac` is monotone toward ZERO and
+    # `look 10s` is nearly free (+$19.29 against HOLD's +$19.46 with full-loss
+    # 26.0% against 28.6%) -- i.e. the cheapest tail protection is the SMALLEST
+    # exit, which is the family-level statement the pooled table already made.
+    # TOOL: `--only-pm` now selects the twap block; use it with `--exclude-pm`'s
+    # complement as the third independent sample instead of discarding it.
+    # MEASURED 2026-09-22, one knob moved at a time off the shipped row
+    # (`--mode exit`, both scopes). The result is a CONTRADICTION, and it is the
+    # reason none of these moved:
+    #   knob        pooled (181) best      Binance (13) best     verdict
+    #   frac        0.10, monotone to 0    1.00, monotone to 1   OPPOSITE
+    #   rev_bps     3.0 (dd -14.57)        6.0                   CONFLICT
+    #   look_s      60.0 (+$24.97)         10.0                  OPPOSITE
+    #   min_tau     60: inert below,       60                    AGREES
+    #               worse above
+    #   min_hold    30s (fewer, later)     no read (n=13)        n/a
+    # SPECIFICS. `look 60s` is a STRICT improvement on pooled (+$1.39 of total,
+    # full-loss 24.9% -> 19.9%, maxDD -15.04 -> -14.71, and both halves improve:
+    # +0.003/+0.127 -> +0.006/+0.131 over a 45-60s plateau) and on the Binance
+    # era it is the WORST of the six settings on money and second-worst on
+    # drawdown (+$2.36 against +$3.14 shipped; maxDD -4.00 against -3.54;
+    # full-loss 23.1% against 15.4%). `frac` is monotone in OPPOSITE directions
+    # on the two scopes. `rev 3bps` wins pooled and loses Binance. So the
+    # parameter surface is NOT PORTABLE across the era boundary and no knob here
+    # can be moved on this evidence.
+    # ⭐ ONE FACT THAT IS ARITHMETIC, NOT STATISTICS: `whole-stake -100%` is
+    # 24.9% at EVERY frac from 10% to 100%. The tail benefit is a STEP, not a
+    # dial -- a 10% partial exit already moves a rescued trade from -100% to
+    # ~-90%, which is outside the <=-99% bucket. So the fraction cannot be
+    # chosen on the tail axis at all; only on money, where the eras disagree.
+    # ⚠️ A 10% EXIT SAVES ~10c ON THE DOLLAR of each rescued loss. Read
+    # "full-loss rate halved" as "that trade no longer loses essentially
+    # EVERYTHING, and 90% of it is still gone" -- not as the loss being avoided.
+    # WHAT WOULD ACTUALLY IMPROVE THIS: not a knob. At 5 exits per 13 entries
+    # the replayed optima are fits; the live era needs enough exits to rank
+    # these directions on its own before any of them is worth setting.
+    # ============ min_tau 60: VERIFIED, AND WHAT THE CHECK FOUND =============
+    # MEASURED 2026-09-22. `min_tau` 0/15/20/25/30 all return the SAME row (46
+    # exits, +$23.89), and "identical to the digit" is also how an UNWIRED flag
+    # looks (this repo has been bitten by that -- see the inert `--price-mode`
+    # in the cross-arm memory), so the tool now logs the tau of every exit.
+    # It is genuinely inert, not broken: the earliest exit anywhere is tau 37s,
+    # and the sweep MOVES above 30 (40->45 exits, 45->44, 60->42, 75->37,
+    # 90->34). On the Binance era it is inert all the way to 60 (all 5 exits are
+    # at tau >= 60), so lowering it to 0 changes nothing on the era we trade.
+    # ⭐ TAU OF THE 46 POOLED EXITS (shipped trigger, min_tau=0 so nothing is
+    # masked): 30-45: 2 | 45-60: 2 | 60-75: 5 | 75-90: 3 | 90-120: 3 |
+    # 120-150: 10 | 150-210: 21.  Median 149s, earliest 37s.
+    # READ THAT AGAINST max_tau_s = 210: 21 of 46 exits (46%) fire at tau
+    # 150-210, i.e. within ~60s of the latest possible entry. THIS RULE IS
+    # MOSTLY CATCHING "I entered and it immediately went against me", which is
+    # a statement about ENTRY TIMING, not about exiting. The consequence was
+    # tested as an entry-side gate (`no-rev Nbps/20s`, see `--mode zone`).
+    # ============ THE LIVE RATE, MEASURED (why the exit has not fired) ========
+    # 2026-09-22: `fills` holds 20 `live`-mode fills inside the 2.07-day
+    # Binance era = 9.7 entries/day (the replay's live band scores 13 of them).
+    # At the replay's 38% fire rate that is ~3.7 exits/day, so the ~40 exits the
+    # kill criterion needs is about 11 DAYS away, not a multi-week mystery --
+    # and `grep -icE "MODEL exit" data/live.log` = 0 with `OPEN MODEL` = 49 all
+    # time, because the arm has had only 2 positions since the ship.
+    # ⛔ DATA TRAP: `fills.mode` is in {'paper','live','ticket','double',
+    # 'stale_maker','cross','impulse','train','reversal_15m'} -- there is NO
+    # 'model'. Model-arm fills are recorded as mode='live'. A query for
+    # mode='model' returns ZERO ROWS SILENTLY, and `decisions` has no `mode`
+    # column at all. Count this arm with mode='live', never 'model'.
+    # ============ THE ENTRY-SIDE MIRROR OF THE EXIT (--mode zone) ============
+    # The tau diagnostic above says the exit mostly catches "entered and it
+    # immediately reacted", so the same test was pointed at the ENTRY: refuse a
+    # tick where the spot has already moved against the proposed side. Pooled it
+    # is the best entry-side result in this file:
+    #   gate            n    EV/$1    t     maxDD   tot/|maxDD|  H h1/h2
+    #   off           181  +0.0732  +1.31  -14.84     1.79     +0.005/+0.141
+    #   no-rev 3/20s  163  +0.0745  +1.26  -16.33     1.49     +0.036/+0.113
+    #   no-rev 3/60s  157  +0.0965  +1.57  -11.92     2.54     +0.059/+0.133
+    #   no-rev 5/60s  173  +0.0794  +1.35  -12.31     2.23     +0.054/+0.104
+    # `no-rev 3bps/60s` is +32% EV, +20% t, 20% SHALLOWER maxDD, return-per-pain
+    # 1.79 -> 2.54, dDay +0.047 -> +0.084, and both halves improve; and at BOTH
+    # thresholds the 60s window beats the 20s one, so the direction repeats.
+    # ⛔ AND IT IS A DISASTER ON THE ERA WE TRADE (Binance, 12-13 entries):
+    # EV +0.1190 -> -0.0548, maxDD -4.00 -> -6.00, t -0.22. Every active cell is
+    # equal or worse there. SAME PATTERN AS EVERY OTHER KNOB IN THIS BLOCK: the
+    # pooled sample offers an improvement the traded era rejects. NOT SHIPPED.
+    # ⭐ THE MECHANISM WORTH KNOWING (and it is why this looked good at first):
+    # the gate does not REMOVE an entry, it DELAYS it. At no-rev 4bps and 5bps
+    # the Binance entry COUNT is still 13 while EV falls +0.1190 -> -0.0100 --
+    # the same 13 rounds, entered at a LATER, worse tick. Any gate on the entry
+    # chain must be read on the price paid, not on the trade count: n unchanged
+    # is not "the gate did nothing".
+    # ⚠️ WHAT THE RUN SURFACED: the third independent example of one rule. Every
+    # pooled optimum in this family has been contradicted on the Binance era in
+    # the OPPOSITE direction (frac, look_s, rev_bps, and now this). At ~13
+    # entries the traded era cannot rank anything -- which is exactly why the
+    # kill criterion is stated in EXITS, not in replayed EV.
+    # KILL CRITERION: over ~40 exits, if the full-loss rate is not lower AND the
+    # P&L is materially worse than holding, set model_exit_on_reaction=False.
+    model_exit_frac: float = 0.25
+    model_exit_look_s: float = 20.0
+    model_exit_rev_bps: float = 5.0
+    model_exit_min_tau_s: float = 60.0
+    # A minimum hold, measured from the FILL. The decision and the fill are
+    # separated by ~1s (median 1.03s live), so a position is born on evidence
+    # already a second old and an exit judging it immediately is judging the
+    # latency. Same reason `cross_exit_min_hold_s` exists.
+    model_exit_min_hold_s: float = 5.0
     # --- stale-display maker ------------------------------------------------
     # MEASURED 2026-09-12, lead-lag cross-correlation over 1,372 rounds of the
     # 1 Hz quote tape (corr of the venue's implied-probability change against
@@ -1073,7 +1450,18 @@ class Settings(BaseSettings):
     # bar) once today is dropped. Shipped live because $1 x 10/day is a bounded
     # way to buy the sample, NOT because it is proven. Kill it if EV/$1 <= 0
     # after ~150 booked entries.
-    cross_enabled: bool = True
+    # ⛔ SHIPPED OFF (2026-09-21). The arm's edge was re-measured on OUR venue
+    # (Binance) at the price we can actually pay -- a 1 s entry lag -- and it is
+    # negative at every band, so the switch is a loser being left available.
+    # The +0.0925 that briefly justified turning it on by default was a 0 ms
+    # number computed on the POLYMARKET window (`chainlink-twap-60s-vs-range-`
+    # `start`, 09-16 19:30 -> 09-19 15:10, `venue=polymarket` in the .env of the
+    # time). On Binance, band [0.45,0.65] tau [60,150], one entry/round:
+    #     ref = strike    lag 0 ms -+0.0118 | lag 1 s -0.0410 | lag 5 s -0.0239
+     #     ref = 60 s level lag 0 ms -0.0061 | lag 1 s -0.0859 | lag 5 s -0.0291
+    # and the WEEKDAY cohort is the worse one (-0.068 at lag 1 s vs +0.096 for
+    # the weekend, n=38), i.e. `cross_weekdays_only` keeps the losing half.
+    cross_enabled: bool = False
     # Restrict CROSS arm execution to weekdays only (Monday-Friday UTC FX week).
     # Backtests show cross arm is strongly profitable on weekdays (+0.0925 EV/$1)
     # and loses money on weekends (-0.0430 EV/$1).
@@ -3908,7 +4296,18 @@ class Settings(BaseSettings):
     shot15_max_quote: float = 0.99
 
     # --- reversal_15m: 15m Reversal Arm driven by 5m reversals -------------
-    reversal_15m_enabled: bool = True
+    # ⛔ SHIPPED OFF (2026-09-21). It was shipped ENABLED with no measurement at
+    # all, and the first measurement refutes it on our own venue. Binance, live
+    # DB, the live rule replayed one entry per 15m round (n=119, 6 days, btc-15m):
+    #   WR 63.0%  paid 0.586  EV +0.0290/$1  pooled t +0.67  day-t +0.66
+    #   halves +0.0638/-0.0053   drop-best-day -0.0192
+    # It fails every check: t < 2 twice over, the halves disagree in SIGN, and
+    # the arm turns negative once the best day is removed. The live record
+    # (20 fills, +$0.47) is consistent with nothing. An earlier +0.0868 (t 2.29)
+    # was the POLYMARKET window, not our venue.
+    # Re-enable only on a fresh measurement that clears the battery, and in
+    # PAPER first (the repo's rule for an unproven mechanism).
+    reversal_15m_enabled: bool = False
     reversal_15m_families: str = "btc-updown-15m,eth-updown-15m"
     reversal_15m_min_wait_s: float = 25.0
     reversal_15m_min_tau_s: float = 270.0
@@ -4299,6 +4698,40 @@ class Settings(BaseSettings):
     # ("limit exceeded"), which is what the on-chain trade reconstruction needs.
     rpcio_api_key: str = ""
     log_level: str = "INFO"
+
+    # --- notifications -----------------------------------------------------
+    # Telegram. OFF by default: the .env on a host that has no token must keep
+    # running exactly as before, and an outbound HTTP call that nobody asked
+    # for is not a default.
+    telegram_enabled: bool = False
+    # Two names for the same secret, the same way `binance_api_secret` and
+    # `secret_key` are two names. `TELEGRAM_BOTFATHER` is what this repo's .env
+    # already carried (it is the NAME of the Telegram bot that issues tokens,
+    # which is how it ended up as a key); `TELEGRAM_BOT_TOKEN` is the canonical
+    # name. Canonical wins if both are set, see `_reconcile_telegram`.
+    telegram_bot_token: str = ""
+    telegram_botfather: str = ""
+    # The chat to send to. A private chat id is a positive integer; a group's
+    # is NEGATIVE, which is why this is a str and not an int -- parsing a group
+    # id as an int and formatting it is a needless failure mode.
+    telegram_chat_id: str = ""
+    # The "chart" button. A TEMPLATE with `{slug}`, so the link can be fixed by
+    # editing one line of .env rather than the code -- and it needs to be,
+    # because this is the one value here that could not be verified from inside
+    # the repo: no code path in this workspace ever constructs a venue WEB url
+    # (the venue is reached through `BAPI_BASE`, an API base, and the websocket
+    # `wss://api.binance.com/sapi/wss`). A wrong value costs a 404 on a button
+    # tap and nothing else: `TelegramNotifier._deliver` drops the keyboard and
+    # re-sends the message if Telegram refuses the URL button, so a bad link can
+    # never make a notification disappear. Set to "" to ship no chart button.
+    telegram_chart_url: str = "https://www.binance.com/en/prediction/{slug}"
+    telegram_timeout_s: float = 10.0
+
+    @model_validator(mode="after")
+    def _reconcile_telegram(self) -> "Settings":
+        if not self.telegram_bot_token and self.telegram_botfather:
+            self.telegram_bot_token = self.telegram_botfather
+        return self
 
     @model_validator(mode="after")
     def _reconcile_credentials(self) -> "Settings":

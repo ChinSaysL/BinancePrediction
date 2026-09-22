@@ -285,8 +285,25 @@ def test_the_impulse_cap_and_the_take_margin_are_independent_knobs():
     from btcpredict.config import settings
     from btcpredict.edge.signal import impulse_price_refusal
 
-    assert settings.impulse_max_price < settings.max_quote, (
-        "the impulse band exists to be tighter than the model's 0.90 band")
+    # ⛔ THE ORDERING ASSERTION THAT USED TO SIT HERE WAS STALE, NOT THE DESIGN.
+    # It read `impulse_max_price < max_quote` -- "the impulse band is tighter
+    # than the MODEL's band" -- which was true while the model's cap was 0.90.
+    # The model cap then moved to 0.70 on 2026-09-22 on its own measured table,
+    # which inverts the inequality WITHOUT either band being touched: the impulse
+    # ceiling 0.75 was fitted independently (`tools/backtest_impulse_orders
+    # --by-price`: the cells above 0.75 are the only negative ones). The two arms
+    # are separate decisions, so what is pinned here is that neither band is
+    # DERIVED from the other -- the impulse ceiling must not follow the model
+    # cap when the model cap moves. If the impulse arm is ever re-enabled, its
+    # band has to be re-measured against the 0.70 cap; until then it is inert
+    # (`entry_mode=model`).
+    old_cap = settings.max_quote
+    try:
+        settings.max_quote = 0.55
+        assert settings.impulse_max_price == 0.75
+        assert settings.impulse_min_price == 0.05
+    finally:
+        settings.max_quote = old_cap
     # A refusal does not depend on the margin, and the margin does not appear in
     # the refusal: change it and the gate's answer is identical.
     before = impulse_price_refusal("impulse", 0.90, settings.impulse_max_price)

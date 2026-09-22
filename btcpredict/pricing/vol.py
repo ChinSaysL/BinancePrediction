@@ -50,7 +50,11 @@ class VolEstimator:
                 self.add_bar(int(k[0]), math.log(c / o),
                              hour=time.gmtime(ts).tm_hour)
         self._recompute_seasonality()
-        log.info("vol seeded: n=%d sigma_1m=%.6f", len(self._returns), self.sigma_1m())
+        # DEBUG: this runs on every spot reconnect as well as at boot -- 5,244
+        # lines, 6.3% of live.log. The sigma that matters is the one the arm
+        # prices with, and that is visible where a fair is computed.
+        log.debug("vol seeded: n=%d sigma_1m=%.6f", len(self._returns),
+                  self.sigma_1m())
 
     def add_bar(self, open_ms: int, log_return: float,
                 hour: int | None = None) -> bool:

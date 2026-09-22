@@ -279,7 +279,10 @@ class LiveBroker:
             return False
         self.wallet_address = wallets[0]["walletAddress"]
         self.wallet_id = wallets[0]["walletId"]
-        log.info("prediction wallet %s", self.wallet_address)
+        # DEBUG: the wallet address is already printed, once, by the
+        # `LIVE mode. wallet <addr> balance $X` line in Bot.setup, which also
+        # carries the number that matters. This was 1,322 lines of duplicate.
+        log.debug("prediction wallet %s", self.wallet_address)
         return True
 
     async def order_book(self, token_id: str, market_id: int) -> dict | None:
