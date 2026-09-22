@@ -844,11 +844,21 @@ def test_verified_fill_skips_verification_entirely():
 # 19:26-20:23 logged "proceeding unverified". Booking on assumption is how the
 # trade record and the venue drift apart.
 
+_UNSET = object()
+
+
 def _buy_broker(*, status=None, held=None, positions_readable=True,
-                order_record_resp=None):
-    """LiveBroker whose place-order succeeds but whose status read fails."""
+                order_record_resp=None, active_orders_resp=_UNSET):
+    """LiveBroker whose place-order succeeds but whose status read fails.
+
+    `active_orders_resp` is whatever order/list returns: `{"orders": []}` is
+    READABLE AND EMPTY, `None` is UNREADABLE, and an order of ours inside it
+    means the venue still holds it as working. Those three must not collapse.
+    """
     from btcpredict.execution import live
 
+    if active_orders_resp is _UNSET:
+        active_orders_resp = {"orders": []}
     b = live.LiveBroker(None, "k", "s", wallet_address="w", wallet_id="1")
 
     async def quote(*a, **kw):
@@ -856,6 +866,8 @@ def _buy_broker(*, status=None, held=None, positions_readable=True,
                 "feeAmount": to_wei(0.1), "averagePrice": 0.57, "expireAt": 0}
 
     async def request(method, path, params=None):
+        if path == live.ACTIVE_ORDERS:
+            return active_orders_resp
         return {"orderId": "o1"}
 
     async def _status(order_id, **kw):
@@ -864,10 +876,19 @@ def _buy_broker(*, status=None, held=None, positions_readable=True,
     async def _positions():
         return held
 
+    b.cancel_calls = []
+
+    async def _cancel(ids):
+        # Real `cancel_orders` posts to the venue over http.client; a test must
+        # not, and the cut-off path calls it before every retry decision.
+        b.cancel_calls.append(list(ids))
+        return []
+
     b.get_quote = quote
     b._request = request
     b._order_status = _status
     b._position_token_ids = _positions
+    b.cancel_orders = _cancel
     if order_record_resp is not None:
         async def _record(order_id, **kw):
             return order_record_resp
@@ -880,16 +901,74 @@ def _buy(b, token="tok"):
                              price=0.57, stake=10.0))
 
 
-def test_unreadable_status_with_no_position_is_not_booked():
-    """The phantom: the venue refused the order, the status read failed, and
-    the bot used to book a trade that never happened."""
-    b = _buy_broker(status=None, held=set())            # readable, token absent
+def test_no_verdict_but_the_POSITION_LIST_holds_the_token_books_it():
+    """⛔ THE FILL SIDE OF THE CUT-OFF, and the reason a 2s budget does not turn
+    fills into retries: order/history has not stamped FILLED yet, but the
+    position exists -- which is the EFFECT of a fill and can only be there if
+    the order went through. It must be BOOKED, never re-placed on top of."""
+    b = _buy_broker(status=None, held={"tok"})
+    fill = _buy(b)
+    assert fill is not None, "a position that exists IS the fill"
+    assert b.cancel_calls == [["o1"]]
+    assert b.last_failure is None
+
+
+def test_no_verdict_with_BOTH_lists_clear_RETRIES_the_round():
+    """⭐ THE 2026-09-22 CUT-OFF, and it inverts the policy below.
+
+    The venue's own records say a FILLED order stamps <=1.65s (p50 0.97s) and a
+    FAILED one 5.25/12.88/14.01s, with order/history reporting SUBMITTED for
+    the whole of those 12.9s: nothing lands between 1.65s and 5.25s. So waiting
+    for the verdict spends a round's window on a stamp that is already true.
+    The retry is authorised by the venue's STATE instead -- the order is pulled
+    and BOTH lists must be readable and hold nothing of ours.
+    """
+    from btcpredict.execution import live
+    b = _buy_broker(status=None, held=set())            # both lists readable
+    assert _buy(b) is None
+    assert b.last_failure == "venue_failed"
+    assert b.last_failure in live.RETRYABLE_FAILURES, "must be retried"
+    assert b.cancel_calls == [["o1"]], "the order is pulled before retrying"
+
+
+def test_no_verdict_with_the_order_still_WORKING_does_not_retry():
+    """The double-buy guard. An order the venue still holds as working can
+    still execute, so placing another is a SECOND position, not a retry."""
+    from btcpredict.execution import live
+    b = _buy_broker(status=None, held=set(),
+                    active_orders_resp={"orders": [{"orderId": "o1"}]})
     assert _buy(b) is None
     assert b.last_failure == "unconfirmed"
-    # And it must NOT be retryable: absence from a lagging position list is
-    # weak evidence, so a second order could double the exposure.
-    from btcpredict.execution import live
     assert b.last_failure not in live.RETRYABLE_FAILURES
+
+
+def test_no_verdict_with_an_UNREADABLE_working_list_does_not_retry():
+    """`[]` and `None` are different answers: only a list we actually READ can
+    say nothing of ours is open."""
+    from btcpredict.execution import live
+    b = _buy_broker(status=None, held=set(), active_orders_resp=None)
+    assert _buy(b) is None
+    assert b.last_failure == "unconfirmed"
+    assert b.last_failure not in live.RETRYABLE_FAILURES
+
+
+def test_the_status_budget_is_honoured_as_written(monkeypatch):
+    """The shortest configurable wait used to be 3.6s (`max(6, ...)`), so a 2s
+    budget silently behaved like a 3.6s one."""
+    from btcpredict.config import settings
+    seen = []
+    for budget, want in ((2.0, 4), (15.0, 26)):
+        monkeypatch.setattr(settings, "order_status_wait_s", budget, raising=False)
+        b = _buy_broker(status="FILLED", held=set())
+
+        async def _status(order_id, **kw):
+            seen.append((budget, kw["tries"]))
+            return "FILLED"
+
+        b._order_status = _status
+        _buy(b)
+    assert seen == [(2.0, 4), (15.0, 26)], (
+        f"2s must mean 4 reads out to ~1.8s; 15s must keep the old 26: {seen}")
 
 
 def test_late_history_check_catches_failed_order():

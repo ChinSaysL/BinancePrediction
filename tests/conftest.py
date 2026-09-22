@@ -14,7 +14,19 @@ monkeypatch wins because it runs after this fixture.
 """
 from __future__ import annotations
 
+import os
+
 import pytest
+
+# ⛔ BEFORE ANYTHING IMPORTS btcpredict.config. `.env` in the working directory is
+# the LIVE trading profile, and pydantic-settings loads it silently on top of
+# every default in config.py -- so a test asserting a SHIPPED default measured
+# the operator's profile instead. Measured 2026-09-22 on one commit, the only
+# difference being that file: 26 failed with it present, 0 failed (1 skipped)
+# with it moved aside. Neither number was about the code.
+#
+# setdefault, not assignment: an explicit override in the environment still wins.
+os.environ.setdefault("BTCPREDICT_ENV_FILE", "none")
 
 
 @pytest.fixture(autouse=True)

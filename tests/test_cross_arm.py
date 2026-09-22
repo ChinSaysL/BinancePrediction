@@ -3072,17 +3072,40 @@ class TestAFailedFOKGetsItsRetries:
         05:34:29  MARKET FAILED  bnb  quote 0.702
         05:34:36  MARKET FILLED  bnb  quote 0.712   <- the retry
 
-    A FOK that fails is retryable ("venue_failed"), but only once the venue SAYS
-    it failed. buy() polled order/history for 3.6s, gave up, found an empty
-    position list, and returned the deliberately NON-retryable "unconfirmed" --
-    while that order's terminalTime was ~8.2s after createTime.
+    THAT WAS THE OLD CONTRACT: a FOK is retryable only once the venue SAYS it
+    failed, so this knob had to out-wait the venue's verdict -- and it was
+    raised three times chasing it (3.6 -> 9.0 -> 15.0 for an 8.2s stamp, then
+    a 9.902s one).
+
+    ⭐ THE CONTRACT CHANGED 2026-09-22. Measured on the venue's OWN records (20
+    orders, createTime -> terminalTime): FILLED n=17 max **1.65s** (p50 0.97s),
+    FAILED n=3 at **5.25 / 12.88 / 14.01s**, with order/history on SUBMITTED
+    throughout the 12.9s. Nothing lands between 1.65s and 5.25s, so waiting
+    past ~2s buys only a blocked tick (an 18.64s one, measured). The retry is
+    now authorised by the venue's STATE instead -- the order is pulled, and
+    both order/list (nothing WORKING) and the position list (nothing held) must
+    be readable and clear of us. See
+    `test_risk_and_execution.py::test_no_verdict_with_BOTH_lists_clear_RETRIES_the_round`
+    and the two tests beside it for the gate this budget now depends on.
     """
 
-    def test_the_status_budget_covers_the_venue_verdict(self):
-        """~8.2s was observed; the budget must exceed it."""
+    def test_the_cut_off_clears_the_slowest_FILL(self):
+        """Fills are the fast outcome (max 1.65s measured), and the budget must
+        still see them -- a cut-off below the fill stamp turns every fill into a
+        position-list race, which is the expensive way to find one."""
         from btcpredict.config import settings as S
-        assert S.order_status_wait_s >= 8.5, (
-            "3.6s gave up before the venue answered, which cost the retry")
+        assert S.order_status_wait_s >= 1.8, (
+            "a FILLED order stamps up to 1.65s (n=17); a shorter cut-off makes "
+            "the position list the only way to see a fill")
+
+    def test_the_cut_off_does_NOT_wait_for_the_venue_verdict(self):
+        """The FAILED stamp arrives at 5.25-14.01s. Waiting for it was the whole
+        cost being removed here, so a budget back up at the old 15.0 means the
+        state gate has been bypassed and every rejection blocks a tick again."""
+        from btcpredict.config import settings as S
+        assert S.order_status_wait_s < 5.0, (
+            "the venue's FAILED verdict takes 5.25-14.01s (n=3) and waiting for "
+            "it blocks the tick; the retry is authorised by the venue's STATE")
 
     def test_the_budget_is_actually_used_by_buy(self):
         import inspect
@@ -3090,6 +3113,13 @@ class TestAFailedFOKGetsItsRetries:
         src = inspect.getsource(live.LiveBroker.buy)
         assert "order_status_wait_s" in src
         assert "tries=6, delay=0.6" not in src, "the frozen 3.6s budget is back"
+        # ⛔ AND IT MUST BE READ AS WRITTEN. A `tries` floor of six made the
+        # shortest configurable wait 3.6s, so a 2s budget silently behaved like
+        # a 3.6s one -- an inert knob, this repo's most expensive failure mode.
+        # Match the EXPRESSION, not a bare `max(6,`: the comment above this
+        # branch quotes the old form, and a source-regex test that matches its
+        # own documentation is a trap this repo has already fallen into once.
+        assert "tries=max(6" not in src, "a floor above the configured budget is back"
 
     def test_a_market_retry_is_worth_three_seconds_of_round(self, store, armed,
                                                             monkeypatch):

@@ -59,6 +59,19 @@ STAKE = 2.0
 # genuinely never binds. `erow` clears this before each rule.
 EXIT_TAU: list[float] = []
 
+# THE RESTING-LIMIT FALLBACK'S OWN COUNTERS (`--limit-fallback`). `sold`/`miss`
+# are what stop the fallback from being read as free money: a resting order that
+# is posted and never reached is a MISSED EXIT, and the tail of the table is
+# decided by how many of those there are. `erow` clears these per rule.
+#   miss    = ATTEMPTS that never came back (one per triggering tick)
+#   posted  = DISTINCT POSITIONS that ever rested an order
+# The two differ because the loop re-prices at every triggering tick, so one
+# position that never fills contributes many `miss`es and exactly one `posted`.
+# Quote the POSITION rate (`sold / posted`); `miss` alone overstates the number
+# of positions exposed to a miss.
+LIMIT: dict = {"sold": 0, "miss": 0, "px": [], "posted": set(),
+               "fixed": {}, "cur": ""}
+
 
 def _maxdd(seq: list[float]) -> float:
     """Worst peak-to-trough of the equity curve, in dollars at STAKE.
@@ -376,7 +389,7 @@ def main() -> None:
                          "rule, and the arm was switched off then) so a "
                          "halves test spans ONE rule")
     ap.add_argument("--only-pm", action="store_true",
-                    help="KEEP ONLY the `chainlink-twap%` rounds -- the "
+                    help="KEEP ONLY the `chainlink-twap%%` rounds -- the "
                          "04-16..04-19 block that `--exclude-pm` throws away. "
                          "This is the third independent sample: same venue, same "
                          "bot, DIFFERENT SETTLEMENT RULE (a 60s TWAP against the "
@@ -407,6 +420,26 @@ def main() -> None:
                          "(see `crossings`). 0 counts raw sign flips, which is "
                          "a property of the sampler -- 1 Hz here against ~58 ms "
                          "live -- and must not be shipped.")
+    ap.add_argument("--whole-floor", action="store_true",
+                    help="reproduce the FIRST (wrong) sell-floor check, which "
+                         "compared the whole POSITION's notional to the venue "
+                         "minimum instead of the SLICE actually sent. It makes "
+                         "a partial exit look viable at frac 0.25, which live "
+                         "it never is -- see the comment at `_slice_ok`.")
+    ap.add_argument("--limit-fallback", action="store_true",
+                    help="model `LiveBroker.sell_limit` beside the MARKET exit: "
+                         "when the venue's ~$1.50 MARKET minimum refuses the "
+                         "slice, REST a LIMIT sell at the venue's tick and fill "
+                         "it only when a LATER recorded bid prints one tick "
+                         "THROUGH the price. Off by default so the existing "
+                         "tables reproduce byte-identically.")
+    ap.add_argument("--limit-single", action="store_true",
+                    help="with --limit-fallback, rest ONE order per position at "
+                         "the FIRST trigger's price instead of re-pricing at "
+                         "every triggering tick. The re-pricing version is the "
+                         "more permissive of the two, so this is the bound:"
+                         "if the ranking does not survive it, it is the "
+                         "re-pricing that produced it.")
     args = ap.parse_args()
     persist = (settings.signal_persistence if args.persistence is None
                else args.persistence)
@@ -806,6 +839,144 @@ def main() -> None:
         # drawdown line too, and a function defined at module scope cannot see a
         # name bound inside `main`. It was a local until that line was added.
 
+        # ⛔ THE VENUE'S FLOOR IS ON THE SLICE THAT IS SENT, NOT ON THE POSITION.
+        #
+        # MEASURED LIVE, 2026-09-22 13:42:01: the reaction exit fired on a
+        # 2.6831-share position and `sell_fak` refused it --
+        #     proceeds $0.3556 under the venue's ~$1.50 MARKET minimum
+        #     (0.6708 shares @ 0.5300) -- not sent
+        # 0.6708 shares is `frac 0.25` of 2.6831, so the check is on the SALE's
+        # notional: 0.25 x shares x price >= 1.50. That needs a position worth
+        # **>= $6.00**, and this arm trades $1-3, so a 25% exit is refused at
+        # EVERY price. The live record agrees: `react` exits booked = 0.
+        #
+        # The first version of this file compared the WHOLE position (`shares *
+        # px_out < 1.5`), a different and much laxer rule: it binds only once
+        # the bid falls below ~0.75 x entry, which is why the exit looked
+        # viable at frac 0.25 in every sweep. `--whole-floor` reproduces it.
+        from btcpredict.execution.live import (
+            SELL_MIN_NOTIONAL_USDT as _SELL_MIN)
+        FLOOR_BASE = 0.25      # model_exit_frac, the configured partial
+        FLOOR_ON_SLICE = not args.whole_floor
+
+        def _eff_frac(f, sh: float, pxo: float, base: float):
+            """The fraction of the position that would actually be SENT.
+
+            `f == "dyn"` is the DYNAMIC rule: sell the SMALLEST slice that
+            clears the venue's floor, never below the configured `base`. It is
+            derived from the venue's constraint rather than tuned, so it keeps
+            the configured partial whenever the venue allows it and degrades to
+            a full exit exactly when a partial one is impossible.
+
+            None when even the WHOLE position cannot clear the floor -- at that
+            price the venue will not buy it at all, which is the case the log
+            above shows.
+            """
+            if f != "dyn":
+                return float(f)
+            if sh * pxo <= 0.0:
+                return None
+            need = _SELL_MIN / (sh * pxo)
+            if need > 1.0:
+                return None
+            return min(1.0, max(base, need))
+
+        def _slice_ok(f, sh: float, pxo: float) -> bool:
+            """Would the venue accept this sale? `--whole-floor` reproduces
+            the wrong version, which compared the whole position."""
+            n = sh * pxo if not FLOOR_ON_SLICE else sh * f * pxo
+            return n >= _SELL_MIN
+
+        # ⛔⛔ THE FILL RULE FOR THE RESTING LIMIT -- READ THIS BEFORE TRUSTING
+        # ANY ROW OF THE `--limit-fallback` TABLE.
+        #
+        # A resting order MUST NOT be credited with a fill merely because the
+        # displayed price REACHED it. That is the single most expensive artifact
+        # in this repo's backtest history: modelled on the same tape with the
+        # same strategy and only the fill rule changed, a touch-fill "maker"
+        # path read **+0.736/$1, t +12.4** while requiring the tape to print
+        # THROUGH the resting price read **-0.182/$1, t -2.5**. The lie is worth
+        # about +0.92 per $1.
+        #
+        # It is not a modelling nicety, it is the whole economics: a resting
+        # order is only reached when the market comes to it, and the market
+        # comes to a resting SELL when the bid RISES to us. That is a bounce,
+        # and conditional on needing to exit, bounces are the exception.
+        #
+        # So: the order rests at `lim` and fills only at the first tick where a
+        # LATER recorded bid is >= lim + one tick. The entry tick itself cannot
+        # fill it (its own bid is < lim + 0.01 by construction), so an instant
+        # cross at the trigger is NOT credited either -- deliberately, since
+        # that would be a taker fill at ~the same price as `sell_fak` and would
+        # hide the real question, which is whether the order that the venue's
+        # MARKET minimum refuses can be SOLD AT ALL.
+        THROUGH = 0.01       # one venue tick, in price
+        LIMIT_FB = bool(args.limit_fallback)
+        LIMIT_SINGLE = bool(args.limit_single)
+
+        def _limit_fill(bmap: dict, side_: str, ts0: int, lim: float,
+                        stop_ts: int) -> int | None:
+            """The tick at which a RESTING sell at `lim` is traded through.
+
+            None means the tape never came through the price before the book
+            goes one-sided at `min_tau` -- a MISSED exit, and the position is
+            still held at the bell.
+            """
+            for t in sorted(bmap):
+                if t <= ts0 or (stop_ts and t > stop_ts):
+                    continue
+                row_ = bmap[t]
+                bb = row_[0] if side_ == "Up" else row_[1]
+                if bb is not None and bb >= lim + THROUGH:
+                    return t
+            return None
+
+        def _sell_slice(ts: int, side_: str, bb, px_out: float, eff,
+                        cost: float, shares: float, bmap: dict,
+                        stop_ts: int):
+            """Price ONE exit and say which path took it.
+
+            MARKET exactly as live -- if the venue's minimum accepts the slice,
+            that is the sale and the limit never exists. Only when it refuses
+            does `--limit-fallback` rest an order instead.
+
+            Returns `(kind, eff, ret_ex, px_used)` with kind one of
+            "market" / "limit" / "blocked" (refused, no fallback) / "missed"
+            (posted, never reached). ONE SLICE, ONE CALL: the fee is charged on
+            the price actually got, and the limit is charged the fee the fill
+            actually carries -- no maker rebate is assumed anywhere.
+
+            ⚠️ THE ORDER IS RE-PRICED AT EVERY TRIGGERING TICK, which is the
+            permissive reading of "keep trying to sell": each attempt rests at
+            the CURRENT bid's tick, so a falling book lowers the price the
+            order needs to be reached at. `--limit-single` freezes the first
+            attempt's price instead (one order, resting to the bell) and is the
+            bound to check any row against.
+            """
+            if eff is not None and _slice_ok(eff, shares, px_out):
+                got = px_out * (1.0 - fee_rate_for_price(px_out))
+                return "market", float(eff), (got - cost) / cost, px_out
+            if not LIMIT_FB or bb is None:
+                return "blocked", 0.0, 0.0, 0.0
+            if LIMIT_SINGLE and LIMIT["cur"] in LIMIT["fixed"]:
+                # one order per position, and it has already missed
+                return "missed", 0.0, 0.0, 0.0
+            # `eff is None` is the `dyn` case where NO slice clears the floor:
+            # the venue constraint that forced a full exit is gone here, so the
+            # fallback reverts to the CONFIGURED partial rather than to 100%.
+            eff2 = FLOOR_BASE if eff is None else float(eff)
+            lim, ts0 = max(0.01, int(bb * 100) / 100.0), ts
+            if LIMIT_SINGLE:
+                LIMIT["fixed"][LIMIT["cur"]] = (lim, ts0)
+            LIMIT["posted"].add(LIMIT["cur"])
+            if _limit_fill(bmap, side_, ts0, lim, stop_ts) is None:
+                LIMIT["miss"] += 1
+                return "missed", 0.0, 0.0, 0.0
+            got = lim * (1.0 - fee_rate_for_price(lim))
+            LIMIT["sold"] += 1
+            LIMIT["px"].append(lim)
+            return "limit", eff2, (got - cost) / cost, lim
+
         def sell_ret(e, rule, stop_c=0.0, stop_pct=0.0, confirm_s=0.0,
                      hold_s=0.0, min_tau=60.0, slip=SLIP,
                      fair_m=0.0, fair_drop=0.0, stale_ms=1000,
@@ -831,6 +1002,13 @@ def main() -> None:
             sseries = live_sig.get(e["slug"]) if args.use_live_sigma else None
             held, blocked = 0.0, 0
             peak_bb = 0.0
+            # WHERE A RESTING ORDER MAY STILL BE REACHED: up to the last tick
+            # above `min_tau`. Past that the book goes one-sided, so a GTC
+            # order left resting would simply be cancelled at the bell.
+            stop_ts = 0
+            for _ts, _tau, *_tail in r["rows"]:
+                if _tau is None or _tau > min_tau:
+                    stop_ts = _ts
             for ts, tau, spot, *_rest in r["rows"]:
                 if ts < e["ts_ms"] + hold_s * 1000:
                     continue
@@ -851,16 +1029,19 @@ def main() -> None:
                     px_out = bb - slip
                     if px_out <= 0.0:
                         continue
-                    if shares * px_out < 1.5:   # live.SELL_MIN_NOTIONAL_USDT
+                    eff = _eff_frac(frac, shares, px_out, FLOOR_BASE)
+                    kind, eff_x, ret_ex, px_used = _sell_slice(
+                        ts, side, bb, px_out, eff, cost, shares, bmap, stop_ts)
+                    if kind == "blocked":
                         blocked += 1
                         continue
-                    got = px_out * (1.0 - fee_rate_for_price(px_out))
-                    ret_ex = (got - cost) / cost
+                    if kind == "missed":
+                        continue
                     EXIT_TAU.append(float(tau or 0.0))
-                    if frac >= 1.0:
-                        return ret_ex, True, blocked, px_out
-                    return (frac * ret_ex + (1.0 - frac) * e["ret"], True,
-                            blocked, px_out)
+                    if eff_x >= 1.0:
+                        return ret_ex, True, blocked, px_used
+                    return (eff_x * ret_ex + (1.0 - eff_x) * e["ret"], True,
+                            blocked, px_used)
                 # ⛔ `force` MUST NOT FALL THROUGH TO THE PRICE BRANCHES. It is
                 # not a rule name the branches know, so without this it landed
                 # on the final `else` (the -stop_pct stop) and fired on every
@@ -955,11 +1136,14 @@ def main() -> None:
                 px_out = bb - slip
                 if px_out <= 0.0:
                     continue
-                if shares * px_out < 1.5:      # live.SELL_MIN_NOTIONAL_USDT
+                eff = _eff_frac(frac, shares, px_out, FLOOR_BASE)
+                kind, eff_x, ret_ex, px_used = _sell_slice(
+                    ts, side, bb, px_out, eff, cost, shares, bmap, stop_ts)
+                if kind == "blocked":
                     blocked += 1
                     continue
-                got = px_out * (1.0 - fee_rate_for_price(px_out))
-                ret_ex = (got - cost) / cost
+                if kind == "missed":
+                    continue
                 EXIT_TAU.append(float(tau or 0.0))
                 # ⭐ A PARTIAL EXIT, and it is the only lever that CAPS the loss
                 # without giving up the whole edge. Sell `frac` of the position
@@ -969,17 +1153,23 @@ def main() -> None:
                 # (1-frac) * (-100%)` instead of a full -100%. The code path
                 # already supports it -- `_cross_exit_execute` splits a partial
                 # sale into a settled part and a new open fill.
-                if frac >= 1.0:
-                    return ret_ex, True, blocked, px_out
-                return (frac * ret_ex + (1.0 - frac) * e["ret"], True, blocked,
-                        px_out)
+                if eff_x >= 1.0:
+                    return ret_ex, True, blocked, px_used
+                return (eff_x * ret_ex + (1.0 - eff_x) * e["ret"], True, blocked,
+                        px_used)
             return e["ret"], False, blocked, None
 
         def erow(label, rule, **kw):
             EXIT_TAU.clear()
+            LIMIT["sold"] = 0
+            LIMIT["miss"] = 0
+            LIMIT["px"].clear()
+            LIMIT["posted"].clear()
+            LIMIT["fixed"].clear()
             out, nex, blocked, blocked_entries, ex_rets = [], 0, 0, 0, []
             ex_px, costs = [], []
             for e in ent:
+                LIMIT["cur"] = e["slug"]
                 ret, ex, bl, pxo = sell_ret(e, rule, **kw)
                 out.append(ret)
                 nex += ex
@@ -1018,6 +1208,19 @@ def main() -> None:
             # position held to the bell); `worst` is the single worst trade.
             whole = 100 * sum(1 for r_ in out if r_ <= -0.99) / len(out)
             worst = min(out)
+            # The fallback's own two numbers, printed only when it was used: of
+            # the triggers its MARKET path refused, how many the resting order
+            # actually reached. A high `missed` is the whole story on a rule
+            # that only pays when the tape bounces.
+            lim_tag = ""
+            if LIMIT["sold"] or LIMIT["miss"]:
+                # POSITIONS, not attempts: the loop re-prices per triggering
+                # tick, so `miss` counts order-attempts and would overstate how
+                # many positions were exposed to a miss.
+                npos = len(LIMIT["posted"])
+                mx = st.fmean(LIMIT["px"]) if LIMIT["px"] else 0.0
+                lim_tag = (f"  | limit {LIMIT['sold']}/{npos} positions filled "
+                           f"@{mx:.3f}  missed {LIMIT['miss']} attempts")
             print(f"  {label:<24} n={len(out):<4} exited {nex:>4} "
                   f"({100*nex/len(out):3.0f}%)  WR {wr:5.1f}%  "
                   f"whole-stake -100% {whole:5.1f}%  worst {worst:+.2f}  "
@@ -1027,7 +1230,7 @@ def main() -> None:
                   f"H {st.fmean([r_ for _e, r_ in order[:half]]):+.3f}/"
                   f"{st.fmean([r_ for _e, r_ in order[half:]]):+.3f}  "
                   f"tot@$2 ${STAKE*sum(out):+7.2f}  "
-                  f"| unsellable {blocked_entries:>3}")
+                  f"| unsellable {blocked_entries:>3}{lim_tag}")
             # ⭐ DRAWDOWN, NOT JUST PnL. These rules exist to change the SHAPE of
             # the loss distribution, and the total is nearly blind to that: an
             # exit that turns full losses into small ones barely moves the sum
@@ -1083,6 +1286,24 @@ def main() -> None:
         for frac in (0.25, 0.50, 0.75):
             erow(f"react 20s/5bps x{frac:.0%}", "reactmove",
                  look_s=20.0, rev_bps=5.0, hold_s=5.0, min_tau=60.0, frac=frac)
+        if args.limit_fallback:
+            # ⭐⭐ THE FRAC DECISION, RE-OPENED. The rows above are priced with
+            # `sell_fak` alone, so at a $1-3 stake EVERY partial is refused by
+            # the venue's ~$1.50 MARKET minimum and the only sellable slice is
+            # 100% -- which is why `model_exit_frac` was set to 1.0. With
+            # `LiveBroker.sell_limit` the slice is placeable at any size, so the
+            # configured partial is a real option again and the frac question
+            # has to be answered on the tape rather than by the floor.
+            # READ THE FILL RATE, NOT THE EV: `limit N/M filled` says how many
+            # of the refused slices the resting order actually reached. The
+            # 100% rows are the control that needs no fallback at all.
+            print("  -- ⭐⭐ SAME RULE WITH THE RESTING-LIMIT FALLBACK "
+                  "(--limit-fallback): the frac decision, re-opened --")
+            for frac in (0.25, 0.50, 0.75, 1.0, "dyn"):
+                lbl = f"x{frac}" if isinstance(frac, str) else f"x{frac:.0%}"
+                erow(f"react 20s/5bps {lbl} +lim", "reactmove",
+                     look_s=20.0, rev_bps=5.0, hold_s=5.0, min_tau=60.0,
+                     frac=frac)
         print("  -- the price-stops that were refuted, kept as the control --")
         erow("stop -0.02 (bid)", "stop", stop_c=0.02, confirm_s=1.0, hold_s=5.0)
         erow("stop -10% (bid)", "stop_pct", stop_pct=0.10, confirm_s=1.0,
@@ -1108,33 +1329,58 @@ def main() -> None:
         # ranking must repeat in both halves) and maxDD beside the total.
         print("  -- ⭐ THE SHIPPED RULE, ONE KNOB AT A TIME (reference row = "
               "react 20s/5bps x25%) --")
-        print("  ---- the fraction sold (model_exit_frac, shipped 0.25) ----")
+        # ⛔ THE "shipped" MARKERS AND THE FIXED ARGUMENTS ARE READ FROM
+        # SETTINGS, NEVER HARDCODED. They were literals (0.25 / 5.0 / 20.0 /
+        # 60.0 / 5.0); the moment the live profile moved one -- `model_exit_frac`
+        # went 0.25 -> 1.0 on 2026-09-22 -- this sweep was ranking a system
+        # nobody runs, with the label pointing at a row that is NOT shipped.
+        _S_FRAC = float(settings.model_exit_frac)
+        _S_REV = float(settings.model_exit_rev_bps)
+        _S_LOOK = float(settings.model_exit_look_s)
+        _S_MTAU = float(settings.model_exit_min_tau_s)
+        _S_HOLD = float(settings.model_exit_min_hold_s)
+
+        def _is(v: float, ref: float) -> str:
+            return "  <- shipped" if abs(v - ref) < 1e-9 else ""
+
+        print(f"  ---- the fraction sold (model_exit_frac, shipped "
+              f"{_S_FRAC:.2f}) ----")
         for fr in (0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.75, 1.00):
-            erow(f"frac {fr:.0%}{'  <- shipped' if fr == 0.25 else ''}",
-                 "reactmove", look_s=20.0, rev_bps=5.0, hold_s=5.0,
-                 min_tau=60.0, frac=fr)
-        print("  ---- the reaction size (model_exit_rev_bps, shipped 5.0) ----")
+            erow(f"frac {fr:.0%}{_is(fr, _S_FRAC)}",
+                 "reactmove", look_s=_S_LOOK, rev_bps=_S_REV, hold_s=_S_HOLD,
+                 min_tau=_S_MTAU, frac=fr)
+        # ⭐ THE DYNAMIC RULE, beside the fixed fractions it would replace: the
+        # smallest slice that clears the venue floor, never below 25%. Where a
+        # fixed 25% is refused at EVERY price, this sells what the venue will
+        # actually take.
+        erow("frac dyn (clears $1.50)", "reactmove", look_s=20.0,
+             rev_bps=5.0, hold_s=5.0, min_tau=60.0, frac="dyn")
+        print(f"  ---- the reaction size (model_exit_rev_bps, shipped "
+              f"{_S_REV:g}) ----")
         for rv in (3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 15.0):
-            erow(f"rev {rv:g}bps{'  <- shipped' if rv == 5.0 else ''}",
-                 "reactmove", look_s=20.0, rev_bps=rv, hold_s=5.0,
-                 min_tau=60.0, frac=0.25)
-        print("  ---- the lookback (model_exit_look_s, shipped 20.0) ----")
+            erow(f"rev {rv:g}bps{_is(rv, _S_REV)}",
+                 "reactmove", look_s=_S_LOOK, rev_bps=rv, hold_s=_S_HOLD,
+                 min_tau=_S_MTAU, frac=_S_FRAC)
+        print(f"  ---- the lookback (model_exit_look_s, shipped "
+              f"{_S_LOOK:g}) ----")
         for lk in (10.0, 20.0, 30.0, 45.0, 60.0, 90.0):
-            erow(f"look {lk:g}s{'  <- shipped' if lk == 20.0 else ''}",
-                 "reactmove", look_s=lk, rev_bps=5.0, hold_s=5.0,
-                 min_tau=60.0, frac=0.25)
+            erow(f"look {lk:g}s{_is(lk, _S_LOOK)}",
+                 "reactmove", look_s=lk, rev_bps=_S_REV, hold_s=_S_HOLD,
+                 min_tau=_S_MTAU, frac=_S_FRAC)
         print("  ---- the late-exit floor (model_exit_min_tau_s, shipped 60.0) "
               "----")
+        print("  ---- the late-exit floor (model_exit_min_tau_s, shipped "
+              f"{_S_MTAU:g}) ----")
         for mt in (0.0, 10.0, 15.0, 20.0, 25.0, 30.0, 40.0, 45.0, 50.0, 60.0,
                    75.0, 90.0):
-            erow(f"min_tau {mt:g}s{'  <- shipped' if mt == 60.0 else ''}",
-                 "reactmove", look_s=20.0, rev_bps=5.0, hold_s=5.0,
-                 min_tau=mt, frac=0.25)
+            erow(f"min_tau {mt:g}s{_is(mt, _S_MTAU)}",
+                 "reactmove", look_s=_S_LOOK, rev_bps=_S_REV, hold_s=_S_HOLD,
+                 min_tau=mt, frac=_S_FRAC)
         # ⭐ AND WHERE THE EXITS LIVE, which is what a min_tau sweep cannot show:
         # the number of exits is flat across 0/15/30 for a reason, and this says
         # which one. Printed for the SHIPPED rule (last erow above).
-        erow("react 20s/5bps x25% (tau diag)", "reactmove", look_s=20.0,
-             rev_bps=5.0, hold_s=5.0, min_tau=0.0, frac=0.25)
+        erow("react @ shipped knobs (tau diag)", "reactmove", look_s=_S_LOOK,
+             rev_bps=_S_REV, hold_s=_S_HOLD, min_tau=0.0, frac=_S_FRAC)
         buckets = ((0, 15), (15, 30), (30, 45), (45, 60), (60, 75), (75, 90),
                    (90, 120), (120, 150), (150, 210), (210, 9999))
         print(f"  ---- TAU OF THE {len(EXIT_TAU)} EXITS (shipped trigger, "
@@ -1148,9 +1394,9 @@ def main() -> None:
                   f"median {st.median(EXIT_TAU):.0f}s")
         print("  ---- the minimum hold (model_exit_min_hold_s, shipped 5.0) ----")
         for hd in (0.0, 2.0, 5.0, 10.0, 20.0, 30.0):
-            erow(f"hold {hd:g}s{'  <- shipped' if hd == 5.0 else ''}",
-                 "reactmove", look_s=20.0, rev_bps=5.0, hold_s=hd,
-                 min_tau=60.0, frac=0.25)
+            erow(f"hold {hd:g}s{_is(hd, _S_HOLD)}",
+                 "reactmove", look_s=_S_LOOK, rev_bps=_S_REV, hold_s=hd,
+                 min_tau=_S_MTAU, frac=_S_FRAC)
         print("  (HOLD is the same-entry baseline the exit is scored against; "
               "`t` is pooled over per-entry returns, and a rule that only "
               "changes the LOSERS cannot raise it by much.)")

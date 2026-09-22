@@ -1,6 +1,7 @@
 """Configuration. Values come from .env, overridable by real environment vars."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Literal
 
@@ -8,6 +9,38 @@ from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def _env_file() -> Path | None:
+    """Which `.env` this process reads -- the operator's, or NONE for the suite.
+
+    ⛔ READ THIS BEFORE CHANGING THE DEFAULT. `.env` in the working directory is
+    the LIVE trading profile on the box, and pydantic-settings loads it silently
+    on top of every default in this file. A test that asserts a SHIPPED default
+    therefore measures whatever profile happens to be sitting next to it -- and
+    the operator's profile is not the code's configuration.
+
+    Measured 2026-09-22, same commit, only the file present/absent:
+        local profile present     26 failed, 2110 passed
+        the same file moved aside  0 failed, 2135 passed, 1 skipped
+    26 failures were an artifact of the environment, and the number had been
+    quoted for days as a "known" baseline -- which is the same mistake as
+    trusting a `.env` over the loaded settings.
+
+    `tests/conftest.py` sets `BTCPREDICT_ENV_FILE=none`, so the suite runs on
+    THESE DEFAULTS everywhere (laptop, CI, the box) instead of inheriting
+    whichever profile is deployed.
+
+    Unset or empty  -> the repo's own `.env` (the bot's behaviour, unchanged).
+    `none`/`off`/`0` -> load no env file at all.
+    Any other value -> that path.
+    """
+    raw = os.environ.get("BTCPREDICT_ENV_FILE")
+    if raw is None or raw == "":
+        return ROOT / ".env"
+    if raw.strip().lower() in {"none", "off", "0"}:
+        return None
+    return Path(raw)
 
 # Public prediction-market feed (unauthenticated, reverse-engineered from the web app).
 BAPI_BASE = "https://www.binance.com/bapi/defi/v1/public/wallet-direct/prediction"
@@ -118,7 +151,7 @@ SYMBOL_BY_PREFIX = {p: s for p, s, _ in MARKETS}
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=ROOT / ".env",
+        env_file=_env_file(),
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
@@ -347,26 +380,6 @@ class Settings(BaseSettings):
     # an order round trip (~2s), so 3 is what fits inside a 10s candle-open
     # window. Retries only ever follow a failure the venue confirmed, never an
     # order whose outcome is unknown (see execution/live.RETRYABLE_FAILURES).
-    # How long buy() waits for order/history to return a TERMINAL status before
-    # falling back to the position list. Seconds; 0 keeps the old 3.6s budget.
-    #
-    # A FOK that fails is retryable ("venue_failed"), but only if we hear the
-    # venue SAY so. Measured 2026-09-15 05:09:13: the order was placed, the
-    # status poll ran 6 x 0.6s = 3.6s and gave up, the position list was empty,
-    # and buy() returned "unconfirmed" -- which is deliberately NOT retryable,
-    # because an empty position list lags a fill and re-placing on it could
-    # double exposure. The venue's own terminalTime for that order was ~8.2s
-    # after createTime, and its verdict was FAILED.
-    #
-    # So the order died after ONE attempt for want of ~5 more seconds of
-    # patience, while the bnb order at 05:34:29 -- whose status did arrive in
-    # time -- was retried at 05:34:36 and FILLED. Five of six MARKET orders
-    # since the switch failed; this is the difference between one shot and the
-    # three `order_max_attempts` already allows.
-    #
-    # Waiting costs nothing when the order filled (the poll returns early on any
-    # terminal status) and costs only time when it did not -- and a failed FOK
-    # costs no money, just the trade.
     # Do not START another attempt with less than this much of the round left.
     # 0 = OFF.
     #
@@ -386,13 +399,37 @@ class Settings(BaseSettings):
     # demonstrably processes fills into the close (live fills booked with
     # 0.0-0.6s of round left). The 07:39:50 eth retry was refused at 3.3s left
     # by the old floor, and the venue never saw a second order.
-    # RAISED 2026-09-20 from 9.0 to 15.0: BSC block times fluctuate and 3-block
-    # relayer executions routinely take 9.5-11.0s (measured live on order
-    # ...884275: terminalTime 9.902s after createTime). A 9s budget gave up
-    # 500ms before the venue's FAILED verdict, misclassifying it as unconfirmed.
-    # Quick fills return immediately, so 15s adds zero latency to successful orders.
     order_min_tau_s: float = 5.0
-    order_status_wait_s: float = 15.0
+    # How long buy() waits for order/history to return a TERMINAL status before
+    # asking the venue's state lists instead. Seconds; 0 keeps the old 3.6s.
+    #
+    # ⭐⭐ CUT TO 2.0s ON 2026-09-22 BY THE OPERATOR'S DECISION, AND THE VERDICT
+    # IS NO LONGER WHAT AUTHORISES A RETRY. Measured on the venue's OWN records
+    # (20 orders, its createTime -> terminalTime, read from order/history):
+    #     FILLED  n=17  min 0.52s  p50 0.97s  p90 1.13s  max 1.65s
+    #     FAILED  n=3       5.25s      12.88s      14.01s
+    # and order/history reported SUBMITTED throughout those 12.9s. NOTHING
+    # lands between 1.65s and 5.25s: fills resolve fast, rejections resolve
+    # late. So the old 15s bought a stamp that was already true, at the cost of
+    # an 18.64s blocked tick inside a 300s round -- and this knob's history
+    # (3.6 -> 9.0 -> 15.0, each raise chasing a slower stamp: 8.2s, then 9.902s)
+    # was three raises of the same wait.
+    #
+    # THE RETRY IS NOW AUTHORISED BY STATE, NOT BY THE STAMP: at the cut-off
+    # `buy()` cancels the order, then requires BOTH of the venue's own lists to
+    # be readable and to contain nothing of ours -- no WORKING order in
+    # order/list AND no position in the token -- before returning the retryable
+    # `venue_failed`. An empty position list alone is still weak evidence (it
+    # lags a fill) and still yields the non-retryable `unconfirmed`; so does an
+    # unreadable list, or an order the venue still holds as working.
+    #
+    # ⛔ THE RISK, STATED ONCE: the exposure risk is a fill whose position entry
+    # lags past the position patience in `_confirm_by_position` (6 x 0.8s), in
+    # which case the retry opens a SECOND position of one stake ($1-3 here).
+    # The operator accepted that in exchange for not losing the trade outright,
+    # which is what the old behaviour did EVERY time. Revert = set this to 15.0
+    # (restores the old wait-and-abandon path) and restart.
+    order_status_wait_s: float = 2.0
     order_max_attempts: int = 3
     # Small pause between attempts: re-quoting into the same instant that just
     # failed tends to fail the same way.
@@ -1217,8 +1254,99 @@ class Settings(BaseSettings):
     # the OPPOSITE direction (frac, look_s, rev_bps, and now this). At ~13
     # entries the traded era cannot rank anything -- which is exactly why the
     # kill criterion is stated in EXITS, not in replayed EV.
-    # KILL CRITERION: over ~40 exits, if the full-loss rate is not lower AND the
-    # P&L is materially worse than holding, set model_exit_on_reaction=False.
+    # ⛔⛔ EVERY FRAC NUMBER ABOVE IS FROM A REPLAY THAT CHECKED THE WRONG
+    # QUANTITY, AND THE CORRECTION CHANGES THE ANSWER. The exit sells `frac` of
+    # a position; the venue refuses any MARKET sell whose PROCEEDS are under
+    # `live.SELL_MIN_NOTIONAL_USDT` ($1.50). The sweep compared the WHOLE
+    # position to that floor (`shares * px < 1.5`) instead of the slice actually
+    # sent (`frac * shares * px < 1.5`) -- a much laxer rule. At `frac 0.25` the
+    # true test needs a **$6+ position** and this arm trades $1-3, so a 25% exit
+    # is refused at EVERY price. The live record agrees: `react` exits booked = 0
+    # (the one trigger, 2026-09-22 13:42:01, was refused: "proceeds $0.3556
+    # under the venue's ~$1.50 MARKET minimum (0.6708 shares @ 0.5300)").
+    #
+    # CORRECTED SWEEP (283 entries, pooled, exit into the recorded bid - 1 tick):
+    #   rule            exited   WR     whole -100%  maxDD   tot/|maxDD|  tot@$2
+    #   HOLD (off)         0   70.7%      29.3%     -20.38     2.96      +60.29
+    #   frac 0.10-0.40     0   70.7%      29.3%     -20.38     2.96      +60.29
+    #   frac 0.50          3   70.7%      29.3%     -20.38     2.94      +59.84
+    #   frac 0.75         40   71.7%      26.5%     -17.37     3.29      +57.22
+    #   frac 1.00         81   60.8%      19.8%     -12.71     4.33      +55.05
+    #   frac dynamic      80   63.3%      20.1%     -15.59     3.42      +53.30
+    #
+    # 25% IS NOT A SMALL SETTING, IT IS EXACTLY HOLD: 0 exits out of 283, and
+    # identical to HOLD to every digit. The live profile therefore sets 1.0.
+    # 1.0 buys a 38% shallower maxDD and 9.5 points off the whole-stake loss rate
+    # for 8.7% of the total, and takes return-per-pain 2.96 -> 4.33 (+46%). Its
+    # costs, stated: win rate 70.7% -> 60.8% and the worst losing streak 7 -> 10.
+    # ⛔ THE RETURN COST FLIPS BETWEEN HALVES (HOLD +0.130/+0.083 vs 1.00
+    # +0.093/+0.101), so judge this on the SHAPE -- drawdown and full-loss rate,
+    # both consistent -- and never on the EV.
+    # ⛔ THE WORST SINGLE TRADE IS STILL -100% in every variant: the floor blocks
+    # the sale exactly when the position has collapsed, which is when the exit
+    # matters most. Nothing here saves the tail.
+    # ⛔ DYNAMIC (sell the smallest slice that clears the floor, min 25%) is
+    # DOMINATED on this tape: worse P&L, worse maxDD, worse return-per-pain and a
+    # worst streak of 14 against 1.00's 10. Measured, not argued -- do not build
+    # it.
+    # ⭐⭐ NOW RE-MEASURED WITH `LiveBroker.sell_limit` IN THE REPLAY. The floor
+    # is a MARKET-only rule, so a resting LIMIT sell is placeable at ANY size,
+    # and "25% is impossible" above is a statement about `sell_fak`, not about
+    # the venue. `--limit-fallback` prices the fallback honestly: the order rests
+    # at the venue's tick and fills ONLY when a LATER recorded bid prints one
+    # tick THROUGH the price -- never on a touch. (Why that rule is not
+    # optional: on this tape, same strategy, only the fill rule changed, a
+    # touch-fill maker model read +0.736/$1 t +12.4 against -0.182/$1 t -2.5 for
+    # print-through. The artifact is worth ~+0.92 per $1.)
+    #
+    # SAME TAPE, 285 entries (`--mode exit --exclude-pm --limit-fallback`).
+    # `filled` is POSITIONS, never order-attempts: the sweep re-prices the
+    # resting order at every triggering tick, so one position that never fills
+    # logs many missed attempts and only one position. Quoting the attempt ratio
+    # reads 81/138 = "59% filled" where the POSITION truth is 81/91 = 89%.
+    #   rule            exited  filled(positions)   WR   whole -100%  maxDD  ratio  tot@$2
+    #   HOLD (off)          0         -          70.5%     29.5%    -20.38  2.92  +59.59
+    #   --- re-priced every triggering tick (permissive) ---
+    #   25%  + limit       81     81/91  (89%)    70.5%     20.0%    -18.05  3.19  +57.53
+    #   50%  + limit       81     79/89  (89%)    70.5%     20.0%    -15.71  3.54  +55.61
+    #   75%  + limit       83     55/63  (87%)    67.4%     19.6%    -13.42  4.08  +54.70
+    #   100% + limit       89      7/9   (78%)    59.6%     18.2%    -11.32  5.02  +56.86
+    #   dyn  + limit       89     11/14  (79%)    63.2%     18.2%    -15.23  3.54  +53.84
+    #   --- ONE order per position, resting at its first price (`--limit-single`) ---
+    #   25%  + limit       74     74/91  (81%)    70.5%     21.8%    -18.05  3.10  +55.93
+    #   50%  + limit       75     73/89  (82%)    70.5%     21.8%    -15.71  3.32  +52.12
+    #   75%  + limit       80     52/63  (83%)    67.4%     20.7%    -13.42  3.80  +50.95
+    #   100% + limit       89      7/9   (78%)    59.6%     18.2%    -11.32  5.02  +56.86
+    #   dyn  + limit       89     11/14  (79%)    63.2%     18.2%    -15.23  3.54  +53.84
+    # Control, the MARKET path alone (no limit): 100% 83 exits, 60.4% WR, 19.6%
+    # whole-stake, maxDD -12.71, ratio 4.32, +54.87; dyn 82, 63.2%, 20.0%,
+    # -15.59, 3.41, +53.12.
+    #
+    # WHAT THIS CHANGES, AND WHAT IT DOES NOT. It changes the REASON, not the
+    # setting: 25% is no longer IMPOSSIBLE, it is merely WORSE. The fallback is
+    # real rather than theoretical -- 81% of the positions the floor refuses are
+    # reached by a single resting order, 89% if it is re-priced -- but 25% gives
+    # up $3.66 of total against HOLD, and against 100% it is worse on EVERY axis
+    # that matters: total (+55.93 vs +56.86), maxDD (-18.05 vs -11.32),
+    # return-per-pain (3.10 vs 5.02) and full-loss rate (21.8% vs 18.2%).
+    # 1.0 is chosen for the SHAPE; under the honest bound it also wins the total.
+    # ⛔ THE 1.00 ROW IS THE ROBUST ONE, AND THAT IS THE POINT: its fill count is
+    # 7/9 and its numbers are IDENTICAL under both variants, because a full
+    # position is almost never under the floor. Every other frac's row moves
+    # with the re-pricing assumption; this one does not.
+    # ⛔ THE CEILING ON THE FALLBACK, stated: a through-print is credited with a
+    # FULL fill of the slice at the resting price. Queue position and partial
+    # fills are not modelled and both cut into the fill rate, so read these
+    # rows as the optimistic end of the limit path exactly as the zero-fill rows
+    # above are its pessimistic end. The two variants bracket the re-pricing
+    # question; neither brackets the queue.
+    # ⛔ AND IT IS NOT WIRED INTO `_cross_exit_execute`, DELIBERATELY. A missed
+    # limit must NOT consume the position's one order (`cross_exit_max_per_position`
+    # / `w["done"]`), or the position is unsellable for the rest of the round --
+    # strictly worse than having no fallback at all.
+    # KILL CRITERION (unchanged, and now reachable): over ~40 exits, if the
+    # full-loss rate is not lower AND the P&L is materially worse than holding,
+    # set model_exit_on_reaction=False.
     model_exit_frac: float = 0.25
     model_exit_look_s: float = 20.0
     model_exit_rev_bps: float = 5.0

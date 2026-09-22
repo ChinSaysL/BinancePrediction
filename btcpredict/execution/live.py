@@ -444,6 +444,31 @@ class LiveBroker:
         })
         return (resp or {}).get("orders") or []
 
+    async def _working_order_ids(self) -> list[str] | None:
+        """Ids the venue still holds as WORKING, or None if unreadable.
+
+        ⛔ None AND [] ARE DIFFERENT ANSWERS. [] means "we read the list and
+        nothing of ours is working"; None means "we could not read it". Only
+        the first can authorise placing another order -- `active_orders()`
+        collapses both into [], which is exactly the distinction an exposure
+        check cannot afford to lose.
+
+        ⚠️ `cancel_orders` ALREADY READS THIS SAME LIST on its refusal path
+        (`_cancel_blocking` -> the -9000 branch), and it logs the same
+        distinction. This asks again anyway because that function's RETURN
+        cannot answer the question: it returns the ids the venue confirmed
+        cancelled, so an order that was already terminal and one whose working
+        state could not be read both come back as []. Measured 2026-09-22: the
+        duplicate read costs 23ms, which is worth paying for an unambiguous
+        answer about exposure rather than refactoring a live path to supply it.
+        """
+        resp = await self._request("GET", ACTIVE_ORDERS, {
+            "walletAddress": self.wallet_address, "limit": 50,
+        })
+        if resp is None:
+            return None
+        return [str(o.get("orderId")) for o in (resp.get("orders") or [])]
+
     async def cancel_orders(self, order_ids: list[str]) -> list[str]:
         """Cancel working orders; returns the ids the venue confirms cancelled.
 
@@ -849,9 +874,12 @@ class LiveBroker:
         # money -- only the trade.
         from btcpredict.config import settings as _s
         _budget = getattr(_s, "order_status_wait_s", 0.0) or 3.6
-        status = await self._order_status(order_id,
-                                          tries=max(6, int(_budget / 0.6)),
-                                          delay=0.6)
+        _delay = 0.6
+        # The budget is honoured AS WRITTEN, at `_delay` resolution. This used
+        # to be `max(6, ...)`, so the shortest wait anyone could configure was
+        # 3.6s no matter what they set.
+        status = await self._order_status(
+            order_id, tries=max(2, int(_budget / _delay) + 1), delay=_delay)
         if status is None:
             # The history endpoint did not answer in time. It lags the
             # place-order call by a second or two, so this is the COMMON case
@@ -859,6 +887,19 @@ class LiveBroker:
             # booked on assumption. Never do that: a phantom fill corrupts the
             # P&L, the risk guard's exposure and the trade record, and nothing
             # downstream can tell it apart from a real trade.
+            # ⛔ AND THE CUT-OFF IS SHORT BY DESIGN, because the venue's verdict
+            # is no longer what authorises a retry. Measured on the venue's OWN
+            # records (20 orders, 2026-09-22, its createTime -> terminalTime):
+            #     FILLED  n=17  min 0.52s  p50 0.97s  p90 1.13s  max 1.65s
+            #     FAILED  n=3       5.25s      12.88s      14.01s
+            # and order/history said SUBMITTED for the whole of those 12.9s.
+            # NOTHING lands between 1.65s and 5.25s. So a 15s budget is spent
+            # waiting for a FAILED stamp that was already true, and it blocks
+            # the tick while it waits (measured: an 18.64s tick). Instead, pull
+            # the order and ask the venue's two STATE lists -- "is anything of
+            # ours still working?" and "do we hold a position?" -- and retry on
+            # the answer rather than on the stamp.
+            await self.cancel_orders([order_id])
             # The position list is the EFFECT of a fill, so ask it instead: a
             # position in this token can only exist if the order went through.
             held = await self._confirm_by_position(token_id)
@@ -896,6 +937,24 @@ class LiveBroker:
                         status = "FILLED"
 
                 if status != "FILLED":
+                    # ⛔ RETRY ON THE VENUE'S OWN STATE, NOT ON WEAK EVIDENCE.
+                    # An empty position list ALONE is weak -- it lags a fill, so
+                    # re-placing on it could double the exposure -- and this
+                    # branch therefore used to abandon the round. That loses
+                    # the trade EVERY time, not sometimes. Ask the second list
+                    # first: an order that can still execute appears in
+                    # order/list as WORKING, so a readable list that omits our
+                    # id is the venue saying no order of ours can fill now. Both
+                    # lists readable, both empty of us -> place again.
+                    open_ids = await self._working_order_ids()
+                    if open_ids is not None and str(order_id) not in open_ids:
+                        self.last_failure = "venue_failed"
+                        log.warning(
+                            "order %s: no verdict in %.1fs, and the venue "
+                            "holds no WORKING order and no position in %s -- "
+                            "retrying (%s)", order_id, _budget, slug,
+                            self.last_order_error or "no reason given")
+                        return None
                     self.last_failure = "unconfirmed"
                     log.error("order %s unverifiable and the venue holds no "
                               "position in %s; NOT booking and NOT retrying%s",
@@ -1101,6 +1160,215 @@ class LiveBroker:
             stake=proceeds, fee_paid=fee,
             order_id=order_id or str(q["quoteId"]),
             ts_ms=int(time.time() * 1000), raw=str(resp)[:2000],
+            token_id=token_id,
+        )
+
+    async def sell_limit(self, *, slug: str, side: str, token_id: str,
+                         shares: float, limit_px: float | None = None,
+                         wait_s: float = 20.0, poll_s: float = 0.75,
+                         fill_break: float = 0.999) -> Fill | None:
+        """Post a resting LIMIT SELL, wait `wait_s`, cancel the remainder.
+
+        WHY THIS EXISTS. `sell_fak` is a MARKET order and the venue's MARKET
+        minimum is ~1.5 USDT of notional, so a position worth less than that
+        cannot be sold through it AT ALL. That is a property of the ORDER TYPE,
+        not a wall: LIMIT carries no such minimum (verified against the venue's
+        schema and live -- see the `order_type` note in config.py). MEASURED
+        2026-09-22 13:42:01: the reaction exit was refused on a 2.6831-share
+        position because its 25% slice came to $0.3556, and with `sell_fak` as
+        the ONLY sell method there was no way to place it. `react` exits booked:
+        0, all-time.
+
+        ⛔ UNITS: `amountIn` FOR A SELL IS SHARES IN WEI, NOT USDT. `get_quote`
+        is the same enum as `place-order-bundle`, so sending USDT here would ask
+        to sell ~`price` times too few shares. `sell_fak` carries the same
+        warning; this method passes `shares` and `side="SELL"` is what makes the
+        venue read it that way.
+
+        ⛔ `stake` ON THE RETURNED FILL IS PROCEEDS -- CASH COMING IN -- exactly
+        as in `sell_fak`. The caller books the sale itself; do NOT hand it to
+        `settle()`, which would pay the position out against the round's winner.
+
+        IT MAY NOT FILL, AND THAT IS THE TRADE-OFF BEING TESTED: a resting order
+        needs the market to come to it. None means a MISSED EXIT **OR AN
+        UNKNOWN ONE** -- the position is still held in the first case, while the
+        second (`last_failure == "sell_unconfirmed"`) means the venue never said
+        and the caller must NOT treat it as safe to sell again. The caller must
+        read `last_failure` before retrying; a retry after a real fill is a
+        naked short.
+
+        THE PRICE IS NOT THE CALLER'S TO CHOOSE. `_cross_exit_execute` is
+        explicit that the arm must not read its own book to price an exit, so
+        when `limit_px` is None the price is taken from the VENUE's own SELL
+        quote (`averagePrice`) and floored to the venue's 2-decimal tick: at or
+        just inside the quoted price, never resting above the market, giving up
+        at most one tick to be filled. That costs one extra quote round trip
+        (a MARKET quote to learn the price, then the LIMIT quote, because the
+        venue requires `priceLimit` on a LIMIT quote) -- paid only on this
+        fallback path.
+        """
+        if not self.enabled:
+            raise LiveBrokerError("wallet not configured; call discover_wallet() first")
+        self.last_failure = None
+        self.last_order_error = None
+        self.last_sell_size = 0.0
+        shares = float(shares or 0.0)
+        if shares <= 0.0 or not token_id:
+            # Nothing to sell, or a position with no token: either would only
+            # produce a venue error naming the wrong cause.
+            self.last_failure = "sell_no_shares"
+            return None
+
+        if limit_px is None:
+            mk = await self.get_quote(token_id, shares, side="SELL",
+                                      order_type="MARKET")
+            if not mk or not mk.get("quoteId"):
+                self.last_failure = "no_sell_quote"
+                log.warning("no SELL quote for %s %s (%.4f shares) -- cannot "
+                            "price the limit", slug, side, shares)
+                return None
+            avg = float(mk.get("averagePrice") or 0.0)
+            if not (0.0 < avg < 1.0):
+                self.last_failure = "sell_price_missing"
+                log.warning("sell limit %s %s: venue quote %.4f is unusable",
+                            slug, side, avg)
+                return None
+            limit_px = max(0.01, int(avg * 100) / 100.0)
+        limit_px = float(limit_px)
+        if not (0.0 < limit_px < 1.0):
+            self.last_failure = "sell_price_missing"
+            return None
+
+        # NO MIN-NOTIONAL CHECK HERE, DELIBERATELY: that rule is MARKET-only and
+        # this path exists precisely to be placeable under it.
+        #
+        # ⛔ `last_sell_size` IS NOT SET HERE, and that is deliberate: it means
+        # "what we actually SOLD", the same as in `sell_fak`. It used to report
+        # the size INTENDED before any order existed, so every refusal (a
+        # rejected placement, an unreadable status) left a nonzero "we sold
+        # this much" behind -- and main.py reads that field to size a pending
+        # sale's confirmation (`sent = getattr(self.broker, "last_sell_size")`).
+        quote = await self.get_quote(token_id, shares, side="SELL",
+                                     order_type="LIMIT",
+                                     price_limit=limit_px)
+        if not quote or not quote.get("quoteId"):
+            self.last_failure = "no_sell_quote"
+            log.warning("no SELL LIMIT quote for %s %s (%.4f shares @ %.4f)",
+                        slug, side, shares, limit_px)
+            return None
+        resp = await self._request("POST", PLACE_ORDER, {
+            "walletAddress": self.wallet_address,
+            "walletId": self.wallet_id,
+            "quoteId": quote["quoteId"],
+            # LIMIT must be GTC; FOK belongs to MARKET (schema, verified live).
+            "timeInForce": "GTC",
+            "accountType": self.account_type,
+            "orderType": "LIMIT",
+            "priceLimit": f"{limit_px:.2f}",
+            "slippageBps": self.slippage_bps,
+        })
+        if not resp:
+            refused = (not self._transport_error
+                       and 400 <= self._last_status < 500)
+            self.last_failure = "rejected" if refused else "unknown"
+            return None
+        order_id = str(resp.get("orderId") or resp.get("bundleId") or "")
+        if not order_id:
+            self.last_failure = "no_order_id"
+            return None
+
+        deadline = time.time() + max(0.0, wait_s)
+        rec: dict | None = None
+        terminal = {"CLOSED", "CANCELLED", "CANCELED", "EXPIRED", "FAILED"}
+        while True:
+            rec = await self.order_record(order_id, tries=1)
+            filled = float((rec or {}).get("fillPercentage") or 0.0)
+            if filled >= fill_break:
+                break
+            if filled <= 0.0 and str((rec or {}).get("status") or "") in terminal:
+                break
+            if time.time() >= deadline:
+                break
+            await asyncio.sleep(poll_s)
+
+        filled = float((rec or {}).get("fillPercentage") or 0.0)
+        if rec is None:
+            # ⛔ THE VENUE DID NOT SAY, and that is NOT the same as "it did not
+            # fill". Mirrors `sell_fak`, which reports `sell_unconfirmed` here
+            # in the same words: a phantom SALE books proceeds that never
+            # arrived AND releases a position the venue still holds, so the
+            # round then settles against shares the ledger thinks are gone.
+            # THIS USED TO REPORT `limit_unfilled`, which asserts the opposite of
+            # what we know -- and the caller's miss branch RETRIES next tick
+            # (main.py: "sell did not fill ... retrying next tick"), so a retry
+            # after a real fill is a naked short. The cancel is best-effort:
+            # leaving an untracked GTC order resting until the bell is worse.
+            await self.cancel_orders([order_id])
+            self.last_failure = "sell_unconfirmed"
+            log.warning("sell limit %s %s @%.4f: order %s status UNREADABLE -- "
+                        "cancelled; UNKNOWN, not a confirmed miss",
+                        slug, side, limit_px, order_id)
+            return None
+        if filled <= 0.0:
+            cancelled = await self.cancel_orders([order_id])
+            # ⛔ RE-READ AFTER CANCELLING, ALWAYS -- the same race `buy_limit`
+            # documents at length. The venue can fill between the last poll and
+            # the cancel landing, and it is WORSE on a sell than on a buy:
+            # returning None there tells the caller it still owns a position the
+            # venue has already paid for, so the round then settles against
+            # shares that no longer exist.
+            post = await self.order_record(order_id, tries=2)
+            post_filled = float((post or {}).get("fillPercentage") or 0.0)
+            if post_filled <= 0.0:
+                self.last_failure = "limit_unfilled"
+                log.info("sell limit %s %s @%.4f unfilled after %.0fs -> %s (%s)",
+                         slug, side, limit_px, wait_s,
+                         "cancelled" if cancelled else "CANCEL NOT CONFIRMED",
+                         order_id)
+                return None
+            log.warning("sell limit %s %s @%.4f RACED THE CANCEL: polled 0%% "
+                        "filled, but the venue now reports %.0f%% (%s) -- "
+                        "booking it", slug, side, limit_px, post_filled * 100,
+                        order_id)
+            rec, filled = post, post_filled
+
+        # FOR A SELL THESE ROLES ARE INVERTED from the buy path:
+        # `filledShareQty` is what we GAVE UP and `filledUsdtAmount` is the cash
+        # we RECEIVED. Parsed separately for that reason, not reused from
+        # `buy_limit`'s arithmetic.
+        if filled < 0.999:                  # partial: cancel the remainder
+            cancelled = await self.cancel_orders([order_id])
+            # ⛔ RE-READ AFTER CANCELLING A PARTIAL TOO, not only a zero. The
+            # same race the no-fill path documents runs here: the remainder can
+            # fill between the last poll and the cancel landing. Booking only
+            # the polled part under-states the proceeds AND tells the caller it
+            # still holds shares the venue has already paid for.
+            # (buy_limit carries the same gap on its own partial path --
+            # reported, not changed: that is the live ENTRY path and it needs
+            # its own verification.)
+            post = await self.order_record(order_id, tries=2)
+            post_filled = float((post or {}).get("fillPercentage") or 0.0)
+            if post_filled > filled:
+                log.warning(
+                    "sell limit %s %s @%.4f: remainder FILLED WITH THE CANCEL "
+                    "(%.0f%% -> %.0f%%, cancel %s) -- booking the venue's "
+                    "number, not the polled one", slug, side, limit_px,
+                    filled * 100, post_filled * 100,
+                    "confirmed" if cancelled else "NOT confirmed")
+                rec, filled = post, post_filled
+        sold = amount_usdt(rec.get("filledShareQty"))
+        proceeds = amount_usdt(rec.get("filledUsdtAmount"))
+        px = (proceeds / sold) if sold > 0 else limit_px
+        fee = amount_usdt(rec.get("marketProviderFee"))
+        self.last_sell_size = float(sold)
+        log.info("sell limit %s %s FILLED %.0f%% @%.4f (%.4f shares -> $%.4f, "
+                 "fee $%.4f)", slug, side, filled * 100, px, sold, proceeds, fee)
+        return Fill(
+            slug=slug, side=side, requested_px=limit_px, filled_px=px,
+            shares=sold,
+            # PROCEEDS, not an outlay. See the docstring.
+            stake=proceeds, fee_paid=fee, order_id=order_id,
+            ts_ms=int(time.time() * 1000), raw=json.dumps(rec, default=str),
             token_id=token_id,
         )
 
