@@ -970,11 +970,11 @@ def main() -> None:
         n = len(rs)
         reach = {s: 0 for s in names}
         died = {s: 0 for s in names}
-        for st in fun.values():
+        for stage in fun.values():
             for s in names:
-                if st >= s:
+                if stage >= s:
                     reach[s] += 1
-            died[st] = died.get(st, 0) + 1
+            died[stage] = died.get(stage, 0) + 1
         print(f"  rounds on the tape: {n} over {days:.1f} days "
               f"({n/max(days,1):.0f}/day)")
         print(f"  {'stage':<38}{'reached':>8}{'%':>6}{'died here':>11}")
@@ -1066,12 +1066,20 @@ def main() -> None:
         # sale per position.
         S = settings
         SLIP, XFEE = 0.01, 0.005
-        # ⛔ NOT `st.fmean` HERE. `main()` assigns a local `st` somewhere below
-        # (a stake temporary), so `st` is a LOCAL of main for the whole
-        # function body and the nested helpers below see it as an unbound
-        # closure variable: "cannot access free variable 'st' where it is not
-        # associated with a value". Bind the function instead.
+        # ⛔ NOT `st.fmean` HERE, AND IT IS NOT PARANOIA. `main()` binds `st` as
+        # a for-loop target (the funnel block's `for stage in ...` used to be
+        # `for st in ...`), and ANY assignment to a name anywhere in a function
+        # makes it local to that function for the whole body -- so every nested
+        # helper that says `st.fmean` resolves to main's local and dies with
+        # "cannot access free variable 'st' where it is not associated with a
+        # value". That rename broke `--mode exit` (it uses st.fmean in `erow`)
+        # and `--mode count` long before the ship mode existed.
         from statistics import fmean as _fmean
+        # The venue refuses a SELL whose notional is under this, so a trigger
+        # whose slice is too small is NOT an exit -- it is a position held to
+        # the bell. Modelled because it binds exactly when the stop is working.
+        from btcpredict.execution.live import (                     # noqa: E402
+            SELL_MIN_NOTIONAL_USDT as _SELL_MIN)
         SZ = dict(lo=S.stake_ev_lo, hi=S.stake_ev_hi,
                   min_stake=S.min_stake_usdt, max_stake=S.max_stake_usdt,
                   tilt=S.stake_tilt, cap=S.stake_cap_usdt,
@@ -1109,9 +1117,24 @@ def main() -> None:
                     (s,))}
             return out
 
-        def _ret_exited(e: dict, rnd: dict, bidmap: dict) -> tuple[float, bool]:
-            """(the per-$1 return with the shipped exit applied, did it exit)."""
+        def _ret_exited(e: dict, rnd: dict, bidmap: dict,
+                        stake: float) -> tuple[float, bool]:
+            """(the per-$1 return with the shipped exit applied, did it exit).
+
+            MIRRORS `main.Bot._reaction_against` -- and the first two versions
+            of this overlay did NOT:
+              * the spot must still be AHEAD of the strike (`log(S/K)*sgn > 0`):
+                the rule exists to protect a LEAD, so once the price is behind
+                the strike there is nothing to protect and it does not fire;
+              * the venue refuses a sell under its notional floor, so a blocked
+                slice is a HOLD, not an exit -- and the floor is checked against
+                the ACTUAL POSITION (`stake / cost` shares), not against the
+                slice per $1 of stake. Getting that unit wrong blocked 81 of 85
+                triggers and reported the exit as inert. That is the third time
+                this unit error has appeared in this repo; see the artifact list.
+            """
             rows = rnd["rows"]
+            strike = rnd.get("strike")
             j = next((k for k, rr in enumerate(rows) if rr[0] >= e["ts_ms"]),
                      None)
             if j is None:
@@ -1120,6 +1143,8 @@ def main() -> None:
             seen = [(rr[0], rr[2]) for rr in rows[:j + 1]
                     if rr[2] and rr[2] > 0]
             look_ms = S.model_exit_look_s * 1000.0
+            sh = stake / ao._cost_per_share(e["px"])        # ACTUAL shares
+            frac = float(S.model_exit_frac)
             for rr in rows[j + 1:]:
                 ts, tau, spot = rr[0], rr[1], rr[2]
                 if ts - e["ts_ms"] < S.model_exit_min_hold_s * 1000:
@@ -1129,6 +1154,10 @@ def main() -> None:
                 if not spot or spot <= 0:
                     continue
                 seen.append((ts, spot))
+                if not (strike and tau and tau > 0):
+                    continue
+                if math.log(spot / strike) * sgn <= 0:
+                    continue         # no lead left to protect -> no trigger
                 past = [s for t, s in seen if t <= ts - look_ms]
                 if not past:
                     continue
@@ -1142,11 +1171,11 @@ def main() -> None:
                         break
                 if not px:
                     continue
-                frac = float(S.model_exit_frac)
-                sh = 1.0 / ao._cost_per_share(e["px"])     # shares per $1
+                if sh * frac * max(0.0, px - SLIP) < _SELL_MIN:
+                    continue         # the venue refuses the SELL
                 got = sh * frac * max(0.0, px - SLIP) * (1.0 - XFEE)
                 rest = sh * (1.0 - frac) * (1.0 if e["won"] else 0.0)
-                return got + rest - 1.0, True
+                return (got + rest) / stake - 1.0, True
             return e["ret"], False
 
         def _battery(ent: list[dict], rmap: dict, *, use_exit: bool,
@@ -1159,7 +1188,7 @@ def main() -> None:
                     continue
                 if use_exit:
                     r, did = _ret_exited(e, rmap[e["slug"]], bmap.get(
-                        e["slug"], {}))
+                        e["slug"], {}), stake)
                     n_exit += 1 if did else 0
                 else:
                     r = e["ret"]
@@ -1213,6 +1242,13 @@ def main() -> None:
             ("min_stake 1->1.5", {}, dict(min_stake=1.5), True),
             ("boost x2 (bands)", {}, dict(boost=2.0), True),
             ("tilt inv_z", {}, dict(tilt="inv_z"), True),
+            ("0.90 + flat $2", dict(max_quote=0.90),
+             dict(min_stake=2.0, max_stake=2.0), True),
+            ("0.90 + ev_hi 0.07", dict(max_quote=0.90), dict(hi=0.07), True),
+            ("flat $2 + ev_hi 0.07", {},
+             dict(min_stake=2.0, max_stake=2.0, hi=0.07), True),
+            ("0.90 + flat $2 + hi0.07", dict(max_quote=0.90),
+             dict(min_stake=2.0, max_stake=2.0, hi=0.07), True),
         ]
         for label, over, sz, use_exit in ship_cands:
             _sz[0] = {**SZ, **(sz or {})}
