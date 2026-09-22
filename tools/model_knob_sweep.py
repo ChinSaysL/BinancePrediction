@@ -179,6 +179,37 @@ def crossings(seen: list[float], strike: float, band: float = 0.0) -> int:
     return cr
 
 
+def strike_crossings(
+        sec_last: list[tuple[float, float]], strike: float,
+        min_secs: int = 3) -> int | None:
+    """`Bot._strike_crossings`, reproduced EXACTLY.
+
+    ⛔ THIS IS NOT `crossings()` ABOVE, AND THE TWO MUST NOT BE CONFUSED. That
+    one counts sign changes of (spot - strike) on every row with a DEAD BAND in
+    sigma units; this one is the LIVE gate:
+      * RESAMPLE to the last spot in each whole second since the round opened
+        (the live poll grid is a median 58-125 ms, so a raw count flips on
+        jitter many times per real crossing and a threshold of 3 would refuse
+        nearly every round);
+      * NO DEAD BAND; a flip is a flip;
+      * fewer than `min_secs` whole seconds -> None, which is "no opinion" and
+        must NOT refuse, or a cold start silently disables the arm.
+
+    `sec_last` is the per-second series built so far; the LAST entry is the
+    second in progress, whose value is the current tick's spot -- exactly what
+    the live buffer holds when the arm evaluates at that tick.
+    """
+    if len(sec_last) < min_secs:
+        return None
+    cr, up = 0, None
+    for _sec, px in sec_last:
+        now_up = px > strike
+        if up is not None and now_up != up:
+            cr += 1
+        up = now_up
+    return cr
+
+
 def replay(rnd: dict, sigma: float, *, persistence: int,
            max_tau: float, min_tau: float | None,
            min_quote: float, max_quote: float,
@@ -187,7 +218,7 @@ def replay(rnd: dict, sigma: float, *, persistence: int,
            margin: float | None = None,
            haircut: float | None = None,
            zone_min_margin: float = 0.0, zone_max_cross: int = 0,
-           zone_band_k: float = 0.5,
+           zone_band_k: float = 0.5, max_strike_crossings: int = 0,
            entry_rev_bps: float = 0.0, entry_look_s: float = 20.0,
            live_sig: list[tuple[int, float]] | None = None) -> dict | None:
     """The first round-qualifying entry under these knobs, or None.
@@ -199,6 +230,8 @@ def replay(rnd: dict, sigma: float, *, persistence: int,
     lo_tau = settings.min_tau_s if min_tau is None else min_tau
     hc = settings.edge_haircut if haircut is None else haircut
     strike = rnd["strike"]
+    start_ms = rnd.get("start_ms") or (rnd["rows"][0][0] if rnd.get("rows") else 0)
+    sec_last: list[tuple[float, float]] = []      # (second, last spot in it)
     streak_side, streak = None, 0
     seen: list[float] = []
     seen_ts: list[tuple[int, float]] = []
@@ -206,6 +239,18 @@ def replay(rnd: dict, sigma: float, *, persistence: int,
         if spot is not None and spot > 0:
             seen.append(spot)
             seen_ts.append((ts_ms, spot))
+            # `Bot._strike_crossings` resamples the round's OWN tape to 1 Hz
+            # (the last spot in each whole second since the round opened) and
+            # does so on EVERY tick -- it has nothing to do with whether the
+            # signal likes the tick. Feeding it only on ticks that already
+            # passed the gates below starves it: the arm's first agreeing tick
+            # can be 200s into the round, and the helper returns None until it
+            # has 3 whole seconds, so the gate could never refuse anything.
+            sec = (ts_ms - start_ms) // 1000
+            if not sec_last or sec_last[-1][0] != sec:
+                sec_last.append((sec, spot))
+            else:
+                sec_last[-1] = (sec, spot)
         if (spot is None or not 0 < tau <= 300
                 or up_ask is None or dn_ask is None):
             streak_side, streak = None, 0
@@ -259,6 +304,16 @@ def replay(rnd: dict, sigma: float, *, persistence: int,
                 if crossings(seen, strike,
                              zone_band_k * sg_i * strike) >= zone_max_cross:
                     continue
+        # ================= THE LIVE CROSSINGS GATE =================
+        # ⛔ THIS IS `Bot._strike_crossings`, THE RULE THAT WENT LIVE ON
+        # 2026-09-22 06:03Z -- NOT the `zone_max_cross` block above, which is
+        # banded. The live gate has NO band and resamples to 1 Hz. It is
+        # evaluated here, in the gate chain after the streak update, because in
+        # the bot a refused tick still extends the persistence streak.
+        if max_strike_crossings > 0:
+            xc = strike_crossings(sec_last, strike)
+            if xc is not None and xc >= max_strike_crossings:
+                continue
         # ============ THE ENTRY-SIDE MIRROR OF THE EXIT RULE ============
         # ⭐ THIS COMES FROM THE EXIT'S OWN DATA, not from a hunch. The tau
         # diagnostic in `--mode exit` shows 21 of 46 reaction exits fire at tau
@@ -366,7 +421,7 @@ def main() -> None:
                     choices=["all", "ofat", "joint", "live", "halves",
                              "fair", "size", "sure", "price", "zone",
                              "exit", "struct", "predict", "react",
-                             "stakeband"],
+                             "crossings", "stakeband"],
                     help="which grid to run")
     ap.add_argument("--weight-low-fair", type=float, default=2.0,
                     help="stake MULTIPLIER for entries with fair <= the cut "
@@ -793,6 +848,67 @@ def main() -> None:
                   f"(n={a2[0]:<4}) B {b2[1]:+.4f} (n={b2[0]:<4})   "
                   f"{'REPEATS' if same else 'FLIPS -> fitting, do not ship'}")
         return
+
+    if args.mode == "crossings":
+        # ============ THE LIVE STRIKE-CROSSINGS GATE ============
+        # ⛔ WHAT THIS IS FOR. `model_max_strike_crossings=3` went live on
+        # 2026-09-22 06:03Z, and the arm's attempt rate on btc-5m fell from
+        # 32-57 rounds/day to 6 in the 12 hours after. The gate's own note
+        # claimed 13.2 -> 10.2 entries/day (-23%); live it cost ~7x the
+        # attempts. That note also states the hazard in its own words -- "our
+        # edge comes from the venue's quote lagging spot, which is LARGEST when
+        # the move is small; refusing small moves removes the edge with the
+        # risk" -- and a round bouncing off the strike IS the small-move round,
+        # so the gate does not remove a random slice of the population, it
+        # removes candidates.
+        # (And this was never replayable before: the `zone_max_cross` block is
+        # a DIFFERENT rule, banded and unresampled. See `strike_crossings`.)
+        #
+        # READ THE INCREMENT, NOT THE HEADLINE CELL. The thresholds nest, so
+        # the question is what each STEP bans: the gate is worth its count only
+        # if the cohort it removes has a NEGATIVE EV. A 46% cut in rounds is a
+        # high price for banning a cohort that is already flat.
+        print("\n=== THE LIVE STRIKE-CROSSINGS GATE (`Bot._strike_crossings`) ===")
+        print("  (1 Hz-resampled sign flips vs the strike, no dead band; 0 = off)")
+        lvl = (0, 2, 3, 4, 5, 6, 8, 10, 15)
+        ent = {}
+        for t in lvl:
+            e = run2(max_strike_crossings=t)
+            ent[t] = e
+            row(f"max_crossings {t}" if t else "crossings OFF", e, len(rs), days)
+        print("\n  -- THE COHORT EACH VALUE REMOVES, MEASURED AGAINST OFF --")
+        print("     (a threshold is worth its cut only if the removed cohort is"
+              " flat or negative)")
+        # ⛔ ANCHOR ON OFF, NOT ON THE NEIGHBOUR. The thresholds NEST and a
+        # HIGHER value is LOOSER -- it refuses fewer rounds -- so consecutive
+        # pairs read "bans 0 of N" and hide the cost entirely. Measured
+        # 2026-09-22: the pairs printed 0,0,0,0,0,0,0 while OFF -> 3 was
+        # removing 66 rounds. What the decision needs is each value against no
+        # gate at all.
+        # ⛔ ALSO DO NOT NAME THIS `base`. `run2` is a closure over main's
+        # `base` (the replay kwargs), so rebinding it here made the NEXT
+        # `run2()` unpack a slug->return dict as kwargs: "replay() got an
+        # unexpected keyword argument 'btc-updown-5m-...'". Measured
+        # 2026-09-22.
+        off_ret = {e["slug"]: e["ret"] for e in ent[lvl[0]]}
+        for t in lvl[1:]:
+            keep = {e["slug"]: e["ret"] for e in ent[t]}
+            gone = [v for k, v in off_ret.items() if k not in keep]
+            won = list(keep.values())
+            ev = (sum(gone) / len(gone)) if gone else float("nan")
+            wr = (100 * sum(1 for v in gone if v > 0) / len(gone)
+                  if gone else float("nan"))
+            evw = (sum(won) / len(won)) if won else float("nan")
+            print(f"     OFF -> {t:<2}  removes {len(gone):>4} of {len(off_ret):>4} "
+                  f"rounds ({len(gone)/max(days,1):4.1f}/day, "
+                  f"{100*len(gone)/max(len(off_ret),1):3.0f}%)  "
+                  f"their EV {ev:+.4f}/$1  WR {wr:5.1f}%  "
+                  f"t {ao.tstat(gone) if gone else 0:+5.2f}  "
+                  f"tot@$2 ${STAKE*sum(gone):+7.2f}   | kept EV "
+                  f"{evw:+.4f}/$1 over {len(won)}")
+        print("  -- and the whole thing vs OFF --")
+        print(f"     OFF gives {len(off_ret)} rounds; the shipped rule (3) keeps "
+              f"{len(ent[3])} ({100*len(ent[3])/max(len(off_ret),1):.0f}%)")
 
     if args.mode == "exit":
         # ================== EARLY EXIT ("price reacting") ==================
