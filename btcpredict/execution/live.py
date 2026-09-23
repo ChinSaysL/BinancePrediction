@@ -81,6 +81,26 @@ BATCH_CANCEL = f"{P}/trade/batch-cancel"
 #: the failure mode this bot spent 2026-09-22 chasing.
 SELL_MIN_NOTIONAL_USDT = 1.0
 
+#: Order statuses the venue considers FINAL. A MARKET order-bundle on this venue
+#: takes 1.2-2.2 s from `createTime` to `terminalTime` (measured 2026-09-23:
+#: 13:52:31.627 -> 13:52:32.915, 13:36:52.522 -> 13:36:54.714,
+#: 11:29:43.878 -> 11:29:45.283), so a single snapshot read right after the ack
+#: shows a WORKING order -- which is how four FILLED sells were booked as
+#: `fak_unfilled` (see `sell_fak`).
+ORDER_TERMINAL_STATUSES = frozenset({
+    "FILLED", "PARTIALLY_FILLED", "FAILED", "CANCELED", "CANCELLED",
+    "REJECTED", "EXPIRED", "CLOSED",
+})
+#: Terminal AND without a fill: the venue genuinely matched nothing.
+ORDER_DEAD_STATUSES = frozenset({
+    "FAILED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "CLOSED",
+})
+#: How long `sell_fak` waits for a terminal status before handing the decision
+#: to the caller's late-confirmation path. Covers the measured 1.2-2.2 s fills
+#: with room to spare, and is short enough not to stall the tick loop.
+SELL_CONFIRM_WAIT_S = 3.0
+SELL_CONFIRM_POLL_S = 0.25
+
 
 def derived_slip_bps(default_bps: int, max_px: float | None,
                      avg_px: float) -> int:
@@ -1023,36 +1043,45 @@ class LiveBroker:
                           order_id, status, slug)
                 return None
 
-        # ⛔ THE POSITION IS THE QUOTE'S `amountOut`. NOT the venue's 2-DECIMAL
-        # `filledShareQty`, and NOT `amountOut - feeAmount` either.
-        # MEASURED from the wallet, not inferred (2026-09-23, order
-        # 26092300001909464075, $1.00 at 0.70):
-        #   wallet   $2.0854 -> $2.50172653 across that one trade
-        #   => the position that settled and redeemed was 1.41632653 shares
-        #   quote `amountOut`        1.4163   <- the position, to the 8th dp
-        #   quote `feeAmount`        0.0123   <- already netted OUT of amountOut
-        #   venue `filledShareQty`   "1.42"   <- that number ROUNDED to 2dp (up)
-        # So `amountOut - feeAmount` (what this code booked before) under-credits
-        # by the whole fee, and the venue's display is a ROUNDING that can sit
-        # ABOVE what we hold: booking "1.42" against a 1.41632653 holding makes
-        # every exit ask to sell more than the position and be refused (-9000),
-        # which is the 2026-09-22 22:43 dead exit. `amountOut` alone reproduced
-        # the wallet to the eighth decimal.
-        # As a consequence the fee needs no separate PnL deduction: it is
-        # already missing from `amountOut`, so `payout - stake` IS the cash PnL.
+        # ⛔ THE POSITION IS `amountOut` -- UNLESS THE VENUE HOLDS FEWER.
+        # `amountOut` is already net of the fee (wallet-measured 2026-09-23,
+        # order 26092300001909464075: amountOut 1.41632653 == the redeemed
+        # position to the 8th dp, `filledShareQty` "1.42" a round-UP of it),
+        # so `amountOut - feeAmount` under-credits and must never be booked.
+        # BUT `amountOut` is priced AT THE QUOTE, and the FOK may fill up to
+        # `slip` worse. Measured from order/history 2026-09-23:
+        #   1790200800  quote 0.64 -> filled 0.65   amountOut 6.0215  venue 5.93
+        #   1790165400  quote 0.67 -> filled 0.68   amountOut 5.1722  venue 5.10
+        #   1790197500  quote 0.67 -> filled 0.67   amountOut 6.0632  venue 6.06
+        # One tick of slippage = ~1.5% fewer shares than the quote promised,
+        # and the 22:04 exit then asked to sell 6.02 of a 5.93 holding (-9000).
+        # The 2026-09-22 22:43 dead exit (3.2442 asked, 3.24 held) is the same.
+        # So: a venue figure within its own 2dp rounding (0.005) confirms
+        # amountOut; one BELOW that cannot be rounding, and the position is the
+        # venue's. The display rounds to nearest, so book its LOWEST consistent
+        # value (`_ex - 0.005`): a sale floored from it never asks for more
+        # than is held. The fee needs no separate PnL deduction either way.
         _rec = await self.order_record(order_id, tries=2, delay=0.4) \
             if order_id else None
         shares = shares_gross
         _ex = amount_usdt((_rec or {}).get("filledShareQty"))
-        if _ex and _ex > 0.0 and abs(_ex - shares) > 0.005:
-            log.info("buy %s %s: venue reads %.2f shares, the quote's amountOut "
-                     "is %.4f -- booking amountOut (that venue figure is the "
-                     "same position rounded to 2dp, and it rounds UP as often "
-                     "as down)", slug, side, _ex, shares)
+        if _ex and _ex > 0.0 and _ex < shares - 0.005:
+            log.warning("buy %s %s: venue holds %.2f shares, the quote's "
+                        "amountOut is %.4f (filled worse than the quote) -- "
+                        "booking %.4f", slug, side, _ex, shares, _ex - 0.005)
+            shares = _ex - 0.005
         if not _ex:
             log.warning("buy %s %s: no executed quantity readable for order %s "
                         "-- booking the quote's amountOut %.4f", slug, side,
                         order_id, shares)
+        # The same for the cash: a fill that SPENT less than the stake
+        # (1790194200: $3.99 asked, `filledUsdtAmount` 3.93) books what left
+        # the wallet. Only below the 2dp display's own rounding.
+        _spent = amount_usdt((_rec or {}).get("filledUsdtAmount"))
+        if _spent and 0.0 < _spent < stake - 0.005:
+            log.warning("buy %s %s: venue spent $%.2f of the $%.4f stake -- "
+                        "booking $%.2f", slug, side, _spent, stake, _spent)
+            stake = _spent
         # The fee is quoted in outcome-token units; express it in USDT so PnL
         # accounting stays in one currency.
         fee_usdt = fee_shares * avg_px
@@ -1221,7 +1250,36 @@ class LiveBroker:
         # never arrived AND releases a position the venue still holds, so the
         # round then settles against a position the ledger thinks is gone.
         order_id = str(resp.get("orderId") or resp.get("bundleId") or "")
-        rec = await self.order_record(order_id, tries=6, delay=0.6) if order_id else None
+        # ⛔⛔ NEVER JUDGE A MARKET ORDER FROM ONE SNAPSHOT TAKEN RIGHT AFTER THE
+        # ACK. `order_record` retries only until the order APPEARS, so reading
+        # the fill there reads a still-OPENING order -- and this venue's MARKET
+        # bundles reach their terminal state 1.2-2.2 s AFTER `createTime`
+        # (measured 2026-09-23, see ORDER_TERMINAL_STATUSES).
+        # WHAT THAT COST: `order/history` for this wallet shows 5 SELLs ever,
+        # **4 FILLED / 1 FAILED**, and the bot booked NONE of the fills -- it
+        # called every one of them `fak_unfilled`, left the position in the
+        # ledger, and `settle_due` then booked the ROUND's own result in place
+        # of the sale. Live 2026-09-23 13:52: the venue sold 5.09 shares at 0.52
+        # for $2.60 (its own `realizedPnl` -$0.90) while the ledger recorded a
+        # full -$3.50 loss; 13:36 sold $2.66 where the ledger recorded +$1.46;
+        # 11:29 sold $5.01 where the ledger recorded +$1.91.
+        # So: wait for a terminal status (bounded), book what the venue says
+        # filled, and when it has still not said, hand back a PENDING fill --
+        # the caller keeps the position watched and closes it through
+        # `confirm_sale` rather than inventing a no-fill.
+        deadline = time.monotonic() + SELL_CONFIRM_WAIT_S
+        rec: dict | None = None
+        while order_id:
+            rec = await self.order_record(order_id, tries=1)
+            if rec is not None:
+                st = str(rec.get("status") or "").upper()
+                fp = float(rec.get("fillPercentage") or 0.0)
+                if st in ORDER_TERMINAL_STATUSES or fp >= 1.0:
+                    break
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(SELL_CONFIRM_POLL_S)
+        status = str((rec or {}).get("status") or "").upper()
         filled = float((rec or {}).get("fillPercentage") or 0.0)
         if rec is None:
             # Unreadable. NOT retryable: re-sending on weak evidence would sell
@@ -1230,29 +1288,115 @@ class LiveBroker:
             log.warning("sell %s %s: order %s status unreadable -- NOT retried; "
                         "the position rides to settlement", slug, side, order_id)
             return None
-        if filled <= 0.0:
+        sold = amount_usdt(rec.get("filledShareQty")) or (float(shares) * filled)
+        if sold <= 0.0 and filled <= 0.0:
+            if status not in ORDER_DEAD_STATUSES:
+                # NOT DEAD, SO NOT A NO-FILL -- and this is the branch the whole
+                # fix turns on. Either the order is still working at the
+                # deadline, or it is a status we do not model (or no status at
+                # all). 141 ms separated the 13:52 order from this branch and
+                # its fill. Say PENDING: the caller keeps the position watched
+                # and closes it through `confirm_sale` on a later tick. Only a
+                # status that MEANS dead is allowed to retire a position.
+                self.last_failure = "sell_pending"
+                self.last_sell_size = float(shares)
+                log.info("sell %s %s: order %s is still '%s' after %.1fs -- NOT "
+                         "a no-fill; the position stays watched and the sale "
+                         "is confirmed late", slug, side, order_id,
+                         status or "unknown", SELL_CONFIRM_WAIT_S)
+                return Fill(
+                    slug=slug, side=side,
+                    requested_px=float(min_px) if min_px is not None else avg_px,
+                    filled_px=avg_px, shares=0.0, stake=0.0, fee_paid=0.0,
+                    order_id=order_id, ts_ms=int(time.time() * 1000),
+                    raw=str(resp)[:2000], token_id=token_id, pending=True,
+                )
             self.last_failure = "fak_unfilled"
-            log.info("sell %s %s: FAK found nothing at or above the floor (%s)",
-                     slug, side, order_id)
+            log.info("sell %s %s: order %s terminal '%s' with NO fill -- the "
+                     "venue matched nothing (quote %.4f)", slug, side, order_id,
+                     status, avg_px)
             return None
 
-        sold = amount_usdt(rec.get("filledShareQty")) or (shares * filled)
-        proceeds = amount_usdt(rec.get("filledUsdtAmount"))
-        px = (proceeds / sold) if sold > 0 else avg_px
         fee = amount_usdt(rec.get("marketProviderFee"))
+        net = amount_usdt(rec.get("filledUsdtAmount"))
+        if net <= 0.0 and sold > 0:
+            # Position gone, cash unreadable: booking $0 proceeds would leave a
+            # hole in the P&L that nothing ever revisits. Price it at the fill
+            # and say so.
+            net = sold * avg_px
+            log.warning("sell %s %s: no readable filledUsdtAmount for %s -- "
+                        "booked %.4f shares at the %.4f fill ($%.4f)",
+                        slug, side, order_id, sold, avg_px, net)
+        # ⛔ GROSS, NOT THE VENUE'S NET. `filledUsdtAmount` is what LANDED
+        # (gross - fee: 5.09 sh @0.52 = $2.6468 gross -> $2.60 in the record),
+        # and `_cross_exit_execute` books `proceeds = sold*px - fee_paid` --
+        # handing back the net as the price charges the fee TWICE. This is why
+        # `PmBroker.sell_fak` books `stake = sold * px`, gross, and it is the
+        # convention every settled row in this ledger already follows.
+        gross = net + fee
+        px = (gross / sold) if sold > 0 else avg_px
         self.last_sell_size = float(sold)
-        log.info("SELL %s %s FILLED %.0f%% @%.4f (%.4f shares -> $%.4f, fee $%.4f)",
-                 slug, side, filled * 100, px, sold, proceeds, fee)
+        log.info("SELL %s %s %s (%.4f shares, $%.4f net + $%.4f fee -> "
+                 "%.4f/share)", slug, side, status or "FILLED", sold, net, fee,
+                 px)
         return Fill(
             slug=slug, side=side,
             requested_px=float(min_px) if min_px is not None else px,
             filled_px=px, shares=sold,
-            # PROCEEDS, not an outlay. See the docstring.
-            stake=proceeds, fee_paid=fee,
+            # PROCEEDS (GROSS of the fee), not an outlay. See the docstring.
+            stake=gross, fee_paid=fee,
             order_id=order_id or str(q["quoteId"]),
             ts_ms=int(time.time() * 1000), raw=str(resp)[:2000],
             token_id=token_id,
         )
+
+    async def confirm_sale(self, *, token_id: str, shares: float,
+                           since_ts: float,
+                           fallback_px: float = 0.0) -> tuple | None:
+        """Did a SELL we placed land? `(sold, px, fee)` or None (ask again).
+
+        THE OTHER HALF OF THE PENDING PATH, AND THE VENUE NEEDS BOTH. On a
+        MARKET bundle the fill is not visible at the moment `sell_fak` returns
+        (1.2-2.2 s to the terminal state), so it returns a `pending` Fill and
+        `_cross_exit_execute` keeps the position watched. `_confirm_pending_sale`
+        then calls THIS method on later ticks -- and without it the caller does
+        `fn is None -> w.pop("pending") -> stop asking`, which retires the watch
+        with the position still on the ledger and hands the round's own result
+        to `settle_due`. That is precisely how a placed-and-FILLED sale ended up
+        booked as a full loss (2026-09-23 13:52).
+
+        MATCHING, and why it is strict. `since_ts` is when we placed the sale;
+        the history also carries the OPERATOR'S OWN manual trades, so a loose
+        match can book someone else's order. Requirements: side SELL, a positive
+        fill, terminal time not before we placed it (5 s of clock slack), and a
+        size no LARGER than what we sent (a stepped-down fill is fine, a bigger
+        one cannot be ours). The most recent match wins.
+        """
+        resp = await self._request("GET", ORDER_HISTORY, {
+            "walletAddress": self.wallet_address, "pageSize": 50, "pageNo": 1})
+        best: tuple | None = None
+        for o in ((resp or {}).get("orders") or []):
+            if str(o.get("side") or "").upper() != "SELL":
+                continue
+            sold = amount_usdt(o.get("filledShareQty")) or 0.0
+            if sold <= 0.0:
+                continue
+            ts = float(o.get("terminalTime") or o.get("createTime") or 0) / 1000.0
+            if since_ts and ts + 5.0 < float(since_ts):
+                continue
+            if shares and sold > float(shares) + 0.02:
+                continue                      # bigger than we sent: not ours
+            if best is None or ts > best[0]:
+                proceeds = amount_usdt(o.get("filledUsdtAmount"))
+                best = (ts, sold, proceeds, amount_usdt(o.get("marketProviderFee")))
+        if best is None:
+            return None
+        _, sold, proceeds, fee = best
+        px = (proceeds / sold) if (sold > 0 and proceeds > 0) else \
+            float(fallback_px or 0.0)
+        log.info("confirm_sale: the venue shows %.4f shares sold @%.4f "
+                 "(proceeds $%.4f, fee $%.4f)", sold, px, proceeds, fee)
+        return (sold, px, fee)
 
     async def sell_limit(self, *, slug: str, side: str, token_id: str,
                          shares: float, limit_px: float | None = None,

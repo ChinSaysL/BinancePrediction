@@ -15,11 +15,15 @@ So the two earlier readings were both wrong:
     "You have exceeded your available shares", and the reaction exit never fired;
   * `filledShareQty` (the first fix) is a DISPLAY ROUNDING that can sit ABOVE the
     holding (1.42 > 1.41632653), which reproduces the same refused exit.
-`amountOut` reproduces the wallet to the eighth decimal, so that is what `buy`
-books. The venue's figure is kept as a cross-check line in the log only.
+`amountOut` reproduces the wallet to the eighth decimal WHEN THE FOK FILLS AT
+THE QUOTE. It may fill up to `slip` worse, and then the venue holds fewer
+(order/history 2026-09-23: quote 0.64 -> filled 0.65, amountOut 6.0215, venue
+5.93 -- the 22:04 exit asked for 6.02 and got -9000). The 22:43 case above is
+the same thing: 3.24 held against an amountOut of 3.2875.
 
 Two properties, so neither can regress quietly:
-  * `buy` books the quote's `amountOut`;
+  * `buy` books `amountOut`, or -- when the venue's figure sits below it by
+    more than its 2dp rounding -- the lowest holding that figure allows;
   * `sell_fak` FLOORS the ask to the venue's step (hundredths) and, if the venue
     still refuses the size, steps the ask down rather than giving up -- quotes are
     read-only, so that costs time and can never place an order. Selling FEWER
@@ -79,14 +83,14 @@ def _stub_quote(b, *, avg=0.6, quote_ok_after=0, amount_out=None, fee=0.0):
     return state
 
 
-def _stub_rest(b, *, executed=VENUE_EXECUTED, fill_pct="1"):
+def _stub_rest(b, *, executed=VENUE_EXECUTED, fill_pct="1", usdt="2"):
     async def _request(method, path, params):
         b.rec["orders"].append({"path": path, "params": params})
         return {"orderId": "o1"}
 
     async def order_record(order_id, tries=3, delay=0.4):
         return {"fillPercentage": fill_pct, "filledShareQty": executed,
-                "filledUsdtAmount": "2", "marketProviderFee": "0.01",
+                "filledUsdtAmount": usdt, "marketProviderFee": "0.01",
                 "status": "FILLED"}
 
     async def _order_status(order_id, tries=8, delay=1.5):
@@ -138,8 +142,13 @@ def test_sell_fak_never_rounds_up():
 
 # --- the BUY side ---------------------------------------------------------
 
-def test_buy_books_the_quotes_amount_out_not_the_venues_display():
-    """`amountOut` is the position; never `amountOut - fee`, never the display."""
+def test_buy_books_the_venue_when_it_holds_fewer_than_amount_out():
+    """The 2026-09-22 22:43 case, re-read: amountOut 3.2875, venue 3.24.
+
+    47 thousandths is no 2dp rounding -- the FOK filled worse than the quote.
+    Book the lowest holding the display allows, never amountOut, never
+    amountOut - fee (3.2442, still above the 3.24 held).
+    """
     b = _broker()
     gross = QUOTE_NET + 0.0433
     _stub_quote(b, avg=0.616481, amount_out=gross, fee=0.0433)
@@ -147,10 +156,8 @@ def test_buy_books_the_quotes_amount_out_not_the_venues_display():
     fill = asyncio.run(b.buy(slug="s", side="Up", token_id="t",
                              price=0.6, stake=2.0))
     assert fill is not None
-    assert abs(fill.shares - gross) < 1e-9, fill.shares
-    assert fill.shares != 3.24 and fill.shares != QUOTE_NET, fill.shares
-    # the price is then the REAL one, not a re-derived float
-    assert abs(fill.filled_px - 2.0 / gross) < 1e-9, fill.filled_px
+    assert abs(fill.shares - 3.235) < 1e-9, fill.shares
+    assert abs(fill.filled_px - 2.0 / 3.235) < 1e-9, fill.filled_px
 
 
 def test_buy_never_books_a_rounding_the_venue_makes_in_our_favour():
@@ -201,3 +208,50 @@ def test_buy_falls_back_to_the_quote_when_the_record_is_unreadable():
     # amountOut, and NOT amountOut - feeAmount (which under-credits the fee)
     assert abs(fill.shares - (QUOTE_NET + 0.0433)) < 1e-9, fill.shares
     assert b.last_failure is None
+
+
+# --- MEASURED 2026-09-23 from order/history: the FOK fills worse than quoted --
+
+import pytest
+
+
+@pytest.mark.parametrize("round_id,stake,amount_out,venue,usdt,booked", [
+    # quote 0.64 -> filled 0.65: the 22:04 refused exit (asked 6.02, held 5.93)
+    ("1790200800", 3.89780256232272, 6.021495927138239, "5.93", "3.9", 5.925),
+    # quote 0.67 -> filled 0.68
+    ("1790165400", 3.5, 5.1721641791044775, "5.1", "3.5", 5.095),
+    # filled AT the quote: the venue confirms amountOut, keep it
+    ("1790197500", 4.1029500656028635, 6.063180387990142, "6.06", "4.1",
+     6.063180387990142),
+])
+def test_buy_books_what_the_venue_holds(round_id, stake, amount_out, venue,
+                                        usdt, booked):
+    b = _broker()
+    _stub_quote(b, avg=stake / amount_out, amount_out=amount_out, fee=0.06)
+    _stub_rest(b, executed=venue, usdt=usdt)
+    fill = asyncio.run(b.buy(slug=round_id, side="Up", token_id="t",
+                             price=0.6, stake=stake))
+    assert fill is not None
+    assert abs(fill.shares - booked) < 1e-9, (round_id, fill.shares)
+    assert abs(fill.stake - stake) < 1e-9, "a 2dp display must not move stake"
+    # and the exit's first ask is at or below what the venue holds
+    b2 = _broker()
+    _stub_quote(b2)
+    _stub_rest(b2)
+    asyncio.run(b2.sell_fak(slug=round_id, side="Up", token_id="t",
+                            shares=fill.shares))
+    assert b2.rec["quotes"][0]["amount"] <= float(venue) - 0.005 + 1e-9 \
+        or booked == amount_out, b2.rec["quotes"]
+
+
+def test_buy_books_the_cash_the_venue_spent():
+    """1790194200: $3.99 asked, `filledUsdtAmount` 3.93, 6.17 shares held."""
+    b = _broker()
+    _stub_quote(b, avg=0.6473, amount_out=6.170323651557267, fee=0.07)
+    _stub_rest(b, executed="6.17", usdt="3.93")
+    fill = asyncio.run(b.buy(slug="s", side="Down", token_id="t",
+                             price=0.64, stake=3.9941409295))
+    assert fill is not None
+    assert abs(fill.stake - 3.93) < 1e-9, fill.stake
+    assert abs(fill.shares - 6.170323651557267) < 1e-9, fill.shares
+    assert abs(fill.filled_px - 3.93 / 6.170323651557267) < 1e-9
