@@ -19,6 +19,7 @@ These pin the parts that are easy to get wrong:
 from __future__ import annotations
 
 import asyncio
+import math
 import pathlib
 import tempfile
 import time
@@ -123,6 +124,8 @@ class TestTheReactionTrigger:
         assert bot._reaction_against(r, "Up") == (False, 0.0)
 
     def test_a_small_wobble_is_not_a_reaction(self, store):
+        """Below the threshold the venue has already repriced -- the whole
+        point of the >=5bps measurement."""
         """Below the threshold the venue has already repriced -- the whole
         point of the >=5bps measurement."""
         r = make_round()
@@ -476,6 +479,64 @@ class TestTheWiring:
             fee=0.0, entry_ms=1) is True
         assert bot._exit_watch["s"]["rule"] == "flip"
 
+
+class TestTheLeadMustBeAtRisk:
+    """`model_exit_max_z`: a bump is not a threat when the lead is still wide.
+
+    REGRESSION CASE -- live 2026-09-23 11:29:43, `btc-updown-5m-1790162700`.
+    A Down position entered at 0.647 was **6.73bps BELOW the strike** with tau
+    15.4s and the arm's own sigma at that tick (`decisions.sigma_1m` 0.000384),
+    i.e. z = 3.46 -- a decided round. A **+19-point bump inside a red candle**
+    (spot 85497 -> 85516, still 57 points under an 85573.6 strike) moved the 20s
+    window by 5.3bps and fired the exit, which then tried to sell the position
+    at 0.93 (the venue killed the order and the position won). The trigger was
+    the defect, not the execution.
+    """
+
+    AHEAD_BPS = 6.73          # how far below the strike the spot was
+    MOVE_AGAINST = 5.3        # the 20s move that fired the rule
+    SIGMA = 0.000384          # the arm's own estimate at that tick
+    TAU = 15.4
+
+    def _bot(self, store, *, ahead_bps=AHEAD_BPS, sigma=SIGMA, tau=TAU):
+        r = make_round()
+        r.end_ms = int(time.time() * 1000) + int(tau * 1000)
+        bot = make_bot(store, r)
+        bot._sigma = sigma
+        # Down is AHEAD when the spot is BELOW the strike, and the move against
+        # it is the spot RISING over the lookback.
+        now = STRIKE * math.exp(-ahead_bps / 1e4)
+        ago = STRIKE * math.exp(-(ahead_bps + self.MOVE_AGAINST) / 1e4)
+        fade(bot, r, ago, now)
+        return bot
+
+    def test_the_gate_refuses_a_decided_round(self, store, monkeypatch):
+        monkeypatch.setattr(settings, "model_exit_max_z", 2.5)
+        bot = self._bot(store)
+        assert bot._reaction_against(bot._round, "Down") == (False, 0.0)
+
+    def test_without_the_gate_the_same_tick_fires(self, store, monkeypatch):
+        """The gate is what changes it -- the trigger itself is untouched."""
+        monkeypatch.setattr(settings, "model_exit_max_z", 0.0)
+        bot = self._bot(store)
+        hit, mv = bot._reaction_against(bot._round, "Down")
+        assert hit is True and mv <= -settings.model_exit_rev_bps
+
+    def test_a_narrow_lead_still_exits(self, store, monkeypatch):
+        """0.9bps ahead at tau 15 is z ~ 0.46: a genuine threat, sell it."""
+        monkeypatch.setattr(settings, "model_exit_max_z", 2.5)
+        bot = self._bot(store, ahead_bps=0.9)
+        assert bot._reaction_against(bot._round, "Down")[0] is True
+
+    def test_a_missing_sigma_never_invents_a_refusal(self, store, monkeypatch):
+        monkeypatch.setattr(settings, "model_exit_max_z", 2.5)
+        bot = self._bot(store, sigma=0.0)
+        assert bot._reaction_against(bot._round, "Down")[0] is True
+
+    def test_the_gate_is_off_by_default(self, store):
+        """The shipped default must be the pre-2026-09-23 rule exactly."""
+        assert settings.model_exit_max_z == 0.0
+
     def test_the_check_runs_in_the_per_market_loop_not_the_decision_block(self):
         src = pathlib.Path("btcpredict/main.py").read_text()
         hook = src.index("await self._model_exit_check(r)")
@@ -500,3 +561,152 @@ class TestTheWiring:
         for tok in ("+0.0641", "+0.0317", "-0.0166", "0.7011", "0.7652",
                     "round-clustered t +1.98", "KILL CRITERION"):
             assert tok in block, tok
+
+
+class TestAFullExitIsRetriedUntilSold:
+    """⛔ Operator, 2026-09-23: once a 100% exit fires, keep selling until it
+    is gone. The rail used to retire the watch after ONE attempt -- a failed
+    sale leaves every share, so `done = max` ran and 21:09 / 22:04 each got a
+    single try before settling -$4.10 / -$3.90."""
+
+    @staticmethod
+    def _bot(store, r, **over):
+        now = int(time.time() * 1000)
+        bot = make_bot(store, r)
+        bot._exit_watch[r.slug] = {
+            "fid": 7, "side": "Up", "token": "t", "shares": 5.93, "stake": 3.9,
+            "fee": 0.04, "entry_ms": now - 30_000, "rule": "react", "done": 0,
+            "flip_ms": None, **over}
+        bot.open_fills[7] = (r.slug, SimpleNamespace())
+        return bot
+
+    def test_a_failed_sale_is_retried_next_tick_even_if_the_rule_clears(
+            self, store, monkeypatch):
+        monkeypatch.setattr(settings, "model_exit_frac", 1.0)
+        r = make_round()
+        bot = self._bot(store, r)
+        fade(bot, r, STRIKE * 1.0040, STRIKE * 1.0020)     # the rule fires
+        calls = []
+
+        async def fake_exec(r_, w, *, tau, sig_name, confirmed=None,
+                            shares=None):
+            calls.append(sig_name)                          # the sale fails
+            if len(calls) == 3:
+                bot.open_fills.pop(w["fid"], None)          # third try sells
+
+        bot._cross_exit_execute = fake_exec
+        assert asyncio.run(bot._model_exit_check(r)) is True
+        # the price recovers: the RULE no longer fires, the sale still retries
+        fade(bot, r, STRIKE * 1.0020, STRIKE * 1.0040)
+        assert asyncio.run(bot._model_exit_check(r)) is True
+        assert asyncio.run(bot._model_exit_check(r)) is True
+        assert calls == ["react", "retry", "retry"], calls
+        # sold: the next tick drops the watch and sends nothing
+        assert asyncio.run(bot._model_exit_check(r)) is False
+        assert r.slug not in bot._exit_watch and len(calls) == 3
+
+    def test_a_remainder_after_a_stepped_down_sale_is_sold_too(
+            self, store, monkeypatch):
+        monkeypatch.setattr(settings, "model_exit_frac", 1.0)
+        r = make_round()
+        bot = self._bot(store, r)
+        fade(bot, r, STRIKE * 1.0040, STRIKE * 1.0020)
+        sold = []
+
+        async def fake_exec(r_, w, *, tau, sig_name, confirmed=None,
+                            shares=None):
+            part = min(2.0, w["shares"])                    # thin book
+            sold.append(part)
+            w["shares"] = round(w["shares"] - part, 6)
+            w["done"] = w.get("done", 0) + 1
+            if w["shares"] <= 1e-9:
+                bot.open_fills.pop(w["fid"], None)
+
+        bot._cross_exit_execute = fake_exec
+        for _ in range(5):
+            asyncio.run(bot._model_exit_check(r))
+        assert abs(sum(sold) - 5.93) < 1e-9, sold
+
+    def test_dust_under_the_venue_step_is_left_alone(self, store, monkeypatch):
+        monkeypatch.setattr(settings, "model_exit_frac", 1.0)
+        r = make_round()
+        bot = self._bot(store, r, selling=True, shares=0.004)
+        bot._cross_exit_execute = None                      # must not be called
+        assert asyncio.run(bot._model_exit_check(r)) is False
+        assert r.slug not in bot._exit_watch
+
+    def test_it_stops_at_the_bell(self, store, monkeypatch):
+        monkeypatch.setattr(settings, "model_exit_frac", 1.0)
+        r = make_round()
+        r.end_ms = int(time.time() * 1000) - 1000
+        bot = self._bot(store, r, selling=True)
+        bot._cross_exit_execute = None
+        assert asyncio.run(bot._model_exit_check(r)) is False
+
+    def test_a_partial_exit_still_gets_one_sale(self, store, monkeypatch):
+        monkeypatch.setattr(settings, "model_exit_frac", 0.25)
+        r = make_round()
+        bot = self._bot(store, r, selling=True,
+                        done=settings.cross_exit_max_per_position)
+        bot._cross_exit_execute = None
+        assert asyncio.run(bot._model_exit_check(r)) is False
+
+
+class TestAPendingBinanceSaleIsConfirmed:
+    """`LiveBroker.confirm_sale` is ASYNC; it used to be called bare, so a
+    pending Binance sale raised TypeError on `got[0]` every tick."""
+
+    def test_the_async_confirmation_is_awaited(self, store, monkeypatch):
+        monkeypatch.setattr(settings, "model_exit_frac", 1.0)
+        r = make_round()
+        bot = TestAFullExitIsRetriedUntilSold._bot(
+            store, r, selling=True, pending=(time.time(), 0.14, 5.93))
+
+        async def confirm_sale(*, token_id, shares, since_ts, fallback_px=0.0):
+            return (5.93, 0.14, 0.01)
+        bot.broker = SimpleNamespace(confirm_sale=confirm_sale)
+        got = []
+
+        async def fake_exec(r_, w, *, tau, sig_name, confirmed=None,
+                            shares=None):
+            got.append((sig_name, confirmed))
+
+        bot._cross_exit_execute = fake_exec
+        assert asyncio.run(bot._model_exit_check(r)) is True
+        assert got == [("react-confirm", (5.93, 0.14, 0.01))]
+
+    def test_a_sale_never_confirmed_is_retried(self, store, monkeypatch):
+        import btcpredict.main as m
+        monkeypatch.setattr(settings, "model_exit_frac", 1.0)
+        r = make_round()
+        old = time.time() - m.PENDING_SALE_GIVEUP_S - 1
+        bot = TestAFullExitIsRetriedUntilSold._bot(
+            store, r, selling=True, pending=(old, 0.14, 5.93))
+
+        async def confirm_sale(*, token_id, shares, since_ts, fallback_px=0.0):
+            return None
+        bot.broker = SimpleNamespace(confirm_sale=confirm_sale)
+        calls = []
+
+        async def fake_exec(r_, w, *, tau, sig_name, confirmed=None,
+                            shares=None):
+            calls.append(sig_name)
+
+        bot._cross_exit_execute = fake_exec
+        asyncio.run(bot._model_exit_check(r))       # gives up on the pending
+        assert "pending" not in bot._exit_watch[r.slug] and calls == []
+        asyncio.run(bot._model_exit_check(r))       # and retries the sale
+        assert calls == ["retry"]
+
+    def test_a_fresh_pending_sale_is_NOT_given_up(self, store, monkeypatch):
+        monkeypatch.setattr(settings, "model_exit_frac", 1.0)
+        r = make_round()
+        bot = TestAFullExitIsRetriedUntilSold._bot(
+            store, r, selling=True, pending=(time.time(), 0.14, 5.93))
+
+        async def confirm_sale(*, token_id, shares, since_ts, fallback_px=0.0):
+            return None
+        bot.broker = SimpleNamespace(confirm_sale=confirm_sale)
+        bot._cross_exit_execute = None
+        assert asyncio.run(bot._model_exit_check(r)) is True
+        assert "pending" in bot._exit_watch[r.slug]

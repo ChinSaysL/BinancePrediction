@@ -31,10 +31,12 @@ upper bound; the GAIN between two cells is what the sweep is for.
 from __future__ import annotations
 
 import argparse
+import bisect
 import math
 import sqlite3
 import statistics as st
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -50,6 +52,255 @@ import arm_overlap as ao                                     # noqa: E402
 # The live flat stake, used by the $-columns and by BOTH reporting helpers
 # (`row` and `erow`). Module scope, because `row` is defined at module scope.
 STAKE = 2.0
+
+#: CLI overrides for the exit's GRIND half (`model_exit_behind_bps` /
+#: `model_exit_behind_hold_s`), read by `_ret_exited`. `None` = use the live
+#: config. They exist because the grind is the ONE half whose exit COUNT moves
+#: with the stake: it sells into a bid of ~0.36, so at $1-2 the venue's $1.00
+#: floor refuses the sale and its cost stays latent, while from ~$2.5 it becomes
+#: placeable and the money is really spent. Without an override a size grid
+#: cannot separate "the stake is expensive" from "the grind is expensive once
+#: the stake lets it fire".
+BEHIND_OVR: dict = {"bps": None, "hold": None}
+
+#: CLI overrides for the exit's TAU FLOOR, one per half
+#: (`--min-tau` / `--min-tau-behind`). `None` = the live config. The floor is
+#: what DISARMS the exit below it, and the two halves do not deserve the same
+#: one: the live 60s was measured on the LEAD half (a still-ahead position is
+#: underpriced by the venue late, so selling it there destroys value), while the
+#: LOSS half's alternative is zero. `0` = armed to the bell.
+TAU_OVR: dict = {"react": None, "behind": None}
+
+#: CLI override for the reaction THRESHOLD (`--rev-bps`, i.e.
+#: `model_exit_rev_bps`), read by `_ret_exited`. `None` = live config. This is
+#: the knob that decides how big a move against us counts as "the lead is being
+#: snapped away", and it is the ONLY lever that fires while we are still AHEAD
+#: (the grind fires after the lead is already gone).
+REV_OVR: dict = {"rev": None}
+
+#: `--exit-max-bid`: REFUSE to sell while the recorded bid is ABOVE this.
+#: `None`/0 = off (sell at any bid, the shipped behaviour).
+#: WHY IT EXISTS. Live 2026-09-23 11:29:43, `btc-updown-5m-1790162700`: the sell
+#: fired off a +19-point BUMP inside a red candle -- spot 85497 -> 85516, still 57
+#: points BELOW an 85573.6 strike, 6.73bps in the money with tau 16s, i.e. ~4.2
+#: sigma of the remaining move (sigma*sqrt(16/60) ~= 1.6bps) and P(win) ~ 0.9999.
+#: The bid there was 0.93-0.95, so the rule was giving away 5c of a near-certain
+#: winner because a 5.3bps/20s threshold does not scale with how far AHEAD it is.
+#: The bid IS the market's read of how done the round is, so this gate is a
+#: statement about the price we would be surrendering, not about the spot.
+MAX_BID_OVR: dict = {"bid": None}
+
+#: `--exit-max-z`: REFUSE to sell while the position is more than this many
+#: sigma of the REMAINING move in the money (`|ln(S/K)| / (sigma*sqrt(tau/60))`).
+#: `None`/0 = off. WHY IT EXISTS, and why it is NOT the same gate as
+#: `--exit-max-bid`: the reaction rule fires on an ABSOLUTE 20s move (5bps),
+#: which says nothing about how far ahead we are. Live 2026-09-23 11:29:43 the
+#: spot sat 6.73bps ahead with tau 16s -- 2.4 sigma by the venue's own implied
+#: vol, ~4.2 sigma by realised -- and a +19-point bump inside a red candle
+#: fired the exit on a position that was (by its own sigma) ~99% won. A gate on
+#: the bid is a statement about the price; a gate on z is a statement about
+#: whether the move is a THREAT, which is what the rule claims to measure.
+MAX_Z_OVR: dict = {"z": None}
+
+#: `--exit-min-prem`: refuse a sale unless the book is still paying MORE than the
+#: position is worth (`bid - slip >= fair + prem`). 0 = off (sell at any price).
+#: ⭐ THE POINT, and it is the repo's own edge run in reverse. The arm's profit
+#: comes from the venue's quote LAGGING the spot; the same lag decides when an
+#: EXIT is paid. Selling at/below the fair value is handing over the spread to
+#: convert a coin flip into a coin flip -- which is why every grind threshold
+#: measured 2026-09-23 lost money (behind 1bp: -$15 to -$44 for $1-9 of
+#: drawdown). Selling while the book is still ABOVE fair captures the lag instead
+#: of paying for it, and by construction it cannot fire on a round the market has
+#: already priced out.
+PREM_OVR: dict = {"prem": None}
+
+#: `--behind-max-tau T`: fire the GRIND half only when `tau <= T`. 0/None = no
+#: ceiling (`None` = read `settings.model_exit_behind_max_tau_s`, the SHIPPED
+#: value -- a literal default here would rank a system nobody runs).
+#: ⭐ WHY A CEILING AND NOT JUST A THRESHOLD. The operator's constraint
+#: (2026-09-23) is "no full loss", and the rule that satisfies it must not touch
+#: winners. Near the bell the two states are separable: a position that will WIN
+#: is AHEAD of the strike, one that will LOSE is BEHIND it -- and a deficit is
+#: only decisive late (σ_1m ~4bps, so 2bps behind is 1.25σ with 10s left but
+#: 0.5σ with 60s). A late grind therefore sells the about-to-lose cohort at
+#: 0.2-0.4 (capping the loss near -60..-80% instead of -100%) while leaving
+#: every winner alone. The early grind has no such separation: at tau 200 a
+#: 2bps deficit is noise, so it fires on rounds that recover and pays the spread
+#: for nothing -- which is exactly what the measured costs showed.
+BMAX_OVR: dict = {"tau": None}
+
+#: `--dump-rows`: print the per-trade sequence (one `#ROW` line each) instead of
+#: holding it inside one report. It exists for the COMPOUNDING audit: the rows
+#: carry PER-$1 RETURNS, not dollars, so a sizing scheme (5% of the bankroll,
+#: say) can be applied to the same trades afterwards without a re-replay -- the
+#: replay is linear in the stake, so only the money needs re-deriving. Both
+#: paths are dumped (exit ON and holding to the bell) and they are the SAME
+#: trades, which is what makes their difference the exit rather than a
+#: different sample.
+DUMP_ROWS: dict = {"on": False}
+
+#: ⛔ TRIGGER vs TAKE, per slug: `"<rule>:<outcome>"` for the LAST time the exit
+#: rule fired, where outcome is `taken` / `floor` (the venue's SELL minimum) /
+#: `no_bid` / `max_bid`. `_ret_exited` returns ONE boolean, and that boolean
+#: conflates two very different failures: a rule that never fires (nothing to
+#: protect) and a rule that fires but cannot sell. "Does the exit cut our
+#: losses?" is a question about the FIRST, and the boolean cannot answer it.
+EXIT_TRIG: dict = {}
+
+# ============================================================================
+# LIVE PARITY. Added 2026-09-23, after measuring the replay against the live
+# fills. Three things the tool did NOT mirror, each of which makes the replay a
+# DIFFERENT RULE from the one on the box:
+#
+#  1. THE WEEKEND OVERRIDES. Live reads every model knob through `Bot._wk`,
+#     which swaps in `settings.weekend_<name>` on Saturday/Sunday UTC. The live
+#     values are not small: max_quote 0.70 -> 0.85, min_edge 0.04 -> 0.06,
+#     edge_haircut 0.5 -> 1.0, persistence 2 -> 3, max_tau 210 -> 240. So every
+#     weekend round in the tape was being replayed under a rule the bot does not
+#     run, on ~2 days of 10.
+#  2. THE CANDLE-MINUTE STREAK RESET. `main.Bot._record` pops the persistence
+#     streak whenever `now_ms // 60_000` changes -- unconditionally, NOT only
+#     when `trade_on_candle_open` is set (it is off). A signal straddling a
+#     minute boundary therefore restarts from 1 live; without the reset the
+#     replay granted every persistence value above 1 a little extra.
+#  3. THE UP-REGIME GATE (`up_regime_gate`, live 0.01). When the last hour's
+#     return exceeds it, live removes the Up candidate BEFORE the side pick, so
+#     a Down candidate on the same quote still stands.
+#
+# `--no-weekend`, `--no-candle-reset` and `--no-up-gate` restore the old
+# behaviour, so any figure quoted before this date can be reproduced.
+#
+# ⛔ AND WHAT THE LIVE RECORD IS NOT. The fills in `fills` (mode='live') span
+# DOZENS of configurations -- min_quote, the crossings gate, the exit rule and
+# stakes from $0.98 to $10 all changed inside the same window. They are a
+# MIXTURE of rules, so they CANNOT be used to validate this replay, and a
+# disagreement with them is not a defect in the model. The replay's reference is
+# the CURRENT config applied to the raw tape (quotes, bids, asks, spot, strikes,
+# winners -- all config-independent). The two live-derived knobs (`--fee-model
+# live`, `--entry-slip`) are VENUE-EXECUTION measurements: what the book does to
+# an order, not what the arm's entries were. They are opt-in and off by default.
+# ============================================================================
+
+
+def _is_weekend_utc(ts_ms: int) -> bool:
+    """Saturday/Sunday UTC -- the same cohort `Bot._wk` uses.
+
+    UTC because the round slugs and every measurement behind the weekend knobs
+    are UTC; a local-time weekend would shift the cohort by hours and score a
+    different set of rounds than the one that was measured.
+    """
+    return time.gmtime(ts_ms / 1000.0).tm_wday >= 5
+
+
+def _wk_live(name: str, ts_ms: int, fallback):
+    """`Bot._wk` for ONE tick: the weekend value on a weekend, else `fallback`.
+
+    Mirror of the live lookup, including the `getattr(..., None)` guard: only a
+    knob that HAS a `weekend_` twin switches, so a knob with no override keeps
+    its weekday value rather than becoming None.
+    """
+    if getattr(settings, "weekend_overrides", False) and _is_weekend_utc(ts_ms):
+        v = getattr(settings, f"weekend_{name}", None)
+        if v is not None:
+            return v
+    return fallback
+
+
+#: THE FEE RATE THE CASH LEGS ARE CHARGED (hook, not a constant).
+#:
+#: `fee_rate_for_price` is the rate the arm's own EV and hurdle are built from,
+#: and it is what the entry GATE must keep using -- change it here and the
+#: replay's entry SET stops matching the bot's. But it is NOT what the venue
+#: charges. Measured 2026-09-23 on 778 live `mode='live'` fills, charged bps of
+#: notional against that model:
+#:
+#:     px band    n     zero-fee   measured bps   model bps   ratio
+#:     0.00-0.50  153     22.9%        160.7        206.5     0.78
+#:     0.50-0.60  143     28.0%        132.6        128.3     1.03
+#:     0.60-0.70  194     24.7%         91.2         75.0     1.22
+#:     0.70-0.80  195     16.9%         60.2         42.9     1.40
+#:     0.80-0.90   85     27.1%         29.4         21.0     1.40
+#:     0.90-1.01    8     25.0%         14.8          9.6     1.54
+#:
+#: So inside the traded band the model UNDERSTATES the realised charge by 20-54%.
+#: `--fee-model live` replaces this hook with the measured band rate (computed
+#: from the DB at run time), which is what the DOLLARS should be priced at. The
+#: default keeps the tool's historical numbers reproducible.
+_FEE_LIVE = False
+
+
+def FEE_RATE(px: float) -> float:
+    """The fee rate the CASH legs are charged (late-bound, see above)."""
+    if _FEE_LIVE:
+        return _measured_fee_rate(px)
+    return fee_rate_for_price(px)
+
+
+def _measured_fee_table(con, days: int = 30):
+    """Fit the realised fee rate as a function of price, from the live fills.
+
+    Bands rather than a fit: the realised rate is a step function on this venue
+    (it charges a partial fill and not a complete one), and the mean per band is
+    the honest expectation -- it INCLUDES the fills that paid nothing.
+    """
+    now = con.execute("select max(ts_ms) from decisions").fetchone()[0] or 0
+    rows = con.execute(
+        "select filled_px px, shares sh, stake, fee_paid fee from fills "
+        "where mode='live' and filled_px>0 and shares>0 and stake>0 "
+        "and ts_ms > ?", (now - days * 86400000,)).fetchall()
+    bands = [(0.0, 0.50), (0.50, 0.60), (0.60, 0.70), (0.70, 0.80),
+             (0.80, 0.90), (0.90, 1.01)]
+    out: list[tuple[float, float, float, int]] = []
+    for lo, hi in bands:
+        g = [r for r in rows if lo <= r[0] < hi]
+        if len(g) < 5:
+            out.append((lo, hi, fee_rate_for_price((lo + hi) / 2.0), len(g)))
+            continue
+        out.append((lo, hi,
+                    st.fmean([(r[3] / (r[1] * r[0])) for r in g]), len(g)))
+    return out, len(rows)
+
+
+def _measured_fee_rate(px: float) -> float:
+    """The realised band rate for this price (set by `--fee-model live`)."""
+    for lo, hi, rate, _n in _FEE_BANDS:
+        if lo <= px < hi:
+            return rate
+    return fee_rate_for_price(px)
+
+
+_FEE_BANDS: list[tuple[float, float, float, int]] = []
+
+
+def up_gate_by_minute(closes: dict[int, float], gate: float) -> dict[int, bool]:
+    """{minute index -> may we take the Up side?}, PRECOMPUTED for the tape.
+
+    Mirrors `Bot._record`'s up-regime gate on top of `ao.one_hour_return`: the
+    last hour's return is read from COMPLETED 1m bars (the current minute has
+    not closed, and using it is a look-ahead of up to 59s on the exact quantity
+    the gate keys on).
+
+    Precomputed because the live gate is evaluated once per poll and the naive
+    per-tick call is O(number of minutes) -- 1M ticks x 14k minutes is why the
+    first version of this did not finish. The answer only changes when a minute
+    closes, so the whole tape is swept once with bisect lookups.
+    """
+    if not closes or gate <= 0:
+        return {}
+    mins = sorted(closes)
+    out: dict[int, bool] = {}
+    for m in mins:
+        newest = m - 1
+        k = bisect.bisect_right(mins, newest) - 1
+        if k < 0:
+            continue
+        r = bisect.bisect_right(mins, mins[k] - 60) - 1
+        if r < 0:
+            continue
+        c0, c1 = closes[mins[k]], closes[mins[r]]
+        if c0 > 0 and c1 > 0:
+            out[m] = not (math.log(c0 / c1) > gate)
+    return out
 
 # WHERE IN THE ROUND THE EXITS ACTUALLY HAPPEN. A `min_tau` sweep that returns
 # the same numbers at 0, 15 and 30 is EITHER a floor that never binds OR a flag
@@ -90,6 +341,308 @@ def _maxdd(seq: list[float]) -> float:
         wor = min(wor, eq - peak)
     return wor
 
+
+def _dd_detail(ent: list, rmap: dict, bmap: dict, stake: float, lo: float,
+               hi: float, bankroll: float, ret_fn, n_boot: int = 2000,
+               seed: int = 7) -> None:
+    """HOW one cell's maxDD is built -- and how much of it is PATH LUCK.
+
+    ⛔ A DRAWDOWN IS ONE PATH THROUGH ONE ORDERING OF THE SAME TRADES, and the
+    grid prints a single peak-to-trough figure that reads like a property of the
+    strategy. It is a property of the SEQUENCE. Three things decide whether it
+    means anything, and the grid prints none of them:
+
+    1. WHERE THE PEAK SAT. The grid divides the drop by the STARTING bankroll,
+       but equity is `bankroll + cumulative`, so a drop that begins from a high
+       peak leaves the wallet far above zero. **Survival is decided by the
+       trough's LEVEL, not by the size of the drop.** A -$75 fall from a +$50
+       peak ends at $55 on an $80 wallet -- uncomfortable, not fatal. The same
+       -$75 from a +$5 peak ends at $10.
+    2. THE ORDER. Same trades, different sequence, different drawdown: the
+       reshuffle below keeps the multiset AND the total identical and moves the
+       drawdown. If the measured figure sits in the middle of that spread it is
+       not a measurement of the strategy at all.
+    3. THE SAMPLE. This is ONE walk over one 15-day tape. The bootstrap of the
+       RETURNS (with replacement) is a different question -- how far the figure
+       moves when the trades themselves are resampled -- and is printed too.
+
+    Read-only, but the numbers come from the same `_ret_exited` path as the
+    grid (`ret_fn`, passed in because it is a closure of `main`), at a FLAT
+    stake, so the walk is the grid's own.
+
+    ⛔ AND THE WALK IS ALREADY EXIT-ADJUSTED -- `_ret_exited` is the exit, per
+    entry, at that entry's own stake (both halves, the z gate, the tau floors,
+    the venue floor checked against the SLICE ACTUALLY SENT, shares floored to
+    0.01, a refused sale retried on the next tick, and the sale priced at
+    `bid - 0.01`). A drawdown that ignored the exit would be a different
+    strategy's drawdown, so the same path is walked a second time with the
+    exit OFF (`e["ret"]`, hold to the bell) and both are printed.
+    """
+    import random
+
+    # (ts, slug, stake, $ with exit, r with exit, exited, $ holding to the bell)
+    rows: list[tuple[int, str, float, float, float, bool, float]] = []
+    for e in ent:
+        sk = stake_for_edge(float(e["ev"]), min_edge=lo, min_stake=stake,
+                            max_stake=stake, edge_at_max=hi)
+        if sk < settings.min_order_usdt:
+            continue
+        # ⛔ ASK THE INSTRUMENT WHETHER THE RULE EVER FIRED. `_ret_exited`'s
+        # boolean is True only when a SALE RESULTED, so 57 "unexited"
+        # catastrophes could be either "no rule fired" or "the rule fired and
+        # the venue refused" -- and those call for opposite fixes.
+        EXIT_TRIG.pop(e["slug"], None)
+        r, did, _rule = ret_fn(e, rmap[e["slug"]], bmap.get(e["slug"], {}),
+                               sk)
+        rows.append((int(e["ts_ms"]), e["slug"], sk, sk * r, r, did,
+                     sk * float(e.get("ret") or 0.0),
+                     EXIT_TRIG.get(e["slug"], "")))
+    rows.sort(key=lambda x: x[0])
+    n = len(rows)
+    if n < 8:
+        print("  too few trades to read")
+        return
+
+    def walk(vals: list[float]) -> tuple[float, float, float]:
+        """-> (maxDD, cumulative AT the peak it fell from, cumulative at low).
+
+        ⛔ `peak_at` IS CAPTURED WHEN THE TROUGH IS RECORDED, not while walking.
+        Tracking "the index/value of the highest cumulative so far" gives the
+        ALL-TIME high, which on a profitable tape happens LATER than the trough
+        -- the first version printed peak +41.75 with a trough of -18.88 and a
+        maxDD of -26.32, three numbers that cannot all be true (peak - low must
+        equal the drawdown). The wallet-at-trough and the maxDD were right; only
+        the peak label was the final high instead of the one the fall started
+        from.
+        """
+        cum = peak = dd = 0.0
+        peak_at = low_at = 0.0
+        for v in vals:
+            cum += v
+            if cum > peak:
+                peak = cum
+            if cum - peak < dd:
+                dd, peak_at, low_at = cum - peak, peak, cum
+        return dd, peak_at, low_at
+
+    dollars = [x[3] for x in rows]
+    dd, peak_at, low_at = walk(dollars)
+    tot = sum(dollars)
+    print(f"\n=== HOW THE maxDD IS BUILT -- flat ${stake:g}, {n} trades, "
+          f"walked in fill order ===")
+    print(f"  equity = ${bankroll:g} + cumulative dollars:")
+    print(f"    total P&L      ${tot:+9.2f}")
+    print(f"    peak           ${peak_at:+9.2f}   <- the peak the trough "
+          f"fell FROM")
+    print(f"    trough         ${low_at:+9.2f}")
+    print(f"    maxDD          ${dd:+9.2f}   = trough - peak (this is the "
+          f"grid's column)")
+    print(f"  ⭐ WALLET AT THE TROUGH: ${bankroll + low_at:.2f} of ${bankroll:g} "
+          f"({100 * (bankroll + low_at) / bankroll:.0f}%) -- survival is "
+          f"decided HERE, not by ${abs(dd):.2f} of drop.")
+    print(f"  the grid's '94% of the bankroll' style row is "
+          f"{100 * abs(dd) / bankroll:.0f}% -- the DROP, which starts from "
+          f"${peak_at:+0.2f}, not from $0.")
+
+    # --- 1b. THE SAME PATH WITH THE EXIT OFF (is the exit in this number?) ---
+    hold = [x[6] for x in rows]
+    hdd, hpeak, hlow = walk(hold)
+    nex = sum(1 for x in rows if x[5])
+    print("\n  -- IS THE EXIT IN THIS NUMBER? same entries, same path, exit "
+          "switch only --")
+    print(f"     exit ON   (live)  total ${tot:+8.2f}  maxDD ${dd:+8.2f}  "
+          f"wallet at trough ${bankroll + low_at:7.2f}  "
+          f"exits {nex}/{n} ({100 * nex / n:.0f}%)")
+    print(f"     exit OFF (hold)   total ${sum(hold):+8.2f}  maxDD ${hdd:+8.2f}  "
+          f"wallet at trough ${bankroll + hlow:7.2f}")
+    cut = abs(hdd) - abs(dd)
+    print(f"     => the exit is worth ${tot - sum(hold):+.2f} of P&L and makes "
+          f"the drawdown ${-cut:+.2f} "
+          f"({'SHALLOWER' if cut > 0 else 'DEEPER'} by ${abs(cut):.2f}) on "
+          f"this path")
+
+    # --- 1c. WHY THE EXIT BARELY MOVES THE TAIL ----------------------------
+    # ⛔ A DRAWDOWN IS NOT AN AVERAGE. The exit can be worth -$20 of P&L overall
+    # and still shave the trough, or cost nothing there -- the only way to tell
+    # is to price BOTH paths over the peak->trough window itself, and to split
+    # the exits by what HOLDING would have done (a lead protected while it is
+    # still ahead is a different trade from a loss cut after the strike broke).
+    ex = [x for x in rows if x[5]]
+    won_r = [x for x in ex if x[6] > 0]
+    lost_r = [x for x in ex if x[6] <= 0]
+    print(f"\n  -- WHAT THE {len(ex)} EXITS ACTUALLY SOLD "
+          f"({100 * len(ex) / n:.0f}% of trades; the other "
+          f"{n - len(ex)} are identical in both paths) --")
+    print(f"     sold a WINNER (holding won)  {len(won_r):3d}  "
+          f"the exit is ${sum(x[3] - x[6] for x in won_r):+8.2f} against "
+          f"holding")
+    print(f"     sold a LOSER  (holding lost) {len(lost_r):3d}  "
+          f"the exit is ${sum(x[3] - x[6] for x in lost_r):+8.2f} for "
+          f"holding")
+    # ⛔ THE QUESTION THE TOTALS HIDE: the exit's job is to CUT A CATASTROPHE,
+    # and a catastrophe is a -100% trade. Counting them separately answers
+    # "does it cap the bad ones" (yes, per event) and "how many does it MISS"
+    # (which is what leaves the drawdown where it is). Both are true at once,
+    # and the totals above cannot distinguish them.
+    fl = [x for x in rows if x[6] <= -0.99]
+    fl_ex = [x for x in fl if x[5]]
+    wn = [x for x in rows if x[6] > 0]
+    wn_ex = [x for x in wn if x[5]]
+    print(f"\n  -- THE CATASTROPHES (-100% trades), and what the exit did --")
+    print(f"     holding loses the whole stake on {len(fl)}/{n} trades "
+          f"({100 * len(fl) / n:.0f}%)")
+    fl_tr = [x for x in fl if x[7]]
+    from collections import Counter
+    for lbl, grp in (("catastrophes", fl), ("winners", wn)):
+        tr = [x for x in grp if x[7]]
+        tk = [x for x in grp if x[5]]
+        why = Counter(x[7].split(":")[-1] for x in tr)
+        print(f"     {lbl:<12} n={len(grp):<4} rule fired {len(tr):3d} "
+              f"({100 * len(tr) / max(1, len(grp)):3.0f}%), sale taken "
+              f"{len(tk):3d} ({100 * len(tk) / max(1, len(grp)):3.0f}%)"
+              f"   {dict(why)}")
+    if fl_ex:
+        rec = [x[3] - x[6] for x in fl_ex]
+        print(f"     the exit CUT {len(fl_ex)} of them "
+              f"({100 * len(fl_ex) / len(fl):.0f}%), recovering "
+              f"${sum(rec):+.2f} (${st.fmean(rec):+.2f} each, i.e. a "
+              f"-100% trade becomes "
+              f"${st.fmean([x[3] / x[2] for x in fl_ex]) * 100:+.0f}% per $1)")
+    print(f"     it MISSED {len(fl) - len(fl_ex)} "
+          f"({100 * (len(fl) - len(fl_ex)) / len(fl):.0f}%) -- "
+          f"{len(fl) - len(fl_tr)} of them never triggered at all, "
+          f"{len(fl_tr) - len(fl_ex)} fired and could not sell. THAT is what "
+          f"the drawdown is made of.")
+    if wn_ex:
+        print(f"     for balance: it also cut {len(wn_ex)} of the {len(wn)} "
+              f"WINNERS ({100 * len(wn_ex) / len(wn):.0f}%), "
+              f"${sum(x[3] - x[6] for x in wn_ex):+.2f}")
+
+    # --- 1d. THE SAME CENSUS PER DAY ---------------------------------------
+    # ⛔ A COVERAGE RATE POOLED OVER 15 DAYS CAN HIDE THE REGIME THAT MATTERS.
+    # The entry set is chosen by the CURRENT config on every day, but the market
+    # it is applied to is not the same, so a rule that covers every loss this
+    # week and half of them three weeks ago reports 30% and reads as a property
+    # of the rule. Split it before quoting it.
+    byday: dict[int, list] = {}
+    for x in rows:
+        byday.setdefault(x[0] // 86400000, []).append(x)
+    print(f"\n  -- BY DAY: the entry set, the losses, and the exit's coverage --")
+    print(f"     {'day':<6} {'n':>4} {'-100%':>6} {'fired':>6} {'taken':>6} "
+          f"{'cut%':>5} {'$ exit-on':>10} {'$ exit-off':>11}")
+    for d in sorted(byday):
+        g = byday[d]
+        cl = [x for x in g if x[6] <= -0.99]
+        tr = [x for x in cl if x[7]]
+        tk = [x for x in cl if x[5]]
+        print(f"     {time.strftime('%m-%d', time.gmtime(d * 86400)):<6} "
+              f"{len(g):4d} {len(cl):6d} {len(tr):6d} {len(tk):6d} "
+              f"{(100 * len(tk) / len(cl) if cl else float('nan')):5.0f} "
+              f"{sum(x[3] for x in g):+10.2f} {sum(x[6] for x in g):+11.2f}")
+
+    def _window(ser: list[float]) -> tuple[float, int, int]:
+        """-> (maxDD, index of the peak it fell FROM, index of the trough).
+
+        ⛔ THE PEAK INDEX MUST BE CAPTURED AT THE TROUGH, not tracked as a
+        running max. `peak` keeps rising to the END of the tape, so "the index
+        of the highest cumulative" is a LATER trade than the peak the trough
+        fell from -- the first version of this printed a NEGATIVE-length window
+        (09-23 -> 09-11, -210 trades, 0 exits), which is what it looks like
+        when the worst stretch is asked for backwards.
+        """
+        cum = peak = dd = 0.0
+        i_pk = i_at_trough = i_lw = 0
+        for i, v in enumerate(ser):
+            cum += v
+            if cum > peak:
+                peak, i_pk = cum, i
+            if cum - peak < dd:
+                dd, i_at_trough, i_lw = cum - peak, i_pk, i
+        return dd, i_at_trough, i_lw
+
+    _d, i_pk, i_lw = _window(dollars)
+    sl = slice(i_pk, i_lw + 1)
+    f = "%m-%d %H:%M"
+    n_ex_w = sum(1 for x in rows[sl] if x[5])
+    print(f"\n  -- THE WORST STRETCH ITSELF: "
+          f"{time.strftime(f, time.gmtime(rows[i_pk][0] / 1000))} -> "
+          f"{time.strftime(f, time.gmtime(rows[i_lw][0] / 1000))} "
+          f"({i_lw - i_pk + 1} trades, {n_ex_w} exits) --")
+    print(f"     exit ON   ${sum(dollars[sl]):+9.2f}")
+    print(f"     exit OFF  ${sum(hold[sl]):+9.2f}")
+    print(f"     => the exit {'barely touches' if abs(sum(dollars[sl]) - sum(hold[sl])) < 0.2 * abs(dd) else 'moves'} "
+          f"the trough: "
+          f"${sum(dollars[sl]) - sum(hold[sl]):+.2f} over "
+          f"{i_lw - i_pk + 1} trades, against a ${abs(dd):.2f} drawdown.")
+
+
+    # --- 2/3. the same trades in a different order, and resampled -----------
+    # ⛔ BOTH PATHS, because the exit's whole claim is TAIL protection and a
+    # single measured drawdown is one draw from that tail. A rule that shaves
+    # the average and clips the tail can show a WORSE measured maxDD and still
+    # be the reason the account survives, so the two distributions are printed
+    # side by side rather than argued about.
+    rnd = random.Random(seed)
+    print(f"\n  -- THE SAME TRADES UNDER {n_boot} RESHUFFLES / RESAMPLES "
+          f"(dollars) --")
+    print(f"     {'path':<10} {'total':>9} {'maxDD':>8} {'wallet@low':>11} "
+          f"{'shuffle p05/50/95':>22} {'pct':>5} {'resample p05/50/95':>22}")
+    for lbl, ser in (("exit ON", dollars), ("exit OFF", hold)):
+        _dd, _pk, _lw = walk(ser)
+        sh: list[float] = []
+        bs: list[float] = []
+        for _ in range(n_boot):
+            s = ser[:]
+            rnd.shuffle(s)
+            sh.append(-walk(s)[0])
+            bs.append(-walk([rnd.choice(ser) for _ in range(n)])[0])
+        sh.sort()
+        bs.sort()
+        pct = 100 * sum(1 for d in sh if d < -_dd) / n_boot
+        print(f"     {lbl:<10} ${sum(ser):+8.2f} ${_dd:+7.2f} "
+              f"${bankroll + _lw:10.2f} "
+              f"${sh[int(.05 * n_boot)]:7.2f}/{sh[n_boot // 2]:7.2f}/"
+              f"{sh[int(.95 * n_boot)]:7.2f} {pct:4.0f}% "
+              f"${bs[int(.05 * n_boot)]:7.2f}/{bs[n_boot // 2]:7.2f}/"
+              f"{bs[int(.95 * n_boot)]:7.2f}")
+    print(f"     ('pct' = where the measured maxDD sits among its own "
+          f"reshuffles: 50% = a typical drawdown for these trades, 95% = a "
+          f"lucky one.")
+    print(f"      'wallet@low' = ${bankroll:g} + the lowest cumulative -- the "
+          f"survival number. 'total' is identical across every reshuffle.)")
+
+    # --- the shape of the bad part -----------------------------------------
+    worst_run, run = 0.0, 0.0
+    streak = worst_streak = 0
+    for v in dollars:
+        run = min(run + v, v) if v < 0 else 0.0
+        worst_run = min(worst_run, run)
+        streak = streak + 1 if v < 0 else 0
+        worst_streak = max(worst_streak, streak)
+    print(f"  worst consecutive LOSS RUN ${worst_run:+.2f} "
+          f"(longest losing streak {worst_streak} trades)")
+    print("  the 5 worst trades:")
+    # ⛔ EIGHT FIELDS, NOT SEVEN. The row gained the trigger string
+    # (`EXIT_TRIG`) after this loop was written, and the 7-name unpack then
+    # raised `ValueError: too many values to unpack` AT THE END of every
+    # `--dd-detail` run -- silently, because the report's own sections print
+    # first and a piped grep returns 0 whether the tail crashed or not. Do not
+    # shorten this to `_tr` removal: the tuple is (ts, slug, stake, $on, r_on,
+    # did, $off, trig).
+    for ts, slug, _sk, dl, r, did, _dh, _tr in sorted(rows,
+                                                      key=lambda x: x[3])[:5]:
+        day = time.strftime("%m-%d %H:%M", time.gmtime(ts / 1000))
+        print(f"    {day} {slug:26s} ${dl:+7.2f} ({r:+.3f}/$1)"
+              f"{'  exited' if did else ''}")
+
+    # --- the per-trade sequence, for the sizing / compounding audits -------
+    if DUMP_ROWS["on"]:
+        print("#ROWS day ts_ms r_on r_off exited rule")
+        for ts, slug, sk, _dl, r, did, dh, _tr in rows:
+            print(f"#ROW {ts // 86400000} {ts} {r:.6f} "
+                  f"{(dh / sk if sk else 0.0):.6f} {int(bool(did))} "
+                  f"{EXIT_TRIG.get(slug, '') or '-'}")
+
 if Path(ao.__file__).resolve().parent != Path(__file__).resolve().parent:
     raise SystemExit(
         f"arm_overlap loaded from {ao.__file__}, not from this tool's own "
@@ -97,7 +650,8 @@ if Path(ao.__file__).resolve().parent != Path(__file__).resolve().parent:
         f"shadowing it; delete the stray, do not edit around it")
 from btcpredict.config import settings                        # noqa: E402
 from btcpredict.edge.signal import (                          # noqa: E402
-    FeeModel, evaluate, fee_rate_for_price, stake_for_edge, tilt_factor)
+    FeeModel, evaluate, evaluate_hybrid, fee_rate_for_price, stake_for_edge,
+    tilt_factor)
 from btcpredict.pricing.digital import fair_value, moneyness_sd  # noqa: E402
 
 # The live gate values, read from config rather than typed here. A sweep that
@@ -107,7 +661,21 @@ from btcpredict.pricing.digital import fair_value, moneyness_sd  # noqa: E402
 LIVE = dict(max_tau=settings.max_tau_s, min_tau=settings.min_tau_s,
             min_quote=settings.min_quote, max_quote=settings.max_quote,
             min_range=settings.model_min_round_range_bps,
-            max_range=settings.model_max_round_range_bps)
+            max_range=settings.model_max_round_range_bps,
+            # ⛔ THE CHOP GATE WAS MISSING HERE, AND IT COST MORE ENTRIES THAN
+            # ANY OTHER KNOB IN THIS FILE IS WORTH. `run2()` defaults
+            # `max_strike_crossings=0`, so every grid in this tool -- the sizing
+            # front tier, the ship tables, `--dd-detail` -- entered rounds the
+            # BOT REFUSES. Measured 2026-09-23 15:00-16:25: the live refusal log
+            # is DOMINATED by this gate (1155 + 713 + 520 + 263 + 197 + 124 =
+            # ~3,000 tick-refusals in three hours: "spot crossed the strike >=3
+            # times"), live took 10 fills in the day, and the replay took 23 on
+            # the SAME tape. A parallel copy of a live gate that is switched off
+            # is not a conservative default -- it is a different strategy.
+            # (Repo artifact #7: a nuisance parameter at a literal default that
+            # is NOT the shipped value ranks a system you do not run.)
+            max_strike_crossings=getattr(settings, "model_max_strike_crossings",
+                                         0) or 0)
 
 
 def load_live_sigma(con) -> dict[str, list[tuple[int, float]]]:
@@ -222,12 +790,21 @@ def replay(rnd: dict, sigma: float, *, persistence: int,
            zone_band_k: float = 0.5, max_strike_crossings: int = 0,
            entry_rev_bps: float = 0.0, entry_look_s: float = 20.0,
            live_sig: list[tuple[int, float]] | None = None,
-           funnel: dict | None = None) -> dict | None:
+           funnel: dict | None = None,
+           weekend: bool = True, candle_reset: bool = True,
+           up_gate: bool = True, up_ok: dict | None = None,
+           entry_slip: float = 0.0) -> dict | None:
     """The first round-qualifying entry under these knobs, or None.
 
     With `live_sig` the fair value at each tick uses the sigma the BOT recorded
     at that moment, so the replay reproduces the live rule rather than a
     parallel one; without it, the round's scalar `sigma`.
+
+    LIVE PARITY (2026-09-23): with `weekend`, `candle_reset` and `up_gate` on --
+    the defaults -- this mirrors `Bot._record` including the parts it used to
+    omit: the weekend knob swap (`Bot._wk`), the wall-clock minute streak reset,
+    and the up-regime gate. Turn them off to reproduce numbers quoted before
+    that date. See the LIVE PARITY note at the top of the file.
 
     With `funnel` (a dict) the furthest GATE STAGE each round reached is written
     into it: the index is the last door the round got through, so a round with no
@@ -241,6 +818,11 @@ def replay(rnd: dict, sigma: float, *, persistence: int,
     """
     lo_tau = settings.min_tau_s if min_tau is None else min_tau
     hc = settings.edge_haircut if haircut is None else haircut
+    up_gate_setting = getattr(settings, "up_regime_gate", 0.0) or 0.0
+    w_sigma = float(getattr(settings, "weekend_sigma_mult", 1.0) or 1.0)
+    # The candle index the streak belongs to. `None` until the first tick, so a
+    # round whose first tick is mid-minute still starts a clean streak.
+    cur_candle: int | None = None
     strike = rnd["strike"]
     start_ms = rnd.get("start_ms") or (rnd["rows"][0][0] if rnd.get("rows") else 0)
     sec_last: list[tuple[float, float]] = []      # (second, last spot in it)
@@ -255,6 +837,16 @@ def replay(rnd: dict, sigma: float, *, persistence: int,
             _deep[_slug] = st
 
     for i, (ts_ms, tau, spot, _up_px, _dn_px, up_ask, dn_ask) in enumerate(rnd["rows"]):
+        # CANDLE-MINUTE STREAK RESET, exactly as live: `now_ms // 60_000`
+        # changing pops the streak for this round unconditionally, on EVERY
+        # tick, before the streak is read or extended. It sits at the top of
+        # the loop for that reason -- a tick the tau window refuses still
+        # resets it in the bot.
+        if candle_reset:
+            _ci = ts_ms // 60_000
+            if _ci != cur_candle:
+                cur_candle = _ci
+                streak_side, streak = None, 0
         if spot is not None and spot > 0:
             seen.append(spot)
             seen_ts.append((ts_ms, spot))
@@ -275,10 +867,30 @@ def replay(rnd: dict, sigma: float, *, persistence: int,
             streak_side, streak = None, 0
             _mark(1)
             continue
-        if not (lo_tau <= tau <= max_tau):
+        # THE WEEKEND KNOB SWAP (`Bot._wk`), per TICK, because the tape spans
+        # weekends and the live rule changes inside it.
+        if weekend and getattr(settings, "weekend_overrides", False) \
+                and _is_weekend_utc(ts_ms):
+            _max_tau = _wk_live("max_tau_s", ts_ms, max_tau)
+            _min_quote = _wk_live("min_quote", ts_ms, min_quote)
+            _max_quote = _wk_live("max_quote", ts_ms, max_quote)
+            _min_edge = _wk_live("min_edge", ts_ms, min_edge)
+            _hc = _wk_live("edge_haircut", ts_ms, hc)
+            _persist = _wk_live("signal_persistence", ts_ms, persistence)
+        else:
+            _max_tau, _min_quote, _max_quote = max_tau, min_quote, max_quote
+            _min_edge, _hc, _persist = min_edge, hc, persistence
+        if not (lo_tau <= tau <= _max_tau):
             _mark(2)
             continue
         sg_i = _sig_at(live_sig, ts_ms, sigma)
+        # `weekend_sigma_mult` is applied by the LIVE estimator, so the recorded
+        # series already carries it; it is applied here only on the fallback
+        # path, where the replay computes its own sigma and would otherwise
+        # price a weekend tick at a weekday volatility.
+        if live_sig is None and weekend and w_sigma != 1.0 \
+                and _is_weekend_utc(ts_ms):
+            sg_i = sg_i * w_sigma
         # main.Bot._round_range_bps: the round's TRAVEL so far, and None (no
         # opinion) until there are two samples -- never a refusal.
         if max_range > 0 and len(seen) >= 2:
@@ -287,12 +899,22 @@ def replay(rnd: dict, sigma: float, *, persistence: int,
                 _mark(3)
                 continue
         fair_up = fair_value(spot, strike, tau, sg_i)
-        sig = evaluate(
-            fair_up, up_ask, dn_ask, fee=None, half_spread=0.0,
+        # THE UP-REGIME GATE: when the last COMPLETED hour is up more than the
+        # gate, the venue has priced Up correctly and our Up edge is
+        # anti-informative, so live removes the Up candidate BEFORE the side
+        # pick -- a Down candidate on the same quote still stands. Read from
+        # completed 1m bars (`ao.one_hour_return`) for the same reason live is:
+        # the current minute has not closed and using it is a look-ahead.
+        _up_ok = True
+        if up_gate and up_gate_setting > 0 and up_ok:
+            _up_ok = up_ok.get(ts_ms // 60_000, True)
+        sig = evaluate_hybrid(
+            fair_up, fair_up, up_ask, dn_ask, up_allowed=_up_ok,
+            fee=None, half_spread=0.0,
             safety_margin=settings.safety_margin, fee_model=FeeModel.NOTIONAL,
-            max_quote=max_quote, min_quote=min_quote,
-            min_edge=(settings.min_edge if min_edge is None else min_edge),
-            edge_haircut=hc)
+            max_quote=_max_quote, min_quote=_min_quote,
+            min_edge=(settings.min_edge if _min_edge is None else _min_edge),
+            edge_haircut=_hc)
         if not sig.act or sig.side is None:
             streak_side, streak = None, 0
             _mark(4)
@@ -361,16 +983,27 @@ def replay(rnd: dict, sigma: float, *, persistence: int,
                     _mark(7)
                     continue
         # ================================================================
-        if streak < persistence:
+        if streak < _persist:
             _mark(8)
             continue
         _mark(9)
         fair_side = fair_up if sig.side == "Up" else 1.0 - fair_up
-        return ao._execute(rnd, i, sig.side, fair_side,
-                           sig.ev_per_dollar or 0.0,
-                           f"model edge {sig.edge:+.3f}", margin=margin,
-                           mz=moneyness_sd(spot, strike, tau, sg_i),
-                           exec_mode=exec_mode, latency_s=latency_s)
+        e = ao._execute(rnd, i, sig.side, fair_side,
+                        sig.ev_per_dollar or 0.0,
+                        f"model edge {sig.edge:+.3f}", margin=margin,
+                        mz=moneyness_sd(spot, strike, tau, sg_i),
+                        exec_mode=exec_mode, latency_s=latency_s)
+        # THE MEASURED SLIPPAGE OF THE LIVE MARKET ORDER. The decision -> fill
+        # lag is a median 2.59s (p90 3.57) on the live record while `latency_s`
+        # is 1.0, and the fill pays ABOVE the ask we recorded at the decision:
+        # measured on 454 live fills, `filled_px - venue_ask` is mean +0.0060,
+        # median +0.0088, p90 +0.0173. Leaving it at 0 prices an entry the bot
+        # never got; `--entry-slip 0.0088` charges the measured median.
+        if e is not None and entry_slip:
+            e["px"] = min(0.999, e["px"] + entry_slip)
+            e["cost"] = ao._cost_per_share(e["px"])
+            e["ret"] = ((1.0 if e["won"] else 0.0) - e["cost"]) / e["cost"]
+        return e
     return None
 
 
@@ -452,7 +1085,7 @@ def main() -> None:
                              "fair", "size", "sure", "price", "zone",
                              "exit", "struct", "predict", "react",
                              "crossings", "funnel", "count", "ship",
-                             "stakeband"],
+                             "stakeband", "sizegrid", "tight", "floor"],
                     help="which grid to run")
     ap.add_argument("--weight-low-fair", type=float, default=2.0,
                     help="stake MULTIPLIER for entries with fair <= the cut "
@@ -526,7 +1159,125 @@ def main() -> None:
                          "more permissive of the two, so this is the bound:"
                          "if the ranking does not survive it, it is the "
                          "re-pricing that produced it.")
+    ap.add_argument("--entry-slip", type=float, default=0.0,
+                    help="VENUE EXECUTION, opt-in: charge the entry the price it "
+                         "paid above the recorded ask (median +0.0073 against "
+                         "the nearest quote on the live fills). NOT a property "
+                         "of the arm's entries -- those span many configs -- it "
+                         "is what an order pays against the book. 0.0 = clean.")
+    ap.add_argument("--fee-model", choices=["curve", "live"], default="curve",
+                    help="`curve` charges the fee `fee_rate_for_price` models "
+                         "(what the arm's own gate uses); `live` charges the "
+                         "band rate MEASURED from this DB's own fills, which "
+                         "is 20-54%% higher inside the traded band. The gate "
+                         "always uses the curve either way -- changing that "
+                         "would change the entry SET, not the money.")
+    ap.add_argument("--bankroll", type=float, default=76.0,
+                    help="report each sizing variant against this bankroll "
+                         "(the deposit the operator is sizing for)")
+    ap.add_argument("--no-weekend", action="store_true",
+                    help="do NOT swap in the weekend knobs (pre-2026-09-23 "
+                         "behaviour: one band/tau/persistence for the whole "
+                         "tape, including weekends)")
+    ap.add_argument("--no-candle-reset", action="store_true",
+                    help="do NOT reset the persistence streak at each "
+                         "wall-clock minute (pre-2026-09-23 behaviour)")
+    ap.add_argument("--no-up-gate", action="store_true",
+                    help="do NOT apply the up-regime gate")
+    ap.add_argument("--sms", default=None,
+                    help="comma list of MAX stakes to sweep (--mode sizegrid)")
+    ap.add_argument("--dump-rows", action="store_true",
+                    help="print the per-trade sequence as `#ROW` lines "
+                         "(day, ts_ms, per-$1 return with the exit, per-$1 "
+                         "return holding, exited, rule). Per-$1 and not "
+                         "dollars on purpose: the replay is linear in the "
+                         "stake, so a sizing scheme (5%% of the bankroll) can "
+                         "be applied afterwards without a re-replay")
+    ap.add_argument("--dd-detail", type=float, default=None,
+                    help="with --mode sizegrid: for ONE flat stake, print how "
+                         "the maxDD is built (the peak it fell from, the "
+                         "wallet's level at the trough) and what the SAME "
+                         "trades score under reordering/resampling. A "
+                         "peak-to-trough figure is one path, not a property "
+                         "of the rule. e.g. --dd-detail 10")
+    ap.add_argument("--smin", default=None,
+                    help="comma list of MIN stakes to sweep (--mode sizegrid); "
+                         "default 1,1.5,2,3")
+    ap.add_argument("--ev-lo", type=float, default=None,
+                    help="override `stake_ev_lo`: the ev/$ at which the ramp "
+                         "pays the MIN stake (--mode sizegrid). The live value "
+                         "is config's; 83%% of entries sit ABOVE the other end "
+                         "of the ramp, so the ramp as shipped is inert.")
+    ap.add_argument("--ev-hi", type=float, default=None,
+                    help="override `stake_ev_hi`: the ev/$ at which the ramp "
+                         "pays the MAX stake (--mode sizegrid)")
+    ap.add_argument("--behind-bps", type=float, default=None,
+                    help="override the exit's GRIND threshold "
+                         "(`model_exit_behind_bps`; 0 = grind OFF = the "
+                         "reaction rule alone). The grind is the half whose "
+                         "exit count RISES with the stake, so a size grid "
+                         "without this reads its cost as the stake's.")
+    ap.add_argument("--behind-hold", type=float, default=None,
+                    help="override `model_exit_behind_hold_s` (seconds the "
+                         "spot must stay behind the strike)")
+    ap.add_argument("--behind-max-tau", type=float, default=None,
+                    help="`--behind-max-tau T`: fire the GRIND half only when "
+                         "tau <= T (0/None = no ceiling = the live behaviour). "
+                         "THE LATE-ONLY GRIND: near the bell a winner is AHEAD "
+                         "of the strike and a loser is BEHIND it, and a deficit "
+                         "is only decisive late (2bps behind is 1.25 sigma at "
+                         "tau 10, 0.5 sigma at tau 60), so this caps the loss on "
+                         "the about-to-lose cohort without cutting winners.")
+    ap.add_argument("--min-tau", type=float, default=None,
+                    help="override the exit's TAU FLOOR for the LEAD half "
+                         "(`model_exit_min_tau_s`; 0 = armed to the bell). This "
+                         "is the window that lost 2026-09-22 23:17 (tau 56) and "
+                         "2026-09-23 10:34 (tau 54).")
+    ap.add_argument("--min-tau-behind", type=float, default=None,
+                    help="override the tau floor for the LOSS half alone "
+                         "(`--behind-bps` must be > 0 to have one)")
+    # ⛔ NOT `--rev-bps`: that name is already taken by the `--mode react`
+    # helper (a different code path). `--exit-rev-bps` is the EXIT's threshold.
+    ap.add_argument("--exit-rev-bps", type=float, default=None,
+                    help="override `model_exit_rev_bps`: how big a move against "
+                         "us counts as a reaction (5.0 live). Lower = more "
+                         "exits, fewer full losses, less P&L.")
+    ap.add_argument("--exit-max-bid", type=float, default=None,
+                    help="REFUSE to sell while the recorded bid is above this "
+                         "(0 = off). Use it to stop the exit giving away a "
+                         "round the market has already priced as won -- the "
+                         "2026-09-23 11:29 trigger sold at 0.93 while the "
+                         "position was ~4.2 sigma in the money with 16s left.")
+    ap.add_argument("--exit-max-z", type=float, default=None,
+                    help="REFUSE to sell while the position is more than this "
+                         "many sigma of the REMAINING move in the money "
+                         "(0 = off). The sigma-scaled form of the same idea: "
+                         "a 5bps/20s move is not a threat when the lead is 4 "
+                         "sigma wide.")
+    ap.add_argument("--exit-min-prem", type=float, default=None,
+                    help="`--exit-min-prem`: refuse a sale unless the book still "
+                         "pays MORE than the model's fair value for the "
+                         "position (`bid - slip >= fair + prem`). 0/None = OFF "
+                         "(sell at any price). THE EDGE RUN IN REVERSE: the "
+                         "arm's profit comes from the venue's quote lagging the "
+                         "spot, and the same lag says when an EXIT is paid -- "
+                         "only while the book is still above fair. Below it we "
+                         "hand over the spread to convert a coin flip into a "
+                         "coin flip, which is why every grind threshold "
+                         "measured 2026-09-23 lost money. Partner it with "
+                         "`--behind-bps`: sell a decided loss at a price the "
+                         "market has not caught up to, not at any price.")
     args = ap.parse_args()
+    BEHIND_OVR["bps"] = args.behind_bps
+    BEHIND_OVR["hold"] = args.behind_hold
+    TAU_OVR["react"] = args.min_tau
+    TAU_OVR["behind"] = args.min_tau_behind
+    REV_OVR["rev"] = args.exit_rev_bps
+    MAX_BID_OVR["bid"] = args.exit_max_bid
+    MAX_Z_OVR["z"] = args.exit_max_z
+    PREM_OVR["prem"] = args.exit_min_prem
+    BMAX_OVR["tau"] = args.behind_max_tau
+    DUMP_ROWS["on"] = bool(getattr(args, "dump_rows", False))
     persist = (settings.signal_persistence if args.persistence is None
                else args.persistence)
 
@@ -599,7 +1350,30 @@ def main() -> None:
               f"(mean {sum(sigmas)/len(sigmas)*1e4:.2f} bps/min)")
 
     base = dict(persistence=persist, exec_mode=args.exec,
-                latency_s=args.latency_s)
+                latency_s=args.latency_s,
+                weekend=not args.no_weekend,
+                candle_reset=not args.no_candle_reset,
+                up_gate=not args.no_up_gate,
+                up_ok=(up_gate_by_minute(ao.minute_closes(rs),
+                                         getattr(settings, "up_regime_gate", 0.0)
+                                         or 0.0)
+                       if not args.no_up_gate else {}),
+                entry_slip=args.entry_slip)
+    if base["up_ok"]:
+        _blocked = sum(1 for v in base["up_ok"].values() if not v)
+        print(f"  up-regime gate: {_blocked} of {len(base['up_ok'])} minutes "
+              f"block the Up side (gate "
+              f"{getattr(settings, 'up_regime_gate', 0.0):+.3f})")
+    if args.fee_model == "live":
+        global _FEE_LIVE, _FEE_BANDS
+        _FEE_BANDS, _n = _measured_fee_table(con)
+        _FEE_LIVE = True
+        print(f"  fee model: LIVE bands measured from {_n} fills in this DB -- "
+              + ", ".join(f"{lo:.2f}-{hi:.2f}:{1e4*rate:.0f}bps(n={n})"
+                          for lo, hi, rate, n in _FEE_BANDS))
+    else:
+        print("  fee model: curve (fee_rate_for_price) -- the rate the arm's own "
+              "gate uses")
 
     def run2(**over) -> list[dict]:
         # ⛔ FOLD `base` IN, DO NOT PASS IT SEPARATELY. `replay(r, sg, **base,
@@ -1057,7 +1831,93 @@ def main() -> None:
                   f"WR {wr_a:5.1f}%  t {ao.tstat(added) if added else 0:+5.2f}"
                   f"   | lost {len(gone)} at EV {ev_g:+.4f}/$1")
 
-    if args.mode == "ship":
+    if args.mode == "tight":
+        # ============ THE TIGHTENING SIDE OF THE ENTRY BAND ============
+        # ⭐ THE ONE DIRECTION THE OFAT LEFT UNPROBED (2026-09-23). Every other
+        # entry knob came back with the LIVE value at or near the best cell, and
+        # the two that did not are monotone in the direction of TIGHTER:
+        #   `max_range 20 -> 12` raised EV 17%, day-t 4.5x (+0.57 -> +2.59) and
+        #   made the drawdown SHALLOWER (-16.51 -> -14.63), and 12 was the
+        #   tightest value the OFAT tested;
+        #   `min_quote` was only ever probed DOWNWARD (0.45 -> 0.05, all worse),
+        #   so the upward side (0.50-0.60) is unmeasured.
+        # Both are the same claim: the arm's edge lives in the rounds that have
+        # MOVED (a range of 8-12bps, a price away from 0.50), not in the flat
+        # ones where the model's `fair` is barely distinguishable from the book.
+        # ⛔ JUDGE ON THE HALVES RANKING, never on the pooled number: a knob
+        # whose ranking FLIPS between halves is a fitted split of one sample --
+        # the `min_tau 60 vs 5` trap (day-t +0.46 -> +1.75, halves reversed).
+        print("\n=== TIGHT: the band the live config has not yet probed "
+              "(H = per-$1 by half) ===")
+        print("  -- the round-range CEILING, tighter than live 12 --")
+        for mr in (12.0, 10.0, 8.0, 6.0):
+            row(f"max_range {mr:g}", run2(max_range=mr), len(rs), days)
+        print("  -- the round-range FLOOR, tighter than live 5 --")
+        for mn in (5.0, 8.0, 10.0):
+            row(f"min_range {mn:g}", run2(min_range=mn), len(rs), days)
+        print("  -- the quote FLOOR, with the MARGINAL COHORT priced --")
+        # ⛔ THE INCREMENT, NOT TWO CONFIDENCE INTERVALS. Raising a floor does
+        # not "improve the cell" -- it REMOVES a cohort, and the honest question
+        # is what THAT cohort earns. `growth(A+B) - growth(A)` is B's own
+        # growth, so the removed rounds' mean return is the whole argument: if
+        # the removed cohort is negative, removing it is a gain of its size; if
+        # it is positive, the floor is buying a nicer ratio with real money.
+        base_e = run2()
+        bmap0 = {e["slug"]: e for e in base_e}
+        print(f"     live floor {settings.min_quote:g}: n={len(base_e)} "
+              f"EV {st.fmean([e['ret'] for e in base_e]):+.4f}/$1")
+        for mq in (0.45, 0.475, 0.50, 0.525, 0.55, 0.575, 0.60):
+            cell = run2(min_quote=mq)
+            got = {e["slug"]: e for e in cell}
+            gone = [e for s, e in bmap0.items() if s not in got]
+            added = [e for s, e in got.items() if s not in bmap0]
+            if gone:
+                print(f"     -> removing {len(gone):3d} rounds at "
+                      f"EV {st.fmean([e['ret'] for e in gone]):+.4f}/$1  "
+                      f"(adds {len(added)})")
+            else:
+                print(f"     -> the baseline itself (removes 0)")
+            row(f"min_quote {mq:g}", cell, len(rs), days)
+        print("  -- the quote CEILING, tighter than live 0.80 --")
+        for xq in (0.80, 0.75, 0.70):
+            row(f"max_quote {xq:g}", run2(max_quote=xq), len(rs), days)
+        print("  -- the two best guessed TOGETHER (the joint cell) --")
+        for mr, mq in ((10.0, 0.50), (8.0, 0.50), (10.0, 0.55)):
+            row(f"mr {mr:g} + mq {mq:g}",
+                run2(max_range=mr, min_quote=mq), len(rs), days)
+        return
+
+    if args.mode == "floor":
+        # ====== THE QUOTE FLOOR AT 0.01 RESOLUTION (added 2026-09-23) ======
+        # WHY THIS EXISTS. The 0.025 grid showed an interior hump peaking at
+        # 0.475 with a DIP exactly at the previously-live 0.50:
+        #   0.525 +0.1309 | **0.50 +0.1201** | 0.475 +0.1345 | 0.45 +0.1315
+        # A local minimum sitting on the value we happened to be running is this
+        # repo's noise signature (the train sweep's X=12.5 hole), so the value
+        # cannot be read off that grid -- the neighbours are what could be
+        # lucky. This resolves it a tick at a time, printing the halves (the
+        # direction check) and the cohort each step adds or removes.
+        # ⛔ `bmap` NOT `base`: see the note in `--mode tight` -- rebinding
+        # `base` breaks `run2`'s closure.
+        print("\n=== THE QUOTE FLOOR AT 0.01 RESOLUTION (H = per-$1 by half) ===")
+        base_e = run2()
+        bmap = {e["slug"]: e for e in base_e}
+        print(f"     live floor {settings.min_quote:g}: n={len(base_e)} "
+              f"EV {st.fmean([e['ret'] for e in base_e]):+.4f}/$1")
+        for mq in (0.44, 0.45, 0.46, 0.47, 0.475, 0.48, 0.49, 0.50, 0.51,
+                   0.52):
+            cell = run2(min_quote=mq)
+            got = {e["slug"]: e for e in cell}
+            gone = [e for s, e in bmap.items() if s not in got]
+            if gone:
+                print(f"     -> removes {len(gone):3d} rounds at "
+                      f"EV {st.fmean([e['ret'] for e in gone]):+.4f}/$1")
+            else:
+                print(f"     -> adds {len(got) - len(bmap):3d} rounds")
+            row(f"min_quote {mq:g}", cell, len(rs), days)
+        return
+
+    if args.mode in ("ship", "sizegrid"):
         # ======= WHAT ACTUALLY SHIPS: ENTRY + SIZING + THE LIVE EXIT =======
         # An entry table is in EV/$1 at a constant stake, so it CANNOT rank a
         # sizing change: `stake_for_edge` pays between min_stake and max_stake as
@@ -1136,50 +1996,138 @@ def main() -> None:
             return out
 
         def _ret_exited(e: dict, rnd: dict, bidmap: dict,
-                        stake: float) -> tuple[float, bool]:
-            """(the per-$1 return with the shipped exit applied, did it exit).
+                        stake: float) -> tuple[float, bool, str]:
+            """(per-$1 return with the live exit applied, did it exit, rule).
 
-            MIRRORS `main.Bot._reaction_against` -- and the first two versions
-            of this overlay did NOT:
-              * the spot must still be AHEAD of the strike (`log(S/K)*sgn > 0`):
-                the rule exists to protect a LEAD, so once the price is behind
-                the strike there is nothing to protect and it does not fire;
-              * the venue refuses a sell under its notional floor, so a blocked
-                slice is a HOLD, not an exit -- and the floor is checked against
-                the ACTUAL POSITION (`stake / cost` shares), not against the
-                slice per $1 of stake. Getting that unit wrong blocked 81 of 85
-                triggers and reported the exit as inert. That is the third time
-                this unit error has appeared in this repo; see the artifact list.
+            MIRRORS `main.Bot._model_exit_check` in FULL -- both halves, the
+            venue floor, and the retry. Versions of this overlay did NOT:
+
+              * `_reaction_against` only: the spot must still be AHEAD of the
+                strike (`log(S/K)*sgn > 0`), because the rule protects a LEAD,
+                so once the price is behind the strike there is nothing to
+                protect. What that misses is the BLEED -- a slow drift across
+                the strike produces no reaction at all and the lead guard turns
+                the exit off exactly when the thesis is dead. Live 2026-09-22
+                23:17 (btc-updown-5m-1790118900, Up, $2 at 0.647) settled
+                -2.0000 with the exit armed and silent. `_grind_against` is the
+                other half: BEHIND the strike by >= model_exit_behind_bps for
+                >= model_exit_behind_hold_s, as a STATE with its own clock.
+              * the floor is a NOTIONAL ON THE SLICE SENT, checked against the
+                ACTUAL POSITION (`stake / cost` shares) -- not the slice per $1
+                of stake. That unit error blocked 81 of 85 triggers once and
+                reported the exit as inert (artifact list, entry 8).
+              * the SHARES ARE FLOORED TO 0.01 before the sale, as
+                `LiveBroker.sell_fak` floors them ("selling FEWER is always
+                accepted"). At $1-2 stakes this is the difference between a sale
+                that clears $1.00 of notional and one that does not.
+              * a refused sale is NOT final: live leaves the position watched and
+                retries EVERY tick, so a refusal here `continue`s the scan.
             """
             rows = rnd["rows"]
             strike = rnd.get("strike")
             j = next((k for k, rr in enumerate(rows) if rr[0] >= e["ts_ms"]),
                      None)
             if j is None:
-                return e["ret"], False
+                return e["ret"], False, ""
             sgn = 1.0 if e["side"] == "Up" else -1.0
+            _t_react = (float(S.model_exit_min_tau_s) if TAU_OVR["react"] is None
+                        else float(TAU_OVR["react"]))
+            _t_behind = (_t_react if TAU_OVR["behind"] is None
+                         else float(TAU_OVR["behind"]))
+            _b_bps = (float(S.model_exit_behind_bps)
+                      if BEHIND_OVR["bps"] is None
+                      else float(BEHIND_OVR["bps"]))
+            _b_hold = (float(S.model_exit_behind_hold_s)
+                       if BEHIND_OVR["hold"] is None
+                       else float(BEHIND_OVR["hold"]))
+            # `None` = no CLI override -> the SHIPPED value, so the replay here
+            # ranks the rule the bot actually runs. A literal default would
+            # rank a system nobody runs (artifact list, entry 7).
+            _bmax = (float(getattr(S, "model_exit_behind_max_tau_s", 0.0) or 0.0)
+                     if BMAX_OVR["tau"] is None
+                     else float(BMAX_OVR["tau"] or 0.0))
+            _rev = (float(S.model_exit_rev_bps) if REV_OVR["rev"] is None
+                    else float(REV_OVR["rev"]))
+            _max_bid = (float(MAX_BID_OVR["bid"] or 0.0))
+            _max_z = (float(MAX_Z_OVR["z"] or 0.0))
+            _prem = float(PREM_OVR["prem"] or 0.0)
+            # ⛔ NOT `idx_of`/`sigmas` FROM THE EXIT BLOCK: they are bound LATER
+            # in `main`, so referencing them here raises NameError the moment
+            # the grid's diagnostic calls this helper (the same footgun the `st`
+            # note above records). Computed into `_SG0` in this block instead.
+            _sg0 = _SG0.get(e["slug"], 0.0)
+            _sseries = live_sig.get(e["slug"]) if args.use_live_sigma else None
             seen = [(rr[0], rr[2]) for rr in rows[:j + 1]
                     if rr[2] and rr[2] > 0]
             look_ms = S.model_exit_look_s * 1000.0
             sh = stake / ao._cost_per_share(e["px"])        # ACTUAL shares
+            # The venue's own step: `int(shares * 100) / 100.0`.
+            sh = int(sh * 100) / 100.0
             frac = float(S.model_exit_frac)
+            behind_since: int | None = None
             for rr in rows[j + 1:]:
                 ts, tau, spot = rr[0], rr[1], rr[2]
                 if ts - e["ts_ms"] < S.model_exit_min_hold_s * 1000:
                     continue
-                if tau is None or tau <= S.model_exit_min_tau_s:
+                # The watch ends only when NEITHER half can still act; tau falls
+                # monotonically so a break here is final.
+                if tau is None or tau <= min(_t_react, _t_behind):
                     break            # the book goes one-sided at the bell
                 if not spot or spot <= 0:
                     continue
                 seen.append((ts, spot))
                 if not (strike and tau and tau > 0):
                     continue
-                if math.log(spot / strike) * sgn <= 0:
-                    continue         # no lead left to protect -> no trigger
-                past = [s for t, s in seen if t <= ts - look_ms]
-                if not past:
-                    continue
-                if math.log(spot / past[-1]) * 1e4 * sgn > -S.model_exit_rev_bps:
+                # ⛔ IS THIS MOVE A THREAT, OR JUST A BUMP? The reaction rule
+                # asks only "did the spot move 5bps against us over 20s", which
+                # is satisfied identically whether we are 0.5 sigma or 4 sigma
+                # ahead. This refuses the tick while the lead is still larger
+                # than `_max_z` sigma of the move LEFT, and KEEPS WATCHING: a
+                # lead that shrinks below the gate can still be sold later, at
+                # which point the sale is real protection rather than
+                # surrendering a won round.
+                # ⚠️ IT APPLIES TO THE LEAD ONLY (`log(S/K)*sgn > 0`), which is
+                # what shipped in `_reaction_against`: a position 4 sigma BEHIND
+                # the strike is exactly the case the grind half exists for, so a
+                # magnitude gate there would suppress the sale that matters.
+                if _max_z and math.log(spot / strike) * sgn > 0:
+                    _sg = _sig_at(_sseries, ts, _sg0)
+                    if _sg and _sg > 0:
+                        if moneyness_sd(spot, strike, tau, _sg) * sgn > _max_z:
+                            continue
+                rule = ""
+                if math.log(spot / strike) * sgn > 0:
+                    # THE REACTION HALF: a lead that is being snapped away.
+                    behind_since = None
+                    if tau <= _t_react:
+                        continue          # this half's floor, separately
+                    past = [s for t, s in seen if t <= ts - look_ms]
+                    if past and (
+                            math.log(spot / past[-1]) * 1e4 * sgn
+                            <= -_rev):
+                        rule = "react"
+                elif _b_bps > 0 and tau > _t_behind:
+                    # THE GRIND HALF: the lead is not snapped away, it is GONE.
+                    # `behind_since` is stamped on the first tick at or beyond
+                    # the threshold and CLEARED the moment the spot is back on
+                    # our side, so a position wobbling across the strike does not
+                    # accumulate time it never spent behind it.
+                    # ⛔ `_bmax` KEEPS THIS TO THE END OF THE ROUND (see
+                    # BMAX_OVR): the same deficit is decisive at tau 10 and
+                    # noise at tau 200, so a ceiling separates "about to lose"
+                    # from "wobbled", which is what lets the sale cap a loss
+                    # without cutting a winner.
+                    if _bmax and tau > _bmax:
+                        continue
+                    behind = -math.log(spot / strike) * 1e4 * sgn
+                    if behind < _b_bps:
+                        behind_since = None
+                    else:
+                        if behind_since is None:
+                            behind_since = ts
+                        if ts - behind_since >= _b_hold * 1000.0:
+                            rule = "grind"
+                if not rule:
                     continue
                 px = None                          # the recorded bid, that tick
                 for t in sorted(bidmap, reverse=True):
@@ -1188,13 +2136,39 @@ def main() -> None:
                         px = u if e["side"] == "Up" else d
                         break
                 if not px:
+                    EXIT_TRIG[e["slug"]] = f"{rule}:no_bid"
                     continue
-                if sh * frac * max(0.0, px - SLIP) < _SELL_MIN:
-                    continue         # the venue refuses the SELL
-                got = sh * frac * max(0.0, px - SLIP) * (1.0 - XFEE)
+                # ⛔ DO NOT GIVE AWAY A DONE ROUND. A bid above `max_bid` means
+                # the market already prices this position as settled in our
+                # favour; selling it is surrendering (1 - bid) of a near-certain
+                # $1. KEEP WATCHING rather than stopping -- the rule is a
+                # transient and the price may fall to a level that is worth
+                # selling at, which is when the exit is actually paid.
+                if _max_bid and px > _max_bid:
+                    EXIT_TRIG[e["slug"]] = f"{rule}:max_bid"
+                    continue
+                out_px = max(0.0, px - SLIP)
+                # ⭐ SELL THE LAG, NOT THE LOSS (see PREM_OVR). `_prem > 0`
+                # refuses the sale unless the book still pays more than the
+                # model's fair value for this position, i.e. unless the venue's
+                # quote has not yet caught up with the spot -- the one state in
+                # which an exit is PAID rather than charged the spread.
+                if _prem > 0:
+                    _sgf = _sig_at(_sseries, ts, _sg0) or _sg0
+                    if strike and tau and _sgf:
+                        _fu = fair_value(spot, strike, tau, _sgf)
+                        _fair_ours = _fu if e["side"] == "Up" else 1.0 - _fu
+                        if out_px < _fair_ours + _prem:
+                            EXIT_TRIG[e["slug"]] = f"{rule}:below_fair"
+                            continue
+                if sh * frac * out_px < _SELL_MIN:
+                    EXIT_TRIG[e["slug"]] = f"{rule}:floor"
+                    continue         # the venue refuses the SELL; retried next tick
+                got = sh * frac * out_px * (1.0 - FEE_RATE(out_px))
                 rest = sh * (1.0 - frac) * (1.0 if e["won"] else 0.0)
-                return (got + rest) / stake - 1.0, True
-            return e["ret"], False
+                EXIT_TRIG[e["slug"]] = f"{rule}:taken"
+                return (got + rest) / stake - 1.0, True, rule
+            return e["ret"], False, ""
 
         def _battery(ent: list[dict], rmap: dict, *, use_exit: bool,
                      tag: str) -> tuple[float, float]:
@@ -1205,7 +2179,7 @@ def main() -> None:
                 if stake <= 0:
                     continue
                 if use_exit:
-                    r, did = _ret_exited(e, rmap[e["slug"]], bmap.get(
+                    r, did, _rule = _ret_exited(e, rmap[e["slug"]], bmap.get(
                         e["slug"], {}), stake)
                     n_exit += 1 if did else 0
                 else:
@@ -1237,10 +2211,13 @@ def main() -> None:
               f"${S.min_stake_usdt:g}->${S.max_stake_usdt:g} at ev "
               f"{S.stake_ev_lo:g}->{S.stake_ev_hi:g}, tilt {S.stake_tilt}, "
               f"cap {S.stake_cap_usdt:g}, boost x{S.model_stake_boost_mult:g}")
-        print(f"  exit react: frac {S.model_exit_frac:g} at "
-              f"{-S.model_exit_rev_bps:g}bps/{S.model_exit_look_s:g}s, "
+        print(f"  exit LIVE: react {-S.model_exit_rev_bps:g}bps/"
+              f"{S.model_exit_look_s:g}s OR behind "
+              f"{S.model_exit_behind_bps:g}bps for "
+              f"{S.model_exit_behind_hold_s:g}s, frac {S.model_exit_frac:g}, "
               f"tau>{S.model_exit_min_tau_s:g}s, hold>{S.model_exit_min_hold_s:g}s"
-              f"  (sell at bid - {SLIP:g} - {XFEE*100:g}bp)")
+              f"  (sold at bid - {SLIP:g}, venue floor ${_SELL_MIN:.2f} on the "
+              f"SLICE, shares floored to 0.01)")
         rmap = {r["slug"]: r for r in rs}
         L = dict(min_edge=S.min_edge, min_quote=S.min_quote,
                  max_quote=S.max_quote,
@@ -1271,6 +2248,8 @@ def main() -> None:
              dict(min_stake=2.0, max_stake=2.0, hi=0.07), True),
         ]
         for label, over, sz, use_exit in ship_cands:
+            if args.mode != "ship":
+                break                  # sizegrid only wants the machinery
             _sz[0] = {**SZ, **(sz or {})}
             ent = run2(**over)
             print(f"  {label:<24} n={len(ent)}"
@@ -1279,6 +2258,209 @@ def main() -> None:
             if label.startswith("live entry") and use_exit:
                 _battery(ent, rmap, use_exit=False, tag="exit OFF")
         _sz[0] = SZ
+
+        if args.mode == "sizegrid":
+            # ============ HOW MUCH PER TRADE: THE (min -> max) GRID ============
+            #
+            # THE QUESTION THIS ANSWERS. `stake_for_edge` puts `min_stake` on
+            # the weakest accepted signal and `max_stake` on the strongest, ramping
+            # linearly in decision-time ev/$. Which PAIR to ship is not answered
+            # by an EV/$1 table -- that is at a constant stake by construction.
+            #
+            # WHAT IS HELD FIXED. The entry SET: sizing re-weights entries, it
+            # does not select them, so one `run2()` (the expensive part) serves
+            # every cell. What is NOT held fixed is the EXIT's viability, which
+            # depends on the stake -- so every cell re-runs the exit per entry
+            # at ITS OWN stake rather than scaling one flat-$2 result.
+            #
+            # ⛔ TWO WAYS TO GET THIS WRONG, both guarded here:
+            #  * bigger stakes make more money on a profitable arm BY
+            #    CONSTRUCTION. That is leverage. So `$/$1 staked` is printed
+            #    beside the totals: it is the allocation-independent quality, and
+            #    a cell that does not beat flat THERE is just more money at more
+            #    risk.
+            #  * a stake change moves the EXIT, and the exit is where the risk
+            #    reduction lives (a $1 position's sale is refused by the venue's
+            #    $1 notional floor the moment the bid drops; a $2 one's is not).
+            #    The `exits` column is printed for exactly that reason.
+            ent = [e for e in run2() if e.get("ev") is not None]
+            ent.sort(key=lambda e: e["ts_ms"])
+            bmap = _bids_for(ent)
+            #: scalar fallback sigma per round, for `--exit-max-z` on the ~23% of
+            #: rounds with no recorded live series.
+            _SG0 = {r["slug"]: ao.rolling_sigma(rs, i)
+                    for i, r in enumerate(rs)}
+
+            def _grid_row(smin: float, smax: float, lo: float, hi: float,
+                          tag: str = "") -> tuple[float, float, float]:
+                """One (min, max) cell: dollars, drawdown, exits."""
+                stks = [stake_for_edge(e["ev"], min_edge=lo, min_stake=smin,
+                                       max_stake=smax, edge_at_max=hi)
+                        for e in ent]
+                cash, n_exit, n_skip = [], 0, 0
+                rules: dict[str, int] = {}
+                for e, sk in zip(ent, stks):
+                    if sk < S.min_order_usdt:
+                        n_skip += 1        # live SKIPS, never rounds up
+                        continue
+                    r, did, rule = _ret_exited(
+                        e, rmap[e["slug"]], bmap.get(e["slug"], {}), sk)
+                    n_exit += 1 if did else 0
+                    rules[rule or "-"] = rules.get(rule or "-", 0) + 1
+                    cash.append((e["day"], sk, sk * r, r))
+                if len(cash) < 8:
+                    print(f"  {tag or f'{smin:g}->{smax:g}':<16} n={len(cash)} "
+                          f"too few to read")
+                    return 0.0, 0.0, 0.0
+                tot = sum(c[2] for c in cash)
+                staked = sum(c[1] for c in cash)
+                curve = peak = dd = 0.0
+                # ⭐ AVERAGE DRAWDOWN BESIDE maxDD (operator's ask, 2026-09-23).
+                # maxDD is ONE point of ONE ordering, so a single unlucky trade
+                # can set it (measured: the same trades reshuffled move it
+                # -18..-65 at $3.50). The time-average of the running distance
+                # below the peak is a property of the whole path, so it is the
+                # stable number to compare cells on; maxDD stays as the tail.
+                dds: list[float] = []
+                for c in cash:
+                    curve += c[2]
+                    peak = max(peak, curve)
+                    dd = min(dd, curve - peak)
+                    dds.append(peak - curve)
+                avg_dd = (sum(dds) / len(dds)) if dds else 0.0
+                half = len(cash) // 2
+                # ⛔ THE HALVES ARE PER-$1 RETURNS, and the first version of
+                # this column was DOLLARS PER TRADE -- wrong, and wrong in the
+                # one place it could not be seen: it sat beside `dDay`, which is
+                # per-$1, and beside `$/$1`, so one row carried two units and
+                # neither was labelled. On a RAMP it is worse than a mislabel:
+                # a cell whose stakes are larger in the first half looks better
+                # in the first half even when its per-$1 edge is identical, so
+                # the column cannot be compared ACROSS cells -- which is the
+                # only reason a halves column exists here.
+                # Both units are now printed: `h/x` per-$1 (allocation-free,
+                # the number to compare between cells) and `$h` the money
+                # actually made in each half (the number that reaches the wallet).
+                h1 = _fmean([c[3] for c in cash[:half]]) if half else 0.0
+                h2 = (_fmean([c[3] for c in cash[half:]])
+                      if len(cash) > half else 0.0)
+                m1 = sum(c[2] for c in cash[:half])
+                m2 = sum(c[2] for c in cash[half:])
+                by: dict[int, list[float]] = {}
+                for c in cash:
+                    by.setdefault(c[0], []).append(c[3])
+                worst = max(by, key=lambda d: _fmean(by[d])) if by else None
+                rest = [r for d, v in by.items() if d != worst for r in v]
+                dday = _fmean(rest) if rest else float("nan")
+                lbl = tag or f"{smin:g}->{smax:g}"
+                print(f"  {lbl:<16} ${_fmean([c[1] for c in cash]):5.2f} "
+                      f"n={len(cash):<4} exits {n_exit:>3}/{len(cash):<4} "
+                      f"${tot:+8.2f} ${tot/max(days,1):+7.2f}/d "
+                      f"avgDD ${avg_dd:+7.2f} "
+                      f"P/|aDD| {tot/max(avg_dd,1e-9):6.2f} "
+                      f"-100% {100*sum(1 for c in cash if c[3] <= -0.99)/max(len(cash),1):3.0f}% "
+                      f"maxDD ${dd:+7.2f} tot/|DD| {tot/max(abs(dd),1e-9):5.2f} "
+                      f"$/$1 {tot/max(staked,1e-9):+.4f} "
+                      f"H/$1 {h1:+.3f}/{h2:+.3f} "
+                      f"H$ {m1:+.2f}/{m2:+.2f} dDay {dday:+.4f}"
+                      + (f"  skip {n_skip}" if n_skip else "")
+                      + ("  " + ",".join(f"{k}:{v}" for k, v in rules.items()
+                                          if k != "-") if n_exit else ""))
+                return tot, dd, staked
+
+            print(f"\n=== SIZING GRID: min -> max, DOLLARS with the LIVE exit "
+                  f"({len(ent)} entries over {days:.2f} days) ===")
+            _evlo = (S.stake_ev_lo if args.ev_lo is None else args.ev_lo)
+            _evhi = (S.stake_ev_hi if args.ev_hi is None else args.ev_hi)
+            print(f"  bankroll ${args.bankroll:g} | ramp is linear in ev/$"
+                  f" from ${_evlo:g} to ${_evhi:g} | "
+                  f"min_order ${S.min_order_usdt:g} | cap ${S.stake_cap_usdt:g}")
+            _gb = (S.model_exit_behind_bps if BEHIND_OVR["bps"] is None
+                   else BEHIND_OVR["bps"])
+            _gh = (S.model_exit_behind_hold_s if BEHIND_OVR["hold"] is None
+                   else BEHIND_OVR["hold"])
+            _gtag = ("  (CLI OVERRIDE)" if (args.behind_bps is not None
+                                            or args.behind_hold is not None)
+                     else "")
+            _gc = (float(getattr(S, "model_exit_behind_max_tau_s", 0.0) or 0.0)
+                   if BMAX_OVR["tau"] is None
+                   else float(BMAX_OVR["tau"] or 0.0))
+            print(f"  exit: react -{S.model_exit_rev_bps:g}bps/"
+                  f"{S.model_exit_look_s:g}s OR grind behind {_gb:g}bps for "
+                  f"{_gh:g}s{'  (GRIND OFF = reaction alone)' if not _gb else ''}"
+                  f"{'  LATE-ONLY tau<=' + format(_gc, 'g') + 's' if (_gb and _gc) else ''}"
+                  f"{'  (CEILING OFF = grind from entry to bell)' if (_gb and not _gc) else ''}"
+                  f"{_gtag}")
+            _tr = (S.model_exit_min_tau_s if TAU_OVR["react"] is None
+                   else TAU_OVR["react"])
+            _tb = (_tr if TAU_OVR["behind"] is None else TAU_OVR["behind"])
+            print(f"  tau floor: lead t>{_tr:g}s"
+                  f"{'  (ARMED TO THE BELL)' if not _tr else ''}"
+                  f" | loss t>{_tb:g}s"
+                  f"{'  <-- CLI OVERRIDE' if (args.min_tau is not None or args.min_tau_behind is not None) else ''}")
+            print(f"  {'min->max':<16} {'avg$':>5} {'n':>8} {'exits':>13} "
+                  f"{'P&L':>9} {'$/day':>8} {'avgDD':>8} {'P/|aDD|':>7} "
+                  f"{'maxDD':>8} {'t/|DD|':>6} "
+                  f"{'$/$1':>7} {'H/$1':>14} {'H$':>14} {'drop-best-day':>13}")
+            print("  (H/$1 = mean per-$1 return of each half -- the comparable "
+                  "number; H$ = dollars made in each half)")
+            mins = ([float(v) for v in args.smin.split(",")] if args.smin
+                    else [1.0, 1.5, 2.0])
+            maxs = ([float(v) for v in args.sms.split(",")] if args.sms
+                    else [1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0])
+            # ⭐ WHERE DOES THE PER-$1 RETURN LIVE? The ramp's whole premise is
+            # that `ev/$` RANKS the entries, so staking more on a bigger ev/$ is
+            # concentration in quality. The grid cannot answer that: a cell's
+            # `$/$1` is a weighted average, so a ramp that is backwards and a
+            # ramp that is right can print the SAME number. This buckets the
+            # entries by their OWN ev/$ and shows each bucket's per-$1 return at
+            # ONE flat stake, which is the allocation-free question -- does the
+            # arm make more per dollar on the trades it likes most?
+            print("\n  -- ⭐ SIZING DIAGNOSTIC: is `ev/$` a ranking? (per-$1 "
+                  "return by the entry's OWN ev/$, live exit at flat $1.5) --")
+            for _lo, _hi in ((0.0, 0.05), (0.05, 0.055), (0.055, 0.06),
+                             (0.06, 0.065), (0.065, 0.075), (0.075, 0.09),
+                             (0.09, 0.11), (0.11, 0.14), (0.14, 1.0)):
+                _sel = [e for e in ent
+                        if _lo <= float(e.get("ev") or 0.0) < _hi]
+                if not _sel:
+                    continue
+                _rr = [_ret_exited(e, rmap[e["slug"]],
+                                   bmap.get(e["slug"], {}), 1.5)[0]
+                       for e in _sel]
+                print(f"    ev {_lo:.3f}-{_hi:.3f}  n={len(_sel):<4} "
+                      f"mean ev {_fmean([float(e.get('ev') or 0) for e in _sel]):.4f}"
+                      f"  per-$1 {_fmean(_rr):+.4f}  "
+                      f"(no exit {_fmean([e['ret'] for e in _sel]):+.4f})")
+            best: list[tuple[float, str, float, float]] = []
+            for smin in mins:
+                for smax in maxs:
+                    if smax < smin:
+                        continue
+                    tag = (f"flat ${smin:g}" if smin == smax
+                           else f"{smin:g}->{smax:g}")
+                    tot, dd, staked = _grid_row(
+                        smin, smax, _evlo, _evhi, tag)
+                    if staked:
+                        best.append((tot / max(abs(dd), 1e-9), tag, tot, dd))
+            print(f"  live (({S.min_stake_usdt:g}->{S.max_stake_usdt:g}) is the "
+                  f"row labelled flat ${S.min_stake_usdt:g} when min==max)")
+            if best:
+                best.sort(reverse=True)
+                print("\n  best by tot/|maxDD|: " + ", ".join(
+                    f"{t} ({r:.2f}, ${tot:+.0f})" for r, t, tot, _ in best[:4]))
+                bd = max(best, key=lambda x: x[2])
+                print(f"  best by P&L:        {bd[1]} ${bd[2]:+.2f} "
+                      f"(maxDD ${bd[3]:+.2f} = "
+                      f"{100*abs(bd[3])/args.bankroll:.0f}% of the bankroll)")
+            # ⛔ `--dd-detail 10` SHOWS THE WORK behind one cell's maxDD: where
+            # the peak sat, where the wallet got to, and what the same trades
+            # score in a different ORDER. A single peak-to-trough figure is one
+            # path, and the grid prints it as if it were a property of the rule.
+            if args.dd_detail:
+                _dd_detail(ent, rmap, bmap, float(args.dd_detail), _evlo,
+                           _evhi, args.bankroll, _ret_exited)
+            return
 
     if args.mode == "exit":
         # ================== EARLY EXIT ("price reacting") ==================
@@ -1440,7 +2622,7 @@ def main() -> None:
             bound to check any row against.
             """
             if eff is not None and _slice_ok(eff, shares, px_out):
-                got = px_out * (1.0 - fee_rate_for_price(px_out))
+                got = px_out * (1.0 - FEE_RATE(px_out))
                 return "market", float(eff), (got - cost) / cost, px_out
             if not LIMIT_FB or bb is None:
                 return "blocked", 0.0, 0.0, 0.0
@@ -1458,7 +2640,7 @@ def main() -> None:
             if _limit_fill(bmap, side_, ts0, lim, stop_ts) is None:
                 LIMIT["miss"] += 1
                 return "missed", 0.0, 0.0, 0.0
-            got = lim * (1.0 - fee_rate_for_price(lim))
+            got = lim * (1.0 - FEE_RATE(lim))
             LIMIT["sold"] += 1
             LIMIT["px"].append(lim)
             return "limit", eff2, (got - cost) / cost, lim
@@ -1468,18 +2650,47 @@ def main() -> None:
                      fair_m=0.0, fair_drop=0.0, stale_ms=1000,
                      look_s=20.0, rev_bps=5.0, frac=1.0,
                      force_tau=0.0, trail_c=0.0, behind_bps=0.0,
-                     behind_confirm_s=1.0):
+                     behind_confirm_s=1.0, behind_min_tau: float | None = None,
+                     stake: float | None = None):
             """Per-$1 return if the rule exits, else the HOLD return.
 
-            Returns (ret, exited, blocked) -- `blocked` counts triggers whose
-            sale the venue would refuse for being under its minimum."""
+            Returns (ret, exited, blocked, px_used) -- `blocked` counts triggers
+            whose sale the venue would refuse for being under its minimum.
+
+            `stake` IS NOT COSMETIC. The venue's sell floor is a NOTIONAL, so
+            whether an exit can be placed at all depends on the stake: at $1 a
+            position's sale is refused the moment the bid drops, at $2 it goes
+            through. The money columns must therefore be produced with the
+            variant's OWN stake, not with the module constant -- which is
+            exactly why this is a parameter and not a global.
+            """
             if rule == "none":          # the baseline: hold to settlement
                 return e["ret"], False, 0, None
+            # ⛔⭐ THE ASYMMETRIC GATE. `min_tau` is a fact about the BOOK (it
+            # goes one-sided at the bell) and the two halves of the exit do NOT
+            # suffer from it equally:
+            #   `reactmove` SELLS A LEAD. Measured on 2,811 settled live btc-5m
+            #     rounds, one trigger per (round, side): below tau 30 the venue's
+            #     bid on a STILL-AHEAD position is 0.791 against a 0.900
+            #     realised win rate -- the venue UNDERPRICES us there, so selling
+            #     that late DESTROYS value (-0.109/share). Same at 30-60s: +0.012,
+            #     a wash. That is the population the disarm was measured on.
+            #   `behind` SELLS A LOSER. The alternative is ZERO, and the same
+            #     measurement has the bid ABOVE the realised win rate at EVERY
+            #     tau (+0.002 at 0-30s ... +0.019 above 180s).
+            # So the two deserve different floors: `behind_min_tau` is the floor
+            # the LOSS half watches to. `None` = the shipped behaviour (one floor
+            # for both). Only the two rules that can be a LOSS trigger may watch
+            # past `min_tau`; every other rule keeps the shipped floor.
+            bt = (min_tau if behind_min_tau is None
+                  else float(behind_min_tau))
+            if rule not in ("behind", "either"):
+                bt = min_tau
             r = by_slug[e["slug"]]
             side, strike = e["side"], r["strike"]
             bmap = bids.get(e["slug"]) or {}
             cost = e["cost"]
-            shares = STAKE / cost
+            shares = (STAKE if stake is None else float(stake)) / cost
             # the (ts, spot) series once, for the reaction move
             spots = [(x[0], x[2]) for x in r["rows"] if x[2]]
             sgn = 1.0 if side == "Up" else -1.0
@@ -1538,7 +2749,9 @@ def main() -> None:
                 # exit. Its ONLY trigger is the block above.
                 if rule == "force":
                     continue
-                if tau is not None and tau <= min_tau:
+                # `min(min_tau, bt)`: the watch stops only when NEITHER half can
+                # still act. tau falls monotonically, so a break is final.
+                if tau is not None and tau <= min(min_tau, bt):
                     break
                 b = bmap.get(ts)
                 bb = None if not b else (b[0] if side == "Up" else b[1])
@@ -1591,6 +2804,13 @@ def main() -> None:
                     lead_bps = math.log(spot / strike) * 1e4 * sgn
                     if lead_bps > 0:
                         behind_run = 0        # back ahead: the grind clock resets
+                        # THE ASYMMETRY, APPLIED: while we are still AHEAD this
+                        # half is `reactmove`, and it obeys ITS OWN floor. Below
+                        # it the lead half is disarmed and only the loss half
+                        # below can fire.
+                        if tau <= min_tau:
+                            hit = False
+                            continue
                         past = [s for t, s in spots if t <= ts - look_s * 1000]
                         hit = bool(past) and (
                             math.log(spot / past[-1]) * 1e4 * sgn <= -rev_bps)
@@ -1686,7 +2906,13 @@ def main() -> None:
                         px_used)
             return e["ret"], False, blocked, None
 
-        def erow(label, rule, **kw):
+        def erow(label, rule, stake_amt: float | None = None, **kw):
+            # `stake_amt` is NOT cosmetic: the venue's sell floor is a NOTIONAL,
+            # so whether an exit can be placed at all depends on the stake (at
+            # $1 a position's sale is refused the moment the bid drops, at $2 it
+            # goes through). A row's money columns must therefore be printed at
+            # the SAME stake its exit was priced at, not at the module constant.
+            _st = STAKE if stake_amt is None else float(stake_amt)
             EXIT_TAU.clear()
             LIMIT["sold"] = 0
             LIMIT["miss"] = 0
@@ -1697,7 +2923,7 @@ def main() -> None:
             ex_px, costs = [], []
             for e in ent:
                 LIMIT["cur"] = e["slug"]
-                ret, ex, bl, pxo = sell_ret(e, rule, **kw)
+                ret, ex, bl, pxo = sell_ret(e, rule, stake=stake_amt, **kw)
                 out.append(ret)
                 nex += ex
                 if ex:
@@ -1756,7 +2982,7 @@ def main() -> None:
                   f"day-t {ao.tstat(dm):+5.2f}  "
                   f"H {st.fmean([r_ for _e, r_ in order[:half]]):+.3f}/"
                   f"{st.fmean([r_ for _e, r_ in order[half:]]):+.3f}  "
-                  f"tot@$2 ${STAKE*sum(out):+7.2f}  "
+                  f"tot@${_st:g} ${_st*sum(out):+7.2f}  "
                   f"| unsellable {blocked_entries:>3}{lim_tag}")
             # ⭐ DRAWDOWN, NOT JUST PnL. These rules exist to change the SHAPE of
             # the loss distribution, and the total is nearly blind to that: an
@@ -1769,19 +2995,19 @@ def main() -> None:
             # a tail measure that a full-loss rule cannot hide from.
             eq, peak, mdd, streak, worst_streak = 0.0, 0.0, 0.0, 0, 0
             for r_ in out:
-                eq += STAKE * r_
+                eq += _st * r_
                 peak = max(peak, eq)
                 mdd = min(mdd, eq - peak)
                 streak = streak + 1 if r_ < 0 else 0
                 worst_streak = max(worst_streak, streak)
             tail5 = st.fmean(sorted(out)[:5]) if len(out) >= 5 else float("nan")
-            ratio = (STAKE * sum(out)) / abs(mdd) if mdd < 0 else float("inf")
+            ratio = (_st * sum(out)) / abs(mdd) if mdd < 0 else float("inf")
             mid_ = len(out) // 2
             mdd1, mdd2 = _maxdd(out[:mid_]), _maxdd(out[mid_:])
             print(f"  {label:<24} maxDD ${mdd:+6.2f}  "
                   f"tot/|maxDD| {ratio:5.2f}  worst streak {worst_streak:<3} "
                   f"mean-worst-5 {tail5:+.4f}  "
-                  f"({STAKE*5*tail5:+.2f} on the 5 worst)  "
+                  f"({_st*5*tail5:+.2f} on the 5 worst)  "
                   f"| halfDD {mdd1:+.2f}/{mdd2:+.2f}")
 
         print(f"\n=== EARLY EXIT vs HOLD ({len(ent)} entries, live band, "
@@ -1826,6 +3052,72 @@ def main() -> None:
             erow(f"react OR behind2bps/5tk t>{mt:g}s", "either",
                  behind_bps=2.0, behind_confirm_s=5.0,
                  look_s=20.0, rev_bps=5.0, hold_s=5.0, min_tau=mt)
+        # ⭐⭐ THE ASYMMETRIC WINDOW, WHICH IS THE SHAPE THE TWO LIVE LOSSES
+        # ACTUALLY HAD. `min_tau` is one floor for two rules that are NOT the
+        # same bet: `reactmove` sells a LEAD (and the venue underprices a
+        # still-ahead position below tau 30 -- 0.791 bid vs 0.900 realised -- so
+        # selling there destroys value), while `behind` sells a LOSER whose only
+        # alternative is ZERO (and the bid beats the realised win rate at every
+        # tau). So: keep the LEAD half at tau>60 and let the LOSS half watch to
+        # the bell. 2026-09-22 23:17 crossed at tau 56 and 2026-09-23 10:34:05
+        # reacted at tau 54 -- both inside the window this opens.
+        print("  -- ⭐⭐ THE ASYMMETRIC GATE: lead half at tau>60, LOSS half "
+              "watching to the bell --")
+        for bt in (60.0, 45.0, 30.0, 15.0, 0.0):
+            erow(f"lead t>60 / loss t>{bt:g}s", "either",
+                 behind_bps=2.0, behind_confirm_s=5.0,
+                 look_s=20.0, rev_bps=5.0, hold_s=5.0, min_tau=60.0,
+                 behind_min_tau=bt)
+        print("  -- ⭐ ...and the same gate at the LIVE flat $1 stake (the "
+              "venue's $1 floor is what decides whether a late sale is "
+              "placeable at all) --")
+        for bt in (60.0, 30.0, 0.0):
+            erow(f"lead t>60 / loss t>{bt:g}s @$1", "either",
+                 behind_bps=2.0, behind_confirm_s=5.0,
+                 look_s=20.0, rev_bps=5.0, hold_s=5.0, min_tau=60.0,
+                 behind_min_tau=bt, stake_amt=1.0)
+        print("  -- ⭐ ...and the LOSS half alone (no reaction rule at all), "
+              "whose granularity is the confirmation count, not seconds --")
+        for bt in (30.0, 0.0):
+            for c in (1.0, 2.0, 5.0):
+                erow(f"behind2bps/{c:g}tk t>{bt:g}s", "behind",
+                     behind_bps=2.0, behind_confirm_s=c, hold_s=5.0,
+                     min_tau=60.0, behind_min_tau=bt)
+        print("  -- ⭐⭐ PROTECTION IN EVERY WINDOW: the WINDOW is not the knob, "
+              "the RULE is. `bid >= fair` only sells when the venue pays MORE "
+              "than our own fair value, so it is a profitable sale BY "
+              "CONSTRUCTION and can be armed to the bell (tau 0) without the "
+              "'selling a winner cheap' problem the reaction rule has --")
+        for mt in (60.0, 30.0, 0.0):
+            erow(f"react 20s/5bps t>{mt:g}s", "reactmove",
+                 look_s=20.0, rev_bps=5.0, hold_s=5.0, min_tau=mt)
+        for mt in (60.0, 30.0, 0.0):
+            for m in (0.0, -0.02):
+                erow(f"bid>=fair{m:+.2f} t>{mt:g}s", "fair", fair_m=m,
+                     hold_s=5.0, min_tau=mt)
+        if args.limit_fallback:
+            # ⭐⭐ WHAT THE LIVE FAILURE ON 2026-09-23 11:29 ACTUALLY NEEDS.
+            # `btc-updown-5m-1790162700`: the exit fired at tau 16.3 on a
+            # -5.3bps/20s wobble while the position was 6.7bps IN THE MONEY, the
+            # venue quoted the sale at 0.9300, and the FOK came back
+            # `fak_unfilled` -- no fill at all, despite a bid of 0.93 on the tape
+            # (the likeliest cause is DEPTH: FOK is all-or-nothing and the order
+            # was 5.40 shares). One tick later the 20s window had gone flat, so
+            # the rule stopped holding and there was no second attempt. The
+            # position rode to the bell and won +$1.91 by luck.
+            # The fix to price is therefore NOT a better price, it is a SECOND
+            # CHANCE at the same trigger: a resting LIMIT at the touch, which is
+            # the one form that can still fill after the market order is killed.
+            # ⚠️ At a $1-2 stake this alternative does not exist: the venue's
+            # LIMIT minimum is 5 SHARES and $1 buys 1.4-3, so a resting sell is
+            # only placeable at the bigger stake -- which is another reason the
+            # stake and the exit cannot be decided separately.
+            print("  -- ⭐⭐ A RESTING LIMIT AT THE TOUCH WHEN THE MARKET KILL "
+                  "LEAVES US WITH NOTHING (the 11:29 failure) --")
+            for _st in (2.0, 3.5, 5.0):
+                erow(f"react t>0 +lim @${_st:g}", "reactmove",
+                     look_s=20.0, rev_bps=5.0, hold_s=5.0, min_tau=0.0,
+                     stake_amt=_st)
         print("  -- ⭐ THE GRIND STOP: sell once the lead is GONE (a state, so a"
               " slow bleed cannot hide from it) --")
         for b in (0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0):

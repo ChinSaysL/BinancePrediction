@@ -79,7 +79,20 @@ BATCH_CANCEL = f"{P}/trade/batch-cancel"
 #: stranded. A guard set TOO HIGH silently kills exits that would have
 #: succeeded, with no order, no error and no log line from the venue: exactly
 #: the failure mode this bot spent 2026-09-22 chasing.
-SELL_MIN_NOTIONAL_USDT = 1.0
+#:
+#: ⛔ CORRECTED AGAIN 2026-09-23 23:10, BY THE OPERATOR: there is NO minimum on
+#: a SELL. The $1.00 guard refused the 22:04 grind exit (5.71 sh @ 0.14 =
+#: $0.78, never sent) and the position settled -$3.90. So the guard is 0: every
+#: sale is sent and the VENUE decides. Kept as a name because the replay tool
+#: (`tools/model_knob_sweep.py`) imports it, so the sim follows the same rule.
+SELL_MIN_NOTIONAL_USDT = 0.0
+
+#: The SELL size ladder `_sell_quote` walks when the venue refuses a quote, as
+#: fractions of the ask; the last rung is floored at 0.01 share (the venue's
+#: step). Quotes are read-only, so a longer ladder costs time, never an order.
+SELL_STEP_FRACS = (1.0, 0.99, 0.95, 0.90, 0.80, 0.65, 0.50, 0.35, 0.25,
+                   0.15, 0.10, 0.05, 0.0)
+SELL_STEP_PAUSE_S = 0.2
 
 #: Order statuses the venue considers FINAL. A MARKET order-bundle on this venue
 #: takes 1.2-2.2 s from `createTime` to `terminalTime` (measured 2026-09-23:
@@ -1116,11 +1129,20 @@ class LiveBroker:
         """
         if quote:
             return quote, shares
-        attempts = (1.0, 0.99, 0.95, 0.90)
-        for step in attempts:
+        # ⛔ STEP DOWN ALL THE WAY, NOT TO 90%. Operator, 2026-09-23: the sale
+        # is critical, so keep asking smaller until the venue quotes one. The
+        # old ladder stopped at 0.90 and 21:09 died on it ("lacks enough
+        # liquidity" at 6.06 / 5.99 / 5.75, nothing smaller ever asked). A
+        # thin book takes a small sale that it refuses whole; the remainder is
+        # retried on the next tick by the caller.
+        asks: list[float] = []
+        for step in SELL_STEP_FRACS:
             ask = shares if step == 1.0 else int(shares * step * 100) / 100.0
-            if ask <= 0.0:
-                break
+            ask = max(ask, 0.01)
+            if ask > shares or (asks and ask >= asks[-1]):
+                continue
+            asks.append(ask)
+        for i, ask in enumerate(asks):
             q = await self.get_quote(token_id, ask, side="SELL",
                                      order_type="MARKET")
             if q and q.get("quoteId"):
@@ -1129,11 +1151,11 @@ class LiveBroker:
                                 "%s) -- quoting %.2f instead", slug, side,
                                 shares, self._last_status, ask)
                 return q, ask
-            if step != attempts[-1]:
+            if i < len(asks) - 1:
                 log.warning("sell %s %s: no quote for %.2f shares (status %s) "
                             "-- retrying smaller", slug, side, ask,
                             self._last_status)
-                await asyncio.sleep(0.4)
+                await asyncio.sleep(SELL_STEP_PAUSE_S)
         return None, shares
 
     async def sell_fak(self, *, slug: str, side: str, token_id: str,
@@ -1282,12 +1304,22 @@ class LiveBroker:
         status = str((rec or {}).get("status") or "").upper()
         filled = float((rec or {}).get("fillPercentage") or 0.0)
         if rec is None:
-            # Unreadable. NOT retryable: re-sending on weak evidence would sell
-            # a position twice, and the second sale has nothing behind it.
-            self.last_failure = "sell_unconfirmed"
-            log.warning("sell %s %s: order %s status unreadable -- NOT retried; "
-                        "the position rides to settlement", slug, side, order_id)
-            return None
+            # Unreadable. NOT a no-fill: the model exit now RETRIES a failed
+            # sale every tick, so calling this None would send a second sale
+            # while the first may have filled unbooked. Say PENDING instead --
+            # `confirm_sale` books it if the venue shows it, and only a sale
+            # still unseen after `PENDING_SALE_GIVEUP_S` is retried.
+            self.last_failure = "sell_pending"
+            self.last_sell_size = float(shares)
+            log.warning("sell %s %s: order %s status unreadable -- treated as "
+                        "PENDING, confirmed late", slug, side, order_id)
+            return Fill(
+                slug=slug, side=side,
+                requested_px=float(min_px) if min_px is not None else avg_px,
+                filled_px=avg_px, shares=0.0, stake=0.0, fee_paid=0.0,
+                order_id=order_id, ts_ms=int(time.time() * 1000),
+                raw=str(resp)[:2000], token_id=token_id, pending=True,
+            )
         sold = amount_usdt(rec.get("filledShareQty")) or (float(shares) * filled)
         if sold <= 0.0 and filled <= 0.0:
             if status not in ORDER_DEAD_STATUSES:

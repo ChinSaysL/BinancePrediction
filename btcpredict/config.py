@@ -1387,6 +1387,36 @@ class Settings(BaseSettings):
     # more exits, and it is a slightly DEEPER drawdown (-8.60 vs -7.87). The
     # direction repeats at every rung and in both halves; the magnitude is small.
     model_exit_min_tau_s: float = 60.0
+    # ---- THE LEAD MUST BE AT RISK, NOT MERELY WOBBLING (added 2026-09-23) ----
+    # `model_exit_rev_bps` is an ABSOLUTE threshold: a 5.0bps move over 20s is
+    # the same trigger whether the position is 0.5 sigma or 4 sigma from the
+    # strike. MEASURED LIVE, 2026-09-23 11:29:43, `btc-updown-5m-1790162700`:
+    # the spot sat 6.73bps BELOW the strike with tau 15.4s and the arm's OWN
+    # sigma at that tick (`decisions.sigma_1m` = 0.000384), so z = 3.46 -- a
+    # DECIDED round -- and a +19-point BUMP inside a
+    # red candle (spot 85497 -> 85516, still 57 points under an 85573.6 strike)
+    # moved the 20s window by 5.3bps and fired the exit. It tried to sell a
+    # decided round at 0.93 (the venue killed the order; the position won).
+    # This gate refuses that tick: sell only when the lead, in sigma of the
+    # move REMAINING, is inside this many sigma.
+    #   z = ln(S/K)/(sigma*sqrt(tau/60))   -- the measured distance to the strike
+    # SWEPT at the shipped size (flat $3.50, exit armed to the bell, no grind,
+    # 284 entries / 14.94 days, `tools/model_knob_sweep.py --mode sizegrid
+    # --exit-max-z`):
+    #     off        77 exits  +$33.44   maxDD -$26.72   $/$1 +0.0336
+    #     4.0        74         +33.97           -26.32         +0.0342
+    #     3.0        73         +34.39           -26.32         +0.0346
+    #     2.5        71         +34.71           -26.32         +0.0349  <- THIS
+    #     2.0        71         +34.52           -26.32         +0.0347
+    #     1.5        70         +29.19           -26.32         +0.0294
+    # A HUMP with its plateau at 2-3 sigma (1.5 is too tight: -$5.5), both
+    # halves positive and better than off at every rung. The 6 suppressed exits
+    # were net NEGATIVE, so this is a small gain (+$1.27 over 15 days) AND the
+    # removal of an error class -- it is not a money-maker.
+    # ⛔ 0.0 = OFF = the old behaviour exactly, and it is the revert. The gate is
+    # also inert when no sigma is available (a missing sigma must never invent a
+    # refusal).
+    model_exit_max_z: float = 0.0
     # ---- THE GRIND HALF: sell once the lead is GONE (added 2026-09-23) -------
     # `model_exit_rev_bps` only fires while the spot is still AHEAD of the strike
     # (there must be a lead to protect), so a slow bleed is invisible to it: on
@@ -1424,6 +1454,27 @@ class Settings(BaseSettings):
     # see, not a measured improvement.
     model_exit_behind_bps: float = 0.0
     model_exit_behind_hold_s: float = 5.0
+    # ---- THE GRIND IS LATE-ONLY: `tau <=` this many seconds (added 2026-09-23)
+    # A 3bps deficit is DECISIVE at tau 30 and NOISE at tau 200, so the ceiling
+    # separates "about to lose" from "wobbled". Measured on the live entry set
+    # (167 entries, flat $5, 15.2 days, live config, `--behind-max-tau`):
+    #     ceiling  exits   cost      whole-100%  cat cut  WINNERS CUT   maxDD
+    #     tau<=30    0     $0        23%           0        0        -24.81
+    #     tau<=45    3     -$5.51    22%           2        1        -24.81
+    #     tau<=60    6     -$1.27    20%           5        1        -23.27 <-
+    #     tau<=90   13    -$18.87    18%           8        5        -27.61
+    #     none      16    -$13.82    16%          11        5        -26.79
+    # Five of its six fires are REAL LOSSES (5:1) and it is the only cell that
+    # IMPROVES the maxDD (-23.27 against -24.81 for holding); by tau<=90 the
+    # winner cuts have gone 1 -> 5 and the cost 15x. The trend is monotone in
+    # the ceiling, so this is the conservative end of a smooth curve and not a
+    # spike -- read it as the direction (later = more selective), not as 60.
+    # ⛔ THE WINDOW CANNOT BE PUSHED TO THE BELL: at tau<=30 the grind fired 18
+    # times and sold NOTHING -- the position's notional is then under the
+    # venue's $1.00 slice floor and the order is refused. ~45s is the floor of
+    # what is placeable at a $5 stake.
+    # ⛔ 0.0 = OFF = the previous behaviour exactly, and it is the revert.
+    model_exit_behind_max_tau_s: float = 0.0
     # A minimum hold, measured from the FILL. The decision and the fill are
     # separated by ~1s (median 1.03s live), so a position is born on evidence
     # already a second old and an exit judging it immediately is judging the

@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 import copy
 import dataclasses
+import inspect
 import logging
 import math
 import signal
@@ -62,6 +63,10 @@ from btcpredict.risk.guards import RiskGuard
 from btcpredict.store.db import Store
 
 log = logging.getLogger("btcpredict")
+
+#: How long a PLACED model-exit sale may stay unconfirmed before it is treated
+#: as failed and retried (MARKET bundles are terminal in 1.2-2.2 s).
+PENDING_SALE_GIVEUP_S = 15.0
 
 
 def _report_task_failure(task) -> None:
@@ -3238,6 +3243,28 @@ class Bot:
         sgn = 1.0 if side == "Up" else -1.0
         if math.log(spot / strike) * sgn <= 0:
             return False, 0.0        # behind: there is nothing to protect here
+        # ⛔ A MOVE AGAINST US IS NOT A THREAT WHEN THE LEAD IS STILL WIDE.
+        # The threshold above is ABSOLUTE (5.0bps/20s) and knows nothing about
+        # how far ahead we are, so a bump inside a trend fires it identically at
+        # 0.5 sigma and at 4 sigma. Live 2026-09-23 11:29:43: 6.73bps ahead
+        # with tau 15.4s and `decisions.sigma_1m` 0.000384, so z = 3.46 -- a
+        # decided round -- triggered on a +19-point bump inside a red candle
+        # and tried to sell a decided round at 0.93. `model_exit_max_z` refuses
+        # that tick -- see its config note for the sweep that priced it.
+        # ⚠️ The gate is on the MAGNITUDE of a lead we HOLD, so it can only
+        # ever suppress this half; `_grind_against` (the lead is already gone)
+        # is deliberately untouched, and here `log(S/K)*sgn > 0` already, so no
+        # `abs()` is needed and a missing sigma leaves the rule as it was.
+        _maxz = float(getattr(settings, "model_exit_max_z", 0.0) or 0.0)
+        if _maxz > 0:
+            _sg = float(getattr(self, "_sigma", 0.0) or 0.0)
+            _end = int(getattr(r, "end_ms", 0) or 0)
+            _tau = (_end - int(time.time() * 1000)) / 1000.0 if _end else 0.0
+            if _sg > 0 and _tau > 0:
+                _z = (math.log(spot / strike) * sgn
+                      / (_sg * math.sqrt(_tau / 60.0)))
+                if _z > _maxz:
+                    return False, 0.0     # a done round: keep watching, do not sell
         cut = int(time.time() * 1000) - int(settings.model_exit_look_s * 1000)
         # ⛔ THE ROUND BOUND, ON BOTH SIDES. `now` is bounded but `past` was not,
         # so the reference price could come from the PREVIOUS round -- whose spot
@@ -3357,21 +3384,47 @@ class Bot:
         # check pops the watch first and the confirmation can never run.
         if w.get("pending"):
             got = self._confirm_pending_sale(r, w)
+            if inspect.isawaitable(got):
+                got = await got
             if got is not None:
                 tau_p = (end_ms - int(time.time() * 1000)) / 1000.0
                 await self._cross_exit_execute(r, w, tau=tau_p,
                                                sig_name="react-confirm",
                                                confirmed=got)
             return True
-        # THE ONE-ORDER-PER-POSITION RAIL, shared with the cross arm: a position
-        # gets one sale, and a refused one does not become an endless retry.
-        if w.get("done", 0) >= settings.cross_exit_max_per_position:
+        # ⛔ A FULL EXIT, ONCE FIRED, IS RETRIED UNTIL THE POSITION IS GONE.
+        # Operator, 2026-09-23: the sale is critical. The rail below used to
+        # retire the watch after ONE attempt -- a failed sale leaves every share
+        # in place, so `w["done"] = max` ran and "retrying next tick" was a lie
+        # (21:09 and 22:04 each got one try, then settled -$4.10 and -$3.90).
+        # So once a 100% exit fires, `selling` is set and every later tick goes
+        # straight to the sale -- no rule re-check, no rail -- until the fill
+        # leaves `open_fills`, the remainder is below the venue's 0.01 step, or
+        # the round ends. A PENDING sale is still only ever confirmed (above),
+        # so this never sends a second order for shares already sold.
+        _sell_all = float(settings.model_exit_frac) >= 1.0
+        selling = bool(w.get("selling")) and _sell_all
+        # THE ONE-ORDER-PER-POSITION RAIL, shared with the cross arm: a PARTIAL
+        # exit gets one sale, so the fraction stays a fraction.
+        if not selling and w.get("done", 0) >= settings.cross_exit_max_per_position:
             watch.pop(r.slug, None)
             return False
         if w["fid"] not in getattr(self, "open_fills", {}):
             watch.pop(r.slug, None)      # settled or sold the normal way
             return False
+        if selling and float(w.get("shares") or 0.0) < 0.01:
+            watch.pop(r.slug, None)      # dust under the venue's step
+            return False
         tau = (end_ms - int(time.time() * 1000)) / 1000.0
+        if selling:
+            if tau <= 0.0:
+                return False             # the round is over; settle_due has it
+            w["tries"] = int(w.get("tries") or 1) + 1
+            log.info("MODEL exit %s: retrying the sale of %.4f %s (attempt %d, "
+                     "tau %.0fs)", r.slug, float(w["shares"]), w["side"],
+                     w["tries"], tau)
+            await self._cross_exit_execute(r, w, tau=tau, sig_name="retry")
+            return True
         if tau <= settings.model_exit_min_tau_s:
             return False                 # the book goes one-sided at the bell
         entry_ms = int(w.get("entry_ms") or 0)
@@ -3380,7 +3433,18 @@ class Bot:
             return False
         hit, mv = self._reaction_against(r, w["side"])
         sig_rule = "react"
-        if not hit and float(settings.model_exit_behind_bps) > 0:
+        # ---- THE GRIND ACTS LATE ONLY WHEN A CEILING IS SET -----------------
+        # See `model_exit_behind_max_tau_s`: measured at 5:1 real losses to
+        # winner cuts at tau<=60 against 1:4 for the reaction half, and it is
+        # the only exit cell that also improves the drawdown.
+        # ⛔ THE CEILING IS CHECKED BEFORE THE CALL, NOT AFTER IT. `_grind_`
+        # `against` stamps `w["behind_since"]`, so gating its RESULT would let a
+        # position that has been behind since tau 200 fire the instant the
+        # ceiling lifts, instead of waiting out `model_exit_behind_hold_s`.
+        _ceil = float(getattr(settings, "model_exit_behind_max_tau_s", 0.0)
+                      or 0.0)
+        if not hit and float(settings.model_exit_behind_bps) > 0 \
+                and not (_ceil > 0 and tau > _ceil):
             # ---- THE OTHER HALF: the lead is not snapped away, it is GONE ----
             # A bleed that drifts across the strike produces no reaction at all,
             # and the reaction rule's lead guard is off once we are behind. This
@@ -3402,9 +3466,13 @@ class Bot:
                      100.0 * float(settings.model_exit_frac))
         _frac = float(settings.model_exit_frac)
         _before = float(w.get("shares") or 0.0)
+        if _sell_all:
+            w["selling"], w["tries"] = True, 1
         await self._cross_exit_execute(
             r, w, tau=tau, sig_name=sig_rule,
             shares=(_before * _frac if _frac < 1.0 else None))
+        if _sell_all:
+            return True                  # anything left is retried next tick
         # ⛔ ONE SALE PER POSITION, OR THE FRACTION IS A LIE. A partial sale
         # SPLITS the fill and leaves the remainder in `open_fills`, so the
         # reaction -- still true, it is a STATE -- would fire again on the next
@@ -5738,6 +5806,8 @@ class Bot:
         # `settle_due` later booked the round result in their place.
         if w.get("pending"):
             got = self._confirm_pending_sale(r, w)
+            if inspect.isawaitable(got):
+                got = await got
             if got is not None:
                 # ⛔ THE REAL TAU, NOT 0.0. This passed a literal zero, so
                 # every confirmed-late sale logged "at tau 0s" and read as a
@@ -5928,9 +5998,42 @@ class Bot:
             log.warning("cross exit %s: sale confirmation failed (%s)",
                         r.slug, exc)
             return None
-        if not got or float(got[0]) <= 0.0:
-            return None
-        return got
+        # ⛔ `LiveBroker.confirm_sale` IS ASYNC (PmBroker's is not). Called
+        # bare it returned a coroutine, and `got[0]` then raised TypeError on
+        # every tick of a pending Binance sale -- never hit live only because
+        # no Binance sale has gone pending yet. Hand the awaitable back; the
+        # callers await it.
+        if inspect.isawaitable(got):
+            return self._finish_pending_confirm(r, w, got)
+        return self._pending_verdict(r, w, got)
+
+    async def _finish_pending_confirm(self, r, w, coro) -> tuple | None:
+        try:
+            got = await coro
+        except Exception as exc:                              # noqa: BLE001
+            log.warning("cross exit %s: sale confirmation failed (%s)",
+                        r.slug, exc)
+            got = None
+        return self._pending_verdict(r, w, got)
+
+    def _pending_verdict(self, r, w, got) -> tuple | None:
+        if got and float(got[0]) > 0.0:
+            return got
+        # A PENDING SALE THE VENUE NEVER SHOWS IS A FAILED ONE. MARKET bundles
+        # reach a terminal state 1.2-2.2 s after createTime (measured
+        # 2026-09-23); well past that with no matching SELL in the history, the
+        # order died. Clear `pending` so a full model exit is RETRIED rather
+        # than left waiting for a confirmation that cannot come. A second ask
+        # for shares already sold is refused by the venue (-9000 "exceeded your
+        # available shares"), never a short.
+        pend = w.get("pending")
+        if pend and w.get("selling") and \
+                time.time() - float(pend[0]) > PENDING_SALE_GIVEUP_S:
+            log.warning("cross exit %s: no sale confirmed %.0fs after it was "
+                        "placed -- treating it as failed and retrying",
+                        r.slug, time.time() - float(pend[0]))
+            w.pop("pending", None)
+        return None
 
     async def _cross_exit_execute(self, r, w, *, tau, sig_name,
                                   confirmed: tuple | None = None,

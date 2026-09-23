@@ -213,3 +213,125 @@ class TestTheExitFiresOnceNamedByTheRuleThatSawIt:
         assert asyncio.run(bot._model_exit_check(r)) is False
         assert not called, "nothing may be sold with the half disabled"
         assert not w.get("halted"), "and nothing may be halted either"
+
+
+CEILING = 60.0      # settings.model_exit_behind_max_tau_s (the shipped value)
+
+
+class TestTheGrindIsLateOnly:
+    """⛔ A 3bps deficit is DECISIVE at tau 30 and NOISE at tau 200.
+
+    Measured on the live entry set (167 entries, flat $5, 15.2 days), grind
+    3bps/5s, `tools/model_knob_sweep.py --behind-max-tau`:
+        ceiling   exits   cost     whole-100%  cat cut  WINNERS CUT
+        tau<=60     6     -$1.27   20%           5        1
+        tau<=90    13    -$18.87   18%           8        5
+        none       16    -$13.82   16%          11        5
+    Five of its six fires are REAL LOSSES and it is the only cell that improves
+    maxDD (-23.27 against -24.81 for holding); by tau<=90 the winner cuts have
+    gone 1 -> 5 and the cost 15x.
+    """
+
+    def _arm(self, bot, r, tau, **over):
+        """`tau` = seconds left in the round, set on the round itself."""
+        r.end_ms = int(time.time() * 1000) + int(tau * 1000)
+        bot.open_fills = {7: (r.slug, object())}
+        bot._exit_watch = {r.slug: watch(**over)}
+        bot.ledger = []
+        return bot._exit_watch[r.slug]
+
+    @pytest.fixture
+    def late_only(self, monkeypatch, armed):
+        """The shipped combination: grind armed, ceiling 60, tau floor off."""
+        monkeypatch.setattr(settings, "model_exit_behind_max_tau_s", CEILING)
+        monkeypatch.setattr(settings, "model_exit_min_tau_s", 0.0)
+        return CEILING
+
+    def test_OFF_by_default_is_the_previous_behaviour(self, store, armed,
+                                                      monkeypatch):
+        """0.0 is the shipped default AND the revert: no ceiling, no opinion."""
+        monkeypatch.setattr(settings, "model_exit_behind_max_tau_s", 0.0)
+        monkeypatch.setattr(settings, "model_exit_min_tau_s", 0.0)
+        r = make_round()
+        bot = make_bot(store, r)
+        w = self._arm(bot, r, 200.0,
+                      behind_since=int(time.time() * 1000) - 20_000)
+        behind_by(bot, r, 60.0)
+        seen = {}
+
+        async def fake(r_, w_, *, tau, sig_name, confirmed=None, shares=None):
+            seen["sig"] = sig_name
+
+        bot._cross_exit_execute = fake
+        assert asyncio.run(bot._model_exit_check(r)) is True
+        assert seen["sig"] == "grind", seen
+
+    def test_a_deficit_EARLY_in_the_round_does_not_sell(self, store, late_only):
+        """The case the ceiling exists for: 30bps behind with 200s to go is a
+        wobble, and selling it is how the old grind cut its winners."""
+        r = make_round()
+        bot = make_bot(store, r)
+        self._arm(bot, r, 200.0, behind_since=int(time.time() * 1000) - 20_000)
+        behind_by(bot, r, 30.0)
+        called = []
+
+        async def fake(*a, **k):
+            called.append(k)
+
+        bot._cross_exit_execute = fake
+        assert asyncio.run(bot._model_exit_check(r)) is False
+        assert not called, "an early deficit is not a decided loss"
+
+    def test_the_clock_is_NOT_STARTED_while_the_ceiling_suppresses_it(
+            self, store, late_only):
+        """⛔ THE REASON THE GATE IS BEFORE THE CALL, NOT AFTER IT. Gating the
+        RESULT would let `_grind_against` stamp `behind_since` at tau 200, so
+        the position would sell the INSTANT the ceiling lifted -- with none of
+        the 5s confirmation the state exists to demand."""
+        r = make_round()
+        bot = make_bot(store, r)
+        w = self._arm(bot, r, 200.0)          # NO clock running yet
+        behind_by(bot, r, 30.0)
+        called = []
+
+        async def fake(*a, **k):
+            called.append(k)
+
+        bot._cross_exit_execute = fake
+        assert asyncio.run(bot._model_exit_check(r)) is False
+        assert not called
+        assert not w.get("behind_since"), (
+            "a suppressed tick must not accumulate behind-time")
+
+    def test_a_deficit_INSIDE_the_ceiling_still_sells(self, store, late_only):
+        """The knob must not disarm the half it belongs to."""
+        r = make_round()
+        bot = make_bot(store, r)
+        self._arm(bot, r, 40.0, behind_since=int(time.time() * 1000) - 20_000)
+        behind_by(bot, r, 30.0)
+        seen = {}
+
+        async def fake(r_, w_, *, tau, sig_name, confirmed=None, shares=None):
+            seen["sig"] = sig_name
+
+        bot._cross_exit_execute = fake
+        assert asyncio.run(bot._model_exit_check(r)) is True
+        assert seen["sig"] == "grind", seen
+
+    def test_the_ceiling_does_not_touch_the_reaction_half(self, store,
+                                                          late_only):
+        """⛔ THE HALVES ARE SEPARATE. The ceiling is a GRIND knob: a snap-away
+        at tau 200 is still the reaction rule's, whatever this is set to."""
+        r = make_round()
+        bot = make_bot(store, r)
+        self._arm(bot, r, 200.0)
+        series(bot, r, [(30, STRIKE * 1.0040), (20, STRIKE * 1.0040),
+                        (10, STRIKE * 1.0020), (2, STRIKE * 1.0020)])
+        seen = {}
+
+        async def fake(r_, w_, *, tau, sig_name, confirmed=None, shares=None):
+            seen["sig"] = sig_name
+
+        bot._cross_exit_execute = fake
+        assert asyncio.run(bot._model_exit_check(r)) is True
+        assert seen["sig"] == "react", seen
