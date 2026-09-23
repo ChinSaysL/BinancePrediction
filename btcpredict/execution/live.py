@@ -1264,8 +1264,25 @@ class LiveBroker:
         if not resp:
             refused = (not self._transport_error
                        and 400 <= self._last_status < 500)
-            self.last_failure = "rejected" if refused else "unknown"
-            return None
+            if refused:
+                self.last_failure = "rejected"
+                return None
+            # A transport error or a 5xx: the order MAY be live. The model exit
+            # retries every tick, so a None here would send a second sale over
+            # an unbooked first one. PENDING hands it to `confirm_sale`, which
+            # finds it in the history by side/size/time (no order id needed).
+            self.last_failure = "sell_pending"
+            self.last_sell_size = float(shares)
+            log.warning("sell %s %s: place-order outcome unknown (status %s) "
+                        "-- treated as PENDING, confirmed late", slug, side,
+                        self._last_status)
+            return Fill(
+                slug=slug, side=side,
+                requested_px=float(min_px) if min_px is not None else avg_px,
+                filled_px=avg_px, shares=0.0, stake=0.0, fee_paid=0.0,
+                order_id="", ts_ms=int(time.time() * 1000), raw="",
+                token_id=token_id, pending=True,
+            )
 
         # Same discipline as `buy`: HTTP 200 + {orderId} does NOT mean filled.
         # A phantom SALE is worse than a phantom buy -- it books proceeds that

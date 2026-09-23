@@ -151,6 +151,22 @@ class TestTheUnsafePathsNeverBookAFill:
         assert f is not None and f.pending is True and f.shares == 0.0
         assert b.last_failure == "sell_pending"
 
+    def test_a_transport_failure_on_place_is_PENDING(self):
+        """The order may be live; a None would let the per-tick retry send a
+        second sale over an unbooked first one."""
+        b = _broker(quote={"quoteId": "q", "averagePrice": "0.70",
+                           "amountOut": str(int(2.1 * 10**18))}, place=None)
+        b._transport_error = True
+        f = _sell(b)
+        assert f is not None and f.pending is True and f.shares == 0.0
+        assert b.last_failure == "sell_pending" and b.last_sell_size == 3.0
+
+    def test_a_4xx_on_place_is_a_plain_refusal(self):
+        b = _broker(quote={"quoteId": "q", "averagePrice": "0.70",
+                           "amountOut": str(int(2.1 * 10**18))}, place=None)
+        b._last_status = 400
+        assert _sell(b) is None and b.last_failure == "rejected"
+
     def test_zero_fill(self):
         """A status that MEANS dead is the only thing allowed to be a no-fill."""
         b = _broker(quote={"quoteId": "q", "averagePrice": "0.70",
