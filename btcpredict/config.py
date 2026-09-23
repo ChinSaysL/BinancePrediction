@@ -306,6 +306,19 @@ class Settings(BaseSettings):
     # 2% -- but an account too small to size is not the same as an account too
     # small to trade, and the venue's floor is $1 at any size.
     stake_floor_to_minimum: bool = False
+    # How large a share of the bankroll the venue's $1 FLOOR may represent
+    # (stake_for_fraction only, and only with stake_floor_to_minimum on). The
+    # rule: when the fraction cannot reach the floor, stake the floor -- UNLESS
+    # the floor is more than this fraction of the bankroll, in which case sit
+    # out (a $1 floor needs a $4 bankroll at 0.25).
+    # ⛔ 0.0 = DISABLED, THE SHIPPED VALUE, on the operator's instruction
+    # 2026-09-23. The consequence, stated once: with it off the arm will stake
+    # the $1 minimum on ANY bankroll, so on a $2 account the floor is 50% of the
+    # account per trade rather than the 25% ceiling that used to refuse it.
+    # ⚠️ It is INERT on the live path (sizing_mode=edge -> stake_for_edge, which
+    # never consults this rule); it binds only if sizing_mode becomes
+    # "fraction" with stake_floor_to_minimum=True. Revert: set 0.25.
+    floor_max_bankroll_fraction: float = 0.0
     # Sizing tilt: multiply the stake by a factor that depends on how undecided
     # the round still is, then re-clamp. Available in every sizing mode, so it
     # redistributes the stake without having to change the base rule.

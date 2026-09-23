@@ -36,7 +36,7 @@ from btcpredict.config import (CROSS_TRADED, MARKETS, SYMBOL_BY_PREFIX,
                                shot15_observed, stake_boosted, settings)
 import btcpredict.edge.shot15 as edge_shot15
 import btcpredict.edge.signal as edge_signal
-from btcpredict.edge.signal import (FLOOR_MAX_BANKROLL_FRACTION, FeeModel,
+from btcpredict.edge.signal import (FeeModel,
                                     Signal, evaluate,
                                     evaluate_hybrid, expected_value,
                                     fee_rate_for_price, impulse_price_refusal,
@@ -5193,9 +5193,11 @@ class Bot:
                 detail=f"stake ${stake:.2f} < ${settings.min_order_usdt:.2f}; "
                        f"bankroll ${self.bankroll:.2f} at "
                        f"{settings.sizing_mode} sizing "
-                       f"({settings.stake_fraction:.4f} x bankroll; the floor "
-                       f"stops under "
-                       f"${settings.min_order_usdt / FLOOR_MAX_BANKROLL_FRACTION:.2f})")
+                       f"({settings.stake_fraction:.4f} x bankroll; "
+                       + (f"the floor stops under "
+                          f"${settings.min_order_usdt / settings.floor_max_bankroll_fraction:.2f})"
+                          if settings.floor_max_bankroll_fraction > 0
+                          else "the floor limit is DISABLED)"))
             return
         # The probe gets NO special sizing: it is the arm's normal order
         # (formula, tilt, caps), so what it measures is what a gate raise
@@ -6936,7 +6938,17 @@ class Bot:
                                       min_stake=settings.min_order_usdt,
                                       cap=settings.stake_cap_usdt,
                                       floor_to_minimum=(
-                                          settings.stake_floor_to_minimum))
+                                          settings.stake_floor_to_minimum),
+                                      # `getattr` for the STUB configs in the
+                                      # tests, the same pattern the min_quote
+                                      # read above uses; absent means the
+                                      # shipped value, which is 0.0 (the floor
+                                      # limit disabled).
+                                      floor_max_bankroll_fraction=float(
+                                          getattr(
+                                              settings,
+                                              "floor_max_bankroll_fraction",
+                                              0.0)))
         # What counts as "strongest": the claimed edge, or expected profit per
         # dollar. The recording favours ev/$ -- large claims are the most
         # inflated, so sizing up on them rewards the noisiest signals.

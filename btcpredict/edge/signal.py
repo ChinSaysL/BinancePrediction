@@ -42,6 +42,8 @@ FEE_MAX_BPS = 200.0
 # When a fraction-based stake is floored to the venue minimum, the floor is
 # only allowed while it stays under this share of the bankroll. $1 is 10% of
 # $10 (trade) and 50% of $2 (do not).
+#: Default for `stake_for_fraction`'s floor limit; the LIVE value is
+#: `config.floor_max_bankroll_fraction`, which ships at 0.0 (disabled).
 FLOOR_MAX_BANKROLL_FRACTION = 0.25
 
 
@@ -502,7 +504,9 @@ def tilt_factor(moneyness_sd: float, *, reference: float, lo: float,
 
 
 def stake_for_fraction(bankroll: float, *, fraction: float, min_stake: float,
-                       cap: float, floor_to_minimum: bool = False) -> float:
+                       cap: float, floor_to_minimum: bool = False,
+                       floor_max_bankroll_fraction: float =
+                       FLOOR_MAX_BANKROLL_FRACTION) -> float:
     """Fixed percentage of the bankroll.
 
     The alternative to a dollar band. A band bet $5-10 regardless of size, so
@@ -524,10 +528,19 @@ def stake_for_fraction(bankroll: float, *, fraction: float, min_stake: float,
     small to size" and "too small to trade" are different statements, and the
     venue's floor is $1 whatever the account holds.
 
-    The floor stops at FLOOR_MAX_BANKROLL_FRACTION of the bankroll. Above it
+    The floor stops at `floor_max_bankroll_fraction` of the bankroll. Above it
     the rule is doing what it says (keep a small account in the market); below
     it the floor is betting a large share of a nearly-empty account -- $1 is
     10% of $10 and 50% of $2 -- and sitting out is the honest answer again.
+
+    ⛔ `floor_max_bankroll_fraction = 0.0` DISABLES that limit, and it is what
+    ships (config `floor_max_bankroll_fraction`, the repo's 0 = OFF). The
+    operator's instruction, 2026-09-23. The consequence, once, in numbers: with
+    it off the arm sizes the $1 minimum on ANY bankroll, so on a $2 account the
+    floor is 50% of the account per trade instead of the rule's 25% ceiling.
+    It is inert on the live path regardless -- that one is `sizing_mode=edge`,
+    i.e. `stake_for_edge`, which never consults this rule. Revert: set
+    `floor_max_bankroll_fraction` to 0.25.
     """
     if bankroll <= 0 or fraction <= 0:
         return 0.0
@@ -540,7 +553,8 @@ def stake_for_fraction(bankroll: float, *, fraction: float, min_stake: float,
     if stake < min_stake:
         if not floor_to_minimum:
             return 0.0
-        if min_stake > bankroll * FLOOR_MAX_BANKROLL_FRACTION:
+        if (floor_max_bankroll_fraction > 0
+                and min_stake > bankroll * floor_max_bankroll_fraction):
             return 0.0
         return min_stake
     return stake
