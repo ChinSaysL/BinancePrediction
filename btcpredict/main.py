@@ -3251,6 +3251,67 @@ class Bot:
         mv = math.log(spot / past[-1]) * 1e4 * sgn
         return (mv <= -settings.model_exit_rev_bps), mv
 
+    def _grind_against(self, r, w) -> tuple[bool, float]:
+        """Is the spot BEHIND the strike, and has it been for long enough?
+
+        (hit, behind_bps). THE SECOND HALF OF THE EXIT, and a different question
+        from `_reaction_against`: that one protects a lead being SNAPPED away,
+        this one gives up on a lead that is GONE.
+
+        ⛔ WHY A REACTION RULE CANNOT COVER THIS CASE. `_reaction_against`
+        requires `log(S/K)*sgn > 0` -- we must still be AHEAD -- and a
+        `model_exit_rev_bps` move inside `model_exit_look_s`. A slow bleed
+        produces neither, and the moment the spot crosses the strike the lead
+        guard turns the exit off for the rest of the round.
+          MEASURED LIVE 2026-09-22 23:17, `btc-updown-5m-1790118900` Up, $2 at
+          0.647: the worst 20s move against it over the WHOLE round was -3.47bps
+          (against a 5.0 threshold), the exit never fired once, and the position
+          settled `won=0 payout=0.0000 pnl=-2.0000` at 23:20:06.
+        That trade was also UN-EXITABLE BY CONSTRUCTION: the spot only crossed
+        the strike at tau 56s, where `model_exit_min_tau_s` (60s) had already
+        disarmed every rule. See the config note on `model_exit_min_tau_s`.
+
+        ⛔ THE STATE MUST HOLD, AND THAT IS NOT A DETAIL. Swept on 293 replayed
+        entries at flat $2 (`tools/model_knob_sweep.py --mode exit`):
+
+            rule                        exits  whole-100%  maxDD   tot@$2  ratio
+            HOLD (exit off)                 0      30.0%   -13.73  +54.30   3.96
+            react 20s/5bps tau>60 (LIVE)   88      19.1%    -7.87  +53.72   6.83
+            react OR behind 1bps           96      18.1%    -9.03  +43.85   4.86
+            react OR behind 2bps/5tk       89      18.8%    -7.87  +55.29   7.03
+
+        An UNGATED grind trigger fires deep -- by the time the spot is behind by
+        1bps the bid has fallen far enough that a $2 position's notional is under
+        the venue's ~$1.50 MARKET minimum, so 46-49 of its triggers are REFUSED
+        and it can only sell where it is not needed. Requiring the state to hold
+        `model_exit_behind_hold_s` removes those triggers and keeps the rest: the
+        row is then identical to the live rule on the drawdown (-7.87) and better
+        on both the total and the full-loss rate.
+
+        `model_exit_behind_bps <= 0` turns this half OFF, which is the revert.
+        """
+        bps = float(settings.model_exit_behind_bps)
+        strike = getattr(r, "strike", None)
+        if bps <= 0 or not strike or strike <= 0 \
+                or w.get("side") not in ("Up", "Down"):
+            return False, 0.0
+        buf = (getattr(self, "_ticks", None) or {}).get(symbol_for_round(r)) or []
+        now = [px for t, px in buf if px and px > 0 and t >= r.start_ms]
+        if len(now) < 3:
+            return False, 0.0
+        sgn = 1.0 if w["side"] == "Up" else -1.0
+        behind = -math.log(now[-1] / strike) * 1e4 * sgn
+        if behind < bps:
+            # BACK ON OUR SIDE: the clock resets. A position that wobbles across
+            # the strike does not accumulate time it never spent behind it.
+            w["behind_since"] = None
+            return False, behind
+        now_ms = int(time.time() * 1000)
+        if not w.get("behind_since"):
+            w["behind_since"] = now_ms
+        return ((now_ms - w["behind_since"])
+                >= settings.model_exit_behind_hold_s * 1000.0), behind
+
     async def _model_exit_check(self, r) -> bool:
         """Sell a MODEL position when the price reacts against it. True = sold.
 
@@ -3309,16 +3370,31 @@ class Bot:
                 int(settings.model_exit_min_hold_s * 1000):
             return False
         hit, mv = self._reaction_against(r, w["side"])
+        sig_rule = "react"
+        if not hit and float(settings.model_exit_behind_bps) > 0:
+            # ---- THE OTHER HALF: the lead is not snapped away, it is GONE ----
+            # A bleed that drifts across the strike produces no reaction at all,
+            # and the reaction rule's lead guard is off once we are behind. This
+            # is the case that settled -$2.00 on 2026-09-22 23:17 with the exit
+            # armed and silent. See `_grind_against` for the measurement.
+            hit, mv = self._grind_against(r, w)
+            sig_rule = "grind"
         if not hit:
             return False
-        log.info("MODEL exit %s: price reacted %.1fbps against %s over %.0fs "
-                 "(tau %.0fs) -- selling %.0f%%", r.slug, mv, w["side"],
-                 settings.model_exit_look_s, tau,
-                 100.0 * float(settings.model_exit_frac))
+        if sig_rule == "react":
+            log.info("MODEL exit %s: price reacted %.1fbps against %s over "
+                     "%.0fs (tau %.0fs) -- selling %.0f%%", r.slug, mv,
+                     w["side"], settings.model_exit_look_s, tau,
+                     100.0 * float(settings.model_exit_frac))
+        else:
+            log.info("MODEL exit %s: spot %.1fbps BEHIND the strike on %s "
+                     "for %.0fs (tau %.0fs) -- selling %.0f%%", r.slug, mv,
+                     w["side"], settings.model_exit_behind_hold_s, tau,
+                     100.0 * float(settings.model_exit_frac))
         _frac = float(settings.model_exit_frac)
         _before = float(w.get("shares") or 0.0)
         await self._cross_exit_execute(
-            r, w, tau=tau, sig_name="react",
+            r, w, tau=tau, sig_name=sig_rule,
             shares=(_before * _frac if _frac < 1.0 else None))
         # ⛔ ONE SALE PER POSITION, OR THE FRACTION IS A LIE. A partial sale
         # SPLITS the fill and leaves the remainder in `open_fills`, so the

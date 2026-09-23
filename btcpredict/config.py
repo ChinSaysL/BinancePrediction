@@ -1351,6 +1351,44 @@ class Settings(BaseSettings):
     model_exit_look_s: float = 20.0
     model_exit_rev_bps: float = 5.0
     model_exit_min_tau_s: float = 60.0
+    # ---- THE WINDOW `model_exit_min_tau_s`, WHICH IS WHAT LOST THE 23:17 TRADE
+    # The exit is disarmed below this tau because the book goes one-sided at the
+    # bell. That also makes every LEAD-based rule blind in the last minute, which
+    # is exactly when rounds turn.
+    #   `btc-updown-5m-1790118900` (2026-09-22 23:17, $2 Up): the spot stayed
+    #   AHEAD of the strike until t=243s (tau 57) and crossed at t=244s (tau 56,
+    #   -1.61bps). At `min_tau 60` the exit was already off, so that trade was
+    #   UN-EXITABLE BY CONSTRUCTION -- no choice of trigger could have saved it.
+    # Swept on 293 entries at flat $2 (`--mode exit`, btc-updown-5m, no PM):
+    #     tau>60 (live)  88 exits   whole-100% 19.1%   maxDD -7.87   tot$ +53.72
+    #     tau>45         94 exits               18.4%          -8.60         +55.14
+    #     tau>30         98 exits               18.1%          -8.60         +55.58
+    #     tau>20         99 exits               18.1%          -8.60         +54.28
+    #     tau>10        100 exits               18.1%          -8.60         +53.74
+    # To be explicit about the size: the gain is +$1.86 over 14.5 days for 10
+    # more exits, and it is a slightly DEEPER drawdown (-8.60 vs -7.87). The
+    # direction repeats at every rung and in both halves; the magnitude is small.
+    model_exit_min_tau_s: float = 60.0
+    # ---- THE GRIND HALF: sell once the lead is GONE (added 2026-09-23) -------
+    # `model_exit_rev_bps` only fires while the spot is still AHEAD of the strike
+    # (there must be a lead to protect), so a slow bleed is invisible to it: on
+    # the 23:17 trade above the worst 20s move over the WHOLE round was -3.47bps
+    # against a 5.0 threshold, and the exit never fired once.
+    # This half fires when the spot is behind the strike by `_bps`, and only
+    # after the state has held `_hold_s` -- because an UNGATED trigger fires
+    # deep, where a $2 position's notional is under the venue's ~$1.50 MARKET
+    # minimum and the sale is REFUSED (46-49 of 96 triggers). Gated:
+    #     live react tau>60               88 exits  whole-100% 19.1%  DD -7.87  $ +53.72
+    #     react OR behind 1bps (ungated)  96 exits            18.1%      -9.03     +43.85
+    #     react OR behind 2bps/5tk        89 exits            18.8%      -7.87     +55.29
+    # ⛔ 0.0 IS THE SHIPPED DEFAULT AND THE REVERT: with it off, `_grind_against`
+    # returns immediately and the exit is byte-for-byte the reaction rule.
+    # ⛔ THE 2bps/5s ROW IS ONE TRADE BETTER THAN THE LIVE RULE (+$1.57, one
+    # full loss avoided) -- that is NOT significance, and the honest reading is
+    # that this half is FREE INSURANCE against the case the reaction rule cannot
+    # see, not a measured improvement.
+    model_exit_behind_bps: float = 0.0
+    model_exit_behind_hold_s: float = 5.0
     # A minimum hold, measured from the FILL. The decision and the fill are
     # separated by ~1s (median 1.03s live), so a position is born on evidence
     # already a second old and an exit judging it immediately is judging the

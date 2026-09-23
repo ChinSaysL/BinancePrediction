@@ -1449,7 +1449,8 @@ def main() -> None:
                      hold_s=0.0, min_tau=60.0, slip=SLIP,
                      fair_m=0.0, fair_drop=0.0, stale_ms=1000,
                      look_s=20.0, rev_bps=5.0, frac=1.0,
-                     force_tau=0.0, trail_c=0.0, behind_bps=0.0):
+                     force_tau=0.0, trail_c=0.0, behind_bps=0.0,
+                     behind_confirm_s=1.0):
             """Per-$1 return if the rule exits, else the HOLD return.
 
             Returns (ret, exited, blocked) -- `blocked` counts triggers whose
@@ -1470,6 +1471,7 @@ def main() -> None:
             sseries = live_sig.get(e["slug"]) if args.use_live_sigma else None
             held, blocked = 0.0, 0
             peak_bb = 0.0
+            behind_run = 0
             # WHERE A RESTING ORDER MAY STILL BE REACHED: up to the last tick
             # above `min_tau`. Past that the book goes one-sided, so a GTC
             # order left resting would simply be cancelled at the bell.
@@ -1558,14 +1560,26 @@ def main() -> None:
                     # WHICHEVER FIRES FIRST: the reaction (protect a lead being
                     # snapped away) OR the grind stop (the lead is already gone).
                     # One rule, one sale -- the one-sale rail is unchanged.
+                    #
+                    # ⛔ THE TWO HALVES MUST NOT SHARE A CONFIRMATION. The
+                    # reaction is a SNAP: it is worth ~1.5bps/share of the arm's
+                    # edge (measured: react exits win 29.5% of the time, i.e. the
+                    # trigger is an adverse move) and delaying it by seconds
+                    # changes which trades it catches. The grind half is a STATE
+                    # that can be true on one noisy print, so IT gets the delay.
+                    # That is why `behind_confirm_s` is separate from `confirm_s`.
                     if not (spot and strike and tau and tau > 0):
                         continue
                     lead_bps = math.log(spot / strike) * 1e4 * sgn
-                    hit = lead_bps <= -behind_bps
-                    if not hit and lead_bps > 0:
+                    if lead_bps > 0:
+                        behind_run = 0        # back ahead: the grind clock resets
                         past = [s for t, s in spots if t <= ts - look_s * 1000]
                         hit = bool(past) and (
                             math.log(spot / past[-1]) * 1e4 * sgn <= -rev_bps)
+                    else:
+                        behind_run = (behind_run + 1
+                                      if lead_bps <= -behind_bps else 0)
+                        hit = behind_run >= behind_confirm_s
                 elif rule in ("fair", "fairdrop", "stale"):
                     # ⭐ THE ONLY FORM OF "EXIT EARLY" THAT CAN PAY, and the
                     # exact criterion: a position worth `p` is worth selling iff
@@ -1777,6 +1791,23 @@ def main() -> None:
         for look, rev in ((20.0, 5.0), (20.0, 3.0), (10.0, 5.0)):
             erow(f"reactmove {look:g}s/{rev:g}bps", "reactmove",
                  look_s=look, rev_bps=rev, hold_s=5.0, min_tau=60.0)
+        # ⭐⭐ THE EXIT WINDOW IS `min_tau`, AND IT IS WHAT LOST THE 23:17 TRADE.
+        # On `btc-updown-5m-1790118900` (23:17:51 entry, $2 Up) the spot stayed
+        # AHEAD of the strike until t=243 (tau 57) and crossed only at t=244
+        # (tau 56, -1.61bps). `min_tau 60` had already disarmed every rule, so
+        # that trade was UN-EXITABLE BY CONSTRUCTION -- not by choice of trigger.
+        # Any rule that only fires while the side is AHEAD is dead in exactly
+        # the rounds that turn against us last. This sweeps the window itself.
+        print("  -- ⭐⭐ THE EXIT WINDOW (min_tau): the 23:17 loss crossed the "
+              "strike at tau 56, where min_tau 60 had already disarmed --")
+        for mt in (60.0, 45.0, 30.0, 20.0, 10.0):
+            erow(f"react 20s/5bps tau>{mt:g}s", "reactmove",
+                 look_s=20.0, rev_bps=5.0, hold_s=5.0, min_tau=mt)
+        print("  -- ⭐ ...and the COMBINED rule at the same windows --")
+        for mt in (45.0, 30.0, 20.0):
+            erow(f"react OR behind2bps/5tk t>{mt:g}s", "either",
+                 behind_bps=2.0, behind_confirm_s=5.0,
+                 look_s=20.0, rev_bps=5.0, hold_s=5.0, min_tau=mt)
         print("  -- ⭐ THE GRIND STOP: sell once the lead is GONE (a state, so a"
               " slow bleed cannot hide from it) --")
         for b in (0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0):
@@ -1786,6 +1817,13 @@ def main() -> None:
         for b in (1.0, 3.0):
             erow(f"react OR behind {b:g}bps", "either", behind_bps=b,
                  look_s=20.0, rev_bps=5.0, hold_s=5.0, min_tau=60.0)
+        print("  -- ⭐ ...with the GRIND half gated by a confirmation (the "
+              "reaction half stays immediate) --")
+        for b in (0.5, 1.0, 2.0):
+            for c in (3.0, 5.0, 10.0):
+                erow(f"react OR behind {b:g}bps/{c:g}tk", "either",
+                     behind_bps=b, behind_confirm_s=c,
+                     look_s=20.0, rev_bps=5.0, hold_s=5.0, min_tau=60.0)
         print("  -- ⭐ PARTIAL reaction exits: cap the loss, keep the edge --")
         for frac in (0.25, 0.50, 0.75):
             erow(f"react 20s/5bps x{frac:.0%}", "reactmove",

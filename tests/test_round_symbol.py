@@ -142,6 +142,9 @@ def test_every_per_symbol_lookup_goes_through_the_helper():
     src = pathlib.Path("btcpredict/main.py").read_text()
     assert src.count('getattr(r, "symbol", "")') == 1
     # `_round_range_bps`, `_train_is_fresh`, `_train_age_ms`, `_cross_level`,
-    # `_cross_signal`, `_strike_crossings` and `_reaction_against` are the
-    # readers; every one of them asks the helper for the symbol.
-    assert src.count(").get(symbol_for_round(r)) or []") == 7
+    # `_cross_signal`, `_strike_crossings`, `_reaction_against` and
+    # `_grind_against` are the readers; every one of them asks the helper for
+    # the symbol. The count is the point of this test, so a new reader must be
+    # ADDED here rather than have the number quietly bumped -- bumping it
+    # without naming the reader is exactly the bypass this guard exists for.
+    assert src.count(").get(symbol_for_round(r)) or []") == 8
