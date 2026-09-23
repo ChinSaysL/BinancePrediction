@@ -1449,7 +1449,7 @@ def main() -> None:
                      hold_s=0.0, min_tau=60.0, slip=SLIP,
                      fair_m=0.0, fair_drop=0.0, stale_ms=1000,
                      look_s=20.0, rev_bps=5.0, frac=1.0,
-                     force_tau=0.0, trail_c=0.0):
+                     force_tau=0.0, trail_c=0.0, behind_bps=0.0):
             """Per-$1 return if the rule exits, else the HOLD return.
 
             Returns (ret, exited, blocked) -- `blocked` counts triggers whose
@@ -1539,6 +1539,33 @@ def main() -> None:
                         continue
                     mv = math.log(spot / past[-1]) * 1e4 * sgn
                     hit = mv <= -rev_bps
+                elif rule == "behind":
+                    # ⭐ SELL ONCE THE LEAD IS GONE -- the GRIND stop.
+                    # `reactmove` protects a lead that is being SNAPPED away: it
+                    # needs `log(S/K)*sgn > 0` (there is a lead to protect) AND a
+                    # `rev_bps` move inside `look_s`. A slow bleed produces
+                    # neither, and the moment the spot crosses the strike the
+                    # lead guard turns the exit off altogether.
+                    #   MEASURED LIVE 2026-09-22 23:17 (btc-updown-5m-1790118900
+                    #   Up, $2 at 0.647): the worst 20s move against it over the
+                    #   WHOLE round was -3.47bps, the exit never fired, and the
+                    #   position settled `won=0 payout=0.0000 pnl=-2.0000`.
+                    # This is a STATE, like `reactmove`, not an event.
+                    if not (spot and strike and tau and tau > 0):
+                        continue
+                    hit = math.log(spot / strike) * 1e4 * sgn <= -behind_bps
+                elif rule == "either":
+                    # WHICHEVER FIRES FIRST: the reaction (protect a lead being
+                    # snapped away) OR the grind stop (the lead is already gone).
+                    # One rule, one sale -- the one-sale rail is unchanged.
+                    if not (spot and strike and tau and tau > 0):
+                        continue
+                    lead_bps = math.log(spot / strike) * 1e4 * sgn
+                    hit = lead_bps <= -behind_bps
+                    if not hit and lead_bps > 0:
+                        past = [s for t, s in spots if t <= ts - look_s * 1000]
+                        hit = bool(past) and (
+                            math.log(spot / past[-1]) * 1e4 * sgn <= -rev_bps)
                 elif rule in ("fair", "fairdrop", "stale"):
                     # ⭐ THE ONLY FORM OF "EXIT EARLY" THAT CAN PAY, and the
                     # exact criterion: a position worth `p` is worth selling iff
@@ -1750,6 +1777,15 @@ def main() -> None:
         for look, rev in ((20.0, 5.0), (20.0, 3.0), (10.0, 5.0)):
             erow(f"reactmove {look:g}s/{rev:g}bps", "reactmove",
                  look_s=look, rev_bps=rev, hold_s=5.0, min_tau=60.0)
+        print("  -- ⭐ THE GRIND STOP: sell once the lead is GONE (a state, so a"
+              " slow bleed cannot hide from it) --")
+        for b in (0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0):
+            erow(f"behind strike {b:g}bps", "behind", behind_bps=b,
+                 hold_s=5.0, min_tau=60.0)
+        print("  -- ⭐ GRIND STOP + reaction: whichever fires first --")
+        for b in (1.0, 3.0):
+            erow(f"react OR behind {b:g}bps", "either", behind_bps=b,
+                 look_s=20.0, rev_bps=5.0, hold_s=5.0, min_tau=60.0)
         print("  -- ⭐ PARTIAL reaction exits: cap the loss, keep the edge --")
         for frac in (0.25, 0.50, 0.75):
             erow(f"react 20s/5bps x{frac:.0%}", "reactmove",
