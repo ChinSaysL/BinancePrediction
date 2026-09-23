@@ -61,11 +61,25 @@ ACTIVE_ORDERS = f"{P}/order/list"
 BATCH_CANCEL = f"{P}/trade/batch-cancel"
 
 
-#: The venue refuses MARKET orders under roughly this notional (its own
-#: schema: "For `MARKET` orders, minimum is approximately 1.5 USDT (varies by
-#: market depth)"). At $1-$2 positions this is the binding constraint on
-#: selling at all, not the book.
-SELL_MIN_NOTIONAL_USDT = 1.5
+#: The venue refuses MARKET orders under roughly this notional. ITS OWN DOC says
+#: "For `MARKET` orders, minimum is approximately 1.5 USDT (varies by market
+#: liquidity)" -- and "approximately" is doing real work in that sentence.
+#:
+#: ⛔ CORRECTED 2026-09-23, BY THE OPERATOR, who places these orders in the
+#: venue's own UI: the minimum is **$1.00**. The documented 1.5 is what THIS
+#: GUARD was built on -- and the guard is a PRE-EMPTIVE REFUSAL, the order is
+#: never sent, so nothing downstream could ever correct it. Every sale whose
+#: proceeds fell between $1.00 and $1.50 was therefore refused by US and
+#: reported as the venue's doing (`sell_below_venue_minimum`).
+#:
+#: THE ASYMMETRY IS WHY ERRING LOW IS THE SAFE SIDE. A sale the venue really
+#: does refuse costs one rejected call and comes back as `-9000 Your order
+#: amount is too small`, which this module already classifies and the exit
+#: retries on the next tick -- the position stays watched and nothing is
+#: stranded. A guard set TOO HIGH silently kills exits that would have
+#: succeeded, with no order, no error and no log line from the venue: exactly
+#: the failure mode this bot spent 2026-09-22 chasing.
+SELL_MIN_NOTIONAL_USDT = 1.0
 
 
 def derived_slip_bps(default_bps: int, max_px: float | None,
@@ -1115,7 +1129,7 @@ class LiveBroker:
         round's winner and this position no longer exists. The caller books the
         sale itself (see `Bot._cross_exit_execute`).
 
-        ⛔ THE VENUE'S MARKET MINIMUM IS ~1.5 USDT of notional, and this bot
+        ⛔ THE VENUE'S MARKET MINIMUM IS $1 OF NOTIONAL, and this bot
         trades $1-$2 positions. A sale whose proceeds fall under that is
         refused outright, so the common case for THIS account is that a sell
         cannot be placed at all. Checked below and reported as
@@ -1167,7 +1181,7 @@ class LiveBroker:
             # The refusal that matters for this account. Reported by name so it
             # is never mistaken for a book or latency problem.
             self.last_failure = "sell_below_venue_minimum"
-            log.info("sell %s %s: proceeds $%.4f under the venue's ~$%.2f "
+            log.info("sell %s %s: proceeds $%.4f under the venue's $%.2f "
                      "MARKET minimum (%.4f shares @ %.4f) -- not sent",
                      slug, side, out_usdt, SELL_MIN_NOTIONAL_USDT, shares, avg_px)
             return None
@@ -1245,7 +1259,8 @@ class LiveBroker:
         """Post a resting LIMIT SELL, wait `wait_s`, cancel the remainder.
 
         WHY THIS EXISTS. `sell_fak` is a MARKET order and the venue's MARKET
-        minimum is ~1.5 USDT of notional, so a position worth less than that
+        minimum is $1 of notional (corrected 2026-09-23; it was believed to be
+        ~1.5), so a position worth less than that
         cannot be sold through it AT ALL. That is a property of the ORDER TYPE,
         not a wall: LIMIT carries no such minimum (verified against the venue's
         schema and live -- see the `order_type` note in config.py). MEASURED

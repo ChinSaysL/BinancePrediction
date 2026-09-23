@@ -445,7 +445,8 @@ class Settings(BaseSettings):
     # safety_margin) and fills at the book's ask.
     # The venue accepts LIMIT only with GTC, and -- verified against
     # the documented schema and the live venue -- a LIMIT needs `priceLimit`,
-    # has no ~1.5 USDT minimum (MARKET does), and fills at OUR price instead of
+    # has no ~1 USDT minimum (MARKET does; corrected 2026-09-23 from ~1.5), and
+    # fills at OUR price instead of
     # the spread. Measured with one real crossing order (2026-09-12): a limit of
     # 0.18 against an ask of 0.15 filled at 0.1526, i.e. at the BOOK's ask, so a
     # taker limit reaches real liquidity while MARKET prices off the venue's
@@ -1257,13 +1258,17 @@ class Settings(BaseSettings):
     # ⛔⛔ EVERY FRAC NUMBER ABOVE IS FROM A REPLAY THAT CHECKED THE WRONG
     # QUANTITY, AND THE CORRECTION CHANGES THE ANSWER. The exit sells `frac` of
     # a position; the venue refuses any MARKET sell whose PROCEEDS are under
-    # `live.SELL_MIN_NOTIONAL_USDT` ($1.50). The sweep compared the WHOLE
+    # `live.SELL_MIN_NOTIONAL_USDT` ($1.00 -- CORRECTED 2026-09-23; it was
+    # believed to be $1.50, which made every number in this section pessimistic
+    # by the slices between $1.00 and $1.50). The sweep compared the WHOLE
     # position to that floor (`shares * px < 1.5`) instead of the slice actually
     # sent (`frac * shares * px < 1.5`) -- a much laxer rule. At `frac 0.25` the
     # true test needs a **$6+ position** and this arm trades $1-3, so a 25% exit
     # is refused at EVERY price. The live record agrees: `react` exits booked = 0
     # (the one trigger, 2026-09-22 13:42:01, was refused: "proceeds $0.3556
     # under the venue's ~$1.50 MARKET minimum (0.6708 shares @ 0.5300)").
+    # NB that refusal stands under the CORRECTED $1.00 floor too ($0.3556 <
+    # $1.00), so this section's conclusion is unaffected by the correction.
     #
     # CORRECTED SWEEP (283 entries, pooled, exit into the recorded bid - 1 tick):
     #   rule            exited   WR     whole -100%  maxDD   tot/|maxDD|  tot@$2
@@ -1375,12 +1380,29 @@ class Settings(BaseSettings):
     # the 23:17 trade above the worst 20s move over the WHOLE round was -3.47bps
     # against a 5.0 threshold, and the exit never fired once.
     # This half fires when the spot is behind the strike by `_bps`, and only
-    # after the state has held `_hold_s` -- because an UNGATED trigger fires
-    # deep, where a $2 position's notional is under the venue's ~$1.50 MARKET
-    # minimum and the sale is REFUSED (46-49 of 96 triggers). Gated:
-    #     live react tau>60               88 exits  whole-100% 19.1%  DD -7.87  $ +53.72
-    #     react OR behind 1bps (ungated)  96 exits            18.1%      -9.03     +43.85
-    #     react OR behind 2bps/5tk        89 exits            18.8%      -7.87     +55.29
+    # after the state has held `_hold_s`.
+    #
+    # ⛔⛔ RE-MEASURED 2026-09-23 AFTER THE $1.00 FLOOR CORRECTION, AND THE
+    # CONCLUSION FLIPPED. With the old (wrong, $1.50) floor most grind triggers
+    # were refused by OUR OWN pre-flight check, which made this half look FREE --
+    # that is why it was shipped. They are not refused. With the true $1.00
+    # floor they EXECUTE, at 0.58-0.63 against a ~0.64 entry (flat $2, 293
+    # entries, PM era excluded):
+    #     rule                            exits  unsellable  whole-100%  DD      $ tot
+    #     HOLD (exit off)                     0        0       30.0%   -13.73  +54.30
+    #     react 20s/5bps tau>60 (react only) 96        0       17.4%    -7.55  +55.75
+    #     react OR behind 2bps/5tk (SHIPPED) 110       20       15.0%    -7.36  +47.25
+    #     react OR behind 3bps (ungated)     104       22       15.4%    -7.36  +58.30
+    #     react OR behind 1bps (ungated)     134        8       10.9%   -10.51  +33.45
+    # READ IT AS INSURANCE, PRICED: at $2 this half removes 2.4pp from the
+    # full-loss rate for ~$8.50 of the $55 edge. It is NOT free, and the earlier
+    # "one trade" framing is void -- it was an artifact of the wrong floor.
+    # ⛔ AND AT A $1 STAKE THE EXIT ITSELF STOPS WORKING: the venue's $1.00 floor
+    # refuses 53 of the 96 reaction triggers on a $1 position (its notional is
+    # ~$1-1.6 and falls under the floor as soon as the bid drops), so the exit
+    # fires on 15% of entries instead of 33% and the full-loss rate stays at
+    # 27%. Smaller stake, smaller loss, weaker protection -- pick which you want;
+    # the two cannot both be had at this venue.
     # ⛔ 0.0 IS THE SHIPPED DEFAULT AND THE REVERT: with it off, `_grind_against`
     # returns immediately and the exit is byte-for-byte the reaction rule.
     # ⛔ THE 2bps/5s ROW IS ONE TRADE BETTER THAN THE LIVE RULE (+$1.57, one

@@ -73,8 +73,10 @@ class TestItRefusesBeforeSendingAnything:
 
     def test_below_the_venue_minimum(self):
         """The binding constraint for a $1-$2 account: the venue refuses
-        MARKET orders under ~1.5 USDT of notional, so most of this bot's
-        positions cannot be sold at all. Reported by name, and NOT sent."""
+        MARKET orders under $1 of notional (corrected 2026-09-23; the doc's
+        "approximately 1.5" had us refusing $1.00-$1.50 slices ourselves), so
+        most of this bot's positions cannot be sold at all. Reported by name,
+        and NOT sent."""
         b = _broker(quote={"quoteId": "q", "averagePrice": "0.30",
                            "amountOut": str(int(0.9 * 10**18))})
         assert _sell(b, shares=3.0) is None

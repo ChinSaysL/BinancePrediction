@@ -3271,22 +3271,31 @@ class Bot:
         the strike at tau 56s, where `model_exit_min_tau_s` (60s) had already
         disarmed every rule. See the config note on `model_exit_min_tau_s`.
 
-        ⛔ THE STATE MUST HOLD, AND THAT IS NOT A DETAIL. Swept on 293 replayed
-        entries at flat $2 (`tools/model_knob_sweep.py --mode exit`):
+        ⛔ RE-MEASURED 2026-09-23 AFTER THE `SELL_MIN_NOTIONAL_USDT` CORRECTION
+        ($1.50 -> $1.00), AND THE NUMBERS MOVED. The old table is void: with the
+        wrong floor most grind triggers were refused by OUR OWN pre-flight
+        check, which made this half look free. 293 replayed entries, flat $2,
+        PM era excluded:
 
-            rule                        exits  whole-100%  maxDD   tot@$2  ratio
-            HOLD (exit off)                 0      30.0%   -13.73  +54.30   3.96
-            react 20s/5bps tau>60 (LIVE)   88      19.1%    -7.87  +53.72   6.83
-            react OR behind 1bps           96      18.1%    -9.03  +43.85   4.86
-            react OR behind 2bps/5tk       89      18.8%    -7.87  +55.29   7.03
+            rule                            exits  unsellable  whole-100%  DD
+            HOLD (exit off)                     0        0        30.0%   -13.73
+            react 20s/5bps tau>60 (LIVE)       96        0        17.4%    -7.55
+            react OR behind 2bps/5tk (THIS)   110       20        15.0%    -7.36
+            react OR behind 3bps (ungated)    104       22        15.4%    -7.36
+            react OR behind 1bps (ungated)    134        8        10.9%   -10.51
 
-        An UNGATED grind trigger fires deep -- by the time the spot is behind by
-        1bps the bid has fallen far enough that a $2 position's notional is under
-        the venue's ~$1.50 MARKET minimum, so 46-49 of its triggers are REFUSED
-        and it can only sell where it is not needed. Requiring the state to hold
-        `model_exit_behind_hold_s` removes those triggers and keeps the rest: the
-        row is then identical to the live rule on the drawdown (-7.87) and better
-        on both the total and the full-loss rate.
+        ⛔ THE SALE CAN BE REFUSED, AND AT A $1 STAKE IT USUALLY IS. The venue's
+        MARKET minimum is $1.00 of notional, so a $1 position (~$1-1.6) falls
+        under it as soon as the bid drops -- 53 of the 96 reaction triggers are
+        refused at that stake, versus 0 at $2. A refusal is not a failure: the
+        position stays watched and the trigger is retried every tick, but it
+        does ride to the bell if the bid never recovers.
+
+        ⛔ PRICED, NOT FREE (re-measured 2026-09-23 with the corrected $1.00
+        floor, flat $2, 293 entries): this half removes 2.4pp from the
+        full-loss rate (17.4% -> 15.0%) for ~$8.50 of the $55 edge (+55.75 ->
+        +47.25). The drawdown barely moves (-7.55 -> -7.36). Insurance, and the
+        premium is stated in `model_exit_behind_bps`.
 
         `model_exit_behind_bps <= 0` turns this half OFF, which is the revert.
         """
@@ -5981,7 +5990,7 @@ class Bot:
             log.info("cross exit %s: sell did not fill (%s) -- retrying next "
                      "tick", slug, getattr(self.broker, "last_failure", "?"))
             # Some no-fills are conditions rather than moments. The venue's
-            # ~$1.5 minimum NOTIONAL refuses to BUY a near-worthless position
+            # $1 minimum NOTIONAL refuses to BUY a near-worthless position
             # at all, so a position whose proceeds fell under it is retried
             # every tick for the rest of the round and can never succeed.
             # That is the `unsellable` column in the exit research, and it is
