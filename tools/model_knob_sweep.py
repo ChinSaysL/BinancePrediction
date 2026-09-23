@@ -626,6 +626,18 @@ def main() -> None:
         print("  -- the quote floor: paying up for a surer side --")
         for v in (0.50, 0.55, 0.60, 0.65, 0.70):
             row(f"min_quote {v:g}", run2(min_quote=v), len(rs), days)
+        # ⭐ THE FLOOR, DOWNWARD (added 2026-09-23). The UPWARD rows above answer
+        # "should we pay up for a surer side". They do not answer the question
+        # the live record asks: `min_quote 0.50` refuses ~60% of the IN-WINDOW
+        # ticks (6,060 of 8h on 2026-09-23), and the model's side prices just
+        # under it in a calm regime -- so the arm sits out for hours. Lowering
+        # the floor admits the cheap side, which also pays the fee at its 180bps
+        # CAP (fee_bps = 180*min(1,(1-px)/px), pinned below px 0.50), so this is
+        # a real trade and not free trades.
+        print("  -- ⭐ the quote floor DOWNWARD: the gate refusing 60% of the "
+              "priced ticks --")
+        for v in (0.30, 0.35, 0.40, 0.45, 0.50):
+            row(f"min_quote {v:g}", run2(min_quote=v), len(rs), days)
         print("  -- the travel band (live ceiling is 35) --")
         for v in (5.0, 8.0, 12.0):
             row(f"min_range {v:g}", run2(min_range=v), len(rs), days)
@@ -663,6 +675,12 @@ def main() -> None:
                  dict(min_range=5.0, max_range=20.0)),
                 ("min_quote 0.50 vs 0.55", dict(min_quote=0.50),
                  dict(min_quote=0.55)),
+                ("min_quote 0.50 -> 0.45", dict(min_quote=0.50),
+                 dict(min_quote=0.45)),
+                ("min_quote 0.45 -> 0.40", dict(min_quote=0.45),
+                 dict(min_quote=0.40)),
+                ("min_quote 0.40 -> 0.35", dict(min_quote=0.40),
+                 dict(min_quote=0.35)),
                 ("max_tau 210 vs 180", dict(max_tau=210.0),
                  dict(max_tau=180.0))):
             got = {}
