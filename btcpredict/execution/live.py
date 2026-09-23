@@ -1023,34 +1023,36 @@ class LiveBroker:
                           order_id, status, slug)
                 return None
 
-        # ⛔ BOOK THE VENUE'S EXECUTED QUANTITY, NOT THE QUOTE'S PROMISE.
-        # `shares_gross`/`fee_shares` come from the QUOTE (`amountOut`,
-        # `feeAmount`); the venue reports what it actually credited on its own
-        # order record as `filledShareQty`, a 2-DECIMAL number. Measured live
-        # 2026-09-22, booked versus venue:
-        #   order ...586724   quote net 3.2442222   venue 3.24   -> SELL REFUSED
-        #   order ...430243   quote net 9.6000000   venue 9.62   -> sell fine
-        # The first asked the venue to sell 0.0042 shares MORE than the position
-        # held: -9000 "You have exceeded your available shares", no sale, and
-        # the reaction exit never fired. The second only worked because the
-        # quote happened to round BELOW the credit.
+        # ⛔ THE POSITION IS THE QUOTE'S `amountOut`. NOT the venue's 2-DECIMAL
+        # `filledShareQty`, and NOT `amountOut - feeAmount` either.
+        # MEASURED from the wallet, not inferred (2026-09-23, order
+        # 26092300001909464075, $1.00 at 0.70):
+        #   wallet   $2.0854 -> $2.50172653 across that one trade
+        #   => the position that settled and redeemed was 1.41632653 shares
+        #   quote `amountOut`        1.4163   <- the position, to the 8th dp
+        #   quote `feeAmount`        0.0123   <- already netted OUT of amountOut
+        #   venue `filledShareQty`   "1.42"   <- that number ROUNDED to 2dp (up)
+        # So `amountOut - feeAmount` (what this code booked before) under-credits
+        # by the whole fee, and the venue's display is a ROUNDING that can sit
+        # ABOVE what we hold: booking "1.42" against a 1.41632653 holding makes
+        # every exit ask to sell more than the position and be refused (-9000),
+        # which is the 2026-09-22 22:43 dead exit. `amountOut` alone reproduced
+        # the wallet to the eighth decimal.
+        # As a consequence the fee needs no separate PnL deduction: it is
+        # already missing from `amountOut`, so `payout - stake` IS the cash PnL.
         _rec = await self.order_record(order_id, tries=2, delay=0.4) \
             if order_id else None
+        shares = shares_gross
         _ex = amount_usdt((_rec or {}).get("filledShareQty"))
-        if _ex and _ex > 0.0:
-            if abs(_ex - (shares_gross - fee_shares)) > 0.005:
-                log.info("buy %s %s: venue credited %.4f shares, the quote "
-                         "promised %.4f -- booking the venue's number",
-                         slug, side, _ex, shares_gross - fee_shares)
-            shares = _ex
-        else:
-            # Unreadable record: keep the quote's arithmetic, which is only ever
-            # off in the third decimal -- but say so, because that number is
-            # what a later SELL will ask for.
+        if _ex and _ex > 0.0 and abs(_ex - shares) > 0.005:
+            log.info("buy %s %s: venue reads %.2f shares, the quote's amountOut "
+                     "is %.4f -- booking amountOut (that venue figure is the "
+                     "same position rounded to 2dp, and it rounds UP as often "
+                     "as down)", slug, side, _ex, shares)
+        if not _ex:
             log.warning("buy %s %s: no executed quantity readable for order %s "
-                        "-- booking the quote's %.4f shares", slug, side,
-                        order_id, shares_gross - fee_shares)
-            shares = shares_gross - fee_shares
+                        "-- booking the quote's amountOut %.4f", slug, side,
+                        order_id, shares)
         # The fee is quoted in outcome-token units; express it in USDT so PnL
         # accounting stays in one currency.
         fee_usdt = fee_shares * avg_px
