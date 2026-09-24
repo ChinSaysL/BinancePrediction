@@ -112,6 +112,14 @@ ORDER_DEAD_STATUSES = frozenset({
 #: to the caller's late-confirmation path. Covers the measured 1.2-2.2 s fills
 #: with room to spare, and is short enough not to stall the tick loop.
 SELL_CONFIRM_WAIT_S = 3.0
+#: How long `buy` waits for a MARKET bundle whose status is still non-terminal
+#: before it may call the order anything. Measured live 2026-09-24 04:52:
+#: order 26092400001911886956 went FILLED **11.1 s** after createTime, while
+#: the bot had already declared it dead at 6.8 s and tried to buy again (only a
+#: min_quote refusal stopped a double position). FAILED stamps have been seen
+#: at 5-14 s. So a verdict is waited for, not inferred.
+BUY_TERMINAL_WAIT_S = 10.0
+BUY_TERMINAL_POLL_S = 0.75
 SELL_CONFIRM_POLL_S = 0.25
 
 
@@ -483,6 +491,29 @@ class LiveBroker:
             if i < tries - 1:
                 await asyncio.sleep(delay)
         return None
+
+    async def _await_terminal(self, order_id: str,
+                              max_wait_s: float) -> dict | None:
+        """The order's history record once it is TERMINAL, bounded by time.
+
+        Returns the last record seen: terminal (FILLED or a failure) when the
+        venue concluded in time, otherwise whatever non-terminal record was last
+        read, or None if the order never appeared in the history at all. The
+        caller must treat a non-terminal or missing record as UNKNOWN -- never
+        as "did not fill" (see BUY_TERMINAL_WAIT_S).
+        """
+        deadline = time.monotonic() + max_wait_s
+        rec = None
+        while True:
+            got = await self.order_record(order_id, tries=1)
+            if got is not None:
+                rec = got
+                st = str(got.get("status") or "").upper()
+                if st == "FILLED" or st in TERMINAL_FAIL_STATUSES:
+                    return got
+            if time.monotonic() >= deadline:
+                return rec
+            await asyncio.sleep(BUY_TERMINAL_POLL_S)
 
     async def active_orders(self) -> list[dict]:
         """Orders still working (OPENING, partly filled) for this wallet."""
@@ -967,7 +998,10 @@ class LiveBroker:
                 # the order has now reached a terminal failure state (FAILED,
                 # CANCELLED, etc.), classify it as venue_failed so the caller
                 # can cleanly retry or skip without a 30s penalty lock.
-                rec = await self.order_record(order_id, tries=2, delay=0.5)
+                # ⛔ WAIT FOR THE VENUE'S VERDICT (BUY_TERMINAL_WAIT_S). The
+                # old single re-read here could see SUBMITTED for an order that
+                # then FILLED 4 s later (2026-09-24 04:52, filled at 11.1 s).
+                rec = await self._await_terminal(order_id, BUY_TERMINAL_WAIT_S)
                 if rec:
                     final_st = rec.get("status") or ""
                     if final_st in TERMINAL_FAIL_STATUSES:
@@ -984,24 +1018,14 @@ class LiveBroker:
                         status = "FILLED"
 
                 if status != "FILLED":
-                    # ⛔ RETRY ON THE VENUE'S OWN STATE, NOT ON WEAK EVIDENCE.
-                    # An empty position list ALONE is weak -- it lags a fill, so
-                    # re-placing on it could double the exposure -- and this
-                    # branch therefore used to abandon the round. That loses
-                    # the trade EVERY time, not sometimes. Ask the second list
-                    # first: an order that can still execute appears in
-                    # order/list as WORKING, so a readable list that omits our
-                    # id is the venue saying no order of ours can fill now. Both
-                    # lists readable, both empty of us -> place again.
-                    open_ids = await self._working_order_ids()
-                    if open_ids is not None and str(order_id) not in open_ids:
-                        self.last_failure = "venue_failed"
-                        log.warning(
-                            "order %s: no verdict in %.1fs, and the venue "
-                            "holds no WORKING order and no position in %s -- "
-                            "retrying (%s)", order_id, _budget, slug,
-                            self.last_order_error or "no reason given")
-                        return None
+                    # ⛔ NO VERDICT = UNKNOWN, NEVER "RETRY". This used to ask
+                    # order/list whether the order was still WORKING and retry
+                    # when it was absent -- but a MARKET bundle NEVER appears in
+                    # order/list, so "absent" was always true. Live 2026-09-24
+                    # 04:52: declared dead at 6.8 s, FILLED at 11.1 s, retry
+                    # attempted. Only a terminal FAILED (above) may authorise a
+                    # retry; anything else abandons the round unbooked, and
+                    # redeem() still claims every claimable token.
                     self.last_failure = "unconfirmed"
                     log.error("order %s unverifiable and the venue holds no "
                               "position in %s; NOT booking and NOT retrying%s",

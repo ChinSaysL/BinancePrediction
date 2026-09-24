@@ -913,22 +913,67 @@ def test_no_verdict_but_the_POSITION_LIST_holds_the_token_books_it():
     assert b.last_failure is None
 
 
-def test_no_verdict_with_BOTH_lists_clear_RETRIES_the_round():
-    """⭐ THE 2026-09-22 CUT-OFF, and it inverts the policy below.
+@pytest.fixture(autouse=True)
+def _fast_verdict_wait(monkeypatch):
+    """The real ceiling is seconds; these stubs answer instantly or never."""
+    from btcpredict.execution import live
+    monkeypatch.setattr(live, "BUY_TERMINAL_WAIT_S", 0.3)
+    monkeypatch.setattr(live, "BUY_TERMINAL_POLL_S", 0.02)
 
-    The venue's own records say a FILLED order stamps <=1.65s (p50 0.97s) and a
-    FAILED one 5.25/12.88/14.01s, with order/history reporting SUBMITTED for
-    the whole of those 12.9s: nothing lands between 1.65s and 5.25s. So waiting
-    for the verdict spends a round's window on a stamp that is already true.
-    The retry is authorised by the venue's STATE instead -- the order is pulled
-    and BOTH lists must be readable and hold nothing of ours.
+
+def test_no_verdict_with_BOTH_lists_clear_does_NOT_retry():
+    """⛔ INVERTED 2026-09-24. This used to RETRY when order/list and the
+    position list were both clear -- but a MARKET bundle never appears in
+    order/list, so "clear" was always true. Live 04:52: declared dead at 6.8 s,
+    the venue FILLED it at 11.1 s, and a second order was attempted. With no
+    terminal verdict the order is UNKNOWN: nothing booked, nothing re-placed.
     """
     from btcpredict.execution import live
     b = _buy_broker(status=None, held=set())            # both lists readable
     assert _buy(b) is None
+    assert b.last_failure == "unconfirmed"
+    assert b.last_failure not in live.RETRYABLE_FAILURES, "must NOT retry"
+    assert b.cancel_calls == [["o1"]], "the order is still pulled"
+
+
+def test_a_LATE_fill_is_booked_not_retried():
+    """The 04:52 order, replayed: SUBMITTED on the first reads, FILLED later.
+    The wait must keep reading until the verdict and then BOOK it."""
+    b = _buy_broker(status=None, held=set())
+    reads = {"n": 0}
+
+    async def _record(order_id, **kw):
+        reads["n"] += 1
+        if reads["n"] < 4:
+            return {"orderId": "o1", "status": "SUBMITTED"}
+        return {"orderId": "o1", "status": "FILLED", "filledShareQty": "17.5",
+                "filledUsdtAmount": "10"}
+    b.order_record = _record
+    fill = _buy(b)
+    assert fill is not None, "a late FILLED verdict is a fill"
+    assert b.last_failure is None
+    assert reads["n"] >= 4
+
+
+def test_a_LATE_failure_is_retryable_as_soon_as_it_lands():
+    """The ceiling is a ceiling: a FAILED verdict ends the wait at once."""
+    import time as _t
+    from btcpredict.execution import live
+    b = _buy_broker(status=None, held=set())
+    reads = {"n": 0}
+
+    async def _record(order_id, **kw):
+        reads["n"] += 1
+        return {"orderId": "o1",
+                "status": "SUBMITTED" if reads["n"] < 3 else "FAILED",
+                "errorMessage": "Failed to execute the market order"}
+    b.order_record = _record
+    live.BUY_TERMINAL_WAIT_S = 30.0          # a long ceiling must not be spent
+    t0 = _t.monotonic()
+    assert _buy(b) is None
     assert b.last_failure == "venue_failed"
-    assert b.last_failure in live.RETRYABLE_FAILURES, "must be retried"
-    assert b.cancel_calls == [["o1"]], "the order is pulled before retrying"
+    assert b.last_failure in live.RETRYABLE_FAILURES
+    assert _t.monotonic() - t0 < 10.0, "waited out the ceiling after FAILED"
 
 
 def test_no_verdict_with_the_order_still_WORKING_does_not_retry():
