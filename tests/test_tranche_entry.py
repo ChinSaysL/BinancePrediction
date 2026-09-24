@@ -218,3 +218,26 @@ class TestATrancheRoundSettlesAsOneTrade:
         rows = store.query("SELECT * FROM settlements WHERE slug='r1'")
         assert bot.pnl.pnl == pytest.approx(sum(r["pnl"] for r in rows))
         assert len(sent) == 1
+
+
+def test_legs_settling_on_different_passes_still_count_once(tmp_path):
+    """Live 05:45: the two legs of one round settled 0.7s apart (separate
+    passes) and printed two SETTLE lines. The partial round is carried until
+    no leg of it is open, then counted once."""
+    bot, store, sent = TestATrancheRoundSettlesAsOneTrade._bot(tmp_path, "Up")
+    real = bot.broker.settle
+    calls = {"n": 0}
+
+    async def settle(fill, winner):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            return None                  # second leg unreadable on pass 1
+        return await real(fill, winner)
+    bot.broker.settle = settle
+    asyncio.run(bot.settle_due())
+    assert bot.pnl.n_trades == 0 and sent == [], "nothing counted mid-round"
+    asyncio.run(bot.settle_due())
+    assert bot.pnl.n_trades == 1 and len(sent) == 1
+    rows = store.query("SELECT * FROM settlements WHERE slug='r1'")
+    assert len(rows) == 2
+    assert bot.pnl.pnl == pytest.approx(sum(r["pnl"] for r in rows))

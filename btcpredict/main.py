@@ -8833,6 +8833,24 @@ class Bot:
             # made a win look like a loss (see _reconcile_bankroll).
             self.bankroll += s.pnl
             del self.open_fills[fid]
+        # A round's legs can settle on DIFFERENT passes (live 05:45: the two
+        # legs of 1790228400 landed 0.7s apart and printed two SETTLE lines).
+        # Carry a partial round until no fill of it is still open, then count
+        # it once.
+        carry = getattr(self, "_settle_carry", None)
+        if carry is None:
+            carry = self._settle_carry = {}
+        for key, a in list(rounds.items()):
+            prev = carry.pop(key, None)
+            if prev is not None:
+                for f in ("pnl", "stake", "fee", "payout"):
+                    a[f] += prev[f]
+                a["legs"] = prev["legs"] + a["legs"]
+                a["won"] = a["won"] and prev["won"]
+                a["main_loss"] = a["main_loss"] or prev["main_loss"]
+            if any(s_ == key[0] for s_, _f in self.open_fills.values()):
+                carry[key] = a
+                del rounds[key]
         for (slug, reserved, pool), a in rounds.items():
             self.guard.on_settle(slug, a["pnl"], reserved=reserved, pool=pool)
             self.pnl.add(a["pnl"], a["stake"], a["fee"], a["won"])
