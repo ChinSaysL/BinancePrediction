@@ -1475,6 +1475,36 @@ class Settings(BaseSettings):
     # what is placeable at a $5 stake.
     # ⛔ 0.0 = OFF = the previous behaviour exactly, and it is the revert.
     model_exit_behind_max_tau_s: float = 0.0
+    # ---- TRANCHE ENTRY: the answer to "cut losers, not winners" (2026-09-24) --
+    # Every SELL-based exit measured loses: after a model entry the book keeps
+    # UNDERPRICING our token even once it goes against us (bid 0.35 still wins
+    # 40-56%), so a sale hands back the edge -- ~65 rules over 11 families, on
+    # the 172 live-parity entries, a 458-entry holdout and 3,538 market rounds.
+    # So the losers are not SOLD, they are never fully BOUGHT: buy
+    # `first_frac` of the stake at the signal and the rest `delay_s` later
+    # only if spot is still on our side of the strike. A loser that turns
+    # early carries a third of the stake; a winner gets the whole stake, and
+    # the add-on is itself +EV (the high bids are underpriced too).
+    # MEASURED (replay, entry at ask+0.0088 + venue fee, add at ask(t+2.6s)),
+    # scaled to the SAME total profit as today's all-in:
+    #                              $lost  worst day  worst 3d  maxDD
+    #   live gate, all-in           42.0    -1.00     -2.11    4.96
+    #   min_edge 0.03 + tranche     39.6    -0.69     -1.81    3.01
+    # delay 5..30s all beat all-in on P&L (+24..+30 vs +19.02) and maxDD
+    # (3.0..4.2 vs 4.96) -- a broad effect, not a tuned spike. Requiring a
+    # minimum LEAD or a third leg measured WORSE. Bootstrap (30d, day blocks):
+    # min_edge 0.03 + tranche at 3.5% beats 5% all-in on median (+568% vs
+    # +527%), p10, P(DD>20%) (25% vs 82%) and the worst week.
+    # ⚠️ The add-on is booked as its own fill and is NOT exit-watched; run it
+    # with the grind exit off (`model_exit_behind_bps = 0`), which measured
+    # better than any exit anyway.
+    # ⛔ `model_tranche_enabled = False` is the previous behaviour exactly.
+    model_tranche_enabled: bool = False
+    model_tranche_first_frac: float = 0.34
+    model_tranche_delay_s: float = 15.0
+    # The add-on's price ceiling: the replay refused adds above 0.92, where the
+    # remaining upside no longer pays the fee and the slip.
+    model_tranche_max_px: float = 0.92
     # A minimum hold, measured from the FILL. The decision and the fill are
     # separated by ~1s (median 1.03s live), so a position is born on evidence
     # already a second old and an exit judging it immediately is judging the

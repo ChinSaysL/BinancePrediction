@@ -1682,6 +1682,7 @@ class Bot:
                 # would skip it on every tick the model does not emit, which is
                 # precisely when a dying thesis has to be sold.
                 await self._model_exit_check(r)
+                await self._tranche_tick(r)
                 is_trade = (cross_traded(prefix)
                             or model_traded(prefix)
                             or reversal_15m_traded(prefix))
@@ -2491,15 +2492,136 @@ class Bot:
                                       mode="stale_maker")
                 return
 
+        # TRANCHE ENTRY (config.model_tranche_*): only `first` goes out now; the
+        # rest is decided once, `model_tranche_delay_s` later, by
+        # `_tranche_tick`. Disabled, `first == stake` and nothing is scheduled.
+        first, rest = self._tranche_split(stake)
         fill = await self._place_order(
             r, sig,
             fair_up=sig.fair_up_model if sig.fair_up_model is not None else fair_up,
-            token=token, stake=stake)
+            token=token, stake=first)
         if not fill:
             return
         await self._book_fill(r, sig, fill, did=did, up=up,
                               spot=spot, sigma=sigma, tau=tau, token=token,
                               arm="model")
+        if rest > 0.0:
+            pend = getattr(self, "_tranche_pending", None)
+            if pend is None:
+                pend = self._tranche_pending = {}
+            pend[r.slug] = {
+                "side": sig.side, "token": token, "rest": rest, "did": did,
+                "due": time.time() + float(settings.model_tranche_delay_s),
+                "sigma": sigma, "fair": sig.fair, "quote": sig.quote,
+                "edge": sig.edge}
+            log.info("TRANCHE %s %s: first $%.2f placed, $%.2f more in %.0fs "
+                     "if spot is still on our side of the strike", r.slug,
+                     sig.side, first, rest, settings.model_tranche_delay_s)
+
+    def _tranche_split(self, stake: float) -> tuple[float, float]:
+        """(now, later) for a MODEL entry. `(stake, 0.0)` when tranching is off.
+
+        Each leg is its own order, so each must clear the venue minimum: the
+        first leg is raised to `min_order_usdt` if the fraction falls under it,
+        and a stake too small for two legs goes out whole (the previous
+        behaviour) rather than as one leg under the minimum.
+        """
+        stake = float(stake or 0.0)
+        if not settings.model_tranche_enabled or stake <= 0.0:
+            return stake, 0.0
+        floor = float(getattr(settings, "min_order_usdt", 0.0) or 0.0)
+        frac = min(1.0, max(0.0, float(settings.model_tranche_first_frac)))
+        first = max(floor, stake * frac)
+        rest = stake - first
+        if rest < floor or rest <= 0.0:
+            return stake, 0.0
+        return first, rest
+
+    async def _tranche_tick(self, r) -> None:
+        """Decide a scheduled add-on ONCE, when it falls due. See `_tranche_split`.
+
+        The rule is the measured one and nothing more: spot on our side of the
+        strike at the due time -> buy the rest; otherwise the round keeps its
+        first leg only. It is decided exactly once (popped before any await),
+        so a slow venue can never turn one add-on into two.
+        """
+        pend = getattr(self, "_tranche_pending", None)
+        if not pend or r is None:
+            return
+        p = pend.get(r.slug)
+        if p is None or time.time() < p["due"]:
+            return
+        pend.pop(r.slug, None)
+        slug, side = r.slug, p["side"]
+        end_ms = int(getattr(r, "end_ms", 0) or 0)
+        tau = (end_ms - int(time.time() * 1000)) / 1000.0 if end_ms else 0.0
+        if tau <= 5.0:
+            log.info("TRANCHE %s: add-on skipped -- tau %.0fs", slug, tau)
+            return
+        # The first leg must still be ours: an exit that already sold it (or
+        # a settlement) means there is no thesis left to add to.
+        w = (getattr(self, "_exit_watch", None) or {}).get(slug)
+        if w is not None and (w.get("selling") or w.get("pending")):
+            log.info("TRANCHE %s: add-on skipped -- the first leg is being "
+                     "sold", slug)
+            return
+        if not any(s == slug for s, _f in
+                   (getattr(self, "open_fills", None) or {}).values()):
+            log.info("TRANCHE %s: add-on skipped -- no open first leg", slug)
+            return
+        strike = float(getattr(r, "strike", 0.0) or 0.0)
+        buf = (getattr(self, "_ticks", None) or {}).get(symbol_for_round(r)) or []
+        now = [px for t, px in buf if px and px > 0]
+        if strike <= 0 or not now:
+            log.info("TRANCHE %s: add-on skipped -- no spot/strike", slug)
+            return
+        spot = now[-1]
+        lead = math.log(spot / strike) * 1e4 * (1.0 if side == "Up" else -1.0)
+        if lead <= 0.0:
+            log.info("TRANCHE %s %s: add-on skipped -- spot %.1fbps BEHIND the "
+                     "strike (the first leg carries the loss, not the stake)",
+                     slug, side, -lead)
+            return
+        allowed, why = self.guard.check_add(slug)
+        if not allowed:
+            log.info("TRANCHE %s: add-on refused by the guard: %s", slug, why)
+            return
+        cap = float(settings.model_tranche_max_px)
+        ask = None
+        _book = getattr(self, "book", None)
+        if _book is not None:
+            with contextlib.suppress(Exception):
+                bp = await _book.best_prices(p["token"],
+                                             getattr(r, "market_id", 0))
+                if bp and float(bp[1] or 0.0) > 0.0:
+                    ask = float(bp[1])
+        if ask is None:
+            log.info("TRANCHE %s: add-on skipped -- no ask to take", slug)
+            return
+        if ask > cap + 1e-9:
+            log.info("TRANCHE %s: add-on skipped -- ask %.3f above the %.2f "
+                     "cap", slug, ask, cap)
+            return
+        fill = await self.broker.buy(slug=slug, side=side, token_id=p["token"],
+                                     price=ask, stake=p["rest"], max_px=cap)
+        if not fill:
+            log.info("TRANCHE %s: add-on not filled (%s)", slug,
+                     getattr(self.broker, "last_failure", None))
+            return
+        sig = edge_signal.Signal(
+            side=side, fair=float(p.get("fair") or 0.0),
+            quote=float(p.get("quote") or 0.0),
+            edge=float(p.get("edge") or 0.0), hurdle=0.0,
+            ev_per_dollar=float("nan"), act=True,
+            reason="tranche add-on", ev_valid=False)
+        # arm=None: the add-on is NOT exit-watched (the watch is keyed by slug
+        # and holds the first leg). See config.model_tranche_enabled.
+        await self._book_fill(r, sig, fill, did=int(p["did"]), up=None,
+                              spot=spot, sigma=float(p.get("sigma") or 0.0),
+                              tau=tau, token=p["token"])
+        log.info("TRANCHE %s %s: add-on $%.2f @%.4f (spot %.1fbps ahead, tau "
+                 "%.0fs)", slug, side, float(fill.stake or 0.0),
+                 float(fill.filled_px or 0.0), lead, tau)
 
     async def _shot15(self, r, spot, tau, sigma, buy_up, buy_down,
                       now_ms: int) -> None:
