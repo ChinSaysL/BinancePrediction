@@ -2582,6 +2582,17 @@ class Bot:
                      "strike (the first leg carries the loss, not the stake)",
                      slug, side, -lead)
             return
+        # DECISIVE LEAD (config.model_tranche_min_z). Measured in units of the
+        # remaining move, so a thin lead with a long way to go does not count.
+        min_z = float(getattr(settings, "model_tranche_min_z", 0.0) or 0.0)
+        if min_z > 0.0:
+            _sg = float(p.get("sigma") or 0.0)
+            z = (lead / 1e4) / (_sg * math.sqrt(tau / 60.0)) if _sg > 0 else 0.0
+            if z < min_z:
+                log.info("TRANCHE %s %s: add-on skipped -- lead %.1fbps is z "
+                         "%.2f < %.2f with %.0fs left (not decisive)", slug,
+                         side, lead, z, min_z, tau)
+                return
         allowed, why = self.guard.check_add(slug)
         if not allowed:
             log.info("TRANCHE %s: add-on refused by the guard: %s", slug, why)

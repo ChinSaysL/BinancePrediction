@@ -241,3 +241,27 @@ def test_legs_settling_on_different_passes_still_count_once(tmp_path):
     rows = store.query("SELECT * FROM settlements WHERE slug='r1'")
     assert len(rows) == 2
     assert bot.pnl.pnl == pytest.approx(sum(r["pnl"] for r in rows))
+
+
+class TestTheDecisiveLeadGate:
+    """config.model_tranche_min_z: the lead must be decisive in units of the
+    move still to come. Live 05:47: +4.8bps with 168s left (z 0.72) was added
+    and reversed 6s later, a both-legs full loss."""
+
+    def test_off_by_default_keeps_the_old_rule(self, on):
+        bot, r = _bot(spot=STRIKE * (1 + 0.2e-4))       # +0.2bps: barely ahead
+        asyncio.run(bot._tranche_tick(r))
+        assert len(bot.bought) == 1
+
+    def test_a_thin_lead_with_time_left_is_not_added(self, on, monkeypatch):
+        monkeypatch.setattr(settings, "model_tranche_min_z", 0.75)
+        # the 05:47 trade: +4.8bps, sigma 0.0004/min, 168s left -> z ~0.72
+        bot, r = _bot(spot=STRIKE * (1 + 4.8e-4), tau_s=168.0)
+        asyncio.run(bot._tranche_tick(r))
+        assert bot.bought == []
+
+    def test_a_decisive_lead_is_added(self, on, monkeypatch):
+        monkeypatch.setattr(settings, "model_tranche_min_z", 0.75)
+        bot, r = _bot(spot=STRIKE * (1 + 8e-4), tau_s=120.0)   # z ~1.4
+        asyncio.run(bot._tranche_tick(r))
+        assert len(bot.bought) == 1

@@ -1505,6 +1505,18 @@ class Settings(BaseSettings):
     # The add-on's price ceiling: the replay refused adds above 0.92, where the
     # remaining upside no longer pays the fee and the slip.
     model_tranche_max_px: float = 0.92
+    # The add-on also needs the lead to be DECISIVE, in units of the move still
+    # to come: z = log(spot/strike)*side / (sigma_1m * sqrt(tau/60)). "Ahead by
+    # any amount" added a 4.8bps lead with 168s left (z 0.72) that reversed 6s
+    # later -- a both-legs full loss (live 2026-09-24 05:47, -$4.75).
+    # MEASURED (replay, 275 live-like entries + 347 other model entries):
+    # full-stake losses fall MONOTONICALLY with z (54 -> 21 -> 11 -> 8 -> 5 at
+    # z 0/0.5/0.7/0.75/1.0; holdout 57 -> 24 -> 17 -> 15 -> 6) and negative
+    # days 27% -> 20%; raw profit per $1 falls ~40% (+29 -> +17 at 0.75)
+    # because winning add-ons are skipped too, so it pairs with a bigger stake:
+    # at 10% it matches today's 6% median with P(DD>30%/30d) 43% -> 11%.
+    # 0.0 = OFF = the previous rule exactly.
+    model_tranche_min_z: float = 0.0
     # A minimum hold, measured from the FILL. The decision and the fill are
     # separated by ~1s (median 1.03s live), so a position is born on evidence
     # already a second old and an exit judging it immediately is judging the
