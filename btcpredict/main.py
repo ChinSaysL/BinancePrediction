@@ -2608,10 +2608,20 @@ class Bot:
             log.info("TRANCHE %s: add-on not filled (%s)", slug,
                      getattr(self.broker, "last_failure", None))
             return
+        # The add-on's OWN valuation, at the price it actually took. Reusing
+        # the entry's fair printed `fair=0.746 quote=0.700` on an add bought at
+        # 0.833 with spot 8.6bps ahead and stored ev_at_fill -0.1069 -- a fair
+        # 15s and a whole move stale (live 2026-09-24 05:01:50).
+        _sg = float(p.get("sigma") or 0.0)
+        try:
+            _fu = fair_value(spot, strike, tau, _sg) if _sg > 0 else None
+        except (ValueError, ZeroDivisionError):
+            _fu = None
+        _fair = (_fu if side == "Up" else 1.0 - _fu) if _fu is not None \
+            else float(p.get("fair") or 0.0)
         sig = edge_signal.Signal(
-            side=side, fair=float(p.get("fair") or 0.0),
-            quote=float(p.get("quote") or 0.0),
-            edge=float(p.get("edge") or 0.0), hurdle=0.0,
+            side=side, fair=float(_fair), quote=float(ask),
+            edge=float(_fair) - float(ask), hurdle=0.0,
             ev_per_dollar=float("nan"), act=True,
             reason="tranche add-on", ev_valid=False)
         # arm=None: the add-on is NOT exit-watched (the watch is keyed by slug
@@ -8757,6 +8767,7 @@ class Bot:
     async def settle_due(self) -> None:
         now_ms = int(time.time() * 1000)
         settled = False
+        rounds: dict[tuple, dict] = {}
         for fid, (slug, fill) in list(self.open_fills.items()):
             row = self.store.get_round(slug)
             if not row or row["end_ms"] > now_ms - 5_000:
@@ -8795,40 +8806,64 @@ class Bot:
             # Release the slot this fill is actually holding. Passing the main
             # the main one for a cross fill would leave `reserved_rounds` occupied
             # forever and the reserved slot permanently unavailable.
+            # ⛔ ONE ROUND = ONE TRADE. The ledger keeps a settlement ROW per
+            # fill (above), but everything that COUNTS -- the running stats,
+            # the risk guard's streak, the SETTLE line, the notification, the
+            # redeem -- is per ROUND. A tranche round has two fills, and booking
+            # them separately printed `trades=2` and two SETTLE lines whose
+            # `pnl` was each a leg, never the trade (live 2026-09-24 05:05:
+            # +0.5850 and +0.6276 for a round that made +1.2126), and would
+            # count one lost round as two consecutive losses.
             reserved, pool = pool_for_mode(self._fill_mode(fid))
-            self.guard.on_settle(slug, s.pnl, reserved=reserved, pool=pool)
-            self.pnl.add(s.pnl, fill.stake, fill.fee_paid, s.won)
-            # Arm the model arm's loss cooldown. Only the MAIN arm's own fills
-            # count: the other arms have their own budgets and their outcomes
-            # say nothing about this one's regime (see config).
-            if (settings.model_cooldown_after_loss > 0 and not s.won
-                    and _is_main_arm_mode(self._fill_mode(fid))):  # noqa: E501
-                self._model_cooldown = int(settings.model_cooldown_after_loss)
-                self._cooldown_round = None
-                log.info("model arm cooldown armed: skipping the next %d "
-                         "signal(s) after %s", self._model_cooldown, slug)
+            a = rounds.setdefault((slug, reserved, pool), {
+                "pnl": 0.0, "stake": 0.0, "fee": 0.0, "payout": 0.0,
+                "legs": [], "won": bool(s.won), "side": fill.side,
+                "winner": winner, "main_loss": False})
+            a["pnl"] += float(s.pnl or 0.0)
+            a["stake"] += float(fill.stake or 0.0)
+            a["fee"] += float(fill.fee_paid or 0.0)
+            a["payout"] += float(getattr(s, "payout", 0.0) or 0.0)
+            a["legs"].append(float(s.pnl or 0.0))
+            a["won"] = a["won"] and bool(s.won)
+            if not s.won and _is_main_arm_mode(self._fill_mode(fid)):
+                a["main_loss"] = True
             # The LEDGER, moved immediately and exactly: the stake has already
             # left the wallet and the payout is on its way, so equity changes by
             # exactly the settlement P&L. Waiting for the venue to agree is what
             # made a win look like a loss (see _reconcile_bankroll).
             self.bankroll += s.pnl
             del self.open_fills[fid]
-            # WIN / LOSS. Sent after `self.bankroll += s.pnl` so the message
-            # quotes the post-settlement equity rather than the pre.
+        for (slug, reserved, pool), a in rounds.items():
+            self.guard.on_settle(slug, a["pnl"], reserved=reserved, pool=pool)
+            self.pnl.add(a["pnl"], a["stake"], a["fee"], a["won"])
+            # Arm the model arm's loss cooldown. Only the MAIN arm's own fills
+            # count: the other arms have their own budgets and their outcomes
+            # say nothing about this one's regime (see config).
+            if settings.model_cooldown_after_loss > 0 and a["main_loss"]:
+                self._model_cooldown = int(settings.model_cooldown_after_loss)
+                self._cooldown_round = None
+                log.info("model arm cooldown armed: skipping the next %d "
+                         "signal(s) after %s", self._model_cooldown, slug)
+            # WIN / LOSS. Sent after the ledger moved so the message quotes the
+            # post-settlement equity rather than the pre.
             self.telegram.settled(
-                slug=slug, side=fill.side, stake=float(fill.stake or 0.0),
-                payout=float(getattr(s, "payout", 0.0) or 0.0),
-                pnl=float(s.pnl or 0.0), won=bool(s.won),
+                slug=slug, side=a["side"], stake=a["stake"],
+                payout=a["payout"], pnl=a["pnl"], won=a["won"],
                 bankroll=float(self.bankroll))
             # Live winnings sit as a claimable position until redeemed; they do
             # not credit the wallet on their own. This is the FAST path -- the
             # venue sometimes rejects a not-yet-final position here, and
-            # sweep_claims() is the retry clock for whatever it drops.
-            if s.won and self.broker.mode == "live":
+            # sweep_claims() is the retry clock for whatever it drops. ONCE per
+            # round: a second call only meets "already have a pending claim".
+            if a["won"] and self.broker.mode == "live":
                 claimed = await self.broker.redeem()
                 log.info("redeem -> %s", str(claimed)[:200])
-            log.info("SETTLE %s %s winner=%s pnl=%+.4f | running: %s",
-                     slug, "WON" if s.won else "LOST", winner, s.pnl, self.pnl)
+            legs = ("" if len(a["legs"]) < 2 else
+                    " (%d legs: %s)" % (len(a["legs"]), ", ".join(
+                        f"{x:+.4f}" for x in a["legs"])))
+            log.info("SETTLE %s %s winner=%s pnl=%+.4f%s | running: %s",
+                     slug, "WON" if a["won"] else "LOST", a["winner"],
+                     a["pnl"], legs, self.pnl)
         if settled:
             # A position closed, so the wallet balance is readable as equity
             # and the next stake should track it (see _refresh_bankroll).

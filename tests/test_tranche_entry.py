@@ -164,3 +164,57 @@ def test_the_entry_hook_runs_every_tick():
     src = pathlib.Path("btcpredict/main.py").read_text()
     i = src.index("await self._model_exit_check(r)\n")
     assert "await self._tranche_tick(r)" in src[i:i + 200]
+
+
+class TestATrancheRoundSettlesAsOneTrade:
+    """Live 2026-09-24 05:05: one round, two legs, printed `trades=2` and two
+    SETTLE lines whose pnl was each a leg (+0.5850, +0.6276), never the trade
+    (+1.2126). The ledger keeps a row per fill; everything that COUNTS is per
+    round."""
+
+    @staticmethod
+    def _bot(tmp_path, won_side="Up"):
+        from btcpredict.calibration.report import PnLSummary
+        from btcpredict.execution.paper import PaperBroker
+        from btcpredict.risk.guards import RiskGuard
+        from btcpredict.store.db import Store
+        store = Store(tmp_path / "t.db")
+        for i, (px, stake) in enumerate(((0.706, 1.51), (0.833, 2.93))):
+            store.insert("fills", {
+                "decision_id": 1, "slug": "r1", "ts_ms": 1000 + i,
+                "mode": "paper", "side": "Up", "requested_px": px,
+                "filled_px": px, "shares": stake / px, "stake": stake,
+                "fee_paid": 0.01, "order_id": f"p{i}", "raw": ""})
+        store.upsert_round({"slug": "r1", "start_ms": 0, "end_ms": 1,
+                            "market_topic_id": 99, "winner": won_side})
+        bot = Bot.__new__(Bot)
+        bot.mode = "paper"; bot.store = store; bot.open_fills = {}
+        bot.bankroll = 100.0; bot._bankroll_drift = 0
+        bot.guard = RiskGuard(daily_loss_cap=100.0, max_consecutive_losses=5,
+                              max_open_rounds=1)
+        bot.broker = PaperBroker(); bot.pnl = PnLSummary()
+        sent = []
+        bot.telegram = SimpleNamespace(settled=lambda **kw: sent.append(kw))
+        bot._restore_open_positions()
+        return bot, store, sent
+
+    def test_a_winning_round_is_one_trade(self, tmp_path):
+        bot, store, sent = self._bot(tmp_path, "Up")
+        asyncio.run(bot.settle_due())
+        assert bot.pnl.n_trades == 1, "one round, one trade"
+        assert bot.pnl.staked == pytest.approx(4.44)
+        rows = store.query("SELECT * FROM settlements WHERE slug='r1'")
+        assert len(rows) == 2, "the ledger still keeps a row per fill"
+        want = sum(r["pnl"] for r in rows)     # the round = the sum of its legs
+        assert want > 1.0
+        assert bot.pnl.pnl == pytest.approx(want, abs=1e-9)
+        assert len(sent) == 1 and sent[0]["pnl"] == pytest.approx(want, abs=1e-9)
+
+    def test_a_losing_round_is_ONE_loss_in_the_streak(self, tmp_path):
+        bot, store, sent = self._bot(tmp_path, "Down")
+        asyncio.run(bot.settle_due())
+        assert bot.pnl.n_trades == 1
+        assert bot.guard.state.consecutive_losses == 1
+        rows = store.query("SELECT * FROM settlements WHERE slug='r1'")
+        assert bot.pnl.pnl == pytest.approx(sum(r["pnl"] for r in rows))
+        assert len(sent) == 1
